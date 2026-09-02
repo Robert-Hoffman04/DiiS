@@ -26,6 +26,10 @@
 #include "unistd.h"
 #include "ehcmodule_elf.h"
 
+/* iosDestroyHeap() was removed from libogc; IPC heaps created with
+   iosCreateHeap() can no longer be released, so this is a no-op. */
+static inline s32 iosDestroyHeap(s32 hid) { (void)hid; return 0; }
+
 #define MLOAD_MLOAD_THREAD_ID	0x4D4C4400
 #define MLOAD_LOAD_MODULE		0x4D4C4480
 #define MLOAD_RUN_MODULE		0x4D4C4481

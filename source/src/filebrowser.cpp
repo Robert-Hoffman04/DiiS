@@ -20,6 +20,7 @@
 
 #include "filebrowser.h"
 #include <sys/dir.h>
+#include <sys/param.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -167,7 +168,7 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 		PAD_ScanPads();
 		WPAD_ScanPads();
 
-		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z)) 
+		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z))
 			return BROWSER_CANCELED;
 
 		if(GetHeld(UP, UP, UP)){

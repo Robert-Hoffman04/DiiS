@@ -147,7 +147,7 @@ static const int lfnPos[13] = {1,3,5,7,9,14,16,18,20,22,24,28,30};
 
 /* Add a DIR_ENT for the files */
 static void add_file(char *fname, FsEntry * entry, int fileLevel) {
-	int i,j,k,n;
+	int i,j,k,n,nlen;
         u8 chk;
 
 	if (numFiles < MAXFILES-1) {
@@ -156,7 +156,10 @@ static void add_file(char *fname, FsEntry * entry, int fileLevel) {
 				if (fname[i]=='.') break;
 			if ((i==0)&&(strcmp(fname,".")==0)) i = 1;
 			if (i<0) i = strlen(fname);
-			for (j=0; j<i; j++)
+			// The 8.3 short-name field is only NAME_LEN bytes; clamp the
+			// copy length while keeping i as the extension offset.
+			nlen = (i > NAME_LEN) ? NAME_LEN : i;
+			for (j=0; j<nlen; j++)
 				files[numFiles].name[j] = fname[j];
 			for (; j<NAME_LEN; j++)
 				files[numFiles].name[j] = 0x20;
@@ -205,7 +208,8 @@ static void add_file(char *fname, FsEntry * entry, int fileLevel) {
 					if (fname[i]=='.') break;
 				if ((i==0)&&(strcmp(fname,".")==0)) i = 1;
 				if (i<0) i = strlen(fname);
-				for (j=0; j<i; j++)
+				nlen = (i > NAME_LEN) ? NAME_LEN : i;
+				for (j=0; j<nlen; j++)
 					files[numFiles].name[j] = fname[j];
 				for (; j<NAME_LEN; j++)
 					files[numFiles].name[j] = 0x20;

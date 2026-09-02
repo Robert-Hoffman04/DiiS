@@ -30,7 +30,7 @@
 #include <wiiuse/wpad.h>
 #include <sys/dir.h>
 #include <ogc/lwp_watchdog.h>
-#include <dopmii/FileSystem.h>
+#include <sys/param.h>
 #include "MMU.h"
 #include "NDSSystem.h"
 #include "cflash.h"
@@ -174,12 +174,6 @@ extern "C"
 
 int main(int argc, char **argv){
 
-	IO::SD OurSD;
-	OurSD.Mount();
-	IO::USB OurUSB;
-	OurUSB.Startup();
-	OurUSB.Mount();
-
 	char filename[MAXPATHLEN];
 	char *rom_filename = filename;
   
@@ -211,9 +205,14 @@ int main(int argc, char **argv){
 		sprintf(rom_filename, "usb:/DS/ROMS");
 	}
 
+#ifdef DESMUME_FORCE_ROM
+	// Hardcoded ROM path for automated testing (see Makefile TESTDEFS).
+	strcpy(rom_filename, device ? "usb:/DS/ROMS/test.nds" : "sd:/DS/ROMS/test.nds");
+#else
 	if(FileBrowser(rom_filename) != 0)
 		quit_game = true;
-	
+#endif
+
 	cflash_disk_image_file = NULL;
 
 	printf("Initializing virtual Nintendo DS...\n");
@@ -719,10 +718,22 @@ bool PickDevice(){
 	bool useGX = false;
 	current3Dcore = 2; //Soft Raster
 
+#ifdef DESMUME_FORCE_CORE
+	// Hardcoded selection for automated testing (see Makefile TESTDEFS).
+	// DESMUME_FORCE_CORE: 1 = GX, 2 = software raster
+	// DESMUME_FORCE_USB:  0 = SD, 1 = USB
+	current3Dcore = DESMUME_FORCE_CORE;
+#ifdef DESMUME_FORCE_USB
+	return DESMUME_FORCE_USB;
+#else
+	return false;
+#endif
+#endif
+
 	while(true){
 		PAD_ScanPads();
 		WPAD_ScanPads();
-		 
+
 		printf("\x1b[2J");
 		printf("\x1b[2;0H");
 		printf("Welcome to DeSmuME Wii!!!\n\n");
@@ -786,7 +797,7 @@ void ShowCredits() {
 
 	printf("Press A to return to the menu.");
 	
-	while(true){ 
+	while(true){
 	    PAD_ScanPads();
 		WPAD_ScanPads();
 		if(GetInput(A, A, A))

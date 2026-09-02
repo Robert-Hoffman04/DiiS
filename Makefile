@@ -26,14 +26,26 @@ INCLUDES	:=
 # options for code generation
 #---------------------------------------------------------------------------------
 
-CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g -O3 -fsigned-char -Wall $(MACHDEP) $(INCLUDE)
+# -fno-strict-aliasing / -fwrapv / -fno-aggressive-loop-optimizations:
+# the DeSmuME core relies on type-punning, signed-overflow wraparound and
+# out-of-bounds pointer arithmetic that was harmless under the 2012 GCC 4.x
+# toolchain but is undefined behaviour that modern GCC (13+) exploits at -O3,
+# miscompiling the GPU/renderer into a blank screen. These flags disable the
+# offending assumptions and restore correct output. Do not remove them.
+OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations
+
+# TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
+#   make TESTDEFS="-DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM"
+# to skip the on-screen device/renderer picker and file browser and boot
+# straight into sd:/DS/ROMS/test.nds for automated testing.
+CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS)
 CXXFLAGS	=	$(CFLAGS)
-LDFLAGS	    =	-g $(MACHDEP) -Wl,-Map,$(notdir $@).map
+LDFLAGS	    =	-g $(MACHDEP) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 
 #---------------------------------------------------------------------------------
 # any extra libraries we wish to link with the project
 #---------------------------------------------------------------------------------
-LIBS        := -ldopmii -lz -lfat -lwiiuse -lbte -lasnd -logc -lm -lwiikeyboard 
+LIBS        := -lz -lfat -lwiiuse -lbte -lasnd -logc -lm -lwiikeyboard
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
