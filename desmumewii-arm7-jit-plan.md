@@ -1,7 +1,12 @@
 # ARM7 THUMB trace-JIT — porting the VBA-GX recompiler to DeSmuME Wii
 
-Status: **plan, not started.** Companion to
+Status: **in progress — P0 landed** (branch `arm7-jit`; vendored infra compiles
+behind `JITDEFS=-DDESMUME_JIT_ARM7`, unwired). Companion to
 [desmumewii-perf-opportunities.md](desmumewii-perf-opportunities.md) §1.2(b).
+
+External references: VBA-GX JIT source `dborth/vbagx` @ `07ee4af`
+(`source/vba/gba/JIT*`, frozen copy in `source/src/jit/upstream/`);
+instruction-conformance test ROMs `jsmolka/gba-tests` (MIT).
 
 The goal: take VBA-GX's THUMB trace-JIT (`dborth/vbagx`, `source/vba/gba/JIT*`,
 release 3.0.1 / Aug 2026, GPL-2.0+, © Daryl Borth) and stand it up as the DS
@@ -303,6 +308,34 @@ Port order: (1) predication wrapper + data-processing (imm operand) — smoke te
 `LDM`/`STM`; (6) multiplies; (7) `MRS`/`MSR`/`SWP`; (8) `SWI`/`BX`/undefined
 terminators. Differential-test each before the next, same as THUMB.
 
+### 5.3 Test corpus
+
+The DS ARM7 *is* an ARM7TDMI, so GBA CPU-conformance suites are directly
+applicable — same core, same ARMv4T semantics, same NZCV behaviour.
+
+* **`jsmolka/gba-tests`** (MIT) — `arm.gba` / `thumb.gba` are the reference
+  ARMv4T instruction-conformance ROMs (every data-processing form, shifter
+  carry case, multiply, `LDM`/`STM` edge case, PC-relative quirk); `memory.gba`
+  covers access widths/alignment. They run all cases and display the number of
+  the first failure (BG mode 4). This is exactly the per-instruction coverage
+  the differential harness wants.
+* **Getting the code onto the ARM7 is the catch.** This Wii port has no DS
+  "GBA mode" (Slot-2 cart on the ARM7 with a GBA memory map, ARM9 halted), so
+  `arm.gba` won't just boot. Two workable routes:
+  1. *Harness ROM* — a small `.nds` whose ARM7 side copies a test payload into
+     ARM7 WRAM, jumps to it, and reports the first-failure number to a fixed
+     main-RAM word the ARM9 prints / writes to `sd:/jit_test.log`. jsmolka's
+     tests already branch to a fail handler with the case number in a register
+     — trivial to trap.
+  2. *Re-target the sources* — the tests are FASMARM assembly; assemble the
+     `arm`/`thumb` test bodies for the DS ARM7 directly into a permanent
+     in-tree regression ROM, keeping the run-all / report-first-failure logic.
+  Route 1 for P2 bring-up (fast), route 2 as the durable regression asset
+  before P5 sign-off.
+* Retain the existing pair — the deterministic `vsd` test ROM and retail
+  Phantom Hourglass — for whole-system soak; the jsmolka suite is the
+  instruction-level net.
+
 ---
 
 ## 6. Phasing
@@ -311,12 +344,12 @@ terminators. Differential-test each before the next, same as THUMB.
 |---|---|---|
 | **P0** | Vendor files into `source/src/jit/`, Makefile wiring, `-DDESMUME_JIT_ARM7` off by default. Provenance/licence headers preserved. | tree builds clean with and without the flag |
 | **P1** | CPU-agnostic refactor: parameterize `JITCache` bank check, introduce `JitCpuProfile`, split VBA's `JITCompiler.cpp` into `jit_trace.*` (scanner/allocator/bailout) + `jit_thumb.cpp` (emitters), retarget flag-bit positions to CPSR, adapt trampoline arg list. | linker stub + trampoline round-trip an empty block, differential harness compiles |
-| **P2** | ARM7 THUMB front-end: scanner + opcode groups 1–6 (§5.1), **C-call memory path only**, VBA timing machinery deleted, DeSmuME `cyclesForThumb`. | groups 1–6 pass differential test on ARM7 BIOS boot + `test.nds` |
+| **P2** | ARM7 THUMB front-end: scanner + opcode groups 1–6 (§5.1), **C-call memory path only**, VBA timing machinery deleted, DeSmuME `cyclesForThumb`. Stand up the differential harness + a jsmolka `thumb` harness ROM (§5.3 route 1). | groups 1–6 pass differential test on ARM7 BIOS boot + `test.nds` + the jsmolka THUMB cases they cover |
 | **P3** | Scheduler integration: `armcpu_exec_block<1>`, cycle-quota yield, IRQ/reschedule bailout, aggregate-cycle return into `armInnerLoop`. | full boot to menu with JIT on, no audio/IPC regression vs interpreter |
 | **P4** | SMC/DMA write invalidation wired through all ARM7 + aliasing ARM9 write paths. THUMB groups 7–10. | SMC torture: a ROM that rewrites ARM7 IWRAM code runs identically |
-| **P5** | Differential soak + benchmark (THUMB only). `tools/benchmark` with a JIT-on column across sw/gx/merge × scenes. Menu toggle (`GCSettings` analogue). **Ported `Profiler` reports THUMB-vs-ARM-vs-fallback instruction mix on 4+ retail ROMs.** | zero differential mismatches over a full PH intro + gameplay capture; benchmark delta + coverage numbers reported |
+| **P5** | Differential soak + benchmark (THUMB only). `tools/benchmark` with a JIT-on column across sw/gx/merge × scenes. Menu toggle (`GCSettings` analogue). **Ported `Profiler` reports THUMB-vs-ARM-vs-fallback instruction mix on 4+ retail ROMs.** | jsmolka `thumb`/`memory` suites all-pass under JIT; zero differential mismatches over a full PH intro + gameplay capture; benchmark delta + coverage numbers reported |
 | **P6** | Inline memory fast paths (MAIN_MEM/ERAM/SWIRAM) via `arm7*Page[]`, WRAMCNT rebuild hook. Block chaining tuning, quota tuning. | measurable ARM7-share reduction, still zero mismatches |
-| **P7** | **ARM (32-bit) front-end** (`jit_arm.cpp`): predication wrapper + barrel shifter + the encoding classes in §5.2, in the stated port order, each differential-tested. Reuses P1–P6 infra unchanged. | ARM groups pass differential test; combined THUMB+ARM coverage and benchmark delta reported |
+| **P7** | **ARM (32-bit) front-end** (`jit_arm.cpp`): predication wrapper + barrel shifter + the encoding classes in §5.2, in the stated port order, each differential-tested. Reuses P1–P6 infra unchanged. Add the jsmolka `arm` harness ROM. | jsmolka `arm` suite all-pass under JIT; ARM groups pass differential test; combined THUMB+ARM coverage and benchmark delta reported |
 | **P8** *(separate effort)* | ARM9 front-end: second `JitCpuProfile` (`isaLevel=5`), TCM-aware page tables, ARMv5 opcode additions in the existing `jit_thumb.cpp`/`jit_arm.cpp`, ARM9 pipeline/cache timing model. | its own plan |
 
 P0–P3 is the credible "is this worth it" gate. Stop and measure there; the P5
