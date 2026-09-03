@@ -18,7 +18,8 @@ include $(DEVKITPPC)/wii_rules
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source/src source/src/metaspu \
-				source/src/addons source/src/utils source/src/gekko_utils
+				source/src/addons source/src/utils source/src/gekko_utils \
+				source/src/jit
 DATA		:=	data  
 INCLUDES	:=
 
@@ -38,7 +39,14 @@ OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizati
 #   make TESTDEFS="-DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM"
 # to skip the on-screen device/renderer picker and file browser and boot
 # straight into sd:/DS/ROMS/test.nds for automated testing.
-CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS)
+
+# JITDEFS: empty by default. Pass  make JITDEFS=-DDESMUME_JIT_ARM7  to compile
+# the ARM7 trace-JIT infrastructure in source/src/jit/ (see
+# desmumewii-arm7-jit-plan.md). Not yet wired into execution. Toggling this
+# needs a  make clean  -- the flag is not tracked in the dependency files.
+JITDEFS     ?=
+
+CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS) $(JITDEFS)
 CXXFLAGS	=	$(CFLAGS)
 LDFLAGS	    =	-g $(MACHDEP) $(OPTFLAGS) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 
