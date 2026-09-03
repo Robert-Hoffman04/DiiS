@@ -167,6 +167,7 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 	while(1){
 		PAD_ScanPads();
 		WPAD_ScanPads();
+		GECKO_Update();   // USB Gecko / EXI debug-serial input (gekko_utils/geckoinput.h)
 
 		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z))
 			return BROWSER_CANCELED;

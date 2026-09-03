@@ -42,7 +42,28 @@
 #include "version.h"
 #include "log_console.h"
 #include "GXRender.h"
+#include "GXMerge.h"
 #include "rasterize.h"
+
+// See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
+// whether draw_thread keeps making progress while GXRender is on the core
+// thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
+// starving draw_thread of vidmutex, vs. something in draw_thread). Throttled -
+// draw_thread runs every vsync and we only need the first handful of frames.
+#ifdef GXRENDER_DEBUG_LOG
+#include <stdio.h>
+static void gxdbg_main(const char *msg)
+{
+	static int n = 0;
+	if (n >= 400) return;
+	n++;
+	FILE *f = fopen("sd:/gxdbg.log", "a");
+	if (f) { fprintf(f, "[main] %s\n", msg); fclose(f); }
+}
+#define GXDBG_MAIN(msg) gxdbg_main(msg)
+#else
+#define GXDBG_MAIN(msg)
+#endif
 #include "filebrowser.h"
 #include "gekko_utils/usb2storage.h"
 #include "gekko_utils/mload.h"
@@ -227,6 +248,13 @@ int main(int argc, char **argv){
 	create_dummy_firmware(); // Must do for some games!
 
 	NDS_3D_ChangeCore(current3Dcore);
+
+	// Hardware 3D/2D compositing path (see GXMerge.h).  Opt-in; GX core only.
+	// Automated-test switch mirrors the DESMUME_FORCE_* pattern (see Makefile).
+#ifdef DESMUME_FORCE_GXCOMPOSITE
+	GXMerge_SetEnabled(current3Dcore == 1);
+#endif
+
 	printf("Initialization successful!\n");
 
 	enable_sound = true;
@@ -259,12 +287,23 @@ void init(){
 	u32 xfbHeight;
 	f32 yscale;
 
-	GXColor background = {0, 0, 0, 0xff};
+	// Alpha 0, not 0xFF: GXRender.cpp's legacy compositor path depends on the
+	// EFB clear alpha staying transparent for its entire life (see the long
+	// comment in ReadFramebuffer()) - an opaque clear here would make every
+	// pixel a 3D scene doesn't actually draw to read back as "3D content"
+	// anyway once the clear used by 3D frames round-trips through
+	// draw_thread's end-of-frame GX_CopyDisp(...,GX_TRUE), which re-clears
+	// the EFB with this same global colour for the next 3D frame to draw
+	// into. RGB is irrelevant to the final picture either way: the display
+	// copy that actually reaches the screen always runs before whichever
+	// clear prepares the EFB for next time.
+	GXColor background = {0, 0, 0, 0};
 	currfb = 0;
 
 	// button initialization
 	PAD_Init();
 	WPAD_Init();
+	GECKO_InputInit();   // USB Gecko / EXI debug-serial input routing (gekko_utils/geckoinput.h)
 	VIDEO_Init();
 
 	rmode = VIDEO_GetPreferredMode(NULL);
@@ -371,6 +410,8 @@ void init(){
 	if (vidmutex == LWP_MUTEX_NULL)
 		LWP_MutexInit(&vidmutex, false);
 
+	GXMerge_Init();
+
 	VIDEO_SetBlack(false);
 }
 
@@ -406,8 +447,11 @@ static void Draw(void) {
 	DCFlushRange(TopScreen, 256*192*2);
 	DCFlushRange(BottomScreen, 256*192*2);
 
+	if (GXMerge_Enabled())
+		GXMerge_Present();
+
 	LWP_MutexUnlock(vidmutex);
-	
+
 	return;
 }
 
@@ -502,9 +546,20 @@ static void *draw_thread(void*){
 
 		if(change_screen_layout)	// call it only when necessary.
 			do_screen_layout();
-		
+
+		GXDBG_MAIN("draw_thread: waiting for vidmutex");
 		LWP_MutexLock(vidmutex);
-		
+		GXDBG_MAIN("draw_thread: vidmutex acquired");
+
+		// GXRender leaves the EFB in GX_PF_RGBA6_Z24 and never restores it; the
+		// hardware-merge sandwich wants a plain RGB8 EFB.  Only switch it for a
+		// present that actually runs the sandwich - otherwise match the legacy
+		// path, which presents through the RGBA6 EFB GXRender left behind.
+		if (GXMerge_HasPresentFrame()) {
+			GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+			GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+		}
+
 		// Transform for scaling and rotate
 
 		Mtx m, m1, m2, mv;
@@ -521,8 +576,11 @@ static void *draw_thread(void*){
 
 		GX_LoadPosMtxImm (mv, GX_PNMTX0);
 
+		GXDBG_MAIN("draw_thread: matrix set up");
+
 		// TOP SCREEN
 		if ((screen_layout != SCREEN_SUB_NORMAL) && (screen_layout != SCREEN_SUB_STRETCH)){
+			GXDBG_MAIN("draw_thread: top screen quad start");
 			GX_LoadTexObj(&TopTex, GX_TEXMAP0);
 			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 				GX_Position2f32(topX, topY);
@@ -534,9 +592,19 @@ static void *draw_thread(void*){
 				GX_Position2f32(topX+width, topY);
 				GX_TexCoord2f32(1, 0);
 			GX_End();
+			GXDBG_MAIN("draw_thread: top screen quad end");
+
+			// TopTex is now the "behind" bucket in merge mode; overlay the 3D
+			// bands and the front bucket on top of it.
+			if (GXMerge_Enabled() && MainScreen.offset == 0) {
+				if (GXMerge_HasPresentFrame())
+					GXMerge_DrawMainScreen(topX, topY, width, height);
+				GXMerge_DrawStatusMarker(topX, topY, width, height);
+			}
 		}
 		// BOTTOM SCREEN
 		if (screen_layout != SCREEN_MAIN_NORMAL && (screen_layout != SCREEN_MAIN_STRETCH)){
+			GXDBG_MAIN("draw_thread: bottom screen quad start");
 			GX_LoadTexObj(&BottomTex, GX_TEXMAP0);
 			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 				GX_Position2f32(bottomX, bottomY);
@@ -548,9 +616,17 @@ static void *draw_thread(void*){
 				GX_Position2f32(bottomX+width, bottomY);
 				GX_TexCoord2f32(1, 0);
 			GX_End();
+			GXDBG_MAIN("draw_thread: bottom screen quad end");
+
+			if (GXMerge_Enabled() && MainScreen.offset != 0) {
+				if (GXMerge_HasPresentFrame())
+					GXMerge_DrawMainScreen(bottomX, bottomY, width, height);
+				GXMerge_DrawStatusMarker(bottomX, bottomY, width, height);
+			}
 
 			// CURSOR
 			if (drawcursor){
+				GXDBG_MAIN("draw_thread: cursor quad start");
 				GX_LoadTexObj(&CursorTex, GX_TEXMAP0);
 				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 					GX_Position2f32(bottomX+cursor.x-5, bottomY+cursor.y-5);
@@ -562,20 +638,26 @@ static void *draw_thread(void*){
 					GX_Position2f32(bottomX+cursor.x+5, bottomY+cursor.y-5);
 					GX_TexCoord2f32(1, 0);
 				GX_End();
+				GXDBG_MAIN("draw_thread: cursor quad end");
 			}
 		}
 
+		GXDBG_MAIN("draw_thread: calling GX_DrawDone");
 		GX_DrawDone();
+		GXDBG_MAIN("draw_thread: GX_DrawDone returned");
 
 		currfb ^= 1;
 
 		GX_CopyDisp(xfb[currfb],GX_TRUE);
+		GXDBG_MAIN("draw_thread: GX_CopyDisp done");
 		VIDEO_SetNextFramebuffer(xfb[currfb]);
 		VIDEO_Flush();
+		GXDBG_MAIN("draw_thread: VIDEO_Flush done");
 
 		LWP_MutexUnlock(vidmutex);
 
 		VIDEO_WaitVSync();
+		GXDBG_MAIN("draw_thread: VIDEO_WaitVSync done, loop end");
 	}
 
 	return NULL;
@@ -614,6 +696,8 @@ void Execute() {
 	LWP_JoinThread(vidthread, NULL);
 	vidthread = LWP_THREAD_NULL;
 
+	GXMerge_Deinit();
+
 	NDS_DeInit();
 
 	GX_AbortFrame();
@@ -648,8 +732,97 @@ void ShowFPS() {
 	}
 }
 
-void DSExec(){  
-   
+#ifdef DESMUME_BENCH
+//---------------------------------------------------------------------------
+// Renderer runtime benchmark (-DDESMUME_BENCH).
+//
+// Measures how many NDS frames the emulator actually completes per second of
+// real (Wii timebase) wall-clock time - i.e. emulation speed relative to a
+// real DS's 59.8261 Hz.  Nothing here throttles: Execute() already runs
+// DSExec() back to back with no frame limiter, so the rate we log is the
+// honest "as fast as this build can go" rate for whatever scene is on screen.
+//
+// Every BENCH_BLOCK frames a CSV row is appended to sd:/bench.log:
+//   frame,wall_us,block_us,exec_us,draw_us
+//     frame     - NDS frame number at end of block
+//     wall_us   - cumulative us since the first benched frame
+//     block_us  - wall us for this block of BENCH_BLOCK frames
+//     exec_us   - us spent in NDS_exec() over the block
+//     draw_us   - us spent in Draw()  over the block
+// After BENCH_FRAMES frames a SUMMARY row is written and the game quits so the
+// Dolphin process can be reaped cleanly.
+//---------------------------------------------------------------------------
+#include <stdio.h>
+#include <ogc/lwp_watchdog.h>
+
+#ifndef DESMUME_BENCH_FRAMES
+#define DESMUME_BENCH_FRAMES 2400
+#endif
+#ifndef DESMUME_BENCH_BLOCK
+#define DESMUME_BENCH_BLOCK 60
+#endif
+
+static void bench_tick(u64 exec_ticks, u64 draw_ticks)
+{
+	static bool  started = false;
+	static u64   t_first = 0;
+	static u64   t_block = 0;
+	static u32   frame   = 0;
+	static u64   acc_exec = 0;
+	static u64   acc_draw = 0;
+
+	u64 now = gettime();
+
+	if (!started) {
+		started = true;
+		t_first = now;
+		t_block = now;
+		FILE *f = fopen("sd:/bench.log", "w");
+		if (f) {
+			fprintf(f, "# desmumewii bench  core=%d  gxmerge=%d  target_hz=59.8261\n",
+			        (int)current3Dcore, (int)GXMerge_Enabled());
+			fprintf(f, "frame,wall_us,block_us,exec_us,draw_us\n");
+			fclose(f);
+		}
+	}
+
+	frame++;
+	acc_exec += ticks_to_microsecs(exec_ticks);
+	acc_draw += ticks_to_microsecs(draw_ticks);
+
+	if (frame % DESMUME_BENCH_BLOCK == 0) {
+		u64 block_us = ticks_to_microsecs(now - t_block);
+		u64 wall_us  = ticks_to_microsecs(now - t_first);
+		FILE *f = fopen("sd:/bench.log", "a");
+		if (f) {
+			fprintf(f, "%u,%llu,%llu,%llu,%llu\n",
+			        frame, (unsigned long long)wall_us, (unsigned long long)block_us,
+			        (unsigned long long)acc_exec, (unsigned long long)acc_draw);
+			fclose(f);
+		}
+		t_block  = now;
+		acc_exec = 0;
+		acc_draw = 0;
+	}
+
+	if (frame >= DESMUME_BENCH_FRAMES) {
+		u64 wall_us = ticks_to_microsecs(now - t_first);
+		double secs = wall_us / 1000000.0;
+		double fps  = secs > 0.0 ? frame / secs : 0.0;
+		FILE *f = fopen("sd:/bench.log", "a");
+		if (f) {
+			fprintf(f, "# SUMMARY frames=%u wall_s=%.3f eff_fps=%.3f pct_realtime=%.1f slowdown=%.2fx\n",
+			        frame, secs, fps, 100.0 * fps / 59.8261,
+			        fps > 0.0 ? 59.8261 / fps : 0.0);
+			fclose(f);
+		}
+		quit_game = true;
+	}
+}
+#endif // DESMUME_BENCH
+
+void DSExec(){
+
 	PAD_ScanPads();
 	WPAD_ScanPads();
 	
@@ -657,6 +830,11 @@ void DSExec(){
 	pad = PAD_ButtonsDown(0);
 
 	process_ctrls_event(&keypad, nds_screen_size_ratio);
+
+	// process_ctrls_event() has just polled the USB Gecko debug-serial channel;
+	// fold its edge events into `pad` too so the emulator-level controls below
+	// (console toggle, layout, GXMerge A/B toggle, ...) are drivable over it.
+	pad |= GECKO_ButtonsDown();
 	
 	// Update cursor position and click
 	if(cursor.down) {
@@ -679,10 +857,32 @@ void DSExec(){
 		change_screen_layout = true;
 	}
 	
-	if ((wpad & WPAD_BUTTON_B) || (pad & PAD_BUTTON_RIGHT)){ 
+	if ((wpad & WPAD_BUTTON_B) || (pad & PAD_BUTTON_RIGHT)){
 		drawcursor ^= 1;
 	}
-	
+
+	// A/B toggle for the hardware 3D/2D merge path (GC D-pad Down; GX core only).
+	if (pad & PAD_BUTTON_DOWN){
+		if (current3Dcore == 1)
+			GXMerge_SetEnabled(!GXMerge_Enabled());
+	}
+
+#ifdef GPU_DISPCAP_DEBUG_LOG
+	// Dump the DISPCAPCNT/offset ring buffer (GPU.cpp) - GC L trigger for an
+	// interactive session, or automatically every ~5s of NDS execution
+	// (overwriting the same file) so a capture centered on any visually-
+	// spotted glitch is never more than a few seconds stale - no working
+	// controller input needed at all; just pull the file right after seeing
+	// the glitch on screen. See GPU_DispCapDumpRing().
+	{
+		static u32 execFrames = 0;
+		execFrames++;
+		if ((pad & PAD_TRIGGER_L) || (execFrames % (5*60) == 0)) {
+			GPU_DispCapDumpRing();
+		}
+	}
+#endif
+
 	if (wpad & WPAD_BUTTON_PLUS)
 		SkipFrame++;
 	
@@ -697,10 +897,19 @@ void DSExec(){
 		(wpad & WPAD_CLASSIC_BUTTON_HOME))
 		quit_game = true;
 
+#ifdef DESMUME_BENCH
+	u64 _b0 = gettime();
+	NDS_exec<TRUE>(0);
+	u64 _b1 = gettime();
+	if (!SkipFrameTracker) Draw();
+	u64 _b2 = gettime();
+	bench_tick(_b1 - _b0, _b2 - _b1);
+#else
 	NDS_exec<TRUE>(0);
 
 	if (!SkipFrameTracker) Draw(); // only update when !Frame skip tracker
-	
+#endif
+
 
 	if(showfps) ShowFPS();
 }

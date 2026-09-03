@@ -1,0 +1,101 @@
+diff --git a/source/draw.cpp b/source/draw.cpp
+index c24e699..1442c3b 100644
+--- a/source/draw.cpp
++++ b/source/draw.cpp
+@@ -88,7 +88,9 @@ static inline void drawScene(void)
+ 	// draw all the regular geometry
+ 	g_room.draw(4, RM_FILL);
+ 
++#ifndef VSD_DETERMINISTIC
+ 	g_doll.ay += 2;
++#endif
+ 	g_doll.draw(5, RM_FILL);
+ 
+ 	// now draw the shadows, if desired
+@@ -134,9 +136,16 @@ void draw(void)
+ 	g_scissor.save();
+ 
+ 	// setup capturing
++#ifdef VSD_DETERMINISTIC
++	// Force plain "source A" capture (current 3D frame only, no blend with the
++	// previous frame) so every displayed frame is identical for A/B screenshots.
++	const int captureModeBits = 0;
++#else
++	const int captureModeBits = g_nCapturemode << 1;
++#endif
+ 	REG_DISPCAPCNT =
+ 		DCAP_ENABLE |
+-		DCAP_MODE(g_nCapturemode << 1) |	// Capture Source    (0=Source A, 1=Source B, 2/3=Sources A+B blended)
++		DCAP_MODE(captureModeBits) |		// Capture Source    (0=Source A, 1=Source B, 2/3=Sources A+B blended)
+ 		DCAP_OFFSET(0) |					// VRAM Write Offset (0=00000h, 0=08000h, 0=10000h, 0=18000h)
+ 		DCAP_SRC(1) |						// Source A          (0=Graphics Screen BG+3D+OBJ, 1=3D Screen)
+ 		DCAP_SRC(0 << 1) |					// Source B          (0=VRAM, 1=Main Memory Display FIFO)
+@@ -176,8 +185,12 @@ void draw(void)
+ 
+ 	g_nFramesDrawn++;
+ 
++#ifndef VSD_DETERMINISTIC
++	// The live counters repaint the sub-screen console every frame - suppressed in
++	// deterministic mode so the sub screen is pixel-stable too.
+ 	printf("\x1b[0;5H    \x1b[0;5H%lu\n", g_nFPS);
+ 	printf("\x1b[1;5H    \x1b[1;5H%i\n", GFX_VERTEX_RAM_USAGE);
+ 	printf("\x1b[2;5H    \x1b[2;5H%i\n", GFX_POLYGON_RAM_USAGE);
+ 	printf("\x1b[3;5H    \x1b[3;5H%i\n", FIX_GFX_RDLINES_COUNT);
++#endif
+ }
+diff --git a/source/main9.cpp b/source/main9.cpp
+index 9671052..fe2cac8 100644
+--- a/source/main9.cpp
++++ b/source/main9.cpp
+@@ -62,12 +62,51 @@ int main(int argc, char *argv[])
+ {
+ 	initialize();
+ 
++#if defined(VSD_DETERMINISTIC)
++	// -------------------------------------------------------------------------
++	// Test-harness build: render a fixed, non-animated scene so screenshots are
++	// byte-identical across runs and across emulator A/B toggles.
++	//
++	//   VSD_WARMUP_FRAMES - frames rendered before the scene is declared stable
++	//                       (default 16; lets textures/geometry/capture settle).
++	//   VSD_FREEZE         - if defined, stop reading input after warmup so stray
++	//                       controller traffic can't perturb the frozen scene.
++	//                       Leave undefined to keep the demo drivable via the
++	//                       serial/pipe controller (move the camera, then it is
++	//                       stable again as soon as input stops).
++	// -------------------------------------------------------------------------
++	#ifndef VSD_WARMUP_FRAMES
++	#define VSD_WARMUP_FRAMES 16
++	#endif
++
++	uint32 frame = 0;
++	while(true)
++	{
++	#ifdef VSD_FREEZE
++		if(frame < VSD_WARMUP_FRAMES)
++			input();
++	#else
++		input();
++	#endif
++		draw();
++		swiWaitForVBlank();
++
++		if(frame == VSD_WARMUP_FRAMES)
++		{
++			// One-time marker the harness can wait on before capturing.
++			printf("\x1b[10;0HVSD READY (deterministic)");
++		}
++		if(frame <= VSD_WARMUP_FRAMES)
++			frame++;
++	}
++#else
+ 	while(true)
+ 	{
+ 		input();
+ 		draw();
+ 		swiWaitForVBlank();
+ 	}
++#endif
+ 
+ 	return RSC_SUCCESS;
+ }

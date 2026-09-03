@@ -150,16 +150,29 @@ bool TexManager::resize(size_t n){
 //----------------------------------------
 
 void TexManager::activateTex(u32 texID){
-	size_t i = texID - 1;
-	
-	if(texID > numTotal){ // We need a texture ID that is too high!
-		
-		// We must allocate more memory.
+	// texID is 0-based - it comes straight from expandFreeTextures()'s
+	// `freeTextureIds.push(i)` loop (i starting at 0), and gxObj() below
+	// indexes textures[id] directly, with no -1. This used to subtract 1
+	// here, disagreeing with both of those: activateTex(0) - guaranteed on
+	// the very first texture ever allocated, every run - computed
+	// i = (size_t)(0 - 1), a wraparound to the largest size_t value, and then
+	// wrote used[i] = true through it: a one-byte out-of-bounds write
+	// (used[-1], immediately before the array) on every single boot. For
+	// every texID after the first, activateTex(texID) and gxObj(texID) were
+	// also then bookkeeping two different slots (index texID-1 vs texID) even
+	// though both actually only ever exchange data through gxObj()'s slot -
+	// harmless to rendering itself (GX_InitTexObj and GX_LoadTexObj always
+	// go through the same gxObj(texID)), but it permanently desynced
+	// used[]/numUsed from what's actually allocated.
+	size_t i = texID;
 
-		//--DCN: Should we allocate more than necessary?
-		//		 Or just up to the texID?
-		if(!resize(texID)){
-			// If resize returns false, that means that we couldn't 
+	if(texID >= numTotal){ // We need a texture ID that doesn't exist yet!
+
+		// We must allocate more memory. Need slots 0..texID, i.e. texID+1 of
+		// them - resizing to exactly texID (as this used to) leaves slot
+		// texID itself out of bounds, one short of what we're about to index.
+		if(!resize(texID + 1)){
+			// If resize returns false, that means that we couldn't
 			// allocate enough memory! PANIC! PANIIIIIIIC!
 			printf("\n -- TexManager::activateTex: No more memory --\n");
 			return;

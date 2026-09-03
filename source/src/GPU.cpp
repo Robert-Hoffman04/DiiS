@@ -28,12 +28,87 @@
 #include <iostream>
 #include "MMU.h"
 #include "GPU.h"
+
+// Diagnostic log for the DISPCAPCNT display-capture path + per-engine
+// DisplayMode, used to confirm/deny whether a game's dual-3D-screen trick
+// (capture engine A's composited 3D output to a VRAM bank, then have engine
+// B display that bank as DisplayMode==2 "VRAM framebuffer" on the other
+// physical screen, flipping POWCNT's swap bit each frame) is what's actually
+// running, and whether the two engines are reading/writing the banks the way
+// that trick requires. Throttled - this is register-write/frame-boundary
+// traffic, not per-pixel.
+#ifdef GPU_DISPCAP_DEBUG_LOG
+#include <stdio.h>
+#include <stdarg.h>
+static void gpudbg(const char *fmt, ...)
+{
+	static int n = 0;
+	if (n >= 4000) return;
+	n++;
+	FILE *f = fopen("sd:/dispcap.log", "a");
+	if (!f) return;
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fclose(f);
+}
+#define GPUDBG(...) gpudbg(__VA_ARGS__)
+
+// Ring buffer of recent frames' DISPCAPCNT/offset state (RAM only - no I/O,
+// so this can run every frame for the whole session at negligible cost).
+// GPU_DispCapDumpRing() (GPU.h), triggered from a GC pad button in
+// main.cpp's DSExec, writes it out on demand - lets a trace be centered on
+// a visual glitch the moment it's spotted on screen instead of a blind
+// timed capture window. See the recorder at the GPU_RenderLine l==0 site.
+struct DispCapRingEntry {
+	u32 frame;
+	u8 offsetA, offsetB;
+	u8 dispModeA, dispModeB;
+	u8 vramBlockA, vramBlockB;
+	u8 bg0_3dA, bg0_3dB;
+	u8 capEnabled, capArm;
+	u8 writeBlock, readBlock;
+	u8 capSrc, srcA, srcB;
+};
+#define DISPCAP_RING_CAP 1024
+static DispCapRingEntry g_dispCapRing[DISPCAP_RING_CAP];
+static u32 g_dispCapRingHead = 0; // next slot to write; entries wrap at DISPCAP_RING_CAP
+
+void GPU_DispCapDumpRing()
+{
+	FILE *f = fopen("sd:/dispring.log", "w");
+	if (!f) return;
+	u32 count = (g_dispCapRingHead < DISPCAP_RING_CAP) ? g_dispCapRingHead : DISPCAP_RING_CAP;
+	u32 start = (g_dispCapRingHead < DISPCAP_RING_CAP) ? 0 : g_dispCapRingHead;
+	fprintf(f, "ring dump: %u entries, head=%u\n", count, g_dispCapRingHead);
+	for (u32 i = 0; i < count; i++) {
+		DispCapRingEntry *e = &g_dispCapRing[(start + i) % DISPCAP_RING_CAP];
+		fprintf(f, "#%u A[disp=%d vram=%d bg0_3d=%d off=%d] B[disp=%d vram=%d bg0_3d=%d off=%d] cap[en=%d arm=%d wBlk=%d rBlk=%d src=%d/%d/%d]\n",
+				e->frame,
+				e->dispModeA, e->vramBlockA, e->bg0_3dA, e->offsetA,
+				e->dispModeB, e->vramBlockB, e->bg0_3dB, e->offsetB,
+				e->capEnabled, e->capArm, e->writeBlock, e->readBlock,
+				e->capSrc, e->srcA, e->srcB);
+	}
+	fclose(f);
+}
+#else
+#define GPUDBG(...)
+#endif
 #include "render3D.h"
 #include "gfx3d.h"
 #include "debug.h"
 #include "NDSSystem.h"
 #include "readwrite.h"
 #include "guDesmume.h"
+#include "GXMerge.h"
+
+// Per-scanline mergeability check (defined below, near GXMerge_FrameMergeable);
+// forward-declared so GPU_RenderLine_layer's 3D split point can call it.
+static bool GXMerge_LineMergeable(GPU * gpu, bool *outAlphaOver,
+                                  bool *outFrontAlphaOver, u8 *outFrontEva,
+                                  u8 *outBrightMode, u8 *outBrightFactor);
 
 #ifdef FASTBUILD
 	#undef FORCEINLINE
@@ -1988,9 +2063,15 @@ void GPU_set_DISPCAPCNT(u32 val)
 			break;
 	}
 
+	GPUDBG("[dispcapcnt] val=0x%08X EVA=%d EVB=%d wBlock=%d wOff=%d capx=%d capy=%d rBlock=%d rOff=%d capSrc=%d srcA=%d srcB=%d mainDisplayMode=%d mainVramBlock=%d mainBG0_3D=%d\n",
+			(unsigned)val, gpu->dispCapCnt.EVA, gpu->dispCapCnt.EVB, gpu->dispCapCnt.writeBlock, gpu->dispCapCnt.writeOffset,
+			gpu->dispCapCnt.capx, gpu->dispCapCnt.capy, gpu->dispCapCnt.readBlock, gpu->dispCapCnt.readOffset,
+			gpu->dispCapCnt.capSrc, gpu->dispCapCnt.srcA, gpu->dispCapCnt.srcB,
+			dispCnt->DisplayMode, dispCnt->VRAM_Block, dispCnt->BG0_3D);
+
 	/*INFO("Capture 0x%X:\n EVA=%i, EVB=%i, wBlock=%i, wOffset=%i, capX=%i, capY=%i\n rBlock=%i, rOffset=%i, srcCap=%i, dst=0x%X, src=0x%X\n srcA=%i, srcB=%i\n\n",
 			val, gpu->dispCapCnt.EVA, gpu->dispCapCnt.EVB, gpu->dispCapCnt.writeBlock, gpu->dispCapCnt.writeOffset,
-			gpu->dispCapCnt.capx, gpu->dispCapCnt.capy, gpu->dispCapCnt.readBlock, gpu->dispCapCnt.readOffset, 
+			gpu->dispCapCnt.capx, gpu->dispCapCnt.capy, gpu->dispCapCnt.readBlock, gpu->dispCapCnt.readOffset,
 			gpu->dispCapCnt.capSrc, gpu->dispCapCnt.dst - MMU.ARM9_LCD, gpu->dispCapCnt.src - MMU.ARM9_LCD,
 			gpu->dispCapCnt.srcA, gpu->dispCapCnt.srcB);*/
 }
@@ -2117,6 +2198,51 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 						{
 							gpu->currBgNum = 0;
 
+							// Hardware-merge path: everything drawn so far this
+							// scanline is the "behind" bucket (already in
+							// GPU_screen); redirect the rest of the walk - the
+							// "front" bucket - into GXMerge's front line buffer
+							// and let the GX hardware sandwich the 3D layer in.
+							bool alphaOver = false;
+							bool frontAlphaOver = false;
+							u8   frontEva = 0;
+							u8   brightMode = 0;
+							u8   brightFactor = 0;
+#ifdef GXMERGE_FORCE
+							if (GXMerge_FrameArmed() && gpu->core == GPU_MAIN)
+#else
+							if (GXMerge_FrameArmed() && gpu->core == GPU_MAIN &&
+							    GXMerge_LineMergeable(gpu, &alphaOver, &frontAlphaOver, &frontEva,
+							                          &brightMode, &brightFactor))
+#endif
+							{
+								// Is there any 2D layer that can sit behind the 3D
+								// layer (>= BG0's priority), i.e. real content to
+								// reveal through transparent 3D?  Cheap register
+								// check - no per-pixel work.
+								const u32 p3d = gpu->dispx_st->dispx_BGxCNT[0].bits.Priority;
+								bool behindContent = gpu->LayersEnable[4];   // sprites: assume some behind
+								for (int bg = 1; bg <= 3 && !behindContent; bg++)
+									if (gpu->LayersEnable[bg] &&
+									    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority >= p3d)
+										behindContent = true;
+
+								GXMerge_RecordLine(l, behindContent, gpu->getHOFS(0), alphaOver,
+								                   frontAlphaOver, frontEva,
+								                   brightMode, brightFactor);
+								gpu->tempScanline = gpu->currDst = GXMerge_FrontLine(l);
+								memset(gpu->bgPixels, 0, 256);   // 3D (BG0) is now "below"
+								// The front line buffer never holds a 3D/behind pixel, so a
+								// CPU blend of a front layer against the bg_under==0 sentinel
+								// is always wrong - it would blend against the (empty) front
+								// buffer.  Clear BG0's 2nd-target bit for the rest of this
+								// line's walk; the GX front draw does that blend instead
+								// (frontAlphaOver band).  blend2[] is rebuilt from BLDCNT
+								// every line (see above), so this is scoped to this line.
+								gpu->blend2[0] = 0;
+								continue;
+							}
+
 							const u16 hofs = gpu->getHOFS(i16);
 
 							gfx3d_GetLineData(l, &gpu->_3dColorLine);
@@ -2171,15 +2297,36 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 {
 	//this macro takes advantage of the fact that there are only two possible values for capx
-	#define CAPCOPY(SRC,DST,SETALPHABIT) \
+	//
+	// DST is always cap_dst - real guest VRAM (MMU.ARM9_LCD-backed), which by
+	// DS-hardware contract is always little-endian, the same as every other
+	// VRAM bank this port touches elsewhere (see LE_TO_LOCAL_16/T1ReadWord use
+	// throughout the BG-bitmap and dispMode==2 paths below). It must be
+	// written with an endian-safe store (T1WriteWord), not HostWriteWord,
+	// which is a raw native 16-bit store - a silent byte-swap on this
+	// (big-endian) target. Previously every capture wrote its pixels
+	// byte-swapped into VRAM; any consumer that later read that bank back
+	// correctly as little-endian (a BG layer pointed at the captured bank -
+	// e.g. Phantom Hourglass's dual-3D-screen trick, which captures Engine
+	// A's composited 3D+2D output to VRAM every frame and displays it via an
+	// ordinary bitmap BG layer on the other physical screen - or dispMode==2)
+	// would then see every pixel's RGB555 channels scrambled: a clean blue
+	// water texture on the "live" screen came out as the pink/black/yellow
+	// blob on the "captured" screen. READFN is HostReadWord when SRC is one
+	// of this file's own internal, native-order buffers (gpu->tempScanline,
+	// gfx3d_GetLineData15bpp's static buf - both written with HostWriteWord
+	// elsewhere, so reading them back with the matching native accessor is
+	// correct), or T1ReadWord for the "Capture VRAM" (srcB==0) case, where
+	// SRC is cap_src - itself real little-endian guest VRAM.
+	#define CAPCOPY(SRC,DST,SETALPHABIT,READFN) \
 	switch(gpu->dispCapCnt.capx) { \
 		case DISPCAPCNT::_128: \
 			for (int i = 0; i < 128; i++)  \
-				HostWriteWord(DST, i << 1, HostReadWord(SRC, i << 1) | (SETALPHABIT?(1<<15):0)); \
+				T1WriteWord(DST, i << 1, READFN(SRC, i << 1) | (SETALPHABIT?(1<<15):0)); \
 			break; \
 		case DISPCAPCNT::_256: \
 			for (int i = 0; i < 256; i++)  \
-				HostWriteWord(DST, i << 1, HostReadWord(SRC, i << 1) | (SETALPHABIT?(1<<15):0)); \
+				T1WriteWord(DST, i << 1, READFN(SRC, i << 1) | (SETALPHABIT?(1<<15):0)); \
 			break; \
 			default: assert(false); \
 		}
@@ -2239,7 +2386,7 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 									//INFO("Capture screen (BG + OBJ + 3D)\n");
 
 									u8 *src = (u8*)(gpu->tempScanline);
-									CAPCOPY(src,cap_dst,true);
+									CAPCOPY(src,cap_dst,true,HostReadWord);
 								}
 							break;
 							case 1:			// Capture 3D
@@ -2247,7 +2394,7 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 									//INFO("Capture 3D\n");
 									u16* colorLine;
 									gfx3d_GetLineData15bpp(l, &colorLine);
-									CAPCOPY(((u8*)colorLine),cap_dst,false);
+									CAPCOPY(((u8*)colorLine),cap_dst,false,HostReadWord);
 								}
 							break;
 						}
@@ -2258,9 +2405,9 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 						//INFO("Capture source is SourceB\n");
 						switch (gpu->dispCapCnt.srcB)
 						{
-							case 0:	
+							case 0:
 								//Capture VRAM
-								CAPCOPY(cap_src,cap_dst,true);
+								CAPCOPY(cap_src,cap_dst,true,T1ReadWord);
 								break;
 							case 1:
 								//capture dispfifo
@@ -2289,42 +2436,59 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 
 						static u16 fifoLine[256];
 
+						// srcB, when it's cap_src (real guest VRAM) or fifoLine
+						// (filled via the endian-safe T1WriteLong just below),
+						// must be read back with T1ReadWord rather than raw
+						// u16[] indexing - same little-endian-VRAM-vs-native-
+						// accessor mismatch as CAPCOPY above. srcA is always
+						// one of this file's own native-order buffers
+						// (tempScanline / gfx3d_GetLineData15bpp's buf), so
+						// raw indexing there is correct and left as-is.
+						bool srcBIsLE;
+
 						if (gpu->dispCapCnt.srcB == 0)			// VRAM screen
+						{
 							srcB = (u16 *)cap_src;
+							srcBIsLE = true;
+						}
 						else
 						{
 							//fifo - tested by splinter cell chaos theory thermal view
 							srcB = fifoLine;
 							for (int i=0; i < 128; i++)
 								T1WriteLong((u8*)srcB, i << 2, DISP_FIFOrecv());
+							srcBIsLE = true;
 						}
 
 
 						const int todo = (gpu->dispCapCnt.capx==DISPCAPCNT::_128?128:256);
 
-						for(u16 i = 0; i < todo; i++) 
+						for(u16 i = 0; i < todo; i++)
 						{
 							u16 a,r,g,b;
 
-							u16 a_alpha = srcA[i] & 0x8000;
-							u16 b_alpha = srcB[i] & 0x8000;
+							const u16 srcAv = srcA[i];
+							const u16 srcBv = srcBIsLE ? T1ReadWord((u8*)srcB, i << 1) : srcB[i];
+
+							u16 a_alpha = srcAv & 0x8000;
+							u16 b_alpha = srcBv & 0x8000;
 
 							if(a_alpha)
 							{
 								a = 0x8000;
-								r = ((srcA[i] & 0x1F) * gpu->dispCapCnt.EVA);
-								g = (((srcA[i] >>  5) & 0x1F) * gpu->dispCapCnt.EVA);
-								b = (((srcA[i] >>  10) & 0x1F) * gpu->dispCapCnt.EVA);
-							} 
+								r = ((srcAv & 0x1F) * gpu->dispCapCnt.EVA);
+								g = (((srcAv >>  5) & 0x1F) * gpu->dispCapCnt.EVA);
+								b = (((srcAv >>  10) & 0x1F) * gpu->dispCapCnt.EVA);
+							}
 							else
 								a = r = g = b = 0;
 
 							if(b_alpha)
 							{
 								a = 0x8000;
-								r += ((srcB[i] & 0x1F) * gpu->dispCapCnt.EVB);
-								g += (((srcB[i] >>  5) & 0x1F) * gpu->dispCapCnt.EVB);
-								b += (((srcB[i] >> 10) & 0x1F) * gpu->dispCapCnt.EVB);
+								r += ((srcBv & 0x1F) * gpu->dispCapCnt.EVB);
+								g += (((srcBv >>  5) & 0x1F) * gpu->dispCapCnt.EVB);
+								b += (((srcBv >> 10) & 0x1F) * gpu->dispCapCnt.EVB);
 							}
 
 							r >>= 4;
@@ -2336,7 +2500,7 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 							g = std::min((u16)31,g);
 							b = std::min((u16)31,b);
 
-							HostWriteWord(cap_dst, i << 1, a | (b << 10) | (g << 5) | r);
+							T1WriteWord(cap_dst, i << 1, a | (b << 10) | (g << 5) | r);
 						}
 					}
 				break;
@@ -2506,12 +2670,198 @@ void GPU::update_winh(int WIN_NUM)
 	}
 }
 
+// Whether the MAIN engine's frame can be handed to the hardware-merge path this
+// frame.  Two tiers:
+//  - Frame-level (GXMerge_FrameMergeable, checked once at line 0): things that
+//    don't vary per scanline and make the sandwich meaningless outright for the
+//    whole frame - a non-2D-compositor display mode, or display capture (which
+//    needs the legacy readback intact).
+//  - Line-level (GXMerge_LineMergeable, Phase 2: re-checked at every 3D split
+//    point): blend/window state that a game can rewrite mid-frame via HBlank IRQ
+//    raster effects. BG0 HOFS (see GXMerge_HofsSegment) and master-bright
+//    mode/factor (see GXMergeBand::brightMode, applied by GXMerge draw 4) are
+//    also read fresh per line but, unlike a window or a mixed blend target,
+//    don't disqualify the line - they just split the band.
+//    GPU_RenderLine_layer already
+//    re-reads all of these fresh every scanline for the legacy per-pixel path
+//    (see gpu->blend2[] just above), so checking them once at line 0 and freezing
+//    the decision for the whole frame was needlessly pessimistic: one scanline
+//    using a window or a blend effect used to fall the *entire screen* back to
+//    the legacy path. Now only the disqualified scanlines do - everything else
+//    still gets the hardware sandwich, coalesced into bands by GXMerge_EndFrame.
+// diagnostic: last reason a mergeability check returned false
+// 0 ok/armed  1 dispMode  2 capture
+// 3 blend2 - a cross-boundary blend GX fixed-function can't express as one
+//   whole-band operation: either the behind-bucket layers that could sit under
+//   3D don't share one blend2 eligibility, or BG0 is a blend 2nd target and the
+//   front bucket isn't the one clean shape the front-vs-beneath blend handles
+//   (a single blend1 BG, no front sprites - see GXMerge_LineMergeable).
+// 4 bright1st  5 window
+// 6 unused (was hofs - now handled per-band, see GXMerge_HofsSegment)
+// 7 unused (was masterbright - now handled per-band via GXMerge draw 4, see
+//   GXMergeBand::brightMode)
+int g_gxmergeFailReason = 0;
+
+static bool GXMerge_FrameMergeable(GPU * gpu)
+{
+	g_gxmergeFailReason = 0;
+
+	// dispMode != 1: the main engine is showing a VRAM framebuffer / FIFO / off,
+	// not the 2D compositor output, so there is nothing to sandwich into.
+	if (gpu->dispMode != 1)
+		{ g_gxmergeFailReason = 1; return false; }
+	// display capture reads the 3D / 2D-composite directly and needs the legacy
+	// readback intact this frame.
+	if (gpu->dispCapCnt.enabled || (gpu->dispCapCnt.val & 0x80000000))
+		{ g_gxmergeFailReason = 2; return false; }
+
+	return true;
+}
+
+// Per-scanline disqualifiers, checked fresh at the 3D split point for every line
+// that has BG0_3D active. A line that fails falls through to the legacy
+// per-pixel setFinalColor3d loop right below the caller's redirect - i.e. just
+// that scanline (and whichever band it ends up in) is composited the old way;
+// every other line's redirect is untouched.
+//
+// *outAlphaOver reports whether the hardware sandwich should draw this line's
+// 3D band with a real per-pixel alpha blend against the behind bucket
+// (GXMerge_HofsSegment's caller, GXMerge_DrawMainScreen, keys off this per
+// band) instead of the default opaque-and-alpha-keyed draw.
+static bool GXMerge_LineMergeable(GPU * gpu, bool *outAlphaOver,
+                                  bool *outFrontAlphaOver, u8 *outFrontEva,
+                                  u8 *outBrightMode, u8 *outBrightFactor)
+{
+	*outAlphaOver = false;
+	*outFrontAlphaOver = false;
+	*outFrontEva = 0;
+	*outBrightMode = 0;
+	*outBrightFactor = 0;
+	const u16 bld = gpu->BLDCNT;
+	const u32 p3d = gpu->dispx_st->dispx_BGxCNT[0].bits.Priority;
+	const u8  blendMode = (bld >> 6) & 3;
+
+	// --- front-bucket shape check (BG0/3D as a blend 2nd target) ----------
+	// BG0 selected as a blend 2nd target means a FRONT-bucket 2D layer above
+	// 3D blends against what is beneath it.  On real hardware
+	// (_master_setFinalBGColor case Blend) that is a constant-fraction blend
+	// by the global BLDALPHA EVA/EVB, so it maps onto one GX blend per band -
+	// but only when (a) the front bucket is a single blend1 BG in alpha-blend
+	// mode with nothing stacked on it (a stacked front layer or a front
+	// sprite would be wrongly translucified by a whole-band blend of the
+	// front composite), and (b) everything the front layer can sit on is
+	// uniformly blend2-eligible (checked with the behind-bucket uniformity
+	// below) - otherwise the DS draws it opaque over the non-eligible parts
+	// and a whole-band blend would over-blend those.
+	// GPU_RenderLine_layer's redirect clears blend2[0] for the front walk, so
+	// the front layer is composited opaque and the GX front draw
+	// (GXMergeBand::frontAlphaOver) does the EVA blend against the EFB.
+	bool wantFrontBlend = false;
+	if (bld & 0x0100)
+	{
+		int frontBG = -1, nFrontBG = 0;
+		for (int bg = 1; bg <= 3; bg++)
+			if (gpu->LayersEnable[bg] &&
+			    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority < p3d)
+				{ nFrontBG++; frontBG = bg; }
+
+		bool frontSprite = false;
+		if (gpu->LayersEnable[4])
+			for (u32 pr = 0; pr <= p3d; pr++)
+				if (gpu->itemsForPriority[pr].nbPixelsX) { frontSprite = true; break; }
+
+		if (nFrontBG == 0 && !frontSprite) {
+			// BG0 is a 2nd target but nothing in front actually blends against
+			// it this line - merge normally, no front blend.
+		} else if (nFrontBG == 1 && !frontSprite &&
+		           blendMode == 1 && (bld & (1 << frontBG))) {
+			wantFrontBlend = true;
+		} else {
+			g_gxmergeFailReason = 3; return false;
+		}
+	}
+
+	// The other five blend-2nd-target bits (BG1,BG2,BG3,OBJ,Backdrop) govern
+	// whether 3D blends against whatever is directly beneath it in the BEHIND
+	// bucket. Real hardware rule, already reproduced in this file's own
+	// _master_setFinal3dColor(): 3D blends with blend2[bg_under] using the 3D
+	// polygon's OWN per-pixel alpha - entirely independent of BLDCNT's blend
+	// mode bits or whether BG0 itself is selected as a 1st target. Which
+	// layer is "bg_under" varies per screen column (whichever behind-bucket
+	// layer happens to be topmost there), so a single GX draw for the whole
+	// band is only correct if every layer that could possibly be "under" 3D
+	// on this line shares the same blend2 eligibility - mixed eligibility is
+	// a genuinely per-pixel condition GX fixed-function can't express in one
+	// band, and falls back same as before.
+	bool underBlend2 = gpu->blend2[5];   // backdrop is always a potential "under"
+	{
+		bool uniform = true;
+		for (int bg = 1; bg <= 3 && uniform; bg++)
+			if (gpu->LayersEnable[bg] &&
+			    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority >= p3d &&
+			    gpu->blend2[bg] != underBlend2)
+				uniform = false;
+		if (uniform && gpu->LayersEnable[4] && gpu->blend2[4] != underBlend2)
+			uniform = false;   // sprites: conservatively assume some may be behind
+		if (!uniform)
+			{ g_gxmergeFailReason = 3; return false; }
+		*outAlphaOver = underBlend2;
+	}
+
+	// Front-vs-beneath blend is only whole-band-correct if the front layer
+	// sits on uniformly blend2-eligible content everywhere (backdrop + every
+	// behind layer, checked just above, plus BG0 itself which the 0x0100 test
+	// guarantees).  Otherwise the DS would draw it opaque over the parts that
+	// aren't 2nd targets - fall back for that line.
+	if (wantFrontBlend)
+	{
+		if (!underBlend2)
+			{ g_gxmergeFailReason = 3; return false; }
+		*outFrontAlphaOver = true;
+		*outFrontEva = gpu->BLDALPHA_EVA;   // pre-clamped 0..16
+	}
+
+	// brightness increase/decrease with BG0 as 1st target => 3D gets brightened
+	if ((bld & 0x0001) && (blendMode >= 2))
+		{ g_gxmergeFailReason = 4; return false; }
+	if (gpu->setFinalColor3d_funcNum >= 4)   // a window is active
+		{ g_gxmergeFailReason = 5; return false; }
+	// BG0 HOFS (3D layer horizontal scroll) no longer disqualifies a line: the
+	// hardware sandwich now reproduces it exactly by drawing each band's 3D quad
+	// from a sub-rect of the resident 3D texture (GXMerge_HofsSegment) instead of
+	// the full 256 columns - see GXMerge_RecordLine's hofs argument and
+	// GXMerge_EndFrame's band-split-on-hofs-change.
+	// MASTER_BRIGHT (mode 1 bright-up / mode 2 bright-down) no longer disqualifies
+	// a line: it applies to the *final* composited scanline, which for a merged
+	// line is the whole behind/3D/front sandwich, so the merge path reproduces it
+	// as a per-band full-width GX pass over the merged EFB (GXMerge draw 4) and
+	// GPU_RenderLine skips the CPU GPU_RenderLine_MasterBrightness pass for merged
+	// lines.  A mid-frame HBlank-IRQ rewrite of the factor/mode just splits the
+	// band (GXMerge_EndFrame), same as HOFS.
+	if (gpu->MasterBrightFactor != 0 &&
+	    (gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2)) {
+		*outBrightMode   = gpu->MasterBrightMode;
+		u32 f = gpu->MasterBrightFactor;
+		*outBrightFactor = (u8)(f > 16 ? 16 : f);
+	}
+
+	g_gxmergeFailReason = 0;
+	return true;
+}
+
 void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 {
 	GPU * gpu = screen->gpu;
 
 	//here is some setup which is only done on line 0
 	if(l == 0) {
+		if (gpu->core == GPU_MAIN && GXMerge_Enabled()) {
+			GXMerge_BeginFrame(MainScreen.offset == 0);
+#ifndef GXMERGE_FORCE
+			if (!GXMerge_FrameMergeable(gpu))
+				GXMerge_Disarm();
+#endif
+		}
 		//this is speculative. the idea is as follows:
 		//whenever the user updates the affine start position regs, it goes into the active regs immediately
 		//(this is handled on the set event from MMU)
@@ -2524,6 +2874,49 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 		//NOTE:
 		//I am REALLY unsatisfied with this logic now. But it seems to be working..
 		gpu->refreshAffineStartRegs(-1,-1);
+
+		// Ring-buffer history recorder: RAM only, no I/O, so it's cheap to run
+		// every frame for the whole session. GPU_DispCapDumpRing() (wired to
+		// a GC pad button in main.cpp) writes it out on demand, so a trace
+		// can be centered on a visual glitch the instant it's spotted on
+		// screen instead of guessing at a timed capture window or a specific
+		// anomaly signature to detect (a prior stall-detector approach here
+		// found no stalls in screen-offset/writeBlock alternation even
+		// across a session where the desync was directly visible on screen -
+		// so whatever's wrong is in the VRAM bank *content* correspondence,
+		// not the swap timing, and needs the raw sequence to find).
+#ifdef GPU_DISPCAP_DEBUG_LOG
+		{
+			static u32 frameCounter = 0;
+			int c = gpu->core;
+			DispCapRingEntry *e = &g_dispCapRing[g_dispCapRingHead % DISPCAP_RING_CAP];
+			if (c == 0) {
+				e->frame = frameCounter;
+				e->offsetA = (u8)screen->offset;
+				e->dispModeA = gpu->dispMode;
+				e->vramBlockA = gpu->vramBlock;
+				e->bg0_3dA = gpu->dispCnt().BG0_3D;
+				e->capEnabled = gpu->dispCapCnt.enabled;
+				e->capArm = (gpu->dispCapCnt.val >> 31) & 1;
+				e->writeBlock = gpu->dispCapCnt.writeBlock;
+				e->readBlock = gpu->dispCapCnt.readBlock;
+				e->capSrc = gpu->dispCapCnt.capSrc;
+				e->srcA = gpu->dispCapCnt.srcA;
+				e->srcB = gpu->dispCapCnt.srcB;
+			} else {
+				e->offsetB = (u8)screen->offset;
+				e->dispModeB = gpu->dispMode;
+				e->vramBlockB = gpu->vramBlock;
+				e->bg0_3dB = gpu->dispCnt().BG0_3D;
+				// B is always processed right after A for the same frame
+				// (NDSSystem.cpp calls MainScreen then SubScreen per line),
+				// so this is the point at which one full frame's entry is
+				// complete - advance the ring.
+				g_dispCapRingHead++;
+				frameCounter++;
+			}
+		}
+#endif
 	}
 
 	if(skip)
@@ -2549,7 +2942,11 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	if(gpu->MasterBrightFactor >= 16 && (gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2))
 	{
 		// except if it could cause any side effects (for example if we're capturing), then don't skip anything
-		if(!(gpu->core == GPU_MAIN && (gpu->dispCapCnt.enabled || l == 0 || l == 191)))
+		// - and, in hardware-merge mode, the MAIN engine's line still has to run
+		//   the layer walk so GXMerge records the band; the full-white/black
+		//   result is produced by GXMerge draw 4 instead (factor 16 => alpha 255).
+		if(!(gpu->core == GPU_MAIN && (gpu->dispCapCnt.enabled || l == 0 || l == 191))
+		   && !(gpu->core == GPU_MAIN && GXMerge_FrameArmed()))
 		{
 			gpu->currLine = l;
 			GPU_RenderLine_MasterBrightness(screen, l);
@@ -2634,7 +3031,14 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	}
 
 
-	GPU_RenderLine_MasterBrightness(screen, l);
+	// Hardware-merge mode: this scanline's behind bucket is only one third of the
+	// final composite (3D + front are added later by the GX sandwich), so
+	// MASTER_BRIGHT must be applied to the whole merged result, not just the
+	// behind bucket sitting in GPU_screen right now.  GXMerge draw 4 does that
+	// per band; skip the CPU pass here for merged lines or the behind bucket
+	// would be brightened twice.
+	if (!(gpu->core == GPU_MAIN && GXMerge_FrameArmed() && GXMerge_LineWasMerged(l)))
+		GPU_RenderLine_MasterBrightness(screen, l);
 }
 
 void gpu_savestate(EMUFILE* os)

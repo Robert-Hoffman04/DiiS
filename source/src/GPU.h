@@ -832,6 +832,14 @@ void GPU_addBack(GPU *, u8 num);
 int  GPU_ChangeGraphicsCore(int coreid);
 void GPU_set_DISPCAPCNT(u32 val) ;
 void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip = false) ;
+#ifdef GPU_DISPCAP_DEBUG_LOG
+// Dumps the last ~1024 frames' worth of DISPCAPCNT/offset ring-buffer history
+// to sd:/dispring.log. Cheap to keep recording every frame (RAM only, no
+// I/O); wired to a GC pad button in main.cpp so it can be triggered the
+// instant a visual desync is spotted on screen, giving a trace centered on
+// the actual glitch instead of a blind timed capture. See GPU.cpp.
+void GPU_DispCapDumpRing();
+#endif
 void GPU_setMasterBrightness (GPU *gpu, u16 val);
 void SetupFinalPixelBlitter (GPU *gpu);
 

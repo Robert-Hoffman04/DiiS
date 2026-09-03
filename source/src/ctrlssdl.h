@@ -29,6 +29,7 @@
 #include "MMU.h"
 
 #include "types.h"
+#include "gekko_utils/geckoinput.h"
 
 #define ADD_KEY(keypad,key) ( (keypad) |= (key) )
 #define RM_KEY(keypad,key) ( (keypad) &= ~(key) )
@@ -61,13 +62,13 @@ enum ds_keys {
 	Input(WPAD_BUTTON_##Wiimote, PAD_BUTTON_##GC, WPAD_CLASSIC_BUTTON_##Classic)
 
 #define Input( Wiimote, GC, Classic ) \
-	((WPAD_ButtonsDown(0) & Wiimote) || (PAD_ButtonsDown(0) & GC) || (WPAD_ButtonsDown(0) & Classic))
+	((WPAD_ButtonsDown(0) & Wiimote) || (PAD_ButtonsDown(0) & GC) || (WPAD_ButtonsDown(0) & Classic) || (GECKO_ButtonsDown() & (GC)))
 
 #define GetHeld( Wiimote, GC, Classic ) \
 	Held(WPAD_BUTTON_##Wiimote, PAD_BUTTON_##GC, WPAD_CLASSIC_BUTTON_##Classic)
 
 #define Held( Wiimote, GC, Classic ) \
-	((WPAD_ButtonsHeld(0) & Wiimote) || (PAD_ButtonsHeld(0) & GC) || (WPAD_ButtonsHeld(0) & Classic))
+	((WPAD_ButtonsHeld(0) & Wiimote) || (PAD_ButtonsHeld(0) & GC) || (WPAD_ButtonsHeld(0) & Classic) || (GECKO_ButtonsHeld() & (GC)))
 
 #else	//!HW_RVL
 
