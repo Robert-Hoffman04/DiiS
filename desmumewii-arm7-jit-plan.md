@@ -1,12 +1,15 @@
 # ARM7 THUMB trace-JIT — porting the VBA-GX recompiler to DeSmuME Wii
 
-Status: **in progress — P0, P1, P2 landed** (branch `arm7-jit`).
-P1: `JitCpuProfile` seam + ARM7 profile, `JITCache` bank check parameterised,
-trampoline reworked to a `jit_cpu_state*` ABI, `jit_trace.*` split, differential
-skeleton; `jitSelfTest()` round-trips a hand-emitted block (PASS on Dolphin).
-P2: real trace scanner + `jit_thumb.cpp` emitter (Formats 1–4, 16, 18); synthetic
-interpreter-vs-JIT differential — 37/37 vectors PASS on Dolphin (regs + NZCV + PC
-exact). Front-end still not wired into execution — that's P3. Companion to
+Status: **in progress — P0–P3 landed** (branch `arm7-jit`).
+P1: `JitCpuProfile` seam + ARM7 profile, `jit_cpu_state*` trampoline ABI,
+`jit_trace.*` split; `jitSelfTest()` round-trips a hand-emitted block (PASS).
+P2/P2b: real scanner + `jit_thumb.cpp` — all THUMB formats (1–19); synthetic
+interpreter-vs-JIT differential = **59/59 vectors PASS** (regs + NZCV + PC exact).
+P3: `jitRunArm7()` spliced into `armInnerLoop` (one block/turn, chaining off);
+zero-progress-bail demotion; SMC recompile fix; live differential harness.
+**Phantom Hourglass boots correctly with the JIT active** (intro cutscene
+renders identically to the interpreter); no hangs. Live multi-instruction
+thumb-block soak → P5. Companion to
 [desmumewii-perf-opportunities.md](desmumewii-perf-opportunities.md) §1.2(b).
 
 External references: VBA-GX JIT source `dborth/vbagx` @ `07ee4af`
@@ -351,7 +354,7 @@ applicable — same core, same ARMv4T semantics, same NZCV behaviour.
 | **P1** | CPU-agnostic refactor: parameterize `JITCache` bank check, introduce `JitCpuProfile`, split VBA's `JITCompiler.cpp` into `jit_trace.*` (scanner/allocator/bailout) + `jit_thumb.cpp` (emitters), retarget flag-bit positions to CPSR, adapt trampoline arg list. | linker stub + trampoline round-trip an empty block, differential harness compiles |
 | **P2** ✅ | ARM7 THUMB front-end: real scanner + `jit_thumb.cpp` emitters. Landed Formats 1–4 (all 16 ALU ops), 16, 18. VBA timing machinery deleted; cycle cost = Σ `cyclesForThumb`. Register shifts by ≥32 guard-bail to the interpreter. **Synthetic** interpreter-vs-JIT differential harness (`jit_thumb_test.cpp`, no scheduler needed). | ✅ 37/37 synthetic vectors PASS on Dolphin (R0–R14 + NZCV + resume PC). *Live-execution + jsmolka THUMB ROM deferred to P3 (needs the dispatch path).* Formats 5/6/9/10/11 (hi-reg, BX, literal load, loads/stores, BL) → **P2b**. |
 | **P2b** | Remaining THUMB: Format 5 (hi-reg ops + BX/mode-exit), Format 6 (PC-rel literal load, compile-time foldable), Formats 9/10/11 (loads/stores via the C-call memory path), Format 13/14/15 (SP-adjust, PUSH/POP, LDM/STM), Format 19 (BL). | those formats pass the synthetic differential; SMC write guards emitted for the store paths |
-| **P3** | Scheduler integration: `armcpu_exec_block<1>`, cycle-quota yield, IRQ/reschedule bailout, aggregate-cycle return into `armInnerLoop`. Wire the differential harness into live execution; stand up the jsmolka `thumb` harness ROM (§5.3 route 1). | full boot to menu with JIT on, no audio/IPC regression vs interpreter; jsmolka THUMB cases covered by landed formats all-pass |
+| **P3** ✅ | `jitRunArm7()` spliced into `armInnerLoop` — one block/turn (`JIT_ENABLE_CHAINING` 0), block cap 32, quota 64. `jitArm7Enabled` master switch. Zero-progress-bail → demote length-1 blocks to a "don't JIT" marker (the ARM7 `BX LR`→ARM idle-loop shape). `invalidateSMCTarget` zeroes length so kills recompile. Live differential harness (`jitRunArm7Checked`). | ✅ PH boots + renders correctly with JIT active; no hang; JIT-off `.dol` byte-identical. *Live thumb-block differential soak + jsmolka ROM → P5.* |
 | **P4** | SMC/DMA write invalidation wired through all ARM7 + aliasing ARM9 write paths. THUMB groups 7–10. | SMC torture: a ROM that rewrites ARM7 IWRAM code runs identically |
 | **P5** | Differential soak + benchmark (THUMB only). `tools/benchmark` with a JIT-on column across sw/gx/merge × scenes. Menu toggle (`GCSettings` analogue). **Ported `Profiler` reports THUMB-vs-ARM-vs-fallback instruction mix on 4+ retail ROMs.** | jsmolka `thumb`/`memory` suites all-pass under JIT; zero differential mismatches over a full PH intro + gameplay capture; benchmark delta + coverage numbers reported |
 | **P6** | Inline memory fast paths (MAIN_MEM/ERAM/SWIRAM) via `arm7*Page[]`, WRAMCNT rebuild hook. Block chaining tuning, quota tuning. | measurable ARM7-share reduction, still zero mismatches |
