@@ -52,6 +52,12 @@ void jitShutdown();
 // stub miss path -> return). Returns true on success; logs either way.
 bool jitSelfTest();
 
+#if defined(DESMUME_JIT_SELFTEST)
+// Synthetic interpreter-vs-JIT differential over a table of THUMB vectors
+// (jit_thumb_test.cpp). Returns the number of failing vectors.
+int jitThumbSelfTest();
+#endif
+
 #endif // DESMUME_JIT_ARM7
 
 #endif // DESMUME_JIT_H

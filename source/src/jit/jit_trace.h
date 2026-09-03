@@ -3,10 +3,15 @@
  *
  * jit_trace.h
  *
- * The front-end-agnostic half of the compiler: block-local scan/allocate/
- * bailout state that both jit_thumb.cpp (P2) and jit_arm.cpp (P7) build on
- * top of. In VBA-GX these structures were file-static inside JITCompiler.cpp;
- * splitting them out is what lets one trace scanner drive two emitter tables.
+ * The front-end-agnostic half of the compiler: the trace scanner, the lazy
+ * host-register allocator, the packed-flag helpers, deferred-bailout
+ * bookkeeping and the block epilogue. jit_thumb.cpp (P2) and jit_arm.cpp (P7)
+ * are just emitter tables that run on top of this.
+ *
+ * Derived from VBA-GX's JITCompiler.cpp (c) Daryl Borth, GPL v2+ -- see
+ * jit/upstream/PROVENANCE.md. The GBA prefetch-buffer / wait-state timing
+ * machinery is dropped (DeSmuME leaves ARM7 access timing disabled); cycle
+ * cost is a compile-time sum of JitCpuProfile::cyclesForThumb.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_TRACE_H
@@ -16,39 +21,97 @@
 
 #if defined(DESMUME_JIT_ARM7)
 
-// Deferred-bailout branch conditions (see JITCompiler.cpp's two-pass scheme).
-enum BailoutCond { COND_BEQ, COND_BNE, COND_BGE, COND_BLT, COND_BLE };
+// --- arena / block budget (from VBA) --------------------------------------
+#define JIT_MAX_WORDS              3072
+#define JIT_YIELD_NUMBER           256
+#define JIT_MAX_BAILOUTS           256
+#define JIT_EPILOGUE_RESERVE_WORDS 64
+#define JIT_BAILOUT_STUB_WORDS     20
 
-struct DeferredBailout {
+// Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top
+// nibble, conventional bits 31..28) -- which is exactly ARM CPSR's N/Z/C/V
+// layout, so PPC_REG_FLAGS can just hold the whole CPSR word.
+#define JITF_N 0
+#define JITF_Z 1
+#define JITF_C 2
+#define JITF_V 3
+
+enum JitBailoutCond { JIT_COND_BEQ, JIT_COND_BNE, JIT_COND_BGE, JIT_COND_BLT, JIT_COND_BLE };
+
+struct JitDeferredBailout {
 	u32* branchPtr;
-	BailoutCond cond;
+	JitBailoutCond cond;
 	u32 pc;
 	u32 cycles;
 	u32 instructions;
 };
 
-struct SMCBailoutPatch {
-	u32* branchLocation;
-	u32  pc;
-	u32  eaReg;
-	u32  instructions;
-	u32  cycles;
-};
-
-// Lazy guest-register cache slot (guest R0..R14 -> host R15..R28).
-struct RegisterState {
+struct JitRegSlot {
 	bool allocated;
 	bool dirty;
 	u8   hostReg;
-	u32  age;   // monotonic, for LRU eviction
+	u32  age;
 };
 
-// Compile a trace starting at startPC using cpu's front-end.
-//
-// P1: no emitter front-end exists yet -- this always registers a length-1
-// "don't JIT this" fallback block (execute == nullptr), which the dispatch
-// path (P3) resolves straight to the interpreter without re-attempting
-// compilation on every fetch.
+// Per-compile state, threaded through the scanner and the emitter table.
+struct JitTraceCtx {
+	const JitCpuProfile& cpu;
+	JITCache&            cache;
+
+	u32* emitPtr;
+	u32* blockStart;
+	u32* quotaGuard;
+	bool arenaAllocated;
+	u32  arenaOffsetStart;
+
+	u32  startPC;
+	u32  currentPC;
+	u32  instrCount;
+	u32  cyclesAccum;          // running compile-time cycle sum for this block
+	bool endBlock;
+	bool blockTerminatedEarly; // a hard exit was emitted; skip the default epilogue
+
+	bool flagsLoaded;
+	bool flagsDirty;
+
+	JitRegSlot regCache[15];
+	u32        allocatedHostRegsMask;
+	u32        currentAge;
+
+	JitDeferredBailout bailouts[JIT_MAX_BAILOUTS];
+	u32                bailoutCount;
+
+	// ---- lifecycle ----
+	void ensureArena();
+
+	// ---- packed flags (PPC_REG_FLAGS == r6 holds the guest CPSR word) ----
+	void ensureFlagsLoaded();
+	void emitFlagBit(u8 targetBit, u32 srcReg, u8 sh);
+	void emitFlagConst(u8 targetBit, bool value);
+	u8   readFlag(u8 flagIdx, u32 dstReg);        // -> dstReg, holding 0/1
+	void flushDirtyFlags();                       // stores + clears dirty
+	void emitDirtyFlagFlush();                    // stores, leaves dirty set
+	void emitNZ(u32 srcReg);
+	void emitCVfromXER(u32 scratchReg);
+
+	// ---- lazy host-register allocator (guest R0..R14 -> host r15..r28) ----
+	u8   allocHostReg(u8 gbaReg, bool loadFromMem, u32& lockedMask);
+	u8   readReg(u8 gbaReg, u32& lockedMask)  { return allocHostReg(gbaReg, true,  lockedMask); }
+	u8   writeReg(u8 gbaReg, bool fullOverwrite, u32& lockedMask);
+	void flushDirtyRegisters();                   // stores + clears dirty
+	void emitDirtyRegisterFlush();                // stores, leaves dirty set
+	void emitEagerFlush();
+
+	// ---- exits ----
+	void emitAddCycles(u32 n);   // r3 += n  (compile-time-known)
+	void emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit = 0);
+	void registerBailout(u32* branchPtr, JitBailoutCond cond);
+};
+
+// Emit one THUMB instruction at ctx.currentPC (opcode already fetched). Sets
+// ctx.endBlock when the trace must stop here. Implemented in jit_thumb.cpp.
+void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode);
+
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu);
 
 #endif // DESMUME_JIT_ARM7
