@@ -43,6 +43,10 @@
 #ifdef DESMUME_JIT_ARM7
 #include "jit/jit.h"
 #endif
+#ifdef DESMUME_ARM_TIME_SPLIT
+#include <ogc/lwp_watchdog.h>
+#include <stdio.h>
+#endif
 
 
 PathInfo path;
@@ -1586,6 +1590,30 @@ static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
 		return arm7;
 }
 
+#ifdef DESMUME_ARM_TIME_SPLIT
+// P5 diagnostic: split armInnerLoop's wall time between the two cores to
+// figure out whether an ARM7-JIT-enabled build's boot-window slowdown is
+// coming from the ARM7 side at all, or from something else entirely.
+// Independent of DESMUME_JIT_ARM7 so a jitoff build can be compared 1:1.
+// gettime() is a cheap timebase read (a couple of mfspr's under libogc), but
+// calling it twice per dispatched guest instruction still perturbs the very
+// timing being measured -- treat absolute numbers as approximate, the
+// arm9/arm7 *ratio* is the useful signal.
+u64 g_arm9Ticks = 0, g_arm7Ticks = 0;
+u64 g_arm7WaitIRQHits = 0, g_arm7RunHits = 0;
+static u32 g_splitCalls = 0;
+static void splitMaybeReport()
+{
+	if ((++g_splitCalls & 0xFFFFF) != 0) return;   // every ~1M dispatch calls
+	FILE* f = fopen("sd:/split.log", "a");
+	if (f) { fprintf(f, "calls=%u arm9us=%llu arm7us=%llu arm7wait=%llu arm7run=%llu\n", g_splitCalls,
+	                 (unsigned long long)ticks_to_microsecs(g_arm9Ticks),
+	                 (unsigned long long)ticks_to_microsecs(g_arm7Ticks),
+	                 (unsigned long long)g_arm7WaitIRQHits,
+	                 (unsigned long long)g_arm7RunHits); fclose(f); }
+}
+#endif
+
 template<bool doarm9, bool doarm7>
 static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 	const u64 nds_timer_base, const s32 s32next, s32 arm9, s32 arm7)
@@ -1598,7 +1626,14 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			if(!NDS_ARM9.waitIRQ)
 			{
 				arm9log();
+#ifdef DESMUME_ARM_TIME_SPLIT
+				u64 _t0 = gettime();
+#endif
 				arm9 += armcpu_exec<ARMCPU_ARM9>();
+#ifdef DESMUME_ARM_TIME_SPLIT
+				g_arm9Ticks += gettime() - _t0;
+				splitMaybeReport();
+#endif
 			}
 			else
 			{
@@ -1610,15 +1645,34 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			if(!NDS_ARM7.waitIRQ)
 			{
 				arm7log();
+#ifdef DESMUME_ARM_TIME_SPLIT
+				u64 _t0 = gettime();
+				g_arm7RunHits++;
+				if ((g_arm7RunHits % 1000) == 0 && g_arm7RunHits <= 120000) {
+					FILE* f = fopen("sd:/split.log", "a");
+					if (f) { fprintf(f, "arm7pc run=%llu pc=%08x T=%d R14=%08x\n",
+					                 (unsigned long long)g_arm7RunHits,
+					                 (unsigned)NDS_ARM7.instruct_adr,
+					                 (int)NDS_ARM7.CPSR.bits.T,
+					                 (unsigned)NDS_ARM7.R[14]); fclose(f); }
+				}
+#endif
 #ifdef DESMUME_JIT_ARM7
 				u32 jitCycles = jitRunArm7();
 				arm7 += (jitCycles ? jitCycles : armcpu_exec<ARMCPU_ARM7>()) << 1;
 #else
 				arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1);
 #endif
+#ifdef DESMUME_ARM_TIME_SPLIT
+				g_arm7Ticks += gettime() - _t0;
+				splitMaybeReport();
+#endif
 			}
 			else
 			{
+#ifdef DESMUME_ARM_TIME_SPLIT
+				g_arm7WaitIRQHits++;
+#endif
 				arm7 = min(s32next, arm7 + kIrqWait);
 				if(arm7 == s32next)
 				{

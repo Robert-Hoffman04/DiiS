@@ -25,7 +25,16 @@
 #include "NDSSystem.h"
 
 #define cpu (&ARMPROC)
-#define TEMPLATE template<int PROCNUM> 
+#define TEMPLATE template<int PROCNUM>
+
+#ifdef DESMUME_ARM_TIME_SPLIT
+#include <stdio.h>
+// P5 diagnostic: how many times wait4IRQ() (SWI 0x06 / the tail of
+// intrWaitARM) actually runs per CPU -- to see whether ARM7 keeps trying to
+// halt-and-wait at all once the "run" side of armInnerLoop's split stops
+// alternating with the "wait" side.
+u64 g_wait4IRQCalls[2] = {0, 0};
+#endif
 
 static const u16 getsinetbl[] = {
 0x0000, 0x0324, 0x0648, 0x096A, 0x0C8C, 0x0FAB, 0x12C8, 0x15E2, 
@@ -217,6 +226,15 @@ TEMPLATE static u32 WaitByLoop()
 TEMPLATE static u32 wait4IRQ()
 {
      //execute= FALSE;
+#ifdef DESMUME_ARM_TIME_SPLIT
+     g_wait4IRQCalls[PROCNUM]++;
+     if ((g_wait4IRQCalls[PROCNUM] & 0xFFFFF) == 0) {
+          FILE* f = fopen("sd:/split.log", "a");
+          if (f) { fprintf(f, "wait4IRQ[%d] calls=%llu wirq=%d waitIRQ=%d\n",
+                            PROCNUM, (unsigned long long)g_wait4IRQCalls[PROCNUM],
+                            (int)cpu->wirq, (int)cpu->waitIRQ); fclose(f); }
+     }
+#endif
      u32 instructAddr = cpu->instruct_adr;
      if(cpu->wirq)
      {
