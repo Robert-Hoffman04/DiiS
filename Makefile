@@ -32,7 +32,7 @@ INCLUDES	:=
 # toolchain but is undefined behaviour that modern GCC (13+) exploits at -O3,
 # miscompiling the GPU/renderer into a blank screen. These flags disable the
 # offending assumptions and restore correct output. Do not remove them.
-OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations
+OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations -flto=auto
 
 # TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
 #   make TESTDEFS="-DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM"
@@ -40,7 +40,7 @@ OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizati
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS)
 CXXFLAGS	=	$(CFLAGS)
-LDFLAGS	    =	-g $(MACHDEP) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
+LDFLAGS	    =	-g $(MACHDEP) $(OPTFLAGS) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 
 #---------------------------------------------------------------------------------
 # any extra libraries we wish to link with the project
