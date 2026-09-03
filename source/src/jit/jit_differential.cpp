@@ -128,11 +128,20 @@ u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
 		return c ? c : 1;
 	}
 
+	// See jit_exec.cpp's identical fix: POP{...,PC} can switch to ARM mode
+	// and clears CPSR.T itself before returning here -- check it rather than
+	// assuming THUMB.
 	const u32 npc = r.nextPC;
-	cpu->instruct_adr     = npc;
-	cpu->instruction      = jitActiveProfile->fetch16(npc & ~1u);
-	cpu->next_instruction = npc + 2;
-	cpu->R[15]            = npc + 4;
+	cpu->instruct_adr = npc;
+	if (cpu->CPSR.bits.T) {
+		cpu->instruction      = jitActiveProfile->fetch16(npc & ~1u);
+		cpu->next_instruction = npc + 2;
+		cpu->R[15]            = npc + 4;
+	} else {
+		cpu->instruction      = jitActiveProfile->fetch32(npc & ~3u);
+		cpu->next_instruction = npc + 4;
+		cpu->R[15]            = npc + 8;
+	}
 
 	// ---- compare (only when both ran the same number of instructions, and
 	// the block has no store -- see the double-apply note above) ----

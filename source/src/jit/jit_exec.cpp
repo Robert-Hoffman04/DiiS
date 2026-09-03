@@ -105,13 +105,24 @@ u32 jitRunArm7()
 		return 0;
 	}
 
-	// re-prime the interpreter pipeline at the resume PC (still THUMB: any
-	// mode switch bailed out before executing)
+	// re-prime the interpreter pipeline at the resume PC. Most exits stay in
+	// THUMB (any mode switch via BX/hi-reg bailed out before executing, see
+	// above) -- but POP{...,PC} switches mode inline (jit_thumb.cpp) and
+	// clears CPSR.T itself before returning here, so check it rather than
+	// assuming THUMB: landing an ARM-mode target through a 16-bit THUMB
+	// fetch misdecodes the real first opcode and sends ARM7's PC off into
+	// unmapped memory (see the plan memory's boot-window regression writeup).
 	const u32 npc = r.nextPC;
-	cpu.instruct_adr     = npc;
-	cpu.instruction      = jitActiveProfile->fetch16(npc & ~1u);
-	cpu.next_instruction = npc + 2;
-	cpu.R[15]            = npc + 4;
+	cpu.instruct_adr = npc;
+	if (cpu.CPSR.bits.T) {
+		cpu.instruction      = jitActiveProfile->fetch16(npc & ~1u);
+		cpu.next_instruction = npc + 2;
+		cpu.R[15]            = npc + 4;
+	} else {
+		cpu.instruction      = jitActiveProfile->fetch32(npc & ~3u);
+		cpu.next_instruction = npc + 4;
+		cpu.R[15]            = npc + 8;
+	}
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;

@@ -504,10 +504,38 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 
 		if (popPC) {
+			// The popped value's bit0 is the real ARMv4T mode switch (same
+			// convention as BX Rs, case 8/sub==3 above) -- POP{...,PC} is by
+			// far the most common function-return shape in THUMB code, and a
+			// return into an ARM-mode caller is completely ordinary. This
+			// used to unconditionally treat every POP{PC} as a THUMB
+			// continuation (masking bit0 and calling emitDynamicExit
+			// regardless), silently dropping the mode switch: the C++ resume
+			// path always re-fetched 16-bit THUMB from the target and never
+			// touched CPSR.T. Landing on a real ARM-mode return address, that
+			// misdecodes the first real ARM opcode as THUMB and free-runs
+			// from there -- observed as ARM7's PC escaping to a garbage
+			// 32-bit address and never recovering (see the plan memory).
 			ctx.flushDirtyRegisters();
-			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 100);
-			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);   // & ~1 (ARMv4T)
+			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 100);                  // R12 = raw popped PC
+			*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);   // R11 = bit0 (mode bit)
+			*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
+			u32* toArm = emitPtr++;                                  // BEQ -> ARM-mode path
+			// bit0==1: stay THUMB (previously the only path taken)
+			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);    // & ~1
 			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+			*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));
+			// bit0==0: switch to ARM. Clear CPSR.T so the C++ resume path
+			// (jit_exec.cpp / jit_differential.cpp) sees T==0 and uses
+			// ARM-mode fetch/pipeline math instead of defaulting to THUMB.
+			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);    // & ~3 (ARM word align)
+			ctx.ensureFlagsLoaded();
+			*emitPtr++ = PPC_LI(PPC_R10, 0x20);                     // CPSR.T bit (bit 5)
+			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+			ctx.flagsDirty = true;
+			ctx.flushDirtyFlags();
+			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+
 			ctx.instrCount++; ctx.currentPC += 2;
 			ctx.endBlock = true; ctx.blockTerminatedEarly = true;
 		}
