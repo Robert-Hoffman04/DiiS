@@ -1052,6 +1052,16 @@ static void loadstate()
 
 	SetupMMU();
 
+#ifdef DESMUME_JIT_ARM7
+	// P4: a state load (or rewind) overwrites MAIN_MEM/SWIRAM/ARM7_ERAM in bulk
+	// via direct buffer copies (ReadStateChunks -> mmu_loadstate), completely
+	// bypassing every _MMU_write* SMC hook above. Any block already compiled
+	// against the pre-load bytes is now stale -- there's no address-range
+	// classification possible here (fixed-size correctness > incremental
+	// perf), so just drop the whole cache.
+	jitCache.flushCache();
+#endif
+
 	execute = 1;//!driver->EMU_IsEmulationPaused();
 }
 

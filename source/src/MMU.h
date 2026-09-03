@@ -32,6 +32,9 @@
 #ifdef HAVE_LUA
 #include "lua-engine.h"
 #endif
+#ifdef DESMUME_JIT_ARM7
+#include "jit/jit.h"
+#endif
 
 #define ARMCPU_ARM7 1
 #define ARMCPU_ARM9 0
@@ -796,6 +799,14 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 1, val, LUAMEMHOOK_WRITE);
 #endif
+#ifdef DESMUME_JIT_ARM7
+		// P4: main RAM is shared -- ARM9 stores, ARM7 stores and DMA (either
+		// CPU) from every PROCNUM/AT combination all funnel through this one
+		// branch, so a single hook here covers all of them for the ARM7 JIT's
+		// most common SMC/cross-CPU-aliasing case. Cheap no-op when nothing
+		// is registered at this page.
+		jitCache.invalidateSMCTarget(addr);
+#endif
 		return;
 	}
 
@@ -830,6 +841,9 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 2, val, LUAMEMHOOK_WRITE);
 #endif
+#ifdef DESMUME_JIT_ARM7
+		jitCache.invalidateSMCTarget(addr); // see _MMU_write08's comment
+#endif
 		return;
 	}
 
@@ -863,6 +877,9 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		T1WriteLong_guaranteedAligned( MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK32, val);
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 4, val, LUAMEMHOOK_WRITE);
+#endif
+#ifdef DESMUME_JIT_ARM7
+		jitCache.invalidateSMCTarget(addr); // see _MMU_write08's comment
 #endif
 		return;
 	}

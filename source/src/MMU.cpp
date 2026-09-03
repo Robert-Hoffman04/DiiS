@@ -41,6 +41,9 @@
 #include "matrix.h"
 #include "readwrite.h"
 #include "MMU_timing.h"
+#ifdef DESMUME_JIT_ARM7
+#include "jit/jit.h"
+#endif
 
 #ifdef DO_ASSERT_UNALIGNED
 #define ASSERT_UNALIGNED(x) assert(x)
@@ -1098,6 +1101,14 @@ void MMU_Reset()
 	MMU_timing.arm9dataFetch.Reset();
 	MMU_timing.arm9codeCache.Reset();
 	MMU_timing.arm9dataCache.Reset();
+
+#ifdef DESMUME_JIT_ARM7
+	// P4: the memsets above (MAIN_MEM/ARM7_ERAM/SWIRAM) are raw buffer clears,
+	// not _MMU_write* calls -- they bypass every SMC hook. Called on every ROM
+	// (re)load via NDS_Reset(), so any block compiled against the previous
+	// ROM/session's memory contents must not survive into the new one.
+	jitCache.flushCache();
+#endif
 }
 
 void MMU_setRom(u8 * rom, u32 mask)
@@ -3680,6 +3691,17 @@ void FASTCALL _MMU_ARM7_write08(u32 adr, u8 val)
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM7][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20]]=val;
+#ifdef DESMUME_JIT_ARM7
+	// P4: catch-all SMC guard for every ARM7-sourced write this function's
+	// earlier special cases didn't already return out of (interpreter stores,
+	// ARM7 DMA, BIOS-HLE) -- covers bank 0x03 (shared WRAM / ARM7_ERAM), where
+	// the JIT's own inline guard (jit_trace.cpp emitSmcCheckAndBail) can't help
+	// because most ARM7 code executing today is ARM-mode (no JIT front-end,
+	// P7) and thus never goes through a compiled store at all. Harmless
+	// no-op for addresses no block was ever registered against --
+	// invalidateSMCTarget() just walks an empty page-registry bucket.
+	jitCache.invalidateSMCTarget(adr);
+#endif
 }
 
 //================================================= MMU ARM7 write 16
@@ -3983,7 +4005,10 @@ void FASTCALL _MMU_ARM7_write16(u32 adr, u16 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
-} 
+#ifdef DESMUME_JIT_ARM7
+	jitCache.invalidateSMCTarget(adr); // see _MMU_ARM7_write08's comment
+#endif
+}
 //================================================= MMU ARM7 write 32
 void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 {
@@ -4100,6 +4125,9 @@ void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
+#ifdef DESMUME_JIT_ARM7
+	jitCache.invalidateSMCTarget(adr); // see _MMU_ARM7_write08's comment
+#endif
 }
 
 //================================================= MMU ARM7 read 08

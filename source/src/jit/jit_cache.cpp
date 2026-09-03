@@ -173,9 +173,13 @@ void JITCache::flushCache() {
 
 	arenaOffset = 0;
 
-	memset(blockTable, 0, HASH_TABLE_SIZE * sizeof(BasicBlock));
-	memset(smcRegistry, 0, SMC_MAP_SIZE * sizeof(BasicBlock*));
-	memset(smcPageFlags, 0, SMC_MAP_SIZE * sizeof(u8));
+	// Defensive null-guards (matching the `if (jitArena)` below): flushCache()
+	// is now also called from outside jit_trace.cpp's own lifecycle (P4 --
+	// MMU_Reset()/savestate-load bulk memory overwrites), so it must tolerate
+	// being invoked before initialize() has ever run.
+	if (blockTable)   memset(blockTable, 0, HASH_TABLE_SIZE * sizeof(BasicBlock));
+	if (smcRegistry)  memset(smcRegistry, 0, SMC_MAP_SIZE * sizeof(BasicBlock*));
+	if (smcPageFlags) memset(smcPageFlags, 0, SMC_MAP_SIZE * sizeof(u8));
 
 	if (jitArena) {
 		u32* emitPtr = jitArena;
