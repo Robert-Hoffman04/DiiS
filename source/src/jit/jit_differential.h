@@ -3,15 +3,18 @@
  *
  * jit_differential.h
  *
- * Lockstep interpreter-vs-JIT validation. Derived from VBA-GX's
- * JITDifferential.* (c) Daryl Borth, GPL v2+ -- see jit/upstream/PROVENANCE.md.
+ * Lockstep interpreter-vs-JIT validation for live execution. Derived from
+ * VBA-GX's JITDifferential.* (c) Daryl Borth, GPL v2+ -- see
+ * jit/upstream/PROVENANCE.md.
  *
- * P1: the DeSmuME-shaped interface + CPU-state snapshot only. The catch-up
- * interpreter re-run that produces the "should have happened" reference is
- * wired up once the block-run dispatch path exists (P3); it needs the same
- * single-step hooks that path introduces.
- *
- * Compiled only when JIT_DIFFERENTIAL_TESTING is defined.
+ * Compiled only when JIT_DIFFERENTIAL_TESTING is defined. In that build
+ * jitRunArm7() routes through jitRunArm7Checked(): it runs `block->length`
+ * interpreter steps from the current state, snapshots, restores, runs the JIT
+ * block for real, and logs any divergence in R0..R14 / the NZCV nibble /
+ * resume PC to sd:/jit.log. Guest memory writes made by the interpreter pass
+ * are NOT reverted, so a block that writes a side-effectful IO register is
+ * double-triggered under this build -- acceptable for a validation build,
+ * where most ARM7 blocks touch only RAM.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_DIFFERENTIAL_H
@@ -23,11 +26,7 @@
 
 struct armcpu_t;
 
-// Run `block` from cpu's current state under the JIT, restore, re-run the same
-// guest instructions through the interpreter, and log any divergence in the
-// 16 GPRs / the NZCV nibble / cycle count. Returns true if a mismatch was
-// reported.
-bool jitRunDifferential(armcpu_t* cpu, BasicBlock* block);
+u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc);
 
 #endif
 

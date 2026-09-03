@@ -23,7 +23,8 @@
 #include "jit_cache.h"
 
 // Maximum guest instructions the trace scanner will pull into one block.
-#define JIT_TRACE_MAX_INSTRUCTIONS 42
+// Kept modest so one block ~= one armInnerLoop interleave slice (P3).
+#define JIT_TRACE_MAX_INSTRUCTIONS 32
 
 // Fixed-layout handshake struct that compiled traces write their outcome into.
 // Must stay 32-byte aligned and layout-stable: jit_trampoline.S and the emitted
@@ -47,6 +48,13 @@ extern "C" void ExecuteJITTrace_Return();
 // Lifecycle -- called from NDS_Init() / NDS_DeInit().
 void jitInit();
 void jitShutdown();
+
+// Live execution. Called from armInnerLoop() when the ARM7 is due to step.
+// Runs one JIT block from NDS_ARM7.instruct_adr and re-primes the interpreter
+// pipeline; returns cycles consumed, or 0 if the interpreter should handle
+// this instruction (ARM mode / uncompilable / disabled).
+extern bool jitArm7Enabled;
+u32 jitRunArm7();
 
 // One-shot ABI round-trip check (hand-emitted block -> trampoline -> linker
 // stub miss path -> return). Returns true on success; logs either way.

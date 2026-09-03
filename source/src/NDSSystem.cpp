@@ -1610,7 +1610,12 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			if(!NDS_ARM7.waitIRQ)
 			{
 				arm7log();
+#ifdef DESMUME_JIT_ARM7
+				u32 jitCycles = jitRunArm7();
+				arm7 += (jitCycles ? jitCycles : armcpu_exec<ARMCPU_ARM7>()) << 1;
+#else
 				arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1);
+#endif
 			}
 			else
 			{

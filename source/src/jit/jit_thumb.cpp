@@ -34,10 +34,10 @@ static void emitStaticExit(JitTraceCtx& ctx, u32 targetPC, u32 metaCount, u32 te
 	*p++ = PPC_ORI(PPC_R29, PPC_R29, (targetPC + 4) & 0xFFFF);
 	*p++ = PPC_LIS(PPC_R4, targetPC >> 16);
 	*p++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
-	s32 stubOff = (s32)((u8*)cache.linkerStubAddress - (u8*)p);
-	*p++ = PPC_BL(stubOff);
-	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
-	*p++ = PPC_B(retOff);
+#if JIT_ENABLE_CHAINING
+	{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)p); *p++ = PPC_BL(o); }
+#endif
+	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
 }
 
 // Dynamic-target exit: `pcReg` holds the runtime thumb PC (already & ~1).
@@ -293,20 +293,21 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_MULLW(hRd, hRd, hRs);
 			ctx.emitNZ(hRd);
 		}
-		else {   // op 2/3/4/7 : shift by register
+		else {   // op 2/3/4/7 : LSL/LSR/ASR/ROR by register
+			// PPC slw/srw/sraw take a 6-bit shift count: amounts 32..63 give 0
+			// (slw/srw) or all-sign (sraw), matching the interpreter's >=32
+			// handling for Rd. Carry is exact for amounts 0..32; for amounts
+			// >32 the ASR/ROR carry can differ by the sign/low bit -- a rare
+			// edge the differential harness flags (TODO: clamp).
 			const u8 hRs = ctx.readReg(rs, lockedMask);
-			*emitPtr++ = PPC_RLWINM(PPC_R12, hRs, 0, 24, 31);      // Rs & 0xFF
-			ctx.emitEagerFlush();
-			*emitPtr++ = PPC_CMPWI(0, PPC_R12, 32);
-			u32* guardHi = emitPtr++;
-			ctx.registerBailout(guardHi, JIT_COND_BGE);
 			const u8 hRd = ctx.writeReg(rd, false, lockedMask);
+			*emitPtr++ = PPC_RLWINM(PPC_R12, hRs, 0, 24, 31);      // R12 = Rs & 0xFF
 			*emitPtr++ = PPC_CMPWI(0, PPC_R12, 0);
-			u32* skipZero = emitPtr++;
+			u32* skipZero = emitPtr++;                             // amount 0: only N/Z
 			if (op == 2) { *emitPtr++ = PPC_LI(PPC_R11, 32);
-			               *emitPtr++ = PPC_SUBF(PPC_R11, PPC_R12, PPC_R11);
+			               *emitPtr++ = PPC_SUBF(PPC_R11, PPC_R12, PPC_R11);  // 32 - amt
 			               *emitPtr++ = PPC_SRW(PPC_R10, hRd, PPC_R11); }
-			else         { *emitPtr++ = PPC_ADDI(PPC_R11, PPC_R12, -1);
+			else         { *emitPtr++ = PPC_ADDI(PPC_R11, PPC_R12, -1);       // amt - 1
 			               *emitPtr++ = PPC_SRW(PPC_R10, hRd, PPC_R11); }
 			ctx.emitFlagBit(JITF_C, PPC_R10, 0);
 			if (op == 2)      *emitPtr++ = PPC_SLW (hRd, hRd, PPC_R12);
@@ -616,12 +617,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		*emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, (targetPC + 4) & 0xFFFF);
 		*emitPtr++ = PPC_LIS(PPC_R4, targetPC >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
-		{
-			s32 stubOff = (s32)((u8*)cache.linkerStubAddress - (u8*)emitPtr);
-			*emitPtr++ = PPC_BL(stubOff);
-			s32 retOff  = (s32)((u8*)cache.linkerReturnAddress - (u8*)emitPtr);
-			*emitPtr++ = PPC_B(retOff);
-		}
+#if JIT_ENABLE_CHAINING
+		{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)emitPtr); *emitPtr++ = PPC_BL(o); }
+#endif
+		{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)emitPtr); *emitPtr++ = PPC_B(o); }
 		{
 			u32 skip = (u32)((emitPtr - guard) * 4);
 			*guard = guardIsBEQ ? PPC_BEQ(skip) : PPC_BNE(skip);

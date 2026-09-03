@@ -395,11 +395,10 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		*ctx.emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, (ctx.currentPC + 4) & 0xFFFF);
 		*ctx.emitPtr++ = PPC_LIS(PPC_R4, ctx.currentPC >> 16);
 		*ctx.emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, ctx.currentPC & 0xFFFF);
-
-		s32 stubOff = (s32)((u8*)cache.linkerStubAddress - (u8*)ctx.emitPtr);
-		*ctx.emitPtr++ = PPC_BL(stubOff);
-		s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)ctx.emitPtr);
-		*ctx.emitPtr++ = PPC_B(retOff);
+#if JIT_ENABLE_CHAINING
+		{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)ctx.emitPtr); *ctx.emitPtr++ = PPC_BL(o); }
+#endif
+		{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)ctx.emitPtr); *ctx.emitPtr++ = PPC_B(o); }
 	}
 
 	// ---- quota-shield yield stub ----

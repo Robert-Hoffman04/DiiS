@@ -44,11 +44,57 @@ static void arm7_slowWrite(u32 addr, u32 val, u32 size)
 
 static void arm7_smcInvalidate(u32 addr) { jitCache.invalidateSMCTarget(addr); }
 
-// --- control / timing stubs (later phases) ---------------------------------
 static u32  arm7_swiHandler(u32 comment) { (void)comment; return 0; }   // P2/P3
 static bool arm7_canEnterThumb(u32 pc)   { (void)pc; return true; }
 static bool arm7_canEnterArm(u32 pc)     { (void)pc; return false; }    // P7
-static u8   arm7_cyclesForThumb(u16 op)  { (void)op; return 1; }        // P2 refines
+
+// Per-instruction cycle cost, approximating armcpu_exec<ARM7>()'s own return
+// (MMU_fetchExecuteCycles ignores the code fetch; ALU=1; data access adds
+// 3 + memcycles for loads, 2 + memcycles for stores; ARM7 main-RAM word
+// access = 2, everything else = 1 -- we assume main RAM, the common case).
+// Exact per-address timing is a P5 refinement; the differential harness
+// measures the drift.
+static u8 arm7_cyclesForThumb(u16 op)
+{
+	switch (op >> 12) {
+		case 0x4:
+			if ((op & 0x0FC0) == 0x0340) return 4;          // MUL (approx)
+			return 1;                                        // F4 ALU / F5 hi-reg
+		case 0x5: {                                          // F10 reg-offset ld/st
+			const u16 s = op & 0x0E00;
+			const bool load = (s == 0x0800 || s == 0x0A00 || s == 0x0C00 ||
+			                   s == 0x0600 || s == 0x0E00);
+			return load ? 5 : 3;
+		}
+		case 0x6: case 0x9:                                  // F9 word / F11 SP
+			return (op & 0x0800) ? 5 : 3;
+		case 0x7: case 0x8:                                  // F9 byte / F8 half
+			return (op & 0x0800) ? 4 : 3;
+		case 0xB: {
+			if ((op & 0x0F00) == 0x0000) return 1;           // F13 ADD/SUB SP
+			if ((op & 0x0600) == 0x0400) {                   // F14 PUSH/POP
+				u32 n = __builtin_popcount(op & 0xFF) + ((op & 0x0100) ? 1 : 0);
+				return (u8)((op & 0x0800 ? 2 : 3) + 2 * n);
+			}
+			return 1;
+		}
+		case 0xC: {                                          // F15 LDMIA/STMIA
+			u32 n = __builtin_popcount(op & 0xFF);
+			if (!n) n = 1;
+			return (u8)(2 + 2 * n);
+		}
+		case 0xD:                                            // F16 Bcc
+			return (op & 0x0F00) == 0x0F00 ? 3 : 3;          // taken cost (approx)
+		case 0xE:                                            // F18 B
+			return 3;
+		case 0xF:                                            // F19 BL
+			return 4;
+		case 0xA:                                            // F12 ADD PC/SP
+			return 1;
+		default:                                             // F1/F2/F3
+			return 1;
+	}
+}
 static u8   arm7_cyclesForArm(u32 op)    { (void)op; return 1; }        // P7
 
 static JitCpuProfile s_arm7Profile;

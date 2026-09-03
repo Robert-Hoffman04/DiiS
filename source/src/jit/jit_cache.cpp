@@ -282,7 +282,10 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 					// Hardware Cache Sync on 4-byte patched instruction
 					DCStoreRange(codePtr, 4);
 					ICInvalidateRange(codePtr, 4);
-					curr->execute = nullptr; // Mark execute as null to force cache miss on next lookup
+					// execute=null + length=0 reads as a genuine miss so the next
+					// lookup recompiles (vs. a length-1 "don't JIT" marker).
+					curr->execute = nullptr;
+					curr->length = 0;
 				}
 
 				// Remove block from the SMC bucket linked list

@@ -21,12 +21,19 @@
 
 #if defined(DESMUME_JIT_ARM7)
 
-// --- arena / block budget (from VBA) --------------------------------------
+// --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
-#define JIT_YIELD_NUMBER           256
+#define JIT_YIELD_NUMBER           64
 #define JIT_MAX_BAILOUTS           256
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
+
+// Block-to-block chaining (self-patching linker stub). Off for P3: one block
+// per armInnerLoop turn keeps the ARM9/ARM7 interleave fine-grained. Revisit
+// in P6 ("block chaining tuning").
+#ifndef JIT_ENABLE_CHAINING
+#define JIT_ENABLE_CHAINING 0
+#endif
 
 // Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top
 // nibble, conventional bits 31..28) -- which is exactly ARM CPSR's N/Z/C/V
