@@ -468,12 +468,41 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		if (nregs == 0) { ctx.endBlock = true; break; }
 
 		ctx.ensureArena();
-		const u8 hSp = ctx.writeReg(13, false, lockedMask);
-		if (!isPop) *emitPtr++ = PPC_ADDI(hSp, hSp, -4 * nregs);   // pre-decrement
-		*emitPtr++ = PPC_RLWINM(PPC_R12, hSp, 0, 0, 29);           // word-align base
-		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
-		ctx.emitMemPrologue();
-		if (!isPop) { *emitPtr++ = PPC_LWZ(PPC_R12, 1, 96); ctx.emitSmcCheckAndBail(PPC_R12); }
+		u8 hSp;
+		if (!isPop) {
+			// Compute the prospective post-decrement, word-aligned base into a
+			// scratch register FIRST and run the SMC guard against it before
+			// committing anything to the cached/guest SP. emitSmcCheckAndBail's
+			// bail resumes this whole PUSH from scratch via the interpreter --
+			// with the old ordering (decrement, then flush via emitMemPrologue,
+			// then guard) a bail here left the decrement already applied in
+			// guest memory while none of the pushed register values had been
+			// written yet, so the interpreter's re-run decremented SP a SECOND
+			// time and the stack slots the original decrement reserved were
+			// never actually filled in -- a real, silent stack corruption a
+			// POP reads back as garbage possibly many instructions later (see
+			// the plan memory for how this was traced).
+			hSp = ctx.readReg(13, lockedMask);
+			*emitPtr++ = PPC_ADDI(PPC_R12, hSp, -4 * nregs);
+			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);
+			*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
+			ctx.emitMemPrologue();
+			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
+			ctx.emitSmcCheckAndBail(PPC_R12);
+			// guard passed -- commit the real decrement and flush it now (the
+			// per-register loop below reuses stack slot 96 for addressing,
+			// and invalidateRegCache() after the loop discards the register
+			// cache without flushing, so this must land in guest memory
+			// before the loop, not just before the block ends).
+			hSp = ctx.writeReg(13, false, lockedMask);
+			*emitPtr++ = PPC_ADDI(hSp, hSp, -4 * nregs);
+			*emitPtr++ = PPC_STW(hSp, 14, 13 * 4);
+		} else {
+			hSp = ctx.writeReg(13, false, lockedMask);
+			*emitPtr++ = PPC_RLWINM(PPC_R12, hSp, 0, 0, 29);       // word-align base
+			*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
+			ctx.emitMemPrologue();
+		}
 
 		bool popPC = false;
 		u32 slot = 0;
