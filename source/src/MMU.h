@@ -818,7 +818,7 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)
 		{
-			T1WriteWord(MMU.ARM9_DTCM, addr & 0x3FFE, val);
+			T1WriteWord_guaranteedAligned(MMU.ARM9_DTCM, addr & 0x3FFE, val);
 #ifdef HAVE_LUA
 			CallRegisteredLuaMemHook(addr, 2, val, LUAMEMHOOK_WRITE);
 #endif
@@ -826,7 +826,7 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		}
 
 	if ( (addr & 0x0F000000) == 0x02000000) {
-		T1WriteWord( MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK16, val);
+		T1WriteWord_guaranteedAligned( MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK16, val);
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 2, val, LUAMEMHOOK_WRITE);
 #endif
@@ -852,7 +852,7 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 	if(PROCNUM==ARMCPU_ARM9)
 		if((addr&(~0x3FFF)) == MMU.DTCMRegion)
 		{
-			T1WriteLong(MMU.ARM9_DTCM, addr & 0x3FFC, val);
+			T1WriteLong_guaranteedAligned(MMU.ARM9_DTCM, addr & 0x3FFC, val);
 #ifdef HAVE_LUA
 			CallRegisteredLuaMemHook(addr, 4, val, LUAMEMHOOK_WRITE);
 #endif
@@ -860,7 +860,7 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 		}
 
 	if ( (addr & 0x0F000000) == 0x02000000) {
-		T1WriteLong( MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK32, val);
+		T1WriteLong_guaranteedAligned( MMU.MAIN_MEM, addr & _MMU_MAIN_MEM_MASK32, val);
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 4, val, LUAMEMHOOK_WRITE);
 #endif
