@@ -1648,13 +1648,28 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #ifdef DESMUME_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 				g_arm7RunHits++;
-				if ((g_arm7RunHits % 1000) == 0 && g_arm7RunHits <= 120000) {
+				// Per-dispatch PC/mode/R14 trace, gated to a narrow g_arm7RunHits
+				// window -- ARM7_PC_DUMP_LO/HI below are investigation-specific
+				// (set to bracket whatever divergence is being chased this time)
+				// and are meant to be edited per use, not a fixed default.
+				// `cached` is armcpu_t::instruction (what will actually execute,
+				// already pre-fetched per the armcpu_prefetch<> convention);
+				// `fresh` is a live re-read of the same address -- comparing the
+				// two catches a stale-prefetch/self-modifying-code artifact
+				// instead of chasing a phantom in the interpreter/JIT itself.
+#define ARM7_PC_DUMP_LO 64000
+#define ARM7_PC_DUMP_HI 66500
+				if (g_arm7RunHits >= ARM7_PC_DUMP_LO && g_arm7RunHits <= ARM7_PC_DUMP_HI) {
 					FILE* f = fopen("sd:/split.log", "a");
-					if (f) { fprintf(f, "arm7pc run=%llu pc=%08x T=%d R14=%08x\n",
+					if (f) { fprintf(f, "arm7pc run=%llu pc=%08x T=%d R14=%08x cached=%08x fresh=%08x\n",
 					                 (unsigned long long)g_arm7RunHits,
 					                 (unsigned)NDS_ARM7.instruct_adr,
 					                 (int)NDS_ARM7.CPSR.bits.T,
-					                 (unsigned)NDS_ARM7.R[14]); fclose(f); }
+					                 (unsigned)NDS_ARM7.R[14],
+					                 (unsigned)NDS_ARM7.instruction,
+					                 NDS_ARM7.CPSR.bits.T
+					                     ? (unsigned)_MMU_read16<ARMCPU_ARM7, MMU_AT_CODE>(NDS_ARM7.instruct_adr & ~1u)
+					                     : (unsigned)_MMU_read32<ARMCPU_ARM7, MMU_AT_CODE>(NDS_ARM7.instruct_adr & ~3u)); fclose(f); }
 				}
 #endif
 #ifdef DESMUME_JIT_ARM7
