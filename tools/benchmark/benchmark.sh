@@ -10,6 +10,8 @@
 #   bench_sw     software rasterizer    DESMUME_FORCE_CORE=2
 #   bench_gx     GX hardware 3D         DESMUME_FORCE_CORE=1
 #   bench_merge  GXMerge sandwich       DESMUME_FORCE_CORE=1 + DESMUME_FORCE_GXCOMPOSITE
+#   bench_jitoff ARM7 interpreter       DESMUME_FORCE_CORE=2, no JITDEFS (P5 A/B baseline)
+#   bench_jiton  ARM7 JIT               DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
 #
 # Prerequisites:
 #   - devkitPPC toolchain           (DEVKITPPC / DEVKITPRO in the environment)
@@ -79,21 +81,45 @@ dolphin_kill() {
 defs_for() {
 	local base="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000"
 	case "$1" in
-		sw)    echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		gx)    echo "$base -DDESMUME_FORCE_CORE=1" ;;
-		merge) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
-		*)     die "unknown mode '$1'" ;;
+		sw)     echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		gx)     echo "$base -DDESMUME_FORCE_CORE=1" ;;
+		merge)  echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
+		# ARM7 JIT A/B (P5): same renderer (sw) as the "sw" baseline so any
+		# delta is purely the ARM7 core, not a renderer swap.
+		jitoff) echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		jiton)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		*)      die "unknown mode '$1'" ;;
 	esac
 }
 
+# JITDEFS (separate Makefile var from TESTDEFS) for a mode; empty for every
+# renderer-only mode.
+jitdefs_for() {
+	case "$1" in
+		jiton) echo "-DDESMUME_JIT_ARM7" ;;
+		*)     echo "" ;;
+	esac
+}
+
+LAST_JITDEFS="__unset__"   # forces a clean before the first build_mode call
+
 build_mode() {
 	local m="$1"
-	echo ">> build bench_$m.dol   ($(defs_for "$m"))"
-	# only main.o consumes the DESMUME_FORCE_* / DESMUME_BENCH defines, so a
-	# forced rebuild of that one object + relink is enough between modes.
+	local jd; jd="$(jitdefs_for "$m")"
+	echo ">> build bench_$m.dol   (TESTDEFS: $(defs_for "$m")${jd:+   JITDEFS: $jd})"
+	: > "$DOLDIR/build_$m.log"
+	# JITDEFS touches every jit/*.cpp TU and depfiles don't track flag changes
+	# (see the plan's BUILD GOTCHA) -- switching it needs a full `make clean`,
+	# unlike the renderer-only TESTDEFS knobs which only main.o consumes.
+	if [ "$jd" != "$LAST_JITDEFS" ]; then
+		( cd "$ROOT" && make clean ) >>"$DOLDIR/build_$m.log" 2>&1
+		LAST_JITDEFS="$jd"
+	fi
+	# only main.o consumes DESMUME_FORCE_*/DESMUME_BENCH, so once JITDEFS is
+	# settled a forced rebuild of that one object + relink is enough.
 	( cd "$ROOT" \
 	  && rm -f build/main.o "$TARGET.elf" "$TARGET.dol" \
-	  && make -j"$(nproc)" TESTDEFS="$(defs_for "$m")" ) >"$DOLDIR/build_$m.log" 2>&1 \
+	  && make -j"$(nproc)" JITDEFS="$jd" TESTDEFS="$(defs_for "$m")" ) >>"$DOLDIR/build_$m.log" 2>&1 \
 		|| { echo "   BUILD FAILED:"; tail -n 15 "$DOLDIR/build_$m.log"; exit 1; }
 	cp "$ROOT/$TARGET.dol" "$DOLDIR/bench_$m.dol"
 	echo "   -> $DOLDIR/bench_$m.dol"

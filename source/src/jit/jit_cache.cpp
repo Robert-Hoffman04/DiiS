@@ -44,8 +44,20 @@
 #if defined(DESMUME_JIT_ARM7)
 
 #include <ogc/cache.h>
+#ifdef DESMUME_JIT_TRACE_FIRST
+#include <stdio.h>
+#endif
 
 JITCache jitCache;
+
+// P5 diagnostic: how often invalidateSMCTarget() is actually called (every
+// hooked write to bank 2/3, from any of the P4 call sites -- ARM7/ARM9/DMA)
+// vs. how often it actually kills a still-live registered block. Decoupled
+// from jit_exec.cpp's own dispatch-count-gated report because most of these
+// calls come from ARM9/interpreter write paths that never touch jitRunArm7()
+// at all, so g_jitAttempts can stay near zero while this is churning.
+u64 g_jitSmcChecks = 0;
+u64 g_jitSmcKills  = 0;
 
 JITCache::JITCache() {
 	jitArena = nullptr;
@@ -258,6 +270,19 @@ void JITCache::flushCache() {
 
 // SMC eviction handler
 void JITCache::invalidateSMCTarget(u32 targetEA) {
+	g_jitSmcChecks++;
+#ifdef DESMUME_JIT_TRACE_FIRST
+	{
+		static u64 s_lastReport = 0;
+		if (g_jitSmcChecks - s_lastReport >= 200000) {
+			s_lastReport = g_jitSmcChecks;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) { fprintf(f, "[jit] smc: %llu checks, %llu kills\n",
+			                 (unsigned long long)g_jitSmcChecks,
+			                 (unsigned long long)g_jitSmcKills); fclose(f); }
+		}
+	}
+#endif
 	// Maximum trace length is (JIT_TRACE_MAX_INSTRUCTIONS+1)*2 bytes. Maximum write size is 36 bytes.
 	// Branchless minimum boundary clamping at 0
 	s32 offsetDiff = (s32)(targetEA - ((JIT_TRACE_MAX_INSTRUCTIONS + 1) * 2));
@@ -290,6 +315,7 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 					// lookup recompiles (vs. a length-1 "don't JIT" marker).
 					curr->execute = nullptr;
 					curr->length = 0;
+					g_jitSmcKills++;
 				}
 
 				// Remove block from the SMC bucket linked list
