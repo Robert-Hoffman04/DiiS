@@ -28,6 +28,25 @@
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
 
+// Worst-case PPC words a single THUMB instruction's emitter can produce before
+// the scanner's next per-iteration budget check runs again. The heaviest
+// formats are PUSH/POP and LDMIA/STMIA with a full 8-9 register list, each
+// register costing ~10 words (address calc + emitSlowLoad/Store's C-call
+// sequence + store/load back into the guest gpr array) on top of the
+// mem prologue/epilogue and SMC check -- hand-measured worst case ~150 words
+// for POP{r0-r7,pc}. This is the headroom the pre-emission budget check in
+// jitCompileTrace() must reserve on top of JIT_EPILOGUE_RESERVE_WORDS; without
+// it, the check only guarantees room for the *previous* instructions plus the
+// epilogue, and a single heavy instruction can emit past JIT_MAX_WORDS. That
+// overrun isn't caught (rewindJITMemory() only ever shrinks, so a negative
+// "unused space" silently becomes a rewind of 0) -- the arena's bump allocator
+// then hands the very next compiled block a region starting inside this
+// block's already-emitted tail, and that block's compiler overwrites it with
+// unrelated code. The corrupted block later runs off into garbage/zeroed
+// memory (observed as a Broadway ISI exception, PC=0, r14=0). 2x margin over
+// the hand-measured worst case.
+#define JIT_MAX_INSTR_RESERVE_WORDS 300
+
 // Block-to-block chaining (self-patching linker stub). Off for P3: one block
 // per armInnerLoop turn keeps the ARM9/ARM7 interleave fine-grained. Revisit
 // in P6 ("block chaining tuning").

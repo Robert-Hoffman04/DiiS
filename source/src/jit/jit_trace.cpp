@@ -16,6 +16,9 @@
 #include <malloc.h>
 #include <string.h>
 #include <ogc/cache.h>
+#ifdef DESMUME_JIT_TRACE_FIRST
+#include <stdio.h>
+#endif
 
 // =========================================================================
 // Lifecycle
@@ -337,8 +340,13 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	while (!ctx.endBlock && ctx.instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
 		if (ctx.arenaAllocated) {
 			s32 used = (s32)(ctx.emitPtr - ctx.blockStart);
+			// Must reserve room for the epilogue/bailout stubs AND the worst-case
+			// size of the instruction we're about to scan -- this check runs
+			// BEFORE jitThumbEmitOne(), so "used" only reflects instructions
+			// already emitted. See JIT_MAX_INSTR_RESERVE_WORDS for why.
 			s32 budget = (s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
-			                   - (s32)ctx.bailoutCount * JIT_BAILOUT_STUB_WORDS);
+			                   - (s32)ctx.bailoutCount * JIT_BAILOUT_STUB_WORDS
+			                   - JIT_MAX_INSTR_RESERVE_WORDS);
 			if (used > budget) { ctx.endBlock = true; break; }
 		}
 
@@ -416,6 +424,21 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	u32 committed    = (actualBytes + 31) & ~31u;
 	s32 diff         = (s32)(JIT_MAX_WORDS * sizeof(u32) - committed);
 	u32 rewind       = diff & ~(diff >> 31);
+
+	// Hard invariant: the per-instruction budget check above must guarantee
+	// this never goes negative -- a negative diff means this block's code
+	// (rewind==0, so arenaOffset stays put) extends past its reserved slot
+	// into memory the NEXT allocateJITMemory() call will hand out and
+	// overwrite, corrupting this still-registered, still-executable block.
+	// Loud and visible rather than a silent arena corruption + eventual wild
+	// jump if JIT_MAX_INSTR_RESERVE_WORDS is ever undersized for a new format.
+#ifdef DESMUME_JIT_TRACE_FIRST
+	if (diff < 0) {
+		FILE* f = fopen("sd:/jit.log", "a");
+		if (f) { fprintf(f, "[jit] !!! ARENA OVERRUN pc=%08x emittedWords=%u over=%d\n",
+		                 (unsigned)startPC, (unsigned)emittedWords, (int)-diff); fclose(f); }
+	}
+#endif
 
 	cache.rewindJITMemory(rewind);
 	DCStoreRange(ctx.blockStart, actualBytes);
