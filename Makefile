@@ -32,7 +32,7 @@ INCLUDES	:=
 # toolchain but is undefined behaviour that modern GCC (13+) exploits at -O3,
 # miscompiling the GPU/renderer into a blank screen. These flags disable the
 # offending assumptions and restore correct output. Do not remove them.
-OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations -flto=auto
+OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations -flto=auto -funroll-loops
 
 # TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
 #   make TESTDEFS="-DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM"
