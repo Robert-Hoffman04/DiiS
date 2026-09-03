@@ -56,19 +56,22 @@ JITCache::JITCache() {
 	linkerReturnAddress = nullptr;
 	arenaOffset = 0;
 	isInitialized = false;
+	smcBankMask = 0;
 }
 
 JITCache::~JITCache() {
     destroy();
 }
 
-void JITCache::initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr, u8* smcFlagsPtr) {
+void JITCache::initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr,
+                          u8* smcFlagsPtr, u32 trackedBankMask) {
 	if (isInitialized) return;
 
 	jitArena = arenaPtr;
 	blockTable = blockPtr;
 	smcRegistry = smcRegPtr;
 	smcPageFlags = smcFlagsPtr;
+	smcBankMask = trackedBankMask;
 	arenaOffset = 0;
 	flushCache();
 	isInitialized = true;
@@ -118,7 +121,7 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute) {
 	// Unlink evicted block from the SMC bucket to prevent dangling pointers
 	if (block->execute != nullptr && block->length > 0) {
 		u8 oldBank = (evictedPC >> 24) & 0xFF;
-		if (oldBank == 2 || oldBank == 3) { // EWRAM or IWRAM
+		if (smcTrackedBank(oldBank)) {
 			u32 oldPage = (evictedPC >> 10) & 0xFFFF;
 			BasicBlock* curr = smcRegistry[oldPage];
 			BasicBlock* prev = nullptr;
@@ -151,7 +154,7 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute) {
 	// Register with SMC tracker
 	if (execute != nullptr && length > 0) {
 		u8 bank = (pc >> 24) & 0xFF;
-		if (bank == 2 || bank == 3) { // EWRAM or IWRAM
+		if (smcTrackedBank(bank)) {
 			u32 startPage = (pc >> 10) & 0xFFFF;
 			smcPageFlags[startPage] = 1;
 			// Intrusively push block to registry head

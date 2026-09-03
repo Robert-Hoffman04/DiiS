@@ -1,7 +1,11 @@
 # ARM7 THUMB trace-JIT — porting the VBA-GX recompiler to DeSmuME Wii
 
-Status: **in progress — P0 landed** (branch `arm7-jit`; vendored infra compiles
-behind `JITDEFS=-DDESMUME_JIT_ARM7`, unwired). Companion to
+Status: **in progress — P0, P1 landed** (branch `arm7-jit`). P1: `JitCpuProfile`
+seam + ARM7 profile, `JITCache` bank check parameterised, trampoline reworked to
+a `jit_cpu_state*` ABI, `jit_trace.*` split from the (still-absent) emitter,
+differential-harness skeleton. `jitSelfTest()` round-trips a hand-emitted block
+through the trampoline + linker stub — verified PASS under Dolphin. Execution
+path unchanged (no front-end yet). Companion to
 [desmumewii-perf-opportunities.md](desmumewii-perf-opportunities.md) §1.2(b).
 
 External references: VBA-GX JIT source `dborth/vbagx` @ `07ee4af`

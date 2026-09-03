@@ -38,12 +38,15 @@
 #include "jit_debug.h"
 
 // DeSmuMEWii port: vendored from VBA-GX (jit/upstream/PROVENANCE.md).
-// P0: includes retargeted to the DeSmuMEWii tree; body otherwise unchanged.
-// The SMC "code can live here" bank test in jit_cache.cpp (bank 2 / bank 3)
-// already lines up with the DS ARM7 code regions (0x02xxxxxx main RAM,
-// 0x03xxxxxx WRAM / shared WRAM); revisited in P4.
+// P1: the hard-coded "code can live in bank 2 / bank 3" SMC test is now driven
+// by smcBankMask, set from JitCpuProfile at initialize() time. For the DS ARM7
+// the tracked banks happen to be the same nibbles -- 0x02xxxxxx main RAM and
+// 0x03xxxxxx WRAM / shared WRAM -- but the ARM9 (and DTCM) will differ.
 
-#define JIT_ARENA_SIZE					(1024 * 1024 * 8) // 8 MB
+// Arena sized down from VBA's 8 MB: the Broadway has only 32 KB L1-I and
+// Dolphin doesn't model it, so a smaller, denser arena is the safer default
+// (see the plan, risk "Broadway I-cache vs arena"). Revisit with hardware.
+#define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
 
@@ -67,6 +70,11 @@ class JITCache {
 		BasicBlock* blockTable;
 		BasicBlock** smcRegistry;
 		bool isInitialized;
+		u32 smcBankMask;   // bit b set => guest bank b holds JIT-tracked code
+
+		inline bool smcTrackedBank(u32 bank) const {
+			return (smcBankMask >> (bank & 31)) & 1u;
+		}
 
 	public:
 		JITCache();
@@ -76,7 +84,8 @@ class JITCache {
 		u32* linkerReturnAddress;
 		u8* smcPageFlags;
 
-		void initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr, u8* smcFlagsPtr);
+		void initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr,
+		                u8* smcFlagsPtr, u32 trackedBankMask);
 		void destroy();
 
 		u32* allocateJITMemory(size_t numBytes);

@@ -1,137 +1,92 @@
 /****************************************************************************
- * Visual Boy Advance GX
+ * DeSmuMEWii ARM7 JIT
  *
- * Daryl Borth 2026
+ * jit_trampoline.S
  *
- * JITTrampoline.S
+ * Hand-written PowerPC ABI bridge between the C++ emulator core and compiled
+ * JIT traces. Derived from Visual Boy Advance GX source/vba/gba/JITTrampoline.S
+ * (c) Daryl Borth, GPL v2+ -- see jit/upstream/PROVENANCE.md.
  *
- * Hand-written PowerPC assembly ABI bridge between the C++ emulator core
- * and compiled JIT traces. This is the only place that translates the
- * ExecuteJITTrace(...) C calling convention into the JIT's internal,
- * non-standard register contract (see JITPPCEmitter.h's register map).
+ * P1 changes vs upstream:
+ *   - New C signature: ExecuteJITTrace(JITBlockFunc execute, JITResult* out,
+ *                                      jit_cpu_state* st).
+ *     The three loose pointers VBA passed (gbaRegs, flags-array, readTable)
+ *     plus its busPrefetchCount are replaced by one jit_cpu_state* whose
+ *     layout is { u32* gpr; u32* cpsr; u8** readTable; } (see
+ *     jit_cpu_profile.h -- LAYOUT IS ABI).
+ *   - busPrefetchCount is gone: the DS ARM7 has no modelled prefetch buffer
+ *     (MMU_timing.h leaves ARM7 access timing disabled), so R5 is free scratch.
+ *   - Flags: VBA faulted four separate flag words from a base pointer; here a
+ *     single guest CPSR word pointer sits at 84(r1) and the emitter (P2)
+ *     masks/inserts the N/Z/C/V nibble (CPSR bits 31..28).
  *
- * ExecuteJITTrace:
- *   - Saves the caller's LR and all non-volatile host registers (R14-R31)
- *     to a fresh 128-byte stack frame, since compiled traces treat R14,
- *     R29-R31 as long-lived state for the duration of the trace.
- *   - Stashes the incoming pointer arguments (gbaRegs, flags, outResult,
- *     busPrefetchCount) into the stack frame at fixed offsets, since the
- *     JIT-emitted code reaches back into this frame (e.g. flags at 84(r1),
- *     outResult at 88(r1)) to load/store lazily rather than carrying every
- *     pointer in a live register for the whole trace.
- *   - Eagerly loads GBA R15 (PC) into R29 and the live busPrefetchCount
- *     value into R5 � the two pieces of state that must already be resident
- *     before the very first compiled instruction runs, since they can't be
- *     lazily faulted in the way GBA R0-R14 and the condition flags are.
- *   - Zeroes the R3 cycle accumulator, then transfers control into the
- *     compiled block via mtctr/bctr (never a normal call � the trace may
- *     chain through any number of subsequent already-compiled blocks via
- *     JITCache's self-patching linker stub before it ever comes back here).
+ * Stack frame (128 bytes), offsets referenced by emitted trace code:
+ *    80(r1)  guest gpr base pointer   (== r14 for the whole trace)
+ *    84(r1)  guest cpsr word pointer
+ *    88(r1)  JITResult* out
+ *     8(r1)  saved host r14..r31
+ *   132(r1)  saved host LR   (128 + 4, in the caller-provided linkage area)
  *
- * ExecuteJITTrace_Return:
- *   - The single landing pad every JIT exit path (default epilogue, deferred
- *     bailout, SMC bailout, quota-shield yield, or a genuine linker-stub
- *     cache miss) ultimately branches to. Writes R3 (cycles) / R4 (nextPC)
- *     out to outResult, flushes the live busPrefetchCount and GBA PC back
- *     to memory, restores the saved host non-volatile registers and LR,
- *     and returns to the C++ dispatch loop.
- *   - Does NOT flush GBA R0-R14 or the condition flags � by contract, any
- *     code that reaches this landing pad has already flushed whatever it
- *     left dirty (FlushDirtyRegisters/FlushDirtyFlags in JITCompiler.cpp);
- *     this trampoline only owns the handful of pieces of state it itself
- *     eagerly loaded on entry.
+ * Register contract during a trace (see jit_ppc_emitter.h for the full map):
+ *   r14      guest gpr base pointer (non-volatile, live entire trace)
+ *   r15..r28 lazily-cached guest R0..R14
+ *   r29      guest R15 / pipeline PC
+ *   r30      guest read page table base (nullptr until P6)
+ *   r6       packed N/Z/C/V
+ *   r3       cycle accumulator (out); r4  next PC (out) / scratch
  ***************************************************************************/
 
-/* DeSmuMEWii port: vendored verbatim from VBA-GX (jit/upstream/PROVENANCE.md).
-   P0: build-guarded only. The C entry signature in jit.h is finalised in P1. */
 #if defined(DESMUME_JIT_ARM7)
 
 .global ExecuteJITTrace
 .type ExecuteJITTrace, @function
 
-# -----------------------------------------------------------------------------
-# ExecuteJITTrace(JITBlockFunc execute, JITResult* outResult,
-#                 u32* busPrefetchCount, u32* gbaRegs, u32* flags,
-#                 GBAReadPageTable readTable)
-#
-# Register Allocations on Entry (PowerPC Standard EABI):
-#   R3: execute (Function pointer to JIT block)
-#   R4: outResult (Pointer to JITResult struct)
-#   R5: busPrefetchCount (Pointer to the live hardware-prefetch-buffer state)
-#   R6: gbaRegs (Pointer to GBA registers array, reg[0..15])
-#   R7: flags (Pointer to flag buffer array)
-#   R8: gbaReadTable (Pointer to gbaReadTable)
-#
-# JIT Execution Register Mapping (Lazy Register Paradigm):
-#   R14      : PPC_REG_GBA_REGS_PTR (Preserved pointer to the C++ gbaRegs array)
-#   R15..R28 : Lazily allocated/cached GBA Registers R0..R14
-#   R29      : PPC_REG_PC (GBA R15 / Pipeline PC - synchronized across boundaries)
-#   R30      : PPC_R30_TABLE (readTable base pointer)
-#   R8       : PPC_REG_N (N_FLAG) - Lazily Allocated
-#   R9       : PPC_REG_Z (Z_FLAG) - Lazily Allocated
-#   R6       : PPC_REG_C (C_FLAG) - Lazily Allocated
-#   R7       : PPC_REG_V (V_FLAG) - Lazily Allocated
-#   R5       : PPC_R5 -- live busPrefetchCount accumulator DURING the trace
-# -----------------------------------------------------------------------------
-
+# ExecuteJITTrace(r3 = JITBlockFunc execute,
+#                 r4 = JITResult*   out,
+#                 r5 = jit_cpu_state* st)
 ExecuteJITTrace:
-    # Save Link Register (LR) in caller's stack frame
     mflr 0
-    stw 0, 4(1)
+    stw 0, 4(1)                  # save LR into caller linkage area
 
-    # Allocate Stack Frame (128 bytes) & Save Host Non-Volatile Registers (R14-R31)
-    stwu 1, -128(1)
-    stmw 14, 8(1)    # Save host registers r14-r31 to stack frame
+    stwu 1, -128(1)             # new frame
+    stmw 14, 8(1)               # save host non-volatiles r14..r31
 
-    # Preserve Volatile Arguments to Stack Frame
-    stw 6, 80(1)     # Stack[80] = gbaRegs pointer (R6)
-    stw 7, 84(1)     # Stack[84] = flags array pointer (R7)
-    stw 4, 88(1)     # Stack[88] = outResult pointer (R4)
-    stw 5, 92(1)     # Stack[92] = busPrefetchCount pointer (R5)
+    lwz 14, 0(5)                # r14 = st->gpr
+    lwz 10, 4(5)                # r10 = st->cpsr
+    lwz 30, 8(5)                # r30 = st->readTable
 
-    # Initialize Lazy Register Context Pointers
-    mr 14, 6         # R14 = PPC_REG_GBA_REGS_PTR (Keep base pointer alive for lazy loads/stores)
-    lwz 29, 60(6)    # R29 = GBA R15 (PC) is loaded eagerly to maintain block branch pipeline tracking
+    stw 14, 80(1)              # [80] guest gpr base
+    stw 10, 84(1)              # [84] guest cpsr pointer
+    stw 4, 88(1)               # [88] JITResult* out
 
-    # Load Global gbaReadTable Pointer safely into Non-Volatile R30
-    mr 30, 8         # R30 = gbaReadTable (PPC_R30_TABLE)
+    lwz 29, 60(14)             # r29 = guest R15 (pipeline PC), loaded eagerly
 
-    # Load live busPrefetchCount into R5 (safely fetched from the pointer)
-    lwz 10, 92(1)    # R10 = busPrefetchCount pointer
-    lwz 5, 0(10)     # R5 = *busPrefetchCount
+    mtctr 3                     # enter the compiled block via CTR (never a call:
+    li 3, 0                     #   the trace may chain through further blocks
+    bctr                       #   via the linker stub before returning here)
 
-    # Execute JIT Block Trace
-    mtctr 3          # Move JIT block function pointer to Count Register (CTR)
-    li 3, 0          # Zero out the hardware cycle accumulator
-    bctr             # Branch to CTR
-
-    # -------------------------------------------------------------------------
-    # LINKER STUB MISS LANDING PAD
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # Every trace exit path (clean epilogue, deferred bailout, SMC bailout,
+    # quota yield, linker-stub cache miss) ultimately lands here.
+    # ---------------------------------------------------------------------
     .global ExecuteJITTrace_Return
+    .type ExecuteJITTrace_Return, @function
 ExecuteJITTrace_Return:
+    lwz 10, 88(1)              # r10 = JITResult* out
+    stw 3, 0(10)              # out->cycles  (r3)
+    stw 4, 4(10)              # out->nextPC  (r4)
 
-    # Post-Execution: Write Back Return Values
-    lwz 10, 92(1)    # R10 = busPrefetchCount pointer
-    stw 5, 0(10)     # *busPrefetchCount = R5
+    lwz 10, 80(1)             # r10 = guest gpr base
+    stw 29, 60(10)            # flush guest R15 (PC)
 
-    # Reload outResult (Using safe scratch R10 to preserve trace outputs)
-    lwz 10, 88(1)    # R10 = outResult pointer
-    stw 3, 0(10)     # outResult->cycles (Returned by JIT trace in R3)
-    stw 4, 4(10)     # outResult->nextPC (Returned by JIT trace in R4)
+    # By contract, guest R0..R14 and the packed flags were already flushed by
+    # the trace before it reached this landing pad; the trampoline owns only
+    # the PC it eagerly loaded.
 
-    # Eagerly flush the modified pipeline PC back to the register state
-    lwz 10, 80(1)    # R10 = gbaRegs pointer
-    stw 29, 60(10)   # Synchronize GBA R15 (PC)
-
-    # NOTE: All GBA flags and registers (R0-R14) must be lazily flushed by the
-    # JIT trace prior to reaching an exit point or dynamic bailout path.
-
-    # Clean up Stack Frame and Restore Host Non-Volatile Registers
-    lmw 14, 8(1)     # Restore host registers r14-r31
-    lwz 0, 128+4(1)  # Load saved host Link Register
-    mtlr 0           # Restore LR
-    addi 1, 1, 128   # Collapse stack frame
-    blr              # Return to C++ host loop
+    lmw 14, 8(1)              # restore host non-volatiles
+    lwz 0, 132(1)            # saved host LR (128 + 4)
+    mtlr 0
+    addi 1, 1, 128
+    blr
 
 #endif /* DESMUME_JIT_ARM7 */

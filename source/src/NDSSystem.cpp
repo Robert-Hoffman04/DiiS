@@ -40,6 +40,9 @@
 #include "GPU.h"
 #include "firmware.h"
 #include "path.h"
+#ifdef DESMUME_JIT_ARM7
+#include "jit/jit.h"
+#endif
 
 
 PathInfo path;
@@ -157,6 +160,11 @@ int NDS_Init( void) {
 	armcpu_new(&NDS_ARM7,1);
 	armcpu_new(&NDS_ARM9,0);
 
+#ifdef DESMUME_JIT_ARM7
+	jitInit();
+	jitSelfTest();
+#endif
+
 	if (SPU_Init(SNDCORE_DUMMY, 740) != 0)
 		return -1;
 
@@ -180,6 +188,9 @@ int NDS_Init( void) {
 }
 
 void NDS_DeInit(void) {
+#ifdef DESMUME_JIT_ARM7
+	jitShutdown();
+#endif
 	if(MMU.CART_ROM != MMU.UNUSED_RAM)
 		NDS_FreeROM();
 

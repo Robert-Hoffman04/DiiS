@@ -7,11 +7,11 @@
  * GX's source/vba/gba/JIT.h (c) Daryl Borth, GPL v2+ -- see
  * jit/upstream/PROVENANCE.md and desmumewii-arm7-jit-plan.md.
  *
- * Phase P0: only the CPU-agnostic infrastructure (block cache + arena + linker
- * stub in jit_cache.*, PowerPC emitter macros in jit_ppc_emitter.h, ABI
- * trampoline in jit_trampoline.S) is present and compiled behind
- * DESMUME_JIT_ARM7. The THUMB / ARM front-ends and the interpreter wiring
- * arrive in later phases.
+ * Phase P1: the CPU-agnostic infrastructure is present and wired to an ARM7
+ * JitCpuProfile, but no opcode front-end exists yet -- jitCompileTrace()
+ * always produces a "don't JIT this" fallback block, so execution is
+ * unchanged. jitSelfTest() round-trips a hand-emitted block through the
+ * trampoline + linker stub to prove the ABI on real hardware.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_H
@@ -19,6 +19,7 @@
 
 #include "../types.h"
 #include "jit_debug.h"
+#include "jit_cpu_profile.h"
 #include "jit_cache.h"
 
 // Maximum guest instructions the trace scanner will pull into one block.
@@ -26,7 +27,8 @@
 
 // Fixed-layout handshake struct that compiled traces write their outcome into.
 // Must stay 32-byte aligned and layout-stable: jit_trampoline.S and the emitted
-// epilogues reach into it by hard-coded offset.
+// epilogues reach into it by hard-coded offset (cycles@0, nextPC@4,
+// instructions@8, bailedOut@12, smcHit@16, smcAddress@20).
 struct JITResult {
 	u32 cycles;
 	u32 nextPC;
@@ -38,13 +40,17 @@ struct JITResult {
 
 #if defined(DESMUME_JIT_ARM7)
 
-// Hand-written PowerPC ABI bridge (jit_trampoline.S). The trailing two
-// arguments are the guest flag store and the guest read-page table; their
-// concrete types are pinned down when the JitCpuProfile seam lands in P1.
-extern "C" void ExecuteJITTrace(JITBlockFunc execute, JITResult* outResult,
-                                u32* busPrefetchCount, u32* guestRegs,
-                                void* guestFlags, void* readTable);
+// Hand-written PowerPC ABI bridge (jit_trampoline.S).
+extern "C" void ExecuteJITTrace(JITBlockFunc execute, JITResult* out, jit_cpu_state* st);
 extern "C" void ExecuteJITTrace_Return();
+
+// Lifecycle -- called from NDS_Init() / NDS_DeInit().
+void jitInit();
+void jitShutdown();
+
+// One-shot ABI round-trip check (hand-emitted block -> trampoline -> linker
+// stub miss path -> return). Returns true on success; logs either way.
+bool jitSelfTest();
 
 #endif // DESMUME_JIT_ARM7
 

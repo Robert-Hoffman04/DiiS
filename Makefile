@@ -48,6 +48,10 @@ JITDEFS     ?=
 
 CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS) $(JITDEFS)
 CXXFLAGS	=	$(CFLAGS)
+# .S files (jit_trampoline.S) are built with -x assembler-with-cpp and see only
+# CPPFLAGS/ASFLAGS, not CFLAGS -- carry JITDEFS through so the DESMUME_JIT_ARM7
+# guard reaches the assembler too.
+ASFLAGS	    =	$(JITDEFS)
 LDFLAGS	    =	-g $(MACHDEP) $(OPTFLAGS) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 
 #---------------------------------------------------------------------------------
