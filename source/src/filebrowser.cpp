@@ -20,10 +20,12 @@
 
 #include "filebrowser.h"
 #include <sys/dir.h>
+#include <sys/param.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include <wiiuse/wpad.h>
 #include "ctrlssdl.h"
 
@@ -57,21 +59,24 @@ static void clear_console(){
 
 static void browse_back(char *str){
 	int length = strlen(str);
-	int idx;
-	for( idx = length; idx > 0; idx-- ) {
+	int idx = length;
+	do{
 		char ch = str[idx];
 		str[idx] = '\0';
 		if( ch == '/' ) {
-			if( str[idx-1] == ':' )		// root folder.
-				str[idx] = '/';		// Check is here, because it happens only once per function call.
+			if( str[idx-1] == ':' ) // root folder.
+				str[idx] = '/';     // Check is here, because it happens only once per function call.
 			break;
 		}
-	}
+		--idx;
+	}while(idx > 0);
 }
+
 
 static ret_action textFileBrowser(file_browser_st *file_struct){
 
 	// Set everything up to read
+
 	DIR* dp = opendir(file_struct->path);
 
 	if(!dp)
@@ -129,7 +134,8 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 			dir[i].attr = fstat.st_mode;
 			++i;
 		}
-	
+		
+		
 	}
 
 	closedir(dp);
@@ -161,8 +167,9 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 	while(1){
 		PAD_ScanPads();
 		WPAD_ScanPads();
+		GECKO_Update();   // USB Gecko / EXI debug-serial input (gekko_utils/geckoinput.h)
 
-		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z)) 
+		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z))
 			return BROWSER_CANCELED;
 
 		if(GetHeld(UP, UP, UP)){

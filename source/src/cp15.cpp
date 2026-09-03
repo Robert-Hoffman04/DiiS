@@ -32,10 +32,12 @@ armcp15_t *armcp15_new(armcpu_t * c)
 	if(!armcp15) return NULL;
 	
 	armcp15->cpu = c;
-	armcp15->IDCode = 0x41049460;
+	//armcp15->IDCode = 0x41049460;
+	//0.9.8
+	armcp15->IDCode = 0x41059461;
 	armcp15->cacheType = 0x0F0D2112;
-	armcp15->TCMSize = 0x00140140;
-	armcp15->ctrl = 0x00000000;
+	armcp15->TCMSize = 0x00140180;
+	armcp15->ctrl = 0x00012078;
 	armcp15->DCConfig = 0x0;    
 	armcp15->ICConfig = 0x0;    
 	armcp15->writeBuffCtrl = 0x0;
@@ -57,6 +59,10 @@ armcp15_t *armcp15_new(armcpu_t * c)
 	armcp15->DTCMRegion = 0x0080000A;
 	armcp15->processID = 0;
 
+	MMU.ARM9_RW_MODE = BIT7(armcp15->ctrl);
+	armcp15->cpu->intVector = 0xFFFF0000 * (BIT13(armcp15->ctrl));
+	armcp15->cpu->LDTBit = !BIT15(armcp15->ctrl); //TBit
+
 	/* preset calculated regionmasks */	
 	for (i=0;i<8;i++) {
 		armcp15->regionWriteMask_USR[i] = 0 ;
@@ -72,7 +78,7 @@ armcp15_t *armcp15_new(armcpu_t * c)
 		armcp15->regionExecuteSet_USR[i] = 0 ;
 		armcp15->regionExecuteSet_SYS[i] = 0 ;
 	} ;
-
+	
 	return armcp15;
 }
 
@@ -267,142 +273,142 @@ BOOL armcp15_store(armcp15_t *armcp15, u8 CRd, u8 adr)
 BOOL armcp15_moveCP2ARM(armcp15_t *armcp15, u32 * R, u8 CRn, u8 CRm, u8 opcode1, u8 opcode2)
 {
 	if(armcp15->cpu->CPSR.bits.mode == USR) return FALSE;
-
+	
 	switch(CRn)
 	{
-	case 0:
-		if((opcode1 == 0)&&(CRm==0))
-		{
-			switch(opcode2)
+		case 0:
+			if((opcode1 == 0)&&(CRm==0))
 			{
-			case 1:
-				*R = armcp15->cacheType;
-				return TRUE;
-			case 2:
-				*R = armcp15->TCMSize;
-				return TRUE;
-			default:
-				*R = armcp15->IDCode;
-				return TRUE;
-			}
-		}
-		return FALSE;
-	case 1:
-		if((opcode1==0) && (opcode2==0) && (CRm==0))
-		{
-			*R = armcp15->ctrl;
-			return TRUE;
-		}
-		return FALSE;
-
-	case 2:
-		if((opcode1==0) && (CRm==0))
-		{
-			switch(opcode2)
-			{
-			case 0:
-				*R = armcp15->DCConfig;
-				return TRUE;
-			case 1:
-				*R = armcp15->ICConfig;
-				return TRUE;
-			default:
-				return FALSE;
-			}
-		}
-		return FALSE;
-	case 3:
-		if((opcode1==0) && (opcode2==0) && (CRm==0))
-		{
-			*R = armcp15->writeBuffCtrl;
-			return TRUE;
-		}
-		return FALSE;
-	case 5:
-		if((opcode1==0) && (CRm==0))
-		{
-			switch(opcode2)
-			{
-			case 2:
-				*R = armcp15->DaccessPerm;
-				return TRUE;
-			case 3:
-				*R = armcp15->IaccessPerm;
-				return TRUE;
-			default:
-				return FALSE;
-			}
-		}
-		return FALSE;
-	case 6:
-		if((opcode1==0) && (opcode2==0))
-		{
-			switch(CRm)
-			{
-			case 0:
-				*R = armcp15->protectBaseSize0;
-				return TRUE;
-			case 1:
-				*R = armcp15->protectBaseSize1;
-				return TRUE;
-			case 2:
-				*R = armcp15->protectBaseSize2;
-				return TRUE;
-			case 3:
-				*R = armcp15->protectBaseSize3;
-				return TRUE;
-			case 4:
-				*R = armcp15->protectBaseSize4;
-				return TRUE;
-			case 5:
-				*R = armcp15->protectBaseSize5;
-				return TRUE;
-			case 6:
-				*R = armcp15->protectBaseSize6;
-				return TRUE;
-			case 7:
-				*R = armcp15->protectBaseSize7;
-				return TRUE;
-			default:
-				return FALSE;
-			}
-		}
-		return FALSE;
-	case 9:
-		if((opcode1==0))
-		{
-			switch(CRm)
-			{
-			case 0:
 				switch(opcode2)
 				{
-				case 0:
-					*R = armcp15->DcacheLock;
-					return TRUE;
-				case 1:
-					*R = armcp15->IcacheLock;
-					return TRUE;
-				default:
-					return FALSE;
-				}
-			case 1:
-				switch(opcode2)
-				{
-				case 0:
-					*R = armcp15->DTCMRegion;
-					return TRUE;
-				case 1:
-					*R = armcp15->ITCMRegion;
-					return TRUE;
-				default:
-					return FALSE;
+					case 1:
+						*R = armcp15->cacheType;
+						return TRUE;
+					case 2:
+						*R = armcp15->TCMSize;
+						return TRUE;
+					default:
+						*R = armcp15->IDCode;
+						return TRUE;
 				}
 			}
-		}
-		return FALSE;
-	default:
-		LOG("Unsupported CP15 operation : MRC\n");
-		return FALSE;
+			return FALSE;
+		case 1:
+			if((opcode1==0) && (opcode2==0) && (CRm==0))
+			{
+				*R = armcp15->ctrl;
+				return TRUE;
+			}
+			return FALSE;
+	
+		case 2:
+			if((opcode1==0) && (CRm==0))
+			{
+				switch(opcode2)
+				{
+					case 0:
+						*R = armcp15->DCConfig;
+						return TRUE;
+					case 1:
+						*R = armcp15->ICConfig;
+						return TRUE;
+					default:
+						return FALSE;
+				}
+			}
+			return FALSE;
+		case 3:
+			if((opcode1==0) && (opcode2==0) && (CRm==0))
+			{
+				*R = armcp15->writeBuffCtrl;
+				return TRUE;
+			}
+			return FALSE;
+		case 5:
+			if((opcode1==0) && (CRm==0))
+			{
+				switch(opcode2)
+				{
+					case 2:
+						*R = armcp15->DaccessPerm;
+						return TRUE;
+					case 3:
+						*R = armcp15->IaccessPerm;
+						return TRUE;
+					default:
+						return FALSE;
+				}
+			}
+			return FALSE;
+		case 6:
+			if((opcode1==0) && (opcode2==0))
+			{
+				switch(CRm)
+				{
+					case 0:
+						*R = armcp15->protectBaseSize0;
+						return TRUE;
+					case 1:
+						*R = armcp15->protectBaseSize1;
+						return TRUE;
+					case 2:
+						*R = armcp15->protectBaseSize2;
+						return TRUE;
+					case 3:
+						*R = armcp15->protectBaseSize3;
+						return TRUE;
+					case 4:
+						*R = armcp15->protectBaseSize4;
+						return TRUE;
+					case 5:
+						*R = armcp15->protectBaseSize5;
+						return TRUE;
+					case 6:
+						*R = armcp15->protectBaseSize6;
+						return TRUE;
+					case 7:
+						*R = armcp15->protectBaseSize7;
+						return TRUE;
+					default:
+						return FALSE;
+				}
+			}
+			return FALSE;
+		case 9:
+			if((opcode1==0))
+			{
+				switch(CRm)
+				{
+					case 0:
+						switch(opcode2)
+						{
+							case 0:
+								*R = armcp15->DcacheLock;
+								return TRUE;
+							case 1:
+								*R = armcp15->IcacheLock;
+								return TRUE;
+							default:
+								return FALSE;
+						}
+					case 1:
+						switch(opcode2)
+						{
+							case 0:
+								*R = armcp15->DTCMRegion;
+								return TRUE;
+							case 1:
+								*R = armcp15->ITCMRegion;
+								return TRUE;
+							default:
+								return FALSE;
+					}
+				}
+			}
+			return FALSE;
+		default:
+			LOG("Unsupported CP15 operation : MRC\n");
+			return FALSE;
 	}
 }
 
@@ -438,150 +444,149 @@ static u32 CP15wait4IRQ(armcpu_t *cpu)
 BOOL armcp15_moveARM2CP(armcp15_t *armcp15, u32 val, u8 CRn, u8 CRm, u8 opcode1, u8 opcode2)
 {
 	if(armcp15->cpu->CPSR.bits.mode == USR) return FALSE;
-
+	
 	switch(CRn)
 	{
-	case 1:
-		if((opcode1==0) && (opcode2==0) && (CRm==0))
-		{
+		case 1:
+			if((opcode1==0) && (opcode2==0) && (CRm==0))
+			{
+				//On the NDS bit0,2,7,12..19 are R/W, Bit3..6 are always set, all other bits are always zero.
+				armcp15->ctrl = (val & 0x000FF085) | 0x00000078;
+				MMU.ARM9_RW_MODE = BIT7(val);
+				//zero 31-jan-2010: change from 0x0FFF0000 to 0xFFFF0000 per gbatek
+				armcp15->cpu->intVector = 0xFFFF0000 * (BIT13(val));
+				armcp15->cpu->LDTBit = !BIT15(val); //TBit
 
-			//On the NDS bit0,2,7,12..19 are R/W, Bit3..6 are always set, all other bits are always zero.
-			armcp15->ctrl = val;
-			MMU.ARM9_RW_MODE = BIT7(val);
-			//zero 31-jan-2010: change from 0x0FFF0000 to 0xFFFF0000 per gbatek
-			armcp15->cpu->intVector = 0xFFFF0000 * (BIT13(val));
-			armcp15->cpu->LDTBit = !BIT15(val); //TBit
-			//LOG("CP15: ARMtoCP ctrl %08X (val %08X)\n", armcp15->ctrl, val);
-			return TRUE;
-		}
-		return FALSE;
-	case 2:
-		if((opcode1==0) && (CRm==0))
-		{
-			switch(opcode2)
-			{
-			case 0:
-				armcp15->DCConfig = val;
 				return TRUE;
-			case 1:
-				armcp15->ICConfig = val;
-				return TRUE;
-			default:
-				return FALSE;
 			}
-		}
-		return FALSE;
-	case 3:
-		if((opcode1==0) && (opcode2==0) && (CRm==0))
-		{
-			armcp15->writeBuffCtrl = val;
-			return TRUE;
-		}
-		return FALSE;
-	case 5:
-		if((opcode1==0) && (CRm==0))
-		{
-			switch(opcode2)
+			return FALSE;
+		case 2:
+			if((opcode1==0) && (CRm==0))
 			{
-			case 2:
-				armcp15->DaccessPerm = val;
-				armcp15_maskPrecalc(armcp15);
-				return TRUE;
-			case 3:
-				armcp15->IaccessPerm = val;
-				armcp15_maskPrecalc(armcp15);
-				return TRUE;
-			default:
-				return FALSE;
-			}
-		}
-		return FALSE;
-	case 6:
-		if((opcode1==0) && (opcode2==0))
-		{
-			switch(CRm)
-			{
-			case 0:
-				armcp15->protectBaseSize0 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 1:
-				armcp15->protectBaseSize1 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 2:
-				armcp15->protectBaseSize2 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 3:
-				armcp15->protectBaseSize3 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 4:
-				armcp15->protectBaseSize4 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 5:
-				armcp15->protectBaseSize5 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 6:
-				armcp15->protectBaseSize6 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			case 7:
-				armcp15->protectBaseSize7 = val;
-				armcp15_maskPrecalc(armcp15) ;
-				return TRUE;
-			default:
-				return FALSE;
-			}
-		}
-		return FALSE;
-	case 7:
-		if((CRm==0)&&(opcode1==0)&&((opcode2==4)))
-		{
-			CP15wait4IRQ(armcp15->cpu);
-			return TRUE;
-		}
-		return FALSE;
-	case 9:
-		if((opcode1==0))
-		{
-			switch(CRm)
-			{
-			case 0:
 				switch(opcode2)
 				{
-				case 0:
-					armcp15->DcacheLock = val;
-					return TRUE;
-				case 1:
-					armcp15->IcacheLock = val;
-					return TRUE;
-				default:
-					return FALSE;
-				}
-			case 1:
-				switch(opcode2)
-				{
-				case 0:
-					armcp15->DTCMRegion = val;
-					MMU.DTCMRegion = val & 0x0FFFFFFC0;
-					return TRUE;
-				case 1:
-					armcp15->ITCMRegion = val;
-					//ITCM base is not writeable!
-					MMU.ITCMRegion = 0;
-					return TRUE;
-				default:
-					return FALSE;
+					case 0:
+						armcp15->DCConfig = val;
+						return TRUE;
+					case 1:
+						armcp15->ICConfig = val;
+						return TRUE;
+					default:
+						return FALSE;
 				}
 			}
-		}
-		return FALSE;
-	default:
-		return FALSE;
+			return FALSE;
+		case 3:
+			if((opcode1==0) && (opcode2==0) && (CRm==0))
+			{
+				armcp15->writeBuffCtrl = val;
+				return TRUE;
+			}
+			return FALSE;
+		case 5:
+			if((opcode1==0) && (CRm==0))
+			{
+				switch(opcode2)
+				{
+					case 2:
+						armcp15->DaccessPerm = val;
+						armcp15_maskPrecalc(armcp15);
+						return TRUE;
+					case 3:
+						armcp15->IaccessPerm = val;
+						armcp15_maskPrecalc(armcp15);
+						return TRUE;
+					default:
+						return FALSE;
+				}
+			}
+			return FALSE;
+		case 6:
+			if((opcode1==0) && (opcode2==0))
+			{
+				switch(CRm)
+				{
+					case 0:
+						armcp15->protectBaseSize0 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 1:
+						armcp15->protectBaseSize1 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 2:
+						armcp15->protectBaseSize2 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 3:
+						armcp15->protectBaseSize3 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 4:
+						armcp15->protectBaseSize4 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 5:
+						armcp15->protectBaseSize5 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 6:
+						armcp15->protectBaseSize6 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					case 7:
+						armcp15->protectBaseSize7 = val;
+						armcp15_maskPrecalc(armcp15) ;
+						return TRUE;
+					default:
+						return FALSE;
+				}
+			}
+			return FALSE;
+		case 7:
+			if((CRm==0)&&(opcode1==0)&&((opcode2==4)))
+			{
+				CP15wait4IRQ(armcp15->cpu);
+				return TRUE;
+			}
+			return FALSE;
+		case 9:
+			if((opcode1==0))
+			{
+				switch(CRm)
+				{
+				case 0:
+					switch(opcode2)
+					{
+						case 0:
+							armcp15->DcacheLock = val;
+							return TRUE;
+						case 1:
+							armcp15->IcacheLock = val;
+							return TRUE;
+						default:
+							return FALSE;
+					}
+				case 1:
+					switch(opcode2)
+					{
+						case 0:
+
+							MMU.DTCMRegion = armcp15->DTCMRegion = val & 0x0FFFF000;
+							return TRUE;
+						case 1:
+							armcp15->ITCMRegion = val;
+							//ITCM base is not writeable!
+							MMU.ITCMRegion = 0;
+							return TRUE;
+						default:
+							return FALSE;
+					}
+				}
+			}
+			return FALSE;
+		default:
+			return FALSE;
 	}
 }
 

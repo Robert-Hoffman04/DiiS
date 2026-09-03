@@ -1,25 +1,22 @@
-//taken from ndstool
-//http://devkitpro.svn.sourceforge.net/viewvc/devkitpro/trunk/tools/nds/ndstool/source/header.cpp?revision=3063
+/*  Copyright (C) 2005-2006 Rafael Vuijk
+    Copyright (C) 2012 DeSmuMEWii team
 
-/* header.cpp - this file is part of DeSmuME
- *
- * Copyright (C) 2005-2006 Rafael Vuijk
- *
- * This file is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2, or (at your option)
- * any later version.
- *
- * This file is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; see the file COPYING.  If not, write to
- * the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
- * Boston, MA 02111-1307, USA.
- */
+    This file is part of DeSmuMEWii
+
+    DeSmuMEWii is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    DeSmuMEWii is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with DeSmuMEWii; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+*/
 
 #include "header.h"
 
@@ -71,14 +68,13 @@ int DetectRomType(const Header& header, char* romdata)
 	unsigned int * data = (unsigned int*)(romdata + 0x4000);
 
 	//this is attempting to check for an utterly invalid nds header
-	if(header.unitcode != 0 && header.unitcode != 2) return ROMTYPE_INVALID;
+	if(header.unitcode < 0 && header.unitcode > 3) return ROMTYPE_INVALID;
 
 	if (header.arm9_rom_offset < 0x4000) return ROMTYPE_HOMEBREW;
 	if (data[0] == 0x00000000 && data[1] == 0x00000000) return ROMTYPE_MULTIBOOT;
 	if (data[0] == 0xE7FFDEFF && data[1] == 0xE7FFDEFF) return ROMTYPE_NDSDUMPED;
-	romdata += 0x200;
 	for (int i=0x200; i<0x4000; i++)
-		if (*romdata) return ROMTYPE_MASKROM;	// found something odd ;)
+		if (romdata[i]) return ROMTYPE_MASKROM;	// found something odd
 	return ROMTYPE_ENCRSECURE;
 }
 

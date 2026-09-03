@@ -200,13 +200,8 @@ public:
 		{
 			strncpy(buffer, pathToCopy, MAX_PATH);
 			int len = strlen(buffer)-1;
-#ifdef WIN32
-			if(buffer[len] != '\\') 
-				strcat(buffer, "\\");
-#else
 			if(buffer[len] != '/') 
 				strcat(buffer, "/");
-#endif
 
 		}
 		else if(action == SET)

@@ -31,100 +31,153 @@
 #include "FIFO.h"
 #include "MMU.h"
 
-//#undef FORCEINLINE
-//#define FORCEINLINE
+#define GPU_MAIN	0
+#define GPU_SUB		1
+// Human readable bitmask names
+#define ADDRESS_STEP_512B	   0x00200
+#define ADDRESS_STEP_1KB		0x00400
+#define ADDRESS_STEP_2KB		0x00800
+#define ADDRESS_STEP_4KB		0x01000
+#define ADDRESS_STEP_8KB		0x02000
+#define ADDRESS_STEP_16KB	   0x04000
+#define ADDRESS_STEP_32KB	   0x08000
+#define ADDRESS_STEP_64KB	   0x10000
+#define ADDRESS_STEP_128KB	   0x20000
+#define ADDRESS_STEP_256KB	   0x40000
+#define ADDRESS_STEP_512KB	   0x80000
+#define ADDRESS_MASK_256KB	   (ADDRESS_STEP_256KB-1)
 
-void gpu_savestate(EMUFILE* os);
-bool gpu_loadstate(EMUFILE* is, int size);
+#define NB_PRIORITIES 4
+#define NB_BG         4
 
-/*******************************************************************************
-    this structure is for display control,
-    it holds flags for general display
-*******************************************************************************/
+#define MMU_ABG		0x06000000
+#define MMU_BBG		0x06200000
+#define MMU_AOBJ	0x06400000
+#define MMU_BOBJ	0x06600000
+#define MMU_LCDC	0x06800000
 
-#ifdef WORDS_BIGENDIAN
-struct _DISPCNT
-{
-/* 7*/  u8 ForceBlank:1;      // A+B:
-/* 6*/  u8 OBJ_BMP_mapping:1; // A+B: 0=2D (128KB), 1=1D (128..256KB)
-/* 5*/  u8 OBJ_BMP_2D_dim:1;  // A+B: 0=128x512,    1=256x256 pixels
-/* 4*/  u8 OBJ_Tile_mapping:1;// A+B: 0=2D (32KB),  1=1D (32..256KB)
-/* 3*/  u8 BG0_3D:1;          // A  : 0=2D,         1=3D
-/* 0*/  u8 BG_Mode:3;         // A+B:
-/*15*/  u8 WinOBJ_Enable:1;   // A+B: 0=disable, 1=Enable
-/*14*/  u8 Win1_Enable:1;     // A+B: 0=disable, 1=Enable
-/*13*/  u8 Win0_Enable:1;     // A+B: 0=disable, 1=Enable
-/*12*/  u8 OBJ_Enable:1;      // A+B: 0=disable, 1=Enable
-/*11*/  u8 BG3_Enable:1;      // A+B: 0=disable, 1=Enable
-/*10*/  u8 BG2_Enable:1;      // A+B: 0=disable, 1=Enable
-/* 9*/  u8 BG1_Enable:1;      // A+B: 0=disable, 1=Enable
-/* 8*/  u8 BG0_Enable:1;        // A+B: 0=disable, 1=Enable
-/*23*/  u8 OBJ_HBlank_process:1;    // A+B: OBJ processed during HBlank (GBA bit5)
-/*22*/  u8 OBJ_BMP_1D_Bound:1;      // A  :
-/*20*/  u8 OBJ_Tile_1D_Bound:2;     // A+B:
-/*18*/  u8 VRAM_Block:2;            // A  : VRAM block (0..3=A..D)
+#define GFXCORE_DEFAULT		 -1
+#define GFXCORE_DUMMY		  0
+#define GFXCORE_FULLSCREEN   (1 << 0)
 
-/*16*/  u8 DisplayMode:2;     // A+B: coreA(0..3) coreB(0..1) GBA(Green Swap)
-                                    // 0=off (white screen)
-                                    // 1=on (normal BG & OBJ layers)
-                                    // 2=VRAM display (coreA only)
-                                    // 3=RAM display (coreA only, DMA transfers)
+///////////////////////////////////////////
 
-/*31*/  u8 ExOBJPalette_Enable:1;   // A+B: 0=disable, 1=Enable OBJ extended Palette
-/*30*/  u8 ExBGxPalette_Enable:1;   // A+B: 0=disable, 1=Enable BG extended Palette
-/*27*/  u8 ScreenBase_Block:3;      // A  : Screen Base (64K step)
-/*24*/  u8 CharacBase_Block:3;      // A  : Character Base (64K step)
-};
-#else
-struct _DISPCNT
-{
-/* 0*/  u8 BG_Mode:3;         // A+B:
-/* 3*/  u8 BG0_3D:1;          // A  : 0=2D,         1=3D
-/* 4*/  u8 OBJ_Tile_mapping:1;     // A+B: 0=2D (32KB),  1=1D (32..256KB)
-/* 5*/  u8 OBJ_BMP_2D_dim:1;  // A+B: 0=128x512,    1=256x256 pixels
-/* 6*/  u8 OBJ_BMP_mapping:1; // A+B: 0=2D (128KB), 1=1D (128..256KB)
-
-                                    // 7-15 same as GBA
-/* 7*/  u8 ForceBlank:1;      // A+B:
-/* 8*/  u8 BG0_Enable:1;        // A+B: 0=disable, 1=Enable
-/* 9*/  u8 BG1_Enable:1;      // A+B: 0=disable, 1=Enable
-/*10*/  u8 BG2_Enable:1;      // A+B: 0=disable, 1=Enable
-/*11*/  u8 BG3_Enable:1;      // A+B: 0=disable, 1=Enable
-/*12*/  u8 OBJ_Enable:1;      // A+B: 0=disable, 1=Enable
-/*13*/  u8 Win0_Enable:1;     // A+B: 0=disable, 1=Enable
-/*14*/  u8 Win1_Enable:1;     // A+B: 0=disable, 1=Enable
-/*15*/  u8 WinOBJ_Enable:1;   // A+B: 0=disable, 1=Enable
-
-/*16*/  u8 DisplayMode:2;     // A+B: coreA(0..3) coreB(0..1) GBA(Green Swap)
-                                    // 0=off (white screen)
-                                    // 1=on (normal BG & OBJ layers)
-                                    // 2=VRAM display (coreA only)
-                                    // 3=RAM display (coreA only, DMA transfers)
-
-/*18*/  u8 VRAM_Block:2;            // A  : VRAM block (0..3=A..D)
-/*20*/  u8 OBJ_Tile_1D_Bound:2;     // A+B:
-/*22*/  u8 OBJ_BMP_1D_Bound:1;      // A  :
-/*23*/  u8 OBJ_HBlank_process:1;    // A+B: OBJ processed during HBlank (GBA bit5)
-/*24*/  u8 CharacBase_Block:3;      // A  : Character Base (64K step)
-/*27*/  u8 ScreenBase_Block:3;      // A  : Screen Base (64K step)
-/*30*/  u8 ExBGxPalette_Enable:1;   // A+B: 0=disable, 1=Enable BG extended Palette
-/*31*/  u8 ExOBJPalette_Enable:1;   // A+B: 0=disable, 1=Enable OBJ extended Palette
-};
-#endif
-
-typedef union
-{
-    struct _DISPCNT bits;
-    u32 val;
-} DISPCNT;
-#define BGxENABLED(cnt,num)    ((num<8)? ((cnt.val>>8) & num):0)
-
-
-enum BlendFunc
-{
+enum BlendFunc{
 	None, Blend, Increase, Decrease
 };
 
+// (00: Normal, 01: Transparent, 10: Object window, 11: Bitmap)
+enum GPU_OBJ_MODE{
+	GPU_OBJ_MODE_Normal = 0,
+	GPU_OBJ_MODE_Transparent = 1,
+	GPU_OBJ_MODE_Window = 2,
+	GPU_OBJ_MODE_Bitmap = 3
+};
+
+enum BGType {
+	BGType_Invalid=0,
+	BGType_Text=1,
+	BGType_Affine=2,
+	BGType_Large8bpp=3,
+	BGType_AffineExt=4,
+	BGType_AffineExt_256x16=5,
+	BGType_AffineExt_256x1=6,
+	BGType_AffineExt_Direct=7
+};
+
+///////////////////////////////////////////
+
+extern CACHE_ALIGN u8 gpuBlendTable555[17][17][32][32];
+extern CACHE_ALIGN u8 GPU_screen[4*256*192];
+extern const BGType GPU_mode2type[8][4];
+extern MMU_struct MMU;
+
+///////////////////////////////////////////
+
+void gpu_savestate(EMUFILE* os);
+bool gpu_loadstate(EMUFILE* is, int size);
+int Screen_Init(int coreid);
+void Screen_Reset(void);
+void Screen_DeInit(void);
+void gpu_SetRotateScreen(u16 angle);
+
+
+/*******************************************************************************
+    This structure is for display control,
+    it holds flags for general display
+*******************************************************************************/
+
+struct _DISPCNT{
+
+#ifdef WORDS_BIGENDIAN
+/* 7*/  u8 ForceBlank:1;            // A+B: // 7-15 same as GBA
+/* 6*/  u8 OBJ_BMP_mapping:1;       // A+B: 0=2D (128KB), 1=1D (128..256KB)
+/* 5*/  u8 OBJ_BMP_2D_dim:1;        // A+B: 0=128x512,    1=256x256 pixels
+/* 4*/  u8 OBJ_Tile_mapping:1;      // A+B: 0=2D (32KB),  1=1D (32..256KB)
+/* 3*/  u8 BG0_3D:1;                // A  : 0=2D,         1=3D
+/* 0*/  u8 BG_Mode:3;               // A+B:
+/*15*/  u8 WinOBJ_Enable:1;         // A+B: 0=disable, 1=Enable
+/*14*/  u8 Win1_Enable:1;           // A+B: 0=disable, 1=Enable
+/*13*/  u8 Win0_Enable:1;           // A+B: 0=disable, 1=Enable
+/*12*/  u8 OBJ_Enable:1;            // A+B: 0=disable, 1=Enable
+/*11*/  u8 BG3_Enable:1;            // A+B: 0=disable, 1=Enable
+/*10*/  u8 BG2_Enable:1;            // A+B: 0=disable, 1=Enable
+/* 9*/  u8 BG1_Enable:1;            // A+B: 0=disable, 1=Enable
+/* 8*/  u8 BG0_Enable:1;            // A+B: 0=disable, 1=Enable
+/*23*/  u8 OBJ_HBlank_process:1;    // A+B: OBJ processed during HBlank (GBA bit5)
+/*22*/  u8 OBJ_BMP_1D_Bound:1;      // A  : Bitmap OBJ 1D-Boundary (see Bit5-6)
+/*20*/  u8 OBJ_Tile_1D_Bound:2;     // A+B: Tile OBJ 1D-Boundary   (see Bit4)
+/*18*/  u8 VRAM_Block:2;            // A  : VRAM block (0..3=A..D)
+
+/*16*/  u8 DisplayMode:2;           // A+B: coreA(0..3) coreB(0..1) GBA(Green Swap)
+                                    // 0=off (white screen)
+                                    // 1=on (normal BG & OBJ layers)
+                                    // 2=VRAM display (coreA only)
+                                    // 3=RAM display (coreA only, DMA transfers)
+
+/*31*/  u8 ExOBJPalette_Enable:1;   // A+B: 0=disable, 1=Enable OBJ extended Palette
+/*30*/  u8 ExBGxPalette_Enable:1;   // A+B: 0=disable, 1=Enable BG extended Palette
+/*27*/  u8 ScreenBase_Block:3;      // A  : Screen Base (64K step)
+/*24*/  u8 CharacBase_Block:3;      // A  : Character Base (64K step)
+#else
+/* 0*/  u8 BG_Mode:3;               // A+B:
+/* 3*/  u8 BG0_3D:1;                // A  : 0=2D,         1=3D
+/* 4*/  u8 OBJ_Tile_mapping:1;      // A+B: 0=2D (32KB),  1=1D (32..256KB)
+/* 5*/  u8 OBJ_BMP_2D_dim:1;        // A+B: 0=128x512,    1=256x256 pixels
+/* 6*/  u8 OBJ_BMP_mapping:1;       // A+B: 0=2D (128KB), 1=1D (128..256KB)
+
+                                    // 7-15 same as GBA
+/* 7*/  u8 ForceBlank:1;            // A+B:
+/* 8*/  u8 BG0_Enable:1;            // A+B: 0=disable, 1=Enable
+/* 9*/  u8 BG1_Enable:1;            // A+B: 0=disable, 1=Enable
+/*10*/  u8 BG2_Enable:1;            // A+B: 0=disable, 1=Enable
+/*11*/  u8 BG3_Enable:1;            // A+B: 0=disable, 1=Enable
+/*12*/  u8 OBJ_Enable:1;            // A+B: 0=disable, 1=Enable
+/*13*/  u8 Win0_Enable:1;           // A+B: 0=disable, 1=Enable
+/*14*/  u8 Win1_Enable:1;           // A+B: 0=disable, 1=Enable
+/*15*/  u8 WinOBJ_Enable:1;         // A+B: 0=disable, 1=Enable
+
+/*16*/  u8 DisplayMode:2;           // A+B: coreA(0..3) coreB(0..1) GBA(Green Swap)
+                                          // 0=off (white screen)
+                                          // 1=on (normal BG & OBJ layers)
+                                          // 2=VRAM display (coreA only)
+                                          // 3=RAM display (coreA only, DMA transfers)
+
+/*18*/  u8 VRAM_Block:2;            // A  : VRAM block (0..3=A..D)
+/*20*/  u8 OBJ_Tile_1D_Bound:2;     // A+B: Tile OBJ 1D-Boundary   (see Bit4)
+/*22*/  u8 OBJ_BMP_1D_Bound:1;      // A  : Bitmap OBJ 1D-Boundary (see Bit5-6)
+/*23*/  u8 OBJ_HBlank_process:1;    // A+B: OBJ processed during HBlank (GBA bit5)
+/*24*/  u8 CharacBase_Block:3;      // A  : Character Base (64K step)
+/*27*/  u8 ScreenBase_Block:3;      // A  : Screen Base (64K step)
+/*30*/  u8 ExBGxPalette_Enable:1;   // A+B: 0=disable, 1=Enable BG extended Palette
+/*31*/  u8 ExOBJPalette_Enable:1;   // A+B: 0=disable, 1=Enable OBJ extended Palette
+#endif
+};
+
+union DISPCNT{
+    struct _DISPCNT bits;
+    u32 val;
+};
 
 /*******************************************************************************
     this structure is for display control of a specific layer,
@@ -132,10 +185,9 @@ enum BlendFunc
     their priority indicate which one to draw on top of the other
     some flags indicate special drawing mode, size, FX
 *******************************************************************************/
+struct _BGxCNT{
 
 #ifdef WORDS_BIGENDIAN
-struct _BGxCNT
-{
 /* 7*/ u8 Palette_256:1;         // 0=16x16, 1=1*256 palette
 /* 6*/ u8 Mosaic_Enable:1;       // 0=disable, 1=Enable mosaic
 /* 2*/ u8 CharacBase_Block:4;    // individual character base offset (n*16KB)
@@ -149,10 +201,7 @@ struct _BGxCNT
                                        // BG2 overflow area wraparound 0=off, 1=wrap
                                        // BG3 overflow area wraparound 0=off, 1=wrap
 /* 8*/ u8 ScreenBase_Block:5;    // individual screen base offset (text n*2KB, BMP n*16KB)
-};
 #else
-struct _BGxCNT
-{
 /* 0*/ u8 Priority:2;            // 0..3=high..low
 /* 2*/ u8 CharacBase_Block:4;    // individual character base offset (n*16KB)
 /* 6*/ u8 Mosaic_Enable:1;       // 0=disable, 1=Enable mosaic
@@ -166,37 +215,35 @@ struct _BGxCNT
                                        // x/rot/s : 128x128 256x256 512x512 1024x1024
                                        // bmp     : 128x128 256x256 512x256 512x512
                                        // large   : 512x1024 1024x512 - -
-};
 #endif
+};
 
-
-typedef union
-{
+union BGxCNT{
     struct _BGxCNT bits;
     u16 val;
-} BGxCNT;
+};
 
 /*******************************************************************************
-    this structure is for background offset
+    This structure is for background offset
 *******************************************************************************/
 
-typedef struct {
+struct BGxOFS{
     u16 BGxHOFS;
     u16 BGxVOFS;
-} BGxOFS;
+};
 
 /*******************************************************************************
-    this structure is for rotoscale parameters
+    This structure is for rotoscale parameters
 *******************************************************************************/
 
-typedef struct {
+struct BGxPARMS{
 	s16 BGxPA;
 	s16 BGxPB;
 	s16 BGxPC;
 	s16 BGxPD;
 	s32 BGxX;
 	s32 BGxY;
-} BGxPARMS;
+};
 
 
 /*******************************************************************************
@@ -211,16 +258,16 @@ typedef struct {
 		+-- BG0/BG1/BG2/BG3/OBJ
 *******************************************************************************/
 
-typedef union {
+union WINxDIM{
 	struct	{
 		u8 end:8;
 		u8 start:8;
 	} bits ;
 	u16 val;
-} WINxDIM;
+};
 
+struct WINxBIT{
 #ifdef WORDS_BIGENDIAN
-typedef struct {
 /* 6*/  u8 :2;
 /* 5*/  u8 WINx_Effect_Enable:1;
 /* 4*/  u8 WINx_OBJ_Enable:1;
@@ -228,9 +275,7 @@ typedef struct {
 /* 2*/  u8 WINx_BG2_Enable:1;
 /* 1*/  u8 WINx_BG1_Enable:1;
 /* 0*/  u8 WINx_BG0_Enable:1;
-} WINxBIT;
 #else
-typedef struct {
 /* 0*/  u8 WINx_BG0_Enable:1;
 /* 1*/  u8 WINx_BG1_Enable:1;
 /* 2*/  u8 WINx_BG2_Enable:1;
@@ -238,11 +283,12 @@ typedef struct {
 /* 4*/  u8 WINx_OBJ_Enable:1;
 /* 5*/  u8 WINx_Effect_Enable:1;
 /* 6*/  u8 :2;
-} WINxBIT;
 #endif
+};
 
+
+union WINxCNT{
 #ifdef WORDS_BIGENDIAN
-typedef union {
 	struct {
 		WINxBIT win0;
 		WINxBIT win1;
@@ -258,9 +304,7 @@ typedef union {
 		u8 high;
 	} bytes;
 	u16 val ;
-} WINxCNT ;
 #else
-typedef union {
 	struct {
 		WINxBIT win0;
 		WINxBIT win1;
@@ -276,26 +320,15 @@ typedef union {
 		u8 high;
 	} bytes;
 	u16 val ;
-} WINxCNT ;
 #endif
-
-/*
-typedef struct {
-    WINxDIM WIN0H;
-    WINxDIM WIN1H;
-    WINxDIM WIN0V;
-    WINxDIM WIN1V;
-    WINxCNT WININ;
-    WINxCNT WINOUT;
-} WINCNT;
-*/
+};
 
 /*******************************************************************************
     this structure is for miscellanous settings
     //TODO: needs further description
 *******************************************************************************/
 
-typedef struct {
+struct MISCCNT{
     u16 MOSAIC;
     u16 unused1;
     u16 unused2;//BLDCNT;
@@ -308,15 +341,14 @@ typedef struct {
     u16 unused8;
     u16 unused9;
 	*/
-} MISCCNT;
+};
 
 
 /*******************************************************************************
     this structure is for 3D settings
 *******************************************************************************/
 
-struct _DISP3DCNT
-{
+struct _DISP3DCNT{
 /* 0*/ u8 EnableTexMapping:1;    //
 /* 1*/ u8 PolygonShading:1;      // 0=Toon Shading, 1=Highlight Shading
 /* 2*/ u8 EnableAlphaTest:1;     // see ALPHA_TEST_REF
@@ -333,11 +365,10 @@ struct _DISP3DCNT
 /*16*/ u16 :16;
 };
 
-typedef union
-{
+union DISP3DCNT{
     struct _DISP3DCNT bits;
     u32 val;
-} DISP3DCNT;
+};
 
 /*******************************************************************************
     this structure is for capture control (core A only)
@@ -345,8 +376,7 @@ typedef union
     source:
     http://nocash.emubase.de/gbatek.htm#dsvideocaptureandmainmemorydisplaymode
 *******************************************************************************/
-struct DISPCAPCNT
-{
+struct DISPCAPCNT{
 	enum CAPX {
 		_128, _256
 	} capx;
@@ -370,7 +400,7 @@ struct DISPCAPCNT
     * core B : 0x04001000
 *******************************************************************************/
 
-typedef struct _reg_dispx {
+typedef struct _reg_dispx{
     DISPCNT dispx_DISPCNT;            // 0x0400x000
     u16 dispA_DISPSTAT;               // 0x04000004
     u16 dispx_VCOUNT;                 // 0x0400x006
@@ -383,77 +413,48 @@ typedef struct _reg_dispx {
     DISP3DCNT dispA_DISP3DCNT;        // 0x04000060
     DISPCAPCNT dispA_DISPCAPCNT;      // 0x04000064
     u32 dispA_DISPMMEMFIFO;           // 0x04000068
-} REG_DISPx ;
+} REG_DISPx;
 
 
-typedef BOOL (*fun_gl_Begin) (int screen);
-typedef void (*fun_gl_End) (int screen);
-// the GUI should use this function prior to all gl calls
-// if call to beg succeeds opengl draw
-void register_gl_fun(fun_gl_Begin beg,fun_gl_End end);
 
-#define GPU_MAIN	0
-#define GPU_SUB		1
-
-/* human readable bitmask names */
-#define ADDRESS_STEP_512B	   0x00200
-#define ADDRESS_STEP_1KB		0x00400
-#define ADDRESS_STEP_2KB		0x00800
-#define ADDRESS_STEP_4KB		0x01000
-#define ADDRESS_STEP_8KB		0x02000
-#define ADDRESS_STEP_16KB	   0x04000
-#define ADDRESS_STEP_32KB	   0x08000
-#define ADDRESS_STEP_64KB	   0x10000
-#define ADDRESS_STEP_128KB	   0x20000
-#define ADDRESS_STEP_256KB	   0x40000
-#define ADDRESS_STEP_512KB	   0x80000
-#define ADDRESS_MASK_256KB	   (ADDRESS_STEP_256KB-1)
+struct _TILEENTRY{
 
 #ifdef WORDS_BIGENDIAN
-struct _TILEENTRY
-{
 /*14*/	unsigned Palette:4;
 /*13*/	unsigned VFlip:1;	// VERTICAL FLIP (top<-->bottom)
 /*12*/	unsigned HFlip:1;	// HORIZONTAL FLIP (left<-->right)
 /* 0*/	unsigned TileNum:10;
-};
 #else
-struct _TILEENTRY
-{
 /* 0*/	unsigned TileNum:10;
 /*12*/	unsigned HFlip:1;	// HORIZONTAL FLIP (left<-->right)
 /*13*/	unsigned VFlip:1;	// VERTICAL FLIP (top<-->bottom)
 /*14*/	unsigned Palette:4;
-};
 #endif
-typedef union
-{
+};
+
+union TILEENTRY{
 	struct _TILEENTRY bits;
 	u16 val;
-} TILEENTRY;
+};
+
+struct _ROTOCOORD{
 
 #ifdef WORDS_BIGENDIAN
-struct _ROTOCOORD
-{
 	u32 pad:4;
 	s32 Integer:20;
 	u32 Fraction:8;
-
-};
 #else
-struct _ROTOCOORD
-{
 	u32 Fraction:8;
 	s32 Integer:20;
 	u32 pad:4;
-};
+
 #endif
-typedef union
-{
+};
+
+union ROTOCOORD{
 	struct _ROTOCOORD bits;
 	s32 val;
-} ROTOCOORD;
-
+};
 
 /*
 	this structure is for color representation,
@@ -480,26 +481,41 @@ struct _COLORx { // abgr x555
 	unsigned alpha:1;	// sometimes it is unused (pad)
 };
 
-typedef union
-{
+union COLOR{
 	struct _COLOR bits;
 	struct _COLORx bitx;
 	u16 val;
-} COLOR;
+};
 
 struct _COLOR32 { // ARGB
-#ifdef WORDS_BIGENDIAN
-	u8 a, b, g, r;
+#if 0
+	unsigned :7;
+	unsigned alpha:1;
+	
+	unsigned :3;
+	unsigned red:5;	
+
+	
+	unsigned :3;
+	unsigned green:5;
+
+	unsigned :3;
+	unsigned blue:5;	
 #else
-	u8 r, g, b, a;
+
+#ifdef WORDS_BIGENDIAN
+	u8 alpha, blue, green, red;
+#else
+	u8 red, green, blue, alpha;
+#endif
+
 #endif
 };
 
-typedef union
-{
+union COLOR32{
 	struct _COLOR32 bits;
 	u32 val;
-} COLOR32;
+};
 
 #define COLOR_16_32(w,i)	\
 	/* doesnt matter who's 16bit who's 32bit */ \
@@ -508,17 +524,6 @@ typedef union
 	i.bits.blue  = w.bits.blue; \
 	i.bits.alpha = w.bits.alpha;
 
-
-
- // (00: Normal, 01: Transparent, 10: Object window, 11: Bitmap)
-enum GPU_OBJ_MODE
-{
-	GPU_OBJ_MODE_Normal = 0,
-	GPU_OBJ_MODE_Transparent = 1,
-	GPU_OBJ_MODE_Window = 2,
-	GPU_OBJ_MODE_Bitmap = 3
-};
-
 /*
 	this structure is for Sprite description,
 	it holds flags & transformations for 1 sprite
@@ -526,8 +531,8 @@ enum GPU_OBJ_MODE
 ref: http://www.bottledlight.com/ds/index.php/Video/Sprites
 */
 
-struct _OAM_
-{
+struct OAM{
+
 #ifdef WORDS_BIGENDIAN
 // attr0
 /* 0*/    unsigned Y:8;
@@ -547,15 +552,15 @@ struct _OAM_
 /*12*/    unsigned PaletteIndex:4;
 /*10*/    unsigned Priority:2;
 // attr3
-          unsigned attr3:16;    
+          unsigned attr3:16;   
 #else
 // attr0
 /* 0*/	unsigned Y:8;
 /* 8*/	unsigned RotScale:2; // (00: Normal, 01: Rot/scale, 10: Disabled, 11: Double-size rot/scale)
 /*10*/	unsigned Mode:2;	 // (00: Normal, 01: Transparent, 10: Object window, 11: Bitmap)
 /*12*/	unsigned Mosaic:1;   // (1: Enabled)
-/*13*/	unsigned Depth:1;	// (0: 16, 1: 256)
-/*14*/	unsigned Shape:2;	// (00: Square, 01: Wide, 10: Tall, 11: Illegal)
+/*13*/	unsigned Depth:1;	 // (0: 16, 1: 256)
+/*14*/	unsigned Shape:2;	 // (00: Square, 01: Wide, 10: Tall, 11: Illegal)
 // attr1
 /* 0*/	signed   X:9;
 /* 9*/	unsigned RotScalIndex:3; // Rot/scale matrix index
@@ -571,44 +576,19 @@ struct _OAM_
 #endif
 };
 
-typedef struct
-{
-#ifdef WORDS_BIGENDIAN
-	 u8 attr00;
-	 u8 attr01;
-	 u8 attr10;
-	 u8 attr11;
-	 u8 attr20;
-	 u8 attr21;
-	 u8 attr30;
-	 u8 attr31;
-#else
-	 u16 attr0;
-	 u16 attr1;
-	 u16 attr2;
-	 u16 attr3;
-#endif
-} OAM;
-
-
-typedef struct
-{
+struct size{
 	 s16 x;
 	 s16 y;
-} size;
+};
 
-
-
+extern const size sprSizeTab[4][4];
 
 /*
 	this structure holds information
 	for rendering.
 */
 
-#define NB_PRIORITIES	4
-#define NB_BG		4
-typedef struct
-{
+struct itemsForPriority_t{
 	u8 PixelsX[256];
 	u8 BGs[NB_BG], nbBGs;
 	u8 pad[1];
@@ -616,40 +596,20 @@ typedef struct
 	//256+8:
 	u8 pad2[248];
 
-	//things were slower when i organized this struct this way. whatever.
+	//things were slower when I organized this struct this way. whatever.
 	//u8 PixelsX[256];
 	//int BGs[NB_BG], nbBGs;
 	//int nbPixelsX;
 	////<-- 256 + 24
 	//u8 pad2[256-24];
-} itemsForPriority_t;
-#define MMU_ABG		0x06000000
-#define MMU_BBG		0x06200000
-#define MMU_AOBJ	0x06400000
-#define MMU_BOBJ	0x06600000
-#define MMU_LCDC	0x06800000
-
-extern CACHE_ALIGN u8 gpuBlendTable555[17][17][32][32];
-
-enum BGType {
-	BGType_Invalid=0, BGType_Text=1, BGType_Affine=2, BGType_Large8bpp=3, 
-	BGType_AffineExt=4, BGType_AffineExt_256x16=5, BGType_AffineExt_256x1=6, BGType_AffineExt_Direct=7
 };
 
-extern const BGType GPU_mode2type[8][4];
-
-struct GPU
-{
-	GPU()
-		: debug(false)
-	{}
+struct GPU{
+	GPU(){}
 
 	// some structs are becoming redundant
 	// some functions too (no need to recopy some vars as it is done by MMU)
 	REG_DISPx * dispx_st;
-
-	//this indicates whether this gpu is handling debug tools
-	bool debug;
 
 	_BGxCNT & bgcnt(int num) { return (dispx_st)->dispx_BGxCNT[num].bits; }
 	_DISPCNT & dispCnt() { return dispx_st->dispx_DISPCNT.bits; }
@@ -658,9 +618,6 @@ struct GPU
 	DISPCAPCNT dispCapCnt;
 	BOOL LayersEnable[5];
 	itemsForPriority_t itemsForPriority[NB_PRIORITIES];
-
-#define BGBmpBB BG_bmp_ram
-#define BGChBB BG_tile_ram
 
 	u32 BG_bmp_large_ram[4];
 	u32 BG_bmp_ram[4];
@@ -695,12 +652,9 @@ struct GPU
 
 	//FIFO	fifo;
 
-	BOOL dispBG[4];
-	BOOL dispOBJ;
-
 	u8 bgPrio[5];
 
-	BOOL bg0HasHighestPrio;
+	//BOOL bg0HasHighestPrio;
 
 	OAM * oam;
 	u32	sprMem;
@@ -755,7 +709,6 @@ struct GPU
 
 	u8* _3dColorLine;
 
-
 	static struct MosaicLookup {
 
 		struct TableEntry {
@@ -780,14 +733,11 @@ struct GPU
 
 	u16 blend(u16 colA, u16 colB);
 
-	template<BlendFunc FUNC, bool WINDOW>
-	FORCEINLINE FASTCALL bool _master_setFinalBGColor(u16 &color, const u32 x, bool);
+	template<bool BACKDROP, BlendFunc FUNC, bool WINDOW>
+	FORCEINLINE FASTCALL bool _master_setFinalBGColor(u16 &color, const u32 x);
 
 	template<BlendFunc FUNC, bool WINDOW>
-	FORCEINLINE FASTCALL void _master_setFinal3dColor(int l, int i16);
-
-	template<BlendFunc FUNC, bool WINDOW>
-	FORCEINLINE FASTCALL void _master_setFinalOBJColor(u16 color, u8 alpha, u8 type, u16 x);
+	FORCEINLINE FASTCALL void _master_setFinal3dColor(int dstX, int srcX);
 
 	int setFinalColorBck_funcNum;
 	int bgFunc;
@@ -801,18 +751,15 @@ struct GPU
 	template<GPU::SpriteRenderMode MODE>
 	void _spriteRender(u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab);
 	
-	inline void spriteRender(u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab)
-	{
+	inline void spriteRender(u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab){
 		if(spriteRenderMode == SPRITE_1D)
 			_spriteRender<SPRITE_1D>(dst,dst_alpha,typeTab, prioTab);
 		else
 			_spriteRender<SPRITE_2D>(dst,dst_alpha,typeTab, prioTab);
 	}
 
+	void setFinalColor3d(int dstX, int srcX);
 
-	void setFinalColor3d(int l, int i16);
-	void setFinalColorSpr(u16 color, u8 alpha, u8 type, u16 x);
-	
 	template<bool BACKDROP, int FUNCNUM> void setFinalColorBG(u16 color, const u32 x);
 	template<bool MOSAIC, bool BACKDROP> FORCEINLINE void __setFinalColorBck(u16 color, const u32 x, const int opaque);
 	template<bool MOSAIC, bool BACKDROP, int FUNCNUM> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x, const int opaque);
@@ -833,104 +780,70 @@ struct GPU
 	template<int WIN_NUM>
 	u8 withinRect(u16 x) const;
 
-	void setBLDALPHA(u16 val)
-	{
+	void setBLDALPHA(u16 val){
 		BLDALPHA_EVA = (val&0x1f) > 16 ? 16 : (val&0x1f); 
 		BLDALPHA_EVB = ((val>>8)&0x1f) > 16 ? 16 : ((val>>8)&0x1f);
 		updateBLDALPHA();
 	}
 
-	void setBLDALPHA_EVA(u8 val)
-	{
+	void setBLDALPHA_EVA(u8 val){
 		BLDALPHA_EVA = (val&0x1f) > 16 ? 16 : (val&0x1f);
 		updateBLDALPHA();
 	}
 	
-	void setBLDALPHA_EVB(u8 val)
-	{
+	void setBLDALPHA_EVB(u8 val){
 		BLDALPHA_EVB = (val&0x1f) > 16 ? 16 : (val&0x1f);
 		updateBLDALPHA();
 	}
 
+	u32 getHOFS(int bg) { return T1ReadWord(&dispx_st->dispx_BGxOFS[bg].BGxHOFS,0) & 0x1FF; }
+	u32 getVOFS(int bg) { return T1ReadWord(&dispx_st->dispx_BGxOFS[bg].BGxVOFS,0) & 0x1FF; }
+
 	typedef u8 TBlendTable[32][32];
 	TBlendTable *blendTable;
 
-	void updateBLDALPHA()
-	{
+	void updateBLDALPHA(){
 		blendTable = (TBlendTable*)&gpuBlendTable555[BLDALPHA_EVA][BLDALPHA_EVB][0][0];
 	}
 	
-	typedef bool ( GPU::*FinalBGColor_ptr)(u16 &, u32, bool);
-	static FinalBGColor_ptr FinalBGColor_lut [8];
-	
-	typedef void ( GPU::*Final3dColor_ptr)(int, int);
-	static Final3dColor_ptr Final3dColor_lut [8];
-
-	typedef void ( GPU::*FinalColorSpr_ptr)(u16, u8, u8, u16);
-	static FinalColorSpr_ptr FinalColorSpr_lut [8];
 };
-#if 0
-// normally should have same addresses
-static void REG_DISPx_pack_test(GPU * gpu)
-{
-	REG_DISPx * r = gpu->dispx_st;
-	printf ("%08x %02x\n",  (u32)r, (u32)(&r->dispx_DISPCNT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispA_DISPSTAT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_VCOUNT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_BGxCNT[0]) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_BGxOFS[0]) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_BG2PARMS) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_BG3PARMS) - (u32)r);
-//	printf ("\t%02x\n", (u32)(&r->dispx_WINCNT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispx_MISC) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispA_DISP3DCNT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispA_DISPCAPCNT) - (u32)r);
-	printf ("\t%02x\n", (u32)(&r->dispA_DISPMMEMFIFO) - (u32)r);
-}
-#endif
 
-CACHE_ALIGN extern u8 GPU_screen[4*256*192];
-
-
-GPU * GPU_Init(u8 l);
-void GPU_Reset(GPU *g, u8 l);
-void GPU_DeInit(GPU *);
-
-//these are functions used by debug tools which want to render layers etc outside the context of the emulation
-namespace GPU_EXT
-{
-	void textBG(GPU * gpu, u8 num, u8 * DST);		//Draw text based background
-	void rotBG(GPU * gpu, u8 num, u8 * DST);
-	void extRotBG(GPU * gpu, u8 num, u8 * DST);
-};
-void sprite1D(GPU * gpu, u16 l, u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab);
-void sprite2D(GPU * gpu, u16 l, u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab);
-
-extern const size sprSizeTab[4][4];
-
-typedef struct {
+struct NDS_Screen{
 	GPU * gpu;
 	u16 offset;
-} NDS_Screen;
+};
 
 extern NDS_Screen MainScreen;
 extern NDS_Screen SubScreen;
 
-int Screen_Init(int coreid);
-void Screen_Reset(void);
-void Screen_DeInit(void);
+GPU * GPU_Init(u8 l);
+void GPU_Reset(GPU *g, u8 l);
+void GPU_DeInit(GPU *);
+void sprite1D(GPU * gpu, u16 l, u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab);
+void sprite2D(GPU * gpu, u16 l, u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * prioTab);
 
-extern MMU_struct MMU;
+void GPU_setVideoProp(GPU *, u32 p);
+void GPU_setBGProp(GPU *, u16 num, u16 p);
+void GPU_setBLDCNT(GPU *gpu, u16 v) ;
+void GPU_setBLDY(GPU *gpu, u16 v) ;
+void GPU_setMOSAIC(GPU *gpu, u16 v) ;
+void GPU_remove(GPU *, u8 num);
+void GPU_addBack(GPU *, u8 num);
+int  GPU_ChangeGraphicsCore(int coreid);
+void GPU_set_DISPCAPCNT(u32 val) ;
+void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip = false) ;
+#ifdef GPU_DISPCAP_DEBUG_LOG
+// Dumps the last ~1024 frames' worth of DISPCAPCNT/offset ring-buffer history
+// to sd:/dispring.log. Cheap to keep recording every frame (RAM only, no
+// I/O); wired to a GC pad button in main.cpp so it can be triggered the
+// instant a visual desync is spotted on screen, giving a trace centered on
+// the actual glitch instead of a blind timed capture. See GPU.cpp.
+void GPU_DispCapDumpRing();
+#endif
+void GPU_setMasterBrightness (GPU *gpu, u16 val);
+void SetupFinalPixelBlitter (GPU *gpu);
 
-
-
-#define GFXCORE_DEFAULT		 -1
-#define GFXCORE_DUMMY		   0
-
-#define GFXCORE_FULLSCREEN	  (1 << 0)
-
-struct GraphicsInterface_struct
-{
+struct GraphicsInterface_struct{
    int id; // ID number for core(see above defines)
    const char *Name; // Name of core
    int flags; // What features the core supports(full screen, etc.)
@@ -941,23 +854,6 @@ struct GraphicsInterface_struct
 } ;
 
 extern GraphicsInterface_struct GFXDummy;
-
-void GPU_setVideoProp(GPU *, u32 p);
-void GPU_setBGProp(GPU *, u16 num, u16 p);
-
-void GPU_setBLDCNT(GPU *gpu, u16 v) ;
-void GPU_setBLDY(GPU *gpu, u16 v) ;
-void GPU_setMOSAIC(GPU *gpu, u16 v) ;
-
-
-void GPU_remove(GPU *, u8 num);
-void GPU_addBack(GPU *, u8 num);
-
-int GPU_ChangeGraphicsCore(int coreid);
-
-void GPU_set_DISPCAPCNT(u32 val) ;
-void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip = false) ;
-void GPU_setMasterBrightness (GPU *gpu, u16 val);
 
 inline void GPU_setWIN0_H(GPU* gpu, u16 val) { gpu->WIN0H0 = val >> 8; gpu->WIN0H1 = val&0xFF; gpu->need_update_winh[0] = true; }
 inline void GPU_setWIN0_H0(GPU* gpu, u8 val) { gpu->WIN0H0 = val;  gpu->need_update_winh[0] = true; }
@@ -995,24 +891,15 @@ inline void GPU_setWINOUT(GPU* gpu, u8 val) { gpu->WINOUT = val&0x1F; gpu->WINOU
 inline void GPU_setWINOBJ(GPU* gpu, u8 val) { gpu->WINOBJ = val&0x1F; gpu->WINOBJ_SPECIAL = (val>>5)&1; }
 
 // Blending
-void SetupFinalPixelBlitter (GPU *gpu);
 #define GPU_setBLDCNT_LOW(gpu, val) {gpu->BLDCNT = (gpu->BLDCNT&0xFF00) | (val); SetupFinalPixelBlitter (gpu);}
 #define GPU_setBLDCNT_HIGH(gpu, val) {gpu->BLDCNT = (gpu->BLDCNT&0xFF) | (val<<8); SetupFinalPixelBlitter (gpu);}
 #define GPU_setBLDCNT(gpu, val) {gpu->BLDCNT = (val); SetupFinalPixelBlitter (gpu);}
+#define GPU_setBLDY_EVY(gpu, val) {gpu->BLDY_EVY = ((val)&0x1f) > 16 ? 16 : ((val)&0x1f);}
 
+//These aren't needed right now since the values get poked into memory via default mmu handling and dispx_st
+//#define GPU_setBGxHOFS(bg, gpu, val) gpu->dispx_st->dispx_BGxOFS[bg].BGxHOFS = ((val) & 0x1FF)
+//#define GPU_setBGxVOFS(bg, gpu, val) gpu->dispx_st->dispx_BGxOFS[bg].BGxVOFS = ((val) & 0x1FF)
 
-
-#define GPU_setBLDY_EVY(gpu, val) {gpu->BLDY_EVY = (val&0x1f) > 16 ? 16 : (val&0x1f);}
-
-#define GPU_setBGxHOFS(bg, gpu, val) gpu->dispx_st->dispx_BGxOFS[bg].BGxHOFS = (val & 0x1F)
-#define GPU_setBGxVOFS(bg, gpu, val) gpu->dispx_st->dispx_BGxOFS[bg].BGxVOFS = (val & 0x1F)
-
-// render
-void gpu_UpdateRender();
-void gpu_SetRotateScreen(u16 angle);
-
-//#undef FORCEINLINE
-//#define FORCEINLINE __forceinline
 
 #endif
 

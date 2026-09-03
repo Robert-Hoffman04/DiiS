@@ -2,22 +2,23 @@
 	Copyright (C) 2006 Mic
     Copyright (C) 2009 CrazyMax 
 	Copyright (C) 2009 DeSmuME team
+    Copyright (C) 2012 DeSmuMEWii team
 
-    This file is part of DeSmuME
+    This file is part of DeSmuMEWii
 
-    DeSmuME is free software; you can redistribute it and/or modify
+    DeSmuMEWii is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation; either version 2 of the License, or
     (at your option) any later version.
 
-    DeSmuME is distributed in the hope that it will be useful,
+    DeSmuMEWii is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with DeSmuME; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+    along with DeSmuMEWii; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
 #include "../addons.h"
@@ -138,7 +139,7 @@ static int lfn_checksum( void)
 // Add a DIR_ENT for the files
 static void add_file(char *fname, FsEntry * entry, int fileLevel)
 {
-	int i,j,k,n;
+	int i,j,k,n,nlen;
 	u8 chk;
 
 	if (numFiles < MAXFILES-1)
@@ -149,7 +150,10 @@ static void add_file(char *fname, FsEntry * entry, int fileLevel)
 				if (fname[i]=='.') break;
 			if ((i==0)&&(strcmp(fname,".")==0)) i = 1;
 			if (i<0) i = strlen(fname);
-			for (j=0; j<i; j++)
+			// The 8.3 short-name field is only NAME_LEN bytes; clamp the
+			// copy length while keeping i as the extension offset.
+			nlen = (i > NAME_LEN) ? NAME_LEN : i;
+			for (j=0; j<nlen; j++)
 				files[numFiles].name[j] = fname[j];
 			for (; j<NAME_LEN; j++)
 				files[numFiles].name[j] = 0x20;
@@ -202,11 +206,12 @@ static void add_file(char *fname, FsEntry * entry, int fileLevel)
 				if (fname[i]=='.') break;
 			if ((i==0)&&(strcmp(fname,".")==0)) i = 1;
 			if (i<0) i = strlen(fname);
-			for (j=0; j<i; j++)
+			nlen = (i > NAME_LEN) ? NAME_LEN : i;
+			for (j=0; j<nlen; j++)
 				files[numFiles].name[j] = fname[j];
 			for (; j<NAME_LEN; j++)
 				files[numFiles].name[j] = 0x20;
-			for (j=0; j<EXT_LEN; j++) 
+			for (j=0; j<EXT_LEN; j++)
 			{
 				if ((size_t)(j+i+1)>=strlen(fname)) break;
 				files[numFiles].ext[j] = fname[j+i+1];
@@ -302,10 +307,8 @@ static BOOL cflash_build_fat()
 	int i,j,k,l,
 	clust,numClusters,
 	clusterNum2,rootCluster;
-	int fileLevel;
 
 	numFiles  = 0;
-	fileLevel = -1;
 	maxLevel  = -1;
 
 	files = (DIR_ENT *) malloc(MAXFILES*sizeof(DIR_ENT));
@@ -364,7 +367,7 @@ static BOOL cflash_build_fat()
 	}
 
 	memset(dirEntriesInCluster, 0, NUMCLUSTERS*sizeof(int));
-	memset(dirEntryPtr, NULL, NUMCLUSTERS*sizeof(DIR_ENT*));
+	memset(dirEntryPtr, 0, NUMCLUSTERS*sizeof(DIR_ENT*));
 
 	// Change the hierarchical layout to a flat one 
 	for (i=0; i<=maxLevel; i++)

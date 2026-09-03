@@ -42,16 +42,16 @@ void IPC_FIFOinit(u8 proc)
 void IPC_FIFOsend(u8 proc, u32 val)
 {
 	u16 cnt_l = T1ReadWord(MMU.MMU_MEM[proc][0x40], 0x184);
-	if (!(cnt_l & 0x8000)) return;			// FIFO disabled
+	if (!(cnt_l & IPCFIFOCNT_FIFOENABLE)) return; // FIFO disabled
 	u8 proc_remote = proc ^ 1;
-
+	
 	if (ipc_fifo[proc].size > 15)
 	{
-		cnt_l |= 0x4000;
+		cnt_l |= IPCFIFOCNT_FIFOERROR;
 		T1WriteWord(MMU.MMU_MEM[proc][0x40], 0x184, cnt_l);
 		return;
 	}
-
+	
 	u16 cnt_r = T1ReadWord(MMU.MMU_MEM[proc_remote][0x40], 0x184);
 	
 	cnt_l &= 0xBFFC;		// clear send empty bit & full
@@ -63,27 +63,27 @@ void IPC_FIFOsend(u8 proc, u32 val)
 	
 	if (ipc_fifo[proc].size > 15)
 	{
-		cnt_l |= 0x0002;		// set send full bit
-		cnt_r |= 0x0200;		// set recv full bit
+		cnt_l |= IPCFIFOCNT_SENDFULL;	// set send full bit
+		cnt_r |= IPCFIFOCNT_RECVFULL;	// set recv full bit
 	}
-
+	
 	T1WriteWord(MMU.MMU_MEM[proc][0x40], 0x184, cnt_l);
 	T1WriteWord(MMU.MMU_MEM[proc_remote][0x40], 0x184, cnt_r);
-
+	
 	setIF(proc_remote, ((cnt_l & 0x0400)<<8));              // IRQ18: recv not empty
 }
 
 u32 IPC_FIFOrecv(u8 proc)
 {
 	u16 cnt_l = T1ReadWord(MMU.MMU_MEM[proc][0x40], 0x184);
-	if (!(cnt_l & 0x8000)) return (0);									// FIFO disabled
+	if (!(cnt_l & IPCFIFOCNT_FIFOENABLE)) return (0);	// FIFO disabled
 	u8 proc_remote = proc ^ 1;
 
 	u32 val = 0;
 
 	if ( ipc_fifo[proc_remote].size == 0 )		// remote FIFO error
 	{
-		cnt_l |= 0x4000;
+		cnt_l |= IPCFIFOCNT_FIFOERROR;
 		T1WriteWord(MMU.MMU_MEM[proc][0x40], 0x184, cnt_l);
 		return (0);
 	}
@@ -104,15 +104,15 @@ u32 IPC_FIFOrecv(u8 proc)
 
 	if ( ipc_fifo[proc_remote].size == 0 )		// FIFO empty
 	{
-		cnt_l |= 0x0100;
-		cnt_r |= 0x0001;
+		cnt_l |= IPCFIFOCNT_RECVEMPTY;
+		cnt_r |= IPCFIFOCNT_SENDEMPTY;
 	}
 
 	T1WriteWord(MMU.MMU_MEM[proc][0x40], 0x184, cnt_l);
 	T1WriteWord(MMU.MMU_MEM[proc_remote][0x40], 0x184, cnt_r);
-
+	
 	setIF(proc_remote, ((cnt_l & 0x0004)<<15));             // IRQ17: send empty
-
+	
 	return (val);
 }
 
@@ -159,7 +159,7 @@ static void GXF_FIFO_handleEvents()
 		//TODO - should this always happen, over and over, until the dma is disabled?
 		//or only when we change to this state?
 		if(MMU_new.gxstat.gxfifo_irq == 1)
-		        setIF(0, (1<<21)); //the half gxfifo irq
+			setIF(0, (1<<21)); //the half gxfifo irq
 		
 		//might need to trigger a gxfifo dma
 		triggerDma(EDMAMode_GXFifo);
@@ -177,10 +177,6 @@ static void GXF_FIFO_handleEvents()
 
 void GFX_FIFOsend(u8 cmd, u32 param)
 {
-	/*if(cmd==0x41) {
-		int zzz=9;
-	}*/
-	
 	//INFO("gxFIFO: send 0x%02X = 0x%08X (size %03i/0x%02X) gxstat 0x%08X\n", cmd, param, gxFIFO.size, gxFIFO.size, gxstat);
 	//printf("fifo recv: %02X: %08X upto:%d\n",cmd,param,gxFIFO.size+1);
 	gxFIFO.cmd[gxFIFO.tail] = cmd;
@@ -208,43 +204,47 @@ bool GFX_PIPErecv(u8 *cmd, u32 *param)
 	if (gxFIFO.size == 0)
 	{
 		GXF_FIFO_handleEvents();
-		return FALSE;
+		return false;
 	}
-
+	
 	*cmd = gxFIFO.cmd[gxFIFO.head];
 	*param = gxFIFO.param[gxFIFO.head];
-
+	
 	gxFIFO.head++;
 	gxFIFO.size--;
 	if (gxFIFO.head > HACK_GXIFO_SIZE-1) gxFIFO.head = 0;
-
+	
 	GXF_FIFO_handleEvents();
 
-	return (TRUE);
+	return true;
 }
 
 void GFX_FIFOcnt(u32 val)
 {
-	////INFO("gxFIFO: write cnt 0x%08X (prev 0x%08X) FIFO size %03i PIPE size %03i\n", val, gxstat, gxFIFO.size, gxPIPE.size);
+        //zeromus: i dont like any of this.
 
-	//NEW ONE:
-	//*
-	if (val & (1<<29))		// clear? (only in homebrew?)
-	{
-		GFX_PIPEclear();
-		GFX_FIFOclear();
-		return;
-	}
+        ////INFO("gxFIFO: write cnt 0x%08X (prev 0x%08X) FIFO size %03i PIPE size %03i\n", val, gxstat, gxFIFO.size, gxPIPE.size);
 
-	//zeromus says: what happened to clear stack?
-	//if (val & (1<<15))		// projection stack pointer reset
-	//{
-	//	gfx3d_ClearStack();
-	//	val &= 0xFFFF5FFF;		// clear reset (bit15) & stack level (bit13)
-	//}
+        //if (val & (1<<29))            // clear? (only in homebrew?)
+        //{
+        //      GFX_PIPEclear();
+        //      GFX_FIFOclear();
+        //      return;
+        //}
 
-	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x600, val);
-	//*/
+        //if (val & (1<<15))            // projection stack pointer reset
+        //{
+        //      gfx3d_ClearStack();
+        //      val &= 0xFFFF5FFF;              // clear reset (bit15) & stack level (bit13)
+        //}
+
+        //T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x600, val);
+
+        //if (gxFIFO.size == 0)         // empty
+        //{
+        //      if (val & 0x80000000)   // IRQ: empty
+        //              setIF(0, (1<<21));
+        //}
 }
 
 // ========================================================= DISP FIFO

@@ -24,9 +24,7 @@
 
 #include "types.h"
 
-#define SRAM_ADDRESS	0x0A000000
-#define SRAM_SIZE	0x10000
-#define NB_STATES       10
+#define NB_STATES 10
 
 extern int lastSaveState;
 

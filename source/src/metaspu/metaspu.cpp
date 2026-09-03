@@ -1,20 +1,21 @@
 /*  Copyright 2009 DeSmuME team
+    Copyright (C) 2012 DeSmuMEWii team
 
-    This file is part of DeSmuME
+    This file is part of DeSmuMEWii
 
-    DeSmuME is free software; you can redistribute it and/or modify
+    DeSmuMEWii is free software; you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
     the Free Software Foundation; either version 2 of the License, or
     (at your option) any later version.
 
-    DeSmuME is distributed in the hope that it will be useful,
+    DeSmuMEWii is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with DeSmuME; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+    along with DeSmuMEWii; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
 #include "../types.h"
@@ -104,26 +105,28 @@ public:
 private:
 	class Adjustobuf
 	{
-		float rate, cursor;
-		int minLatency, targetLatency, maxLatency;
-		std::queue<s16> buffer;
-		s16 curr[2];
 	public:
-		int size;
 		Adjustobuf(int _minLatency, int _maxLatency)
-			: minLatency(_minLatency)
-			, maxLatency(_maxLatency)
+			: rollingTotalSize(0)
+			, kAverageSize(80000)
 			, size(0)
-		{
-			rollingTotalSize = 0;
-			targetLatency = (maxLatency + minLatency)/2;
-			rate = 1.0f;
-			cursor = 0.0f;
+			, minLatency(_minLatency)
+			, maxLatency(_maxLatency)
+			, targetLatency((_maxLatency + _minLatency)/2)
+			, rate(1.0f)
+			, cursor(0.0f)
+		{	
 			curr[0] = curr[1] = 0;
-			kAverageSize = 80000;
 		}
-
+		
+		s64 rollingTotalSize;
+		u32 kAverageSize;		
+		int size;		
+		int minLatency, maxLatency, targetLatency;
+		float rate, cursor;
+		std::queue<s16> buffer;
 		std::queue<int> statsHistory;
+		s16 curr[2];
 
 		void enqueue(s16 left, s16 right) 
 		{
@@ -131,10 +134,6 @@ private:
 			buffer.push(right);
 			size++;
 		}
-
-		s64 rollingTotalSize;
-
-		u32 kAverageSize;
 
 		void addStatistic()
 		{

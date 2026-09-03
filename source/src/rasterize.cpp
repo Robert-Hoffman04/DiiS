@@ -35,11 +35,10 @@
 #include <assert.h>
 #include <math.h>
 #include <string.h>
-#include <stdint.h>
 
 #include "bits.h"
 #include "common.h"
-#include "matrix.h"
+//#include "matrix.h"
 #include "render3D.h"
 #include "gfx3d.h"
 #include "texcache.h"
@@ -118,6 +117,41 @@ static FORCEINLINE int fastFloor(float f)
 //*/
 
 
+
+
+union FragmentColor {
+	u32 color;
+	struct {
+#ifdef WORDS_BIGENDIAN
+		u8 a,b,g,r;
+#else
+		u8 r,g,b,a;
+#endif
+	};
+};
+
+inline FragmentColor MakeFragmentColor(u8 r, u8 g,u8 b,u8 a){
+	FragmentColor ret;
+	ret.r = r; ret.g = g; ret.b = b; ret.a = a;
+	return ret;
+}
+
+struct Fragment
+{
+	u32 depth;
+
+	struct {
+		u8 opaque, translucent;
+	} polyid;
+
+	u8 stencil;
+
+	struct {
+		u8 isTranslucentPoly:1;
+		u8 fogged:1;
+	};
+};
+
 //INLINE static void SubmitVertex(int vert_index, VERT& rawvert)
 //{
 //	verts[vert_index] = &rawvert;
@@ -129,7 +163,7 @@ static FragmentColor toonTable[32];
 static u8 fogTable[32768];
 
 static FORCEINLINE int iround(float f) {
-	return (int)f; 
+	return (int)f;
 }
 
 
@@ -372,8 +406,7 @@ public:
 	
 	VERT* verts[MAX_CLIPPED_VERTS];
 
-    PolyAttr polyAttr;
-	int polynum;
+	PolyAttr polyAttr;
 
 
 	struct Sampler
@@ -381,7 +414,7 @@ public:
 		Sampler() {}
 
 		RasterizerUnit* unit;
-			
+		
 		int width, height;
 		int wmask, hmask;
 		int wrap;
@@ -494,17 +527,6 @@ public:
 				dst.b = modulate_table[texColor.b][materialColor.b];
 				dst.a = modulate_table[GFX3D_5TO6(texColor.a)][GFX3D_5TO6(materialColor.a)]>>1;
 				//dst.color.components.a = 31;
-				//#ifdef _MSC_VER
-				//if(GetAsyncKeyState(VK_SHIFT)) {
-				//	//debugging tricks
-				//	dst = materialColor;
-				//	if(GetAsyncKeyState(VK_TAB)) {
-				//		u8 alpha = dst.a;
-				//		dst.color = polynum*8+8;
-				//		dst.a = alpha;
-				//	}
-				//}
-				//#endif
 				break;
 			case 1: //decal
 				u = invu*w;
@@ -805,6 +827,7 @@ public:
 	//This function can handle any convex N-gon up to octagons
 	//verts must be clockwise.
 	//I didnt reference anything for this algorithm but it seems like I've seen it somewhere before.
+	//Maybe it is like crow's algorithm
 	template<bool SLI>
 	void shape_engine(int type, bool backwards)
 	{

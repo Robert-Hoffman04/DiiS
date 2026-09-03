@@ -21,6 +21,9 @@
 #include <algorithm>
 #include <assert.h>
 #include <map>
+#ifdef GXRENDER_DEBUG_LOG
+#include <stdio.h>
+#endif
 #include "texcache.h"
 #include "bits.h"
 #include "common.h"
@@ -216,6 +219,10 @@ static void DebugDumpTexture(TexCacheItem* item)
 }
 #endif
 
+//notes on the cache:
+//I am really unhappy with the ref counting. this needs to be automatic.
+//We could do something better than a linear search through cache items, but it may not be worth it.
+//Also we may need to rescan more often (every time a sample loops)
 class TexCache
 {
 public:
@@ -333,6 +340,8 @@ public:
 			//the texture matches params, but isnt suspected invalid. accept it.
 			if (!curr->suspectedInvalid) return curr;
 
+			//we suspect the texture may be invalid. we need to do a byte-for-byte comparison to re-establish that it is valid:
+
 			//when the palettes dont match:
 			//note that we are considering 4x4 textures to have a palette size of 0.
 			//they really have a potentially HUGE palette, too big for us to handle like a normal palette,
@@ -352,6 +361,7 @@ public:
 			//REMINDER to make it primary/newest when we have smarter code
 			//list_remove(curr);
 			//list_push_front(curr);
+			curr->suspectedInvalid = false;
 			return curr;
 
 		REJECT:
@@ -380,6 +390,28 @@ public:
 		newitem->decoded = (u8*)memalign(32,newitem->decode_len);
 		list_push_front(newitem);
 		//printf("allocating: up to %d with %d items\n",cache_size,index.size());
+
+#ifdef GXRENDER_DEBUG_LOG
+		// Bisection aid for the "strange coloring" GX-only texture bug
+		// (Phase 5 Symptom A): dump which DS texture format/mode and cache
+		// TEXFORMAT (32bpp=GX, 15bpp=softrast) each newly-decoded texture
+		// used, so we can tell whether the bad content is even hitting the
+		// code path we suspect.
+		{
+			static int n = 0;
+			if (n < 200) {
+				n++;
+				FILE *f = fopen("sd:/texdbg.log", "a");
+				if (f) {
+					fprintf(f, "tex: mode=%lu fmt32=%d sizeX=%lu sizeY=%lu texpal=%lu format=0x%08lX\n",
+					        (unsigned long)textureMode, (int)(TEXFORMAT==TexFormat_32bpp),
+					        (unsigned long)sizeX, (unsigned long)sizeY,
+					        (unsigned long)texpal, (unsigned long)format);
+					fclose(f);
+				}
+			}
+		}
+#endif
 
 		u32 *dwdst = (u32*)newitem->decoded;
 		
@@ -518,7 +550,21 @@ public:
 
 				for (u16 y = 0; y < yTmpSize; ++y)
 				{
-					u32 tmpPos[4]={((y<<2)+3)*sizeX,((y<<2)+2)*sizeX,((y<<2)+1)*sizeX,(y<<2)*sizeX};
+					// tmpPos[sy] is where row sy of this 4-row tile lands in the
+					// output image; sy also selects which byte of currBlock (the
+					// per-row 2-bit color indices) that row uses, a few lines
+					// down (`currBlock>>(sy<<3)`). This used to run high-to-low
+					// (tmpPos[0]=row 3, tmpPos[3]=row 0) to compensate for
+					// currBlock being read as a raw big-endian load of
+					// little-endian VRAM data - byte 0 of that misread value was
+					// actually the source's LAST byte (row 3), so the reversal
+					// here canceled it back out to the correct row, by accident.
+					// Now that currBlock gets properly byte-swapped before use
+					// (LE_TO_LOCAL_32, above - byte 0 is genuinely row 0 again),
+					// this reversal is uncanceled and flips every tile's 4 rows
+					// vertically. Ascending order matches sy directly to its own
+					// row.
+					u32 tmpPos[4]={(y<<2)*sizeX,((y<<2)+1)*sizeX,((y<<2)+2)*sizeX,((y<<2)+3)*sizeX};
 
 					for (u16 x = 0; x < xTmpSize; ++x, ++d)
 					{
@@ -534,7 +580,14 @@ public:
 							continue;
 						}
 
-						u32 currBlock	= map[d];
+						// map[d] is the same kind of raw little-endian VRAM read
+						// as TEXMODE_16BPP's map[x] above (see the comment
+						// there) - byte 0 is meant to be block-row 0's 4 texel
+						// indices, byte 3 block-row 3's, and a native big-endian
+						// load of the 4 bytes reverses that order. slot1[d] right
+						// below already goes through LE_TO_LOCAL_16 for the same
+						// reason; this 32-bit sibling read didn't.
+						u32 currBlock	= LE_TO_LOCAL_32(map[d]);
 						u16 pal1		= LE_TO_LOCAL_16(slot1[d]);
 						u16 pal1offset	= (pal1 & 0x3FFF)<<1;
 						u8  mode		= pal1>>14;
@@ -568,13 +621,13 @@ public:
 								color1.val = tmp_col[0];
 								color2.val = tmp_col[1];
 
-								u8 red1   = color1.bits.r;
-								u8 green1 = color1.bits.g;
-								u8 blue1  = color1.bits.b;
+								u8 red1   = color1.bits.red;
+								u8 green1 = color1.bits.green;
+								u8 blue1  = color1.bits.blue;
 
-								u8 red2   = color2.bits.r;
-								u8 green2 = color2.bits.g;
-								u8 blue2  = color2.bits.b;
+								u8 red2   = color2.bits.red;
+								u8 green2 = color2.bits.green;
+								u8 blue2  = color2.bits.blue;
 
 								tmp1 =  (((INTx5(red1)   + INTx3(red2))   >>6) <<  0) |
 									(((INTx5(green1) + INTx3(green2)) >>6) <<  5) |
@@ -643,12 +696,27 @@ public:
 			}
 		case TEXMODE_16BPP:
 			{
+				// map[] casts a raw byte pointer into DS texture VRAM (always
+				// little-endian - it's a straight copy of the DS's own memory)
+				// to u16* and reads it with a native load. On the big-endian
+				// PowerPC Wii CPU that reinterprets every texel's 16-bit color
+				// word high-byte/low-byte swapped - a small change in the
+				// source data's low byte (usually the least significant color
+				// bits) lands in the *high* byte of the misread value and vice
+				// versa, turning what should be a smoothly-varying texture
+				// into near-random per-texel noise ("checkerboard where a
+				// gradient should be"). Every other little-endian VRAM/palette
+				// read in this file already
+				// goes through LE_TO_LOCAL_16/32 or MemSpan::dump16's explicit
+				// WORDS_BIGENDIAN swap (see mspal.dump16() above, and
+				// slot1[d]'s LE_TO_LOCAL_16() in the TEXMODE_4X4 case below) -
+				// this was simply missed.
 				for(int j = 0; j < ms.numItems; ++j) {
 					u16* map = (u16*)ms.items[j].ptr;
 					int len = ms.items[j].len>>1;
 					for(int x = 0; x < len; ++x)
 					{
-						u16 c = map[x];
+						u16 c = LE_TO_LOCAL_16(map[x]);
 						int alpha = ((c&0x8000)?opaqueColor:0);
 						*dwdst++ = CONVERT(c&0x7FFF,alpha);
 					}
@@ -656,6 +724,78 @@ public:
 				break;
 			}
 		} //switch(texture format)
+
+#ifdef GXRENDER_DEBUG_LOG
+		// Sample a handful of decoded texels straight out of texcache's own
+		// buffer - before setTexture() ever tiles/uploads it to GX - so we can
+		// tell whether a bad-looking texture is wrong here already (a decode
+		// bug) or only once it reaches the screen (a GX upload/render bug).
+		{
+			static int n = 0;
+			if (n < 150) {
+				n++;
+				FILE *f = fopen("sd:/texdbg.log", "a");
+				if (f) {
+					fprintf(f, "decoded mode=%lu sizeX=%lu sizeY=%lu texpal=%lu:",
+					        (unsigned long)newitem->mode, (unsigned long)sizeX,
+					        (unsigned long)sizeY, (unsigned long)texpal);
+					const u8 *px = newitem->decoded;
+					u32 total = sizeX * sizeY;
+					for (int s = 0; s < 8; s++) {
+						u32 idx = (total * s) / 8;
+						const u8 *t = px + idx * 4;
+						// packed layout is [alpha,blue,green,red] per texel
+						fprintf(f, " (r%u g%u b%u a%u)", t[3], t[2], t[1], t[0]);
+					}
+					fprintf(f, "\n");
+					fclose(f);
+				}
+			}
+		}
+#endif
+
+#ifdef GXTEX_DUMP_PPM
+		// One-shot full-image dump of texcache's own decoded buffer - before
+		// setTexture() ever tiles/uploads it to GX - as a plain P6 PPM, so it
+		// can be pulled off the SD card and viewed directly as an image. Lets
+		// us see the WHOLE texture (not just 8 spot samples) and settle,
+		// definitively, whether a bad-looking texture is already wrong here
+		// (a decode bug) or only once it reaches the screen (a GX upload/
+		// render bug). Not wired into any shipping build flag.
+		if (newitem->mode == TEXMODE_4X4 && sizeX == GXTEX_DUMP_PPM) {
+			static bool dumped = false;
+			if (!dumped) {
+				dumped = true;
+				FILE *f = fopen("sd:/texdump.ppm", "wb");
+				if (f) {
+					fprintf(f, "P6\n%lu %lu\n255\n", (unsigned long)sizeX, (unsigned long)sizeY);
+					const u8 *px = newitem->decoded;
+					for (u32 i = 0; i < imageSize; i++) {
+						const u8 *t = px + i * 4;   // [alpha,blue,green,red]
+						u8 rgb[3] = { t[3], t[2], t[1] };
+						fwrite(rgb, 1, 3, f);
+					}
+					fclose(f);
+				}
+			}
+		}
+#endif
+
+#ifdef GXTEX_FORCE_MODE_MAGENTA
+		// Temporary bisection aid: flood-fill every texture of one specific
+		// DS format with solid magenta so its on-screen footprint is
+		// unmistakable. Not wired into any shipping build flag.
+#ifdef GXTEX_FORCE_SIZEX
+		if (newitem->mode == GXTEX_FORCE_MODE_MAGENTA && sizeX == GXTEX_FORCE_SIZEX) {
+#else
+		if (newitem->mode == GXTEX_FORCE_MODE_MAGENTA) {
+#endif
+			u32 *fill = (u32*)newitem->decoded;
+			u32 magenta = RGB16TO32(0x7C1F, 255);   // DS BGR555 full R + full B
+			for (u32 i = 0; i < imageSize; i++)
+				fill[i] = magenta;
+		}
+#endif
 
 #ifdef DO_DEBUG_DUMP_TEXTURE
 	DebugDumpTexture(newitem);

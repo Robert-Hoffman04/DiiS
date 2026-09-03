@@ -1,7 +1,7 @@
 #include <ppc-asm.h>
 
-	.globl ps_guMtxDesmumeTrans
-ps_guMtxDesmumeTrans:
+	.globl texCoordTrans
+texCoordTrans:
 	psq_l        f0,0(r4),0,0
 	psq_l        f3,0(r5),0,0
 	psq_l        f2,32(r4),0,0
@@ -312,81 +312,110 @@ ps_MatrixMultiply:
 	blr
 
 	.globl ps_mtx_fix2float4x4
-	//r3 = mtx, r4= div
+	//r3 = mtx, f1 = div
 ps_mtx_fix2float4x4:
 		// f0(0) = mtx0  , f0(1) = mtx1
 	psq_l        f0,0(r3),0,0
-		// f1(0) = mtx2  , f1(1) = mtx3
-	psq_l        f1,8(r3),0,0
-		// f2(0) = mtx4  , f2(1) = mtx5
-	psq_l        f2,16(r3),0,0
-		// f3(0) = mtx6  , f3(1) = mtx7
-	psq_l        f3,24(r3),0,0
-		// f4(0) = mtx8  , f4(1) = mtx9
-	psq_l        f4,32(r3),0,0
-		// f5(0) = mtx10 , f5(1) = mtx11
-	psq_l        f5,40(r3),0,0
-		// f6(0) = mtx12 , f6(1) = mtx13
-	psq_l        f6,48(r3),0,0
-		// f7(0) = mtx14 , f7(1) = mtx15
-	psq_l        f7,56(r3),0,0
-		// f8(0) = div     , f8(1) = div
-	lfs          f8,0(r4)
-	ps_div       f12,f0,f8							//free: f0
-	ps_div       f13,f1,f8							//free: f1
-	ps_div       f0,f2,f8							//free: f2
-	ps_div       f1,f3,f8							//free: f3
-	ps_div       f2,f4,f8							//free: f4
-	ps_div       f3,f5,f8							//free: f5
-	ps_div       f2,f6,f8							//free: f6
-	ps_div       f3,f7,f8							//free: f7
-	psq_st       f12,0(r3),0,0
-	psq_st       f13,8(r3),0,0
+		// f1(0) = div     , f1(1) = div
+	//lfs          f1,0(r4)
+		// f2(0) = mtx2  , f2(1) = mtx3
+	psq_l        f2,8(r3),0,0
+		// f3(0) = mtx4  , f3(1) = mtx5
+	psq_l        f3,16(r3),0,0
+		// f4(0) = mtx6  , f4(1) = mtx7
+	psq_l        f4,24(r3),0,0
+		// f5(0) = mtx8  , f5(1) = mtx9
+	psq_l        f5,32(r3),0,0
+		// f6(0) = mtx10 , f6(1) = mtx11
+	psq_l        f6,40(r3),0,0
+		// f7(0) = mtx12 , f7(1) = mtx13
+	psq_l        f7,48(r3),0,0
+		// f8(0) = mtx14 , f8(1) = mtx15
+	psq_l        f8,56(r3),0,0
+
+	ps_div       f9,f0,f1							//free: f0
+	ps_div       f10,f2,f1							//free: f2
+	ps_div       f0,f3,f1							//free: f3
+	ps_div       f2,f4,f1							//free: f4
+	ps_div       f3,f5,f1							//free: f5
+	ps_div       f4,f6,f1							//free: f6
+	ps_div       f5,f7,f1							//free: f7
+	ps_div       f6,f8,f1							//free: f7
+	psq_st       f9,0(r3),0,0
+	psq_st       f10,8(r3),0,0
 	psq_st       f0,16(r3),0,0
-	psq_st       f1,24(r3),0,0
-	psq_st       f2,32(r3),0,0
-	psq_st       f3,40(r3),0,0
-	psq_st       f4,48(r3),0,0
-	psq_st       f5,56(r3),0,0
+	psq_st       f2,24(r3),0,0
+	psq_st       f3,32(r3),0,0
+	psq_st       f4,40(r3),0,0
+	psq_st       f5,48(r3),0,0
+	psq_st       f6,56(r3),0,0
 	blr
 
 	.globl ps_mtx_fix2float3x4
-	//r3 = mtx, r4= div
+	//r3 = mtx, f1 = div
 ps_mtx_fix2float3x4:
 		// f0(0) = mtx0  , f0(1) = mtx1
 	psq_l        f0,0(r3),0,0
-		// f1(0) = mtx2  , f1(1) = mtx3
-	psq_l        f1,8(r3),0,0
-		// f2(0) = mtx4  , f2(1) = mtx5
-	psq_l        f2,16(r3),0,0
-		// f3(0) = mtx6  , f3(1) = mtx7
-	psq_l        f3,24(r3),0,0
-		// f4(0) = mtx8  , f4(1) = mtx9
-	psq_l        f4,32(r3),0,0
-		// f5(0) = mtx10 , f5(1) = mtx11
-	psq_l        f5,40(r3),0,0
-		// f6(0) = mtx12 , f6(1) = mtx13
-	psq_l        f6,48(r3),0,0
-		// f7(0) = mtx14 , f7(1) = mtx15
-	psq_l        f7,56(r3),0,0
-		// f8(0) = div     , f8(1) = div
-	lfs          f8,0(r4)
-	ps_div       f12,f0,f8							//free: f0
-	ps_div       f13,f1,f8							//free: f1
-	ps_div       f0,f2,f8							//free: f2
-	ps_div       f1,f3,f8							//free: f3
-	ps_div       f2,f4,f8							//free: f4
-	ps_div       f3,f5,f8							//free: f5
-	psq_st       f12,0(r3),0,0
-	psq_st       f13,8(r3),0,0
+		// f1(0) = div     , f1(1) = div
+	//lfs          f1,0(r4)
+		// f2(0) = mtx2  , f2(1) = mtx3
+	psq_l        f2,8(r3),0,0
+		// f3(0) = mtx4  , f3(1) = mtx5
+	psq_l        f3,16(r3),0,0
+		// f4(0) = mtx6  , f4(1) = mtx7
+	psq_l        f4,24(r3),0,0
+		// f5(0) = mtx8  , f5(1) = mtx9
+	psq_l        f5,32(r3),0,0
+		// f6(0) = mtx10 , f6(1) = mtx11
+	psq_l        f6,40(r3),0,0
+
+	ps_div       f7,f0,f1							//free: f0
+	ps_div       f9,f2,f1							//free: f2
+	ps_div       f0,f3,f1							//free: f3
+	ps_div       f2,f4,f1							//free: f4
+	ps_div       f3,f5,f1							//free: f5
+	ps_div       f4,f6,f1							//free: f6
+	psq_st       f7,0(r3),0,0
+	psq_st       f9,8(r3),0,0
 	psq_st       f0,16(r3),0,0
-	psq_st       f1,24(r3),0,0
-	psq_st       f2,32(r3),0,0
-	psq_st       f3,40(r3),0,0
+	psq_st       f2,24(r3),0,0
+	psq_st       f3,32(r3),0,0
+	psq_st       f4,40(r3),0,0
 	blr
 
+	.globl setFinalColorCombine
+setFinalColorCombine:		
+		// 32
+	lis          r9,Unit32@ha
+	//r3 = cA, r4 = cB
+		// f0(0) = alpha  , f0(1) = blue
+	psq_l        f0,0(r3),0,1
+		// f1(0) = green  , f1(1) = red
+	psq_l        f1,2(r3),0,1
+		// f4(0) = alpha  , f4(1) = alpha
+	ps_merge00   f4,f0,f0
+		// f2(0) = cB.a  , f2(1) = cB.b
+	psq_l        f2,0(r4),0,2
+		//f5(0) = a * a , f5(1) = b  * a
+	ps_mul       f5,f0,f4					//Used: f5   Free: f0
+		// f7(0) = 32    , f7(1) = 32
+	lfs          f7,Unit32@l(r9)
+		// f3(0) = cB.g  , f3(1) = cB.r
+	psq_l        f3,2(r4),0,2		
+		// 32 - alpha
+	ps_sub       f8,f7,f4					//Used: f8   Free: f7
+		//f6(0) = g * a , f6(1) = r  * a
+	ps_mul       f6,f1,f4					//Used: f6   Free: f1
+		//
+	ps_madds0    f9,f2,f8,f5
+	ps_madds0    f10,f3,f8,f6
+	psq_st       f9,0(r3),0,3
+	psq_st       f10,2(r3),0,3
+	blr
 
 	.section .data
 	.balign 4
 Unit16:
 	.float	16.0
+Unit32:
+	.float	32.0

@@ -27,7 +27,19 @@
 #include "matrix.h"
 #include "MMU.h"
 
-#ifndef ENABLE_PAIRED_SINGLE
+#ifdef ENABLE_PAIRED_SINGLE
+
+FORCEINLINE void mtx_fix2float4x4(float* matrix, const float divisor){
+	const float d = 1.0f/divisor;
+	ps_mtx_fix2float4x4(matrix, d);
+}
+
+FORCEINLINE void mtx_fix2float3x4(float* matrix, const float divisor){
+	const float d = 1.0f/divisor;
+	ps_mtx_fix2float3x4(matrix, d);
+}
+
+#else
 
 void _NOSSE_MatrixMultVec4x4 (const float *matrix, float *vecPtr){
 	float x = vecPtr[0];
@@ -126,6 +138,15 @@ void MatrixCopy (float* matrixDST, const float* matrixSRC){
 
 }
 
+FORCEINLINE void mtx_fix2float4x4(float* matrix, const float divisor){
+	for(int i=0;i<4*4;i++)
+		matrix[i] /= divisor;
+}
+
+FORCEINLINE void mtx_fix2float3x4(float* matrix, const float divisor){
+	for(int i=0;i<3*4;i++)
+		matrix[i] /= divisor;
+}
 #endif //switched c/asm functions
 //-----------------------------------------
 
@@ -234,81 +255,6 @@ void MatrixStackLoadMatrix (MatrixStack *stack, int pos, const float *ptr){
 	MatrixCopy (&stack->matrix[pos*16], ptr);
 }
 
-void Vector2Copy(float *dst, const float *src){
-	dst[0] = src[0];
-	dst[1] = src[1];
-}
 
-void Vector2Add(float *dst, const float *src){
-	dst[0] += src[0];
-	dst[1] += src[1];
-}
-
-void Vector2Subtract(float *dst, const float *src){
-	dst[0] -= src[0];
-	dst[1] -= src[1];
-}
-
-float Vector2Dot(const float *a, const float *b){
-	return (a[0]*b[0]) + (a[1]*b[1]);
-}
-
-/* http://www.gamedev.net/community/forums/topic.asp?topic_id=289972 */
-float Vector2Cross(const float *a, const float *b){
-	return (a[0]*b[1]) - (a[1]*b[0]);
-}
-
-float Vector3Dot(const float *a, const float *b) {
-	return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-}
-
-void Vector3Cross(float* dst, const float *a, const float *b) {
-	dst[0] = a[1]*b[2] - a[2]*b[1];
-	dst[1] = a[2]*b[0] - a[0]*b[2];
-	dst[2] = a[0]*b[1] - a[1]*b[0];
-}
-
-
-float Vector3Length(const float *a){
-	float lengthSquared = Vector3Dot(a,a);
-	float length = sqrt(lengthSquared);
-	return length;
-}
-
-void Vector3Add(float *dst, const float *src){
-	dst[0] += src[0];
-	dst[1] += src[1];
-	dst[2] += src[2];
-}
-
-void Vector3Subtract(float *dst, const float *src){
-	dst[0] -= src[0];
-	dst[1] -= src[1];
-	dst[2] -= src[2];
-}
-
-void Vector3Scale(float *dst, const float scale){
-	dst[0] *= scale;
-	dst[1] *= scale;
-	dst[2] *= scale;
-}
-
-void Vector3Copy(float *dst, const float *src){
-	dst[0] = src[0];
-	dst[1] = src[1];
-	dst[2] = src[2];
-}
-
-void Vector3Normalize(float *dst){
-	float length = Vector3Length(dst);
-	Vector3Scale(dst,1.0f/length);
-}
-
-void Vector4Copy(float *dst, const float *src){
-	dst[0] = src[0];
-	dst[1] = src[1];
-	dst[2] = src[2];
-	dst[3] = src[3];
-}
 
 

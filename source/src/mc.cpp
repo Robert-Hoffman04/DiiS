@@ -194,39 +194,13 @@ u8 fw_transfer(memory_chip_t *mc, u8 data)
 	{
 		return (mc->write_enable ? 0x02 : 0x00);
 	}
-	else if(mc->com == FW_CMD_READ_ID)
-	{
-		switch(mc->addr)
-		{
-		//here is an ID string measured from an old ds fat: 62 16 00 (0x62=sanyo)
-		//but we chose to use an ST from martin's ds fat string so programs might have a clue as to the firmware size:
-		//20 40 12
-		case 0: 
-			data = 0x20;
-			mc->addr=1; 
-			break;
-		case 1: 
-			data = 0x40; //according to gbatek this is the device ID for the flash on someone's ds fat
-			mc->addr=2; 
-			break;
-		case 2: 
-			data = 0x12;
-			mc->addr = 0; 
-			break;
-		}
-	}
-	else	//finally, check if it's a new command
+	else	// finally, check if it's a new command
 	{
 		switch(data)
 		{
 			case 0: break;	// nothing
-
-			case FW_CMD_READ_ID:
-				mc->addr = 0;
-				mc->com = FW_CMD_READ_ID;
-				break;
-			
-			case FW_CMD_READ:    //read command
+		   
+			case FW_CMD_READ:	// read command
 				mc->addr = 0;
 				mc->addr_shift = 3;
 				mc->com = FW_CMD_READ;
@@ -284,7 +258,7 @@ bool BackupDevice::load_state(EMUFILE* is)
 {
 	u32 version;
 	if(read32le(&version,is)!=1) return false;
-	if(version>=0){
+	if(version==0 || version==1) {
 		readbool(&write_enable,is);
 		read32le(&com,is);
 		read32le(&addr_size,is);
@@ -294,11 +268,9 @@ bool BackupDevice::load_state(EMUFILE* is)
 		state = (STATE)temp;
 		readbuffer(data,is);
 		readbuffer(data_autodetect,is);
+		if(version==1)
+			read32le(&addr,is);
 	}
-	if(version>=1)
-		read32le(&addr,is);
-
-
 	return true;
 }
 
@@ -383,9 +355,6 @@ void BackupDevice::reset_command()
 				case 0:
 				case 1:
 					printf("Catastrophic error while autodetecting save type.\nIt will need to be specified manually\n");
-					#ifdef _MSC_VER
-					MessageBox(0,"Catastrophic Error Code: Camel;\nyour save type has not been autodetected correctly;\nplease report to developers",0,0);
-					#endif
 					addr_size = 1; //choose 1 just to keep the busted savefile from growing too big
 					break;
 				case 2:
@@ -396,7 +365,6 @@ void BackupDevice::reset_command()
 					//another modern typical case..
 					//but unfortunately we select this case for spider-man 3, when what it meant to do was
 					//present the archaic 1+2 case
-					//it seems that over the hedge does this also.
 					addr_size = 2;
 					break;
 				case 4:
@@ -460,13 +428,9 @@ u8 BackupDevice::data_command(u8 val, int cpu)
 				}
 				else
 				{
-					if(write_enable)
-					{
-						//printf("WRITE ADR: %08X\n",addr);
-						data[addr] = val;
-						flushPending = true;
-						//printf("writ: %08X\n",addr);
-					}
+					data[addr] = val;
+					flushPending = true;
+					//printf("writ: %08X\n",addr);
 				}
 				addr++;
 			}
@@ -486,7 +450,6 @@ u8 BackupDevice::data_command(u8 val, int cpu)
 			case 0: break; //??
 
 			case 8:
-				printf("COMMAND%c: Unverified Backup Memory command: %02X FROM %08X\n",(cpu==ARMCPU_ARM9)?'9':'7',val, (cpu==ARMCPU_ARM9)?NDS_ARM9.instruct_adr:NDS_ARM7.instruct_adr);
 				val = 0xAA;
 				break;
 
@@ -530,7 +493,7 @@ u8 BackupDevice::data_command(u8 val, int cpu)
 			default:
 				printf("COMMAND%c: Unhandled Backup Memory command: %02X FROM %08X\n",(cpu==ARMCPU_ARM9)?'9':'7',val, (cpu==ARMCPU_ARM9)?NDS_ARM9.instruct_adr:NDS_ARM7.instruct_adr);
 				break;
-		} //switch(val)
+		}
 	}
 	return val;
 }
@@ -664,7 +627,7 @@ static int no_gba_unpackSAV(void *in_buf, u32 fsize, void *out_buf, u32 &size)
 				src_pos += 3;
 				continue;
 			}
-			
+
 			else if (cc > 0x80)		// repeat
 			{
 				cc -= 0x80;
@@ -952,10 +915,8 @@ void BackupDevice::flush()
 void BackupDevice::raw_applyUserSettings(u32& size)
 {
 	//respect the user's choice of backup memory type
-	if(CommonSettings.manualBackupType == MC_TYPE_AUTODETECT){
+	if(CommonSettings.manualBackupType == MC_TYPE_AUTODETECT)
 		addr_size = addr_size_for_old_save_size(size);
-
-	}
 	else
 	{
 		int savetype = save_types[CommonSettings.manualBackupType][0];

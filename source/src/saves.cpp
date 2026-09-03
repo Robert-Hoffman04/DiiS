@@ -45,6 +45,7 @@
 #include "readwrite.h"
 #include "GPU.h"
 #include "gfx3d.h"
+#include "GXMerge.h"
 #include "movie.h"
 #include "mic.h"
 #include "MMU_timing.h"
@@ -106,7 +107,6 @@ SFORMAT SF_ARM7[]={
 	{ "7int", 4, 1, &NDS_ARM7.intVector },
 	{ "7LDT", 1, 1, &NDS_ARM7.LDTBit },
 	{ "7Wai", 4, 1, &NDS_ARM7.waitIRQ },
-	//{ "7wIR", 4, 1, &NDS_ARM7.wIRQ, },
 	{ "7wir", 4, 1, &NDS_ARM7.wirq, },
 	{ 0 }
 };
@@ -143,7 +143,6 @@ SFORMAT SF_ARM9[]={
 	{ "9int", 4, 1, &NDS_ARM9.intVector},
 	{ "9LDT", 1, 1, &NDS_ARM9.LDTBit},
 	{ "9Wai", 4, 1, &NDS_ARM9.waitIRQ},
-	//{ "9wIR", 4, 1, &NDS_ARM9.wIRQ},
 	{ "9wir", 4, 1, &NDS_ARM9.wirq},
 	{ 0 }
 };
@@ -177,7 +176,7 @@ SFORMAT SF_NDS[]={
 	{ "_TPX", 2, 1, &nds.touchX},
 	{ "_TPY", 2, 1, &nds.touchY},
 	{ "_TPB", 4, 1, &nds.isTouch},
-	{ "_DBG", 4, 1, &nds.debugConsole},
+	{ "_DBG", 4, 1, 0}, //No debug
 	{ 0 }
 };
 
@@ -250,14 +249,6 @@ SFORMAT SF_MMU[]={
 	
 	{ 0 }
 };
-
-#ifdef _MOVIETIME_
-SFORMAT SF_MOVIE[]={
-	{ "FRAC", 4, 1, &currFrameCounter},
-	{ "LAGC", 4, 1, &TotalLagFrames},
-	{ 0 }
-};
-#endif
 
 static void mmu_savestate(EMUFILE* os)
 {
@@ -494,7 +485,8 @@ static void cp15_savestate(EMUFILE* os)
 	write32le(0,os);
 
 	cp15_saveone((armcp15_t *)NDS_ARM9.coproc[15],os);
-	cp15_saveone((armcp15_t *)NDS_ARM7.coproc[15],os);
+	//ARM7 does not have coprocessor
+	//cp15_saveone((armcp15_t *)NDS_ARM7.coproc[15],os);
 }
 
 static bool cp15_loadone(armcp15_t *cp15, EMUFILE* is)
@@ -550,7 +542,16 @@ static bool cp15_loadstate(EMUFILE* is, int size)
 	if(version != 0) return false;
 
 	if(!cp15_loadone((armcp15_t *)NDS_ARM9.coproc[15],is)) return false;
-	if(!cp15_loadone((armcp15_t *)NDS_ARM7.coproc[15],is)) return false;
+	
+	if(version == 0)
+	{
+		//ARM7 does not have coprocessor
+		u8 *tmp_buf = new u8 [sizeof(armcp15_t)];
+		if (!tmp_buf) return false;
+		if(!cp15_loadone((armcp15_t *)tmp_buf,is)) return false;
+		delete [] tmp_buf;
+		tmp_buf = NULL;
+	}
 
 	return true;
 }
@@ -584,16 +585,15 @@ void scan_savestates()
 
   clear_savestates();
 
-  for(int i = 0; i < NB_STATES; i++ )
-    {
-		path.getpathnoext(path.STATES, filename);
-	  
-		if (strlen(filename) + strlen(".dst") + strlen("-2147483648") /* = biggest string for i */ >MAX_PATH) return ;
-		sprintf(filename+strlen(filename), ".ds%d", i);
-		if( stat(filename,&sbuf) == -1 ) continue;
-		savestates[i-1].exists = TRUE;
-		strncpy(savestates[i-1].date, format_time(sbuf.st_mtime),40);
-		savestates[i-1].date[40-1] = '\0';
+  for(int i = 0; i < NB_STATES; i++ ){
+	path.getpathnoext(path.STATES, filename);
+	
+	if (strlen(filename) + strlen(".dst") + strlen("-2147483648") /* = biggest string for i */ >MAX_PATH) return ;
+	sprintf(filename+strlen(filename), ".ds%d", i);
+	if( stat(filename,&sbuf) == -1 ) continue;
+	savestates[i].exists = TRUE;
+	strncpy(savestates[i].date, format_time(sbuf.st_mtime),40);
+	savestates[i].date[40-1] = '\0';
     }
 
   return ;
@@ -656,64 +656,6 @@ void loadstate_slot(int num)
    }
 }
 
-u8 sram_read (u32 address) {
-	address = address - SRAM_ADDRESS;
-
-	if ( address > SRAM_SIZE )
-		return 0;
-
-	return MMU.CART_RAM[address];
-
-}
-
-void sram_write (u32 address, u8 value) {
-
-	address = address - SRAM_ADDRESS;
-
-	if ( address < SRAM_SIZE )
-		MMU.CART_RAM[address] = value;
-
-}
-
-int sram_load (const char *file_name) {
-
-	FILE *file;
-	size_t elems_read;
-
-	file = fopen ( file_name, "rb" );
-	if( file == NULL )
-		return 0;
-
-	elems_read = fread ( MMU.CART_RAM, SRAM_SIZE, 1, file );
-
-	fclose ( file );
-
-//	osd->setLineColor(255, 255, 255);
-//	osd->addLine("Loaded SRAM");
-
-	return 1;
-
-}
-
-int sram_save (const char *file_name) {
-
-	FILE *file;
-	size_t elems_written;
-
-	file = fopen ( file_name, "wb" );
-	if( file == NULL )
-		return 0;
-
-	elems_written = fwrite ( MMU.CART_RAM, SRAM_SIZE, 1, file );
-
-	fclose ( file );
-
-//	osd->setLineColor(255, 255, 255);
-//	osd->addLine("Saved SRAM");
-
-	return 1;
-
-}
 
 // note: guessSF is so we don't have to do a linear search through the SFORMAT array every time
 // in the (most common) case that we already know where the next entry is.
@@ -938,9 +880,6 @@ static void writechunks(EMUFILE* os);
 
 bool savestate_save(EMUFILE* outstream, int compressionLevel)
 {
-	//--DCN: This is from "zlib" in the windows folder, which is
-	// odd because up top it checks if we DO have "HAVE_LIBZ"
-	// Z_NO_COMPRESSION is equal to 0
 	#ifndef HAVE_LIBZ
 	compressionLevel = Z_NO_COMPRESSION;
 	#endif
@@ -1013,15 +952,18 @@ bool savestate_save (const char *file_name)
 	FILE* file = fopen(file_name,"wb");
 	if(file)
 	{
-		elems_written = fwrite(ms.buf(),1,ms.size(),file);
+		elems_written = fwrite(ms.buf(), 1, ms.size(), file);
 		fclose(file);
-		return (elems_written == ms.size());
+		return (elems_written == (size_t)(ms.size()));
 	} else return false;
 }
 
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
+	// Hardware-merge mode de-swizzles the GX 3D scene lazily; the SF_GFX3D chunk
+	// (gfx3d_convertedScreen) needs it materialised now.  No-op when merge is off.
+	GXMerge_MaterializeConverted();
 	savestate_WriteChunk(os,1,SF_ARM9);
 	savestate_WriteChunk(os,2,SF_ARM7);
 	savestate_WriteChunk(os,3,cp15_savestate);
@@ -1035,10 +977,6 @@ static void writechunks(EMUFILE* os) {
 	savestate_WriteChunk(os,81,mic_savestate);
 	savestate_WriteChunk(os,90,SF_GFX3D);
 	savestate_WriteChunk(os,91,gfx3d_savestate);
-#ifdef _MOVIETIME_
-	savestate_WriteChunk(os,100,SF_MOVIE);
-	//savestate_WriteChunk(os,101,mov_savestate);
-#endif	
 	savestate_WriteChunk(os,110,SF_WIFI);
 	savestate_WriteChunk(os,120,SF_RTC);
 	savestate_WriteChunk(os,0xFFFFFFFF,(SFORMAT*)0);
@@ -1067,14 +1005,12 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 			case 7: if(!gpu_loadstate(is,size)) ret=false; break;
 			case 8: if(!spu_loadstate(is,size)) ret=false; break;
 			case 81: if(!mic_loadstate(is,size)) ret=false; break;
-#ifdef _MOVIETIME_
-			case 90: if(!ReadStateChunk(is,SF_GFX3D,size)) ret=false; break;
-#endif
+			// No movies
+			//case 90: if(!ReadStateChunk(is,SF_GFX3D,size)) ret=false; break;
 			case 91: if(!gfx3d_loadstate(is,size)) ret=false; break;
-#ifdef _MOVIETIME_
-			case 100: if(!ReadStateChunk(is,SF_MOVIE, size)) ret=false; break;
+			// No movies
+			//case 100: if(!ReadStateChunk(is,SF_MOVIE, size)) ret=false; break;
 			//case 101: if(!mov_loadstate(is, size)) ret=false; break;
-#endif			
 			case 110: if(!ReadStateChunk(is,SF_WIFI,size)) ret=false; break;
 			case 120: if(!ReadStateChunk(is,SF_RTC,size)) ret=false; break;
 			default:
@@ -1114,7 +1050,7 @@ static void loadstate()
 		_MMU_write16<ARMCPU_ARM9>(REG_BASE_DISPB+subRegenAddr[i], _MMU_read16<ARMCPU_ARM9>(REG_BASE_DISPB+subRegenAddr[i]));
 	// no need to restore 0x60 since control and MMU.ARM9_REG are both in the savestates, and restoring it could mess up the ack bits anyway
 
-	SetupMMU(nds.debugConsole);
+	SetupMMU();
 
 	execute = 1;//!driver->EMU_IsEmulationPaused();
 }
@@ -1168,9 +1104,6 @@ bool savestate_load(EMUFILE* is)
 	NDS_Reset();
 	_HACK_DONT_STOPMOVIE = false;
 
-	//reset some options to their old defaults which werent saved
-	nds.debugConsole = FALSE;
-
 	//GPU_Reset(MainScreen.gpu, 0);
 	//GPU_Reset(SubScreen.gpu, 1);
 	//gfx3d_reset();
@@ -1183,18 +1116,10 @@ bool savestate_load(EMUFILE* is)
 	if(!x && !SAV_silent_fail_flag)
 	{
 		printf("Error loading savestate. It failed halfway through;\nSince there is no savestate backup system, your current game session is wrecked");
-#ifdef _WINDOWS
-		//HACK! we really need a better way to handle this kind of feedback
-		MessageBox(0,"Error loading savestate. It failed halfway through;\nSince there is no savestate backup system, your current game session is wrecked",0,0);
-#endif
 		return false;
 	}
 
 	loadstate();
-
-	if((nds.debugConsole!=0) != CommonSettings.DebugConsole) {
-		printf("WARNING: forcing console debug mode to: debugmode=%s\n",nds.debugConsole?"TRUE":"FALSE");
-	}
 
 	return true;
 }
@@ -1214,7 +1139,6 @@ int rewindstates = 16;
 int rewindinterval = 4;
 
 void rewindsave () {
-
 
 	//printf("rewindsave"); printf("%d%s", currFrameCounter, "\n");
 
@@ -1241,8 +1165,6 @@ void rewindsave () {
 void dorewind()
 {
 	//printf("rewind\n");
-
-	nds.debugConsole = FALSE;
 
 	int size = rewindbuffer.size();
 

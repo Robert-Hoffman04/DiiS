@@ -24,15 +24,15 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include "types.h"
 #include <vector>
 #include <algorithm>
 #include <string>
 #include <stdarg.h>
 
-#ifdef _XBOX
-#undef min;
-#undef max;
+#include "types.h"
+
+#ifdef _MSC_VER
+#include <io.h>
 #endif
 
 class EMUFILE {

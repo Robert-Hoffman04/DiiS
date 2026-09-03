@@ -23,7 +23,6 @@
 #ifndef _RTC_H_
 #define _RTC_H_
 #include <stdlib.h>
-#include <time.h>
 #include "types.h"
 
 extern	void rtcInit();

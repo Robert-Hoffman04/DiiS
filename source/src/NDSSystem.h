@@ -148,13 +148,12 @@ void NDS_RescheduleGXFIFO(u32 cost);
 void NDS_RescheduleDMA();
 void NDS_RescheduleTimers();
 
-enum ENSATA_HANDSHAKE
+enum NDS_CONSOLE_TYPE
 {
-	ENSATA_HANDSHAKE_none = 0,
-	ENSATA_HANDSHAKE_query = 1,
-	ENSATA_HANDSHAKE_ack = 2,
-	ENSATA_HANDSHAKE_confirm = 3,
-	ENSATA_HANDSHAKE_complete = 4,
+	NDS_CONSOLE_TYPE_FAT,
+	NDS_CONSOLE_TYPE_LITE,
+	NDS_CONSOLE_TYPE_IQUE,
+	NDS_CONSOLE_TYPE_DSI
 };
 
 struct NDSSystem
@@ -170,36 +169,9 @@ struct NDSSystem
 	BOOL isTouch;
 	u16 pad;
 
-	u8 *FW_ARM9BootCode;
-	u8 *FW_ARM7BootCode;
-	u32 FW_ARM9BootCodeAddr;
-	u32 FW_ARM7BootCodeAddr;
-	u32 FW_ARM9BootCodeSize;
-	u32 FW_ARM7BootCodeSize;
-
 	BOOL sleeping;
 	BOOL cardEjected;
-
-	//this is not essential NDS runtime state.
-	//it was perhaps a mistake to put it here.
-	//it is far less important than the above.
-	//maybe I should move it.
-	s32 idleCycles;
-	s32 runCycleCollector[16];
-	s32 idleFrameCounter;
-	s32 cpuloopIterationCount; //counts the number of times during a frame that a reschedule happened
-
-	//if the game was booted on a debug console, this is set
-	BOOL debugConsole;
-
-	//set if the user requests ensata emulation
-	BOOL ensataEmulation;
-
-	//there is a hack in the ipc sync for ensata. this tracks its state
-	u32 ensataIpcSyncCounter;
-
-	//maintains the state of the ensata handshaking protocol
-	u32 ensataHandshake;
+	u32 freezeBus;
 
 	struct {
 		u8 lcd, gpuMain, gfx3d_render, gfx3d_geometry, gpuSub, dispswap;
@@ -223,19 +195,11 @@ struct NDS_fw_touchscreen_cal {
   u8 screen_y;
 };
 
-/** /brief The type of DS
- */
-enum nds_fw_ds_type {
-  NDS_FW_DS_TYPE_FAT,
-  NDS_FW_DS_TYPE_LITE,
-  NDS_FW_DS_TYPE_iQue
-};
-
 #define MAX_FW_NICKNAME_LENGTH 10
 #define MAX_FW_MESSAGE_LENGTH 26
 
 struct NDS_fw_config_data {
-  enum nds_fw_ds_type ds_type;
+  NDS_CONSOLE_TYPE ds_type;
 
   u8 fav_colour;
   u8 birth_month;
@@ -249,8 +213,8 @@ struct NDS_fw_config_data {
 
   u8 language;
 
-  /* touchscreen calibration */
-  struct NDS_fw_touchscreen_cal touch_cal[2];
+  // touchscreen calibration
+  NDS_fw_touchscreen_cal touch_cal[2];
 };
 
 extern NDSSystem nds;
@@ -292,15 +256,16 @@ struct GameInfo
 	u32 crc;
 	NDS_header header;
 	char ROMserial[20];
-	char ROMfullName[7][0x100];
+	char ROMname[20];
+	//char ROMfullName[7][0x100];
 	void populate();
 	char* romdata;
-	int romsize;
+	u32 romsize;
 };
 
 typedef struct TSCalInfo
 {
-	struct adc
+	struct
 	{
 		u16 x1, x2;
 		u16 y1, y2;
@@ -308,7 +273,7 @@ typedef struct TSCalInfo
 		u16 height;
 	} adc;
 
-	struct scr
+	struct
 	{
 		u8 x1, x2;
 		u8 y1, y2;
@@ -399,48 +364,9 @@ template<bool FORCE> void NDS_exec(s32 nb = 560190<<1);
 
 extern int lagframecounter;
 
-static INLINE void NDS_ARM9HBlankInt(void)
-{
-    if(T1ReadWord(MMU.ARM9_REG, 4) & 0x10)
-    {
-         //MMU.reg_IF[0] |= 2;// & (MMU.reg_IME[0] << 1);// (MMU.reg_IE[0] & (1<<1));
-		setIF(0, 2);
-    }
-}
-
-static INLINE void NDS_ARM7HBlankInt(void)
-{
-    if(T1ReadWord(MMU.ARM7_REG, 4) & 0x10)
-    {
-        // MMU.reg_IF[1] |= 2;// & (MMU.reg_IME[1] << 1);// (MMU.reg_IE[1] & (1<<1));
-		setIF(1, 2);
-    }
-}
-
-static INLINE void NDS_ARM9VBlankInt(void)
-{
-    if(T1ReadWord(MMU.ARM9_REG, 4) & 0x8)
-    {
-        // MMU.reg_IF[0] |= 1;// & (MMU.reg_IME[0]);// (MMU.reg_IE[0] & 1);
-		setIF(0, 1);
-              //emu_halt();
-              /*logcount++;*/
-    }
-}
-
-static INLINE void NDS_ARM7VBlankInt(void)
-{
-    if(T1ReadWord(MMU.ARM7_REG, 4) & 0x8)
-        // MMU.reg_IF[1] |= 1;// & (MMU.reg_IME[1]);// (MMU.reg_IE[1] & 1);
-		setIF(1, 1);
-         //emu_halt();
-}
-
-void NDS_swapScreen(void);
+//void NDS_swapScreen(void);
 
 int NDS_WriteBMP_32bppBuffer(int width, int height, const void* buf, const char *filename);
-
-
 
 extern struct TCommonSettings {
 	TCommonSettings() 
@@ -452,8 +378,6 @@ extern struct TCommonSettings {
 		, PatchSWI3(false)
 		, UseExtFirmware(false)
 		, BootFromFirmware(false)
-		, DebugConsole(false)
-		, EnsataEmulation(false)
 		, cheatsDisable(false)
 		, num_cores(1)
 		, rigorous_timing(false)
@@ -469,6 +393,7 @@ extern struct TCommonSettings {
 		strcpy(Firmware, "firmware.bin");
 		NDS_FillDefaultFirmwareConfigData(&InternalFirmConf);
 
+		// WIFI mode: adhoc = 0, infrastructure = 1
 		wifi.mode = 0;
 		wifi.infraBridgeAdapter = 0;
 
@@ -493,9 +418,6 @@ extern struct TCommonSettings {
 	char Firmware[256];
 	bool BootFromFirmware;
 	struct NDS_fw_config_data InternalFirmConf;
-
-	bool DebugConsole;
-	bool EnsataEmulation;
 	
 	bool cheatsDisable;
 
@@ -561,10 +483,7 @@ extern std::string InputDisplayString;
 extern int LagFrameFlag;
 extern int lastLag, TotalLagFrames;
 
-void MovieSRAM();
-
 void ClearAutoHold(void);
 
 #endif
 
- 	  	 

@@ -73,9 +73,6 @@
 //produce a 32bpp color from a DS RGB16
 #define RGB16TO32(col,alpha) (((alpha)<<24) | ((((col) & 0x7C00)>>7)<<16) | ((((col) & 0x3E0)>>2)<<8) | (((col) & 0x1F)<<3))
 
-//produce a 32bpp color from a ds RGB15, using a table
-#define RGB15TO32_NOALPHA(col) ( color_15bit_to_24bit[col&0x7FFF] )
-
 //produce a 32bpp color from a ds RGB15 plus an 8bit alpha, using a table
 #define RGB15TO32(col,alpha8) ( ((alpha8)<<24) | color_15bit_to_24bit[col&0x7FFF] )
 
@@ -106,7 +103,6 @@ inline u32 RGB15TO6665(u16 col, u8 alpha5)
 
 //produce a 15bpp color from individual 5bit components
 #define R5G5B5TORGB15(r,g,b) ((r)|((g)<<5)|((b)<<10))
-#define RGB15TO32_NOALPHA(col) ( color_15bit_to_24bit[col&0x7FFF] )
 
 //produce a 16bpp color from individual 5bit components
 #define R6G6B6TORGB15(r,g,b) ((r>>1)|((g&0x3E)<<4)|((b&0x3E)<<9))
@@ -193,8 +189,7 @@ struct POLY {
 	}
 };
 
-#define POLYLIST_SIZE 40000 //100000
-//#define POLYLIST_SIZE 2048
+#define POLYLIST_SIZE 40000
 struct POLYLIST {
 	POLY list[POLYLIST_SIZE];
 	int count;
@@ -213,7 +208,7 @@ struct VERT {
 			float u,v;
 		};
 	};
-	void set_coord(float x, float y, float z, float w) { 
+	void set_coord(float x, float y, float z, float w) {
 		this->x = x;
 		this->y = y;
 		this->z = z;
@@ -248,15 +243,10 @@ struct VERT {
 	}
 };
 
-#define VERTLIST_SIZE 100000//400000
-//#define VERTLIST_SIZE 10000
+#define VERTLIST_SIZE 100000
 struct VERTLIST {
 	VERT list[VERTLIST_SIZE];
 	int count;
-};
-
-struct INDEXLIST {
-	int list[POLYLIST_SIZE];
 };
 
 
@@ -299,8 +289,19 @@ private:
 
 //used to communicate state to the renderer
 struct GFX3D{
-    GFX3D()
-		: enableTexturing(true)
+	GFX3D():
+		  polylist(0)
+		, vertlist(0)		
+		, fogColor(0)
+		, fogOffset(0)		
+		, fogShift(0)
+		, shading(TOON)
+		, activeFlushCommand(0)
+		, pendingFlushCommand(0)
+		, clearDepth(1)
+		, clearColor(0)	
+		, alphaTestRef(0)
+		, enableTexturing(true)
 		, enableAlphaTest(true)
 		, enableAlphaBlending(true)
 		, enableAntialiasing(false)
@@ -308,43 +309,21 @@ struct GFX3D{
 		, enableClearImage(false)
 		, enableFog(false)
 		, enableFogAlphaOnly(false)
-		, fogShift(0)
-		, shading(TOON)
-		, polylist(0)
-		, vertlist(0)
-		, alphaTestRef(0)
-		, clearDepth(1)
-		, clearColor(0)
-		, fogColor(0)
-		, fogOffset(0)
-		, frameCtr(0)
-		, frameCtrRaw(0)
-    {
+	{
 		int i = ARRAY_SIZE(u16ToonTable) - 1;
 		do{
 			u16ToonTable[i] = 0;
 			--i;
 		}while(i >= 0);
 	}
-	BOOL enableTexturing, enableAlphaTest, enableAlphaBlending,
-		enableAntialiasing, enableEdgeMarking, enableClearImage, enableFog, enableFogAlphaOnly;
-	
-	u32 fogShift;
-	
+
 	static const u32 TOON = 0;
 	static const u32 HIGHLIGHT = 1;
-	u32 shading;
 	
+	int indexlist[POLYLIST_SIZE];
 	POLYLIST* polylist;
 	VERTLIST* vertlist;
-	int indexlist[POLYLIST_SIZE];
 	
-	BOOL wbuffer, sortmode;
-	
-	u8 alphaTestRef;
-	
-	u32 clearDepth;
-	u32 clearColor;
 	#include "PACKED.h"
 	struct {
 		u32 fogColor;
@@ -353,14 +332,25 @@ struct GFX3D{
 	#include "PACKED_END.h"
 
 	u32 fogOffset;
+	u32 fogShift;
+
+	u32 shading;
 	
-	//ticks every time flush() is called
-	int frameCtr;
+	u32 activeFlushCommand;
+	u32 pendingFlushCommand;
 	
-	//you can use this to track how many real frames passed, for comparing to frameCtr;
-	int frameCtrRaw;
+	u32 clearDepth;
+	u32 clearColor;
 	
 	u16 u16ToonTable[32];
+	
+	u8 alphaTestRef;
+	
+	bool enableTexturing, enableAlphaTest, enableAlphaBlending,
+		enableAntialiasing, enableEdgeMarking, enableClearImage, 
+		enableFog, enableFogAlphaOnly;
+	
+	bool wbuffer, sortmode;
 };
 extern GFX3D gfx3d;
 

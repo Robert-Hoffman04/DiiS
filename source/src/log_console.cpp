@@ -40,7 +40,7 @@ static u16 log_next = 0;
 static bool log_active = true;
 static bool video_active = true;
  
-static int __out_write(struct _reent *r, int fd, const char *ptr, size_t len) {
+static ssize_t __out_write(struct _reent *r, void *fd, const char *ptr, size_t len) {
 	 
 	if (!ptr || len <= 0)
 		return -1;

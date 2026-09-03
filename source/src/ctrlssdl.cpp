@@ -28,9 +28,16 @@
 u16 wiimote_cfg[NB_KEYS];
 u16 gamecube_cfg[NB_KEYS];
 //u16 nbr_joy;
-mouse_status mouse;
+cursor_status cursor;
 
 extern volatile BOOL execute;
+
+// Bottom (touch) screen quad geometry, set by do_screen_layout() in main.cpp
+// (FrontEnd.h). WPAD_SetVRes() reports the IR pointer in full Wii video-mode
+// pixel space, not DS touch-screen space, so the IR override below has to
+// invert the same transform draw_thread() uses to place the quad.
+extern int bottomX, bottomY;
+extern float scalex, scaley;
 
 /* Keypad key names */
 const char *key_names[NB_KEYS] =
@@ -122,13 +129,13 @@ void load_default_config(const u16 kbCfg[])
   memcpy(gamecube_cfg, default_gamecube_cfg, sizeof(gamecube_cfg));
 }
 
-/* Set mouse coordinates */
-void set_mouse_coord(signed long x,signed long y)
+/* Set cursor coordinates */
+static void set_cursor_coord(signed long x,signed long y)
 {
   if(x<0) x = 0; else if(x>255) x = 255;
   if(y<0) y = 0; else if(y>192) y = 192;
-  mouse.x = x;
-  mouse.y = y;
+  cursor.x = x;
+  cursor.y = y;
 }
 
 /* Update NDS keypad */
@@ -220,23 +227,29 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
     WPAD_Probe(WPAD_CHAN_ALL, &type);
     wd_one = WPAD_Data(0);
 
+	// USB Gecko / EXI debug-serial input (see gekko_utils/geckoinput.h).
+	GECKO_Update();
+	u32 gecko_h = GECKO_ButtonsHeld();
+
 	u32 wpad_h = WPAD_ButtonsHeld(0);
-	u32 pad_h = PAD_ButtonsHeld(0);
+	// d-pad bits are applied through the explicit CHECK_KEY() lines below, so
+	// keep them out of pad_h (KEY_SELECT is mapped to PAD_BUTTON_RIGHT).
+	u32 pad_h = PAD_ButtonsHeld(0) |
+		(gecko_h & ~(PAD_BUTTON_LEFT | PAD_BUTTON_RIGHT | PAD_BUTTON_UP | PAD_BUTTON_DOWN));
 
 	s32 pad_stickx = PAD_StickX(0);
 	s32 pad_sticky = PAD_StickY(0);
 	s32 pad_substickx = PAD_SubStickX(0);
 	s32 pad_substicky = PAD_SubStickY(0);
 
-	int i;
-	for(i = FIRST_KEY; i <= LAST_KEY; i++) {
+	for(int i = FIRST_KEY; i <= LAST_KEY; i++) {
 		CHECK_KEY(i, wpad_h & default_wiimote_cfg[i], pad_h & default_gamecube_cfg[i]);
 	}
 
-	CHECK_KEY(KEY_RIGHT, (pad_stickx > 20),  wpad_h & WPAD_CLASSIC_BUTTON_RIGHT);
-	CHECK_KEY(KEY_LEFT,  (pad_stickx < -20), wpad_h & WPAD_CLASSIC_BUTTON_LEFT);
-	CHECK_KEY(KEY_UP,    (pad_sticky > 20),  wpad_h & WPAD_CLASSIC_BUTTON_UP);
-	CHECK_KEY(KEY_DOWN,  (pad_sticky < -20), wpad_h & WPAD_CLASSIC_BUTTON_DOWN);
+	CHECK_KEY(KEY_RIGHT, (pad_stickx > 20)  || (gecko_h & PAD_BUTTON_RIGHT), wpad_h & WPAD_CLASSIC_BUTTON_RIGHT);
+	CHECK_KEY(KEY_LEFT,  (pad_stickx < -20) || (gecko_h & PAD_BUTTON_LEFT),  wpad_h & WPAD_CLASSIC_BUTTON_LEFT);
+	CHECK_KEY(KEY_UP,    (pad_sticky > 20)  || (gecko_h & PAD_BUTTON_UP),    wpad_h & WPAD_CLASSIC_BUTTON_UP);
+	CHECK_KEY(KEY_DOWN,  (pad_sticky < -20) || (gecko_h & PAD_BUTTON_DOWN),  wpad_h & WPAD_CLASSIC_BUTTON_DOWN);
 
 	// Hack ... remove if this seems stupid ? Or remap the buttons for nunchuk.. IDC I use a CC
 	if (wd_one->exp.type == EXP_NUNCHUK)
@@ -247,56 +260,51 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 	}
 
 	if ((wpad_h & WPAD_BUTTON_A) || (pad_h & PAD_TRIGGER_Z))
-		mouse.down = TRUE;
+		cursor.down = true;
 	  
 	if (!(wpad_h & WPAD_BUTTON_A) && !(pad_h & PAD_TRIGGER_Z)) {
-		if(mouse.down) {
-			mouse.click = TRUE;
-			mouse.down = FALSE;
+		if(cursor.down) {
+			cursor.click = true;
+			cursor.down = false;
 		}
 	}
 
 	if ((wpad_h & WPAD_BUTTON_LEFT) || (pad_substickx < -20)){
-		--mouse.x;
+		--cursor.x;
 	} 
 
 	if ((wpad_h & WPAD_BUTTON_RIGHT) || (pad_substickx > 20)){
-		++mouse.x;
+		++cursor.x;
 	} 
 
 	if ((wpad_h & WPAD_BUTTON_DOWN) || (pad_substicky < -20)) {
-		++mouse.y;
+		++cursor.y;
 	} 
 		
 	if ((wpad_h & WPAD_BUTTON_UP) || (pad_substicky > 20)){
-		--mouse.y;
+		--cursor.y;
 	}
-	// WiiMote Mouse co-ords
-	if (wd_one->ir.valid)
-	{
-		mouse.x = wd_one->ir.x;
-		mouse.y = wd_one->ir.y;
+	// WiiMote cursor co-ords. ir.x/ir.y come back in Wii video-mode pixel
+	// space (see WPAD_SetVRes() in main.cpp), while cursor.x/y are DS
+	// touch-screen coordinates (0..255 x 0..191) -- invert the quad
+	// placement transform from do_screen_layout()/draw_thread() to convert.
+	// Previously this assigned ir.x/ir.y straight into cursor.x/y: on any
+	// layout where the touch quad isn't pinned to the TV's top-left corner
+	// (i.e. every normal layout) that clamps to a fixed corner regardless of
+	// where the pointer actually is, and it did so unconditionally every
+	// frame -- silently overwriting whatever the GC C-stick/D-pad path above
+	// had just set, which is why neither input method appeared to move the
+	// cursor at all.
+	if (wd_one->ir.valid && scalex != 0.0f && scaley != 0.0f){
+		signed long ir_x = (signed long)(wd_one->ir.x / scalex) - bottomX;
+		signed long ir_y = (signed long)(wd_one->ir.y / scaley) - bottomY;
+		if (ir_x >= 0 && ir_x <= 255 && ir_y >= 0 && ir_y <= 192){
+			cursor.x = ir_x;
+			cursor.y = ir_y;
+		}
 	}
 
-	set_mouse_coord( mouse.x, mouse.y );
-
-		  
-		  /*
-		        signed long scaled_x =
-					screen_to_touch_range_x( event.button.x,
-											 nds_screen_size_ratio);
-				  signed long scaled_y =
-					screen_to_touch_range_y( event.button.y,
-											 nds_screen_size_ratio);
-	
-				  if( scaled_y >= 192)
-					set_mouse_coord( scaled_x, scaled_y - 192);
-				}
-*/
-        //  SDL_WarpMouse(mouse.x, mouse.y);
-//		  set_mouse_coord( mouse.x, mouse.y );
-	  //}
-  
+	set_cursor_coord( cursor.x, cursor.y );  
 
 }
 

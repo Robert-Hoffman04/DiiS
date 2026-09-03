@@ -26,8 +26,9 @@
 #include <iosfwd>
 #include <string>
 #include <assert.h>
+#include <math.h>
 #include "types.h"
-#include "matrix.h"
+#include "mem.h"
 #include "emufile.h"
 
 
@@ -36,6 +37,31 @@
 
 #define CHANSTAT_STOPPED          0
 #define CHANSTAT_PLAY             1
+
+
+//--MOVED from Matrix.h
+//these functions are an unreliable, inaccurate floor.
+//it should only be used for positive numbers
+//this isnt as fast as it could be if we used a visual c++ intrinsic, but those appear not to be universally available
+FORCEINLINE u32 u32floor(float f){
+	return (u32)f;
+}
+FORCEINLINE u32 u32floor(double d){
+	return (u32)d;
+}
+
+//same as above but works for negative values too.
+//be sure that the results are the same thing as floorf!
+FORCEINLINE s32 s32floor(float f){
+	return (s32)floorf(f);
+}
+
+
+template<int NUM>
+static FORCEINLINE void memset_u16_le(void* dst, u16 val){
+	for(int i=0;i<NUM;i++)
+		T1WriteWord((u8*)dst,i<<1,val);
+}
 
 static FORCEINLINE u32 sputrunc(float f) { return u32floor(f); }
 static FORCEINLINE u32 sputrunc(double d) { return u32floor(d); }
@@ -74,48 +100,34 @@ struct channel_struct
 	channel_struct()
 	{}
 	u32 num;
-   u8 vol;
-   u8 datashift;
-   u8 hold;
-   u8 pan;
-   u8 waveduty;
-   u8 repeat;
-   u8 format;
-   u8 keyon;
-   u8 status;
-   u32 addr;
-   u16 timer;
-   u16 loopstart;
-   u32 length;
-   u32 totlength;
-   double double_totlength_shifted;
-   union {
+	u8 vol;
+	u8 datashift;
+	u8 hold;
+	u8 pan;
+	u8 waveduty;
+	u8 repeat;
+	u8 format;
+	u8 status;
+	u32 addr;
+	u16 timer;
+	u16 loopstart;
+	u32 length;
+	u32 totlength;
+	double double_totlength_shifted;
+	union {
 		s8 *buf8;
 		s16 *buf16;
-   };
-   double sampcnt;
-   double sampinc;
-   // ADPCM specific
-   u32 lastsampcnt;
-   s16 pcm16b, pcm16b_last;
-   s16 loop_pcm16b;
-   int index;
-   int loop_index;
-   u16 x;
-   s16 psgnoise_last;
-};
-
-class SPUFifo
-{
-public:
-	SPUFifo();
-	void enqueue(s16 val);
-	s16 dequeue();
-	s16 buffer[16];
-	s32 head,tail,size;
-	void save(EMUFILE* fp);
-	bool load(EMUFILE* fp);
-	void reset();
+	};
+	double sampcnt;
+	double sampinc;
+	// ADPCM specific
+	u32 lastsampcnt;
+	s16 pcm16b, pcm16b_last;
+	s16 loop_pcm16b;
+	int index;
+	int loop_index;
+	u16 x;
+	s16 psgnoise_last;
 };
 
 class SPU_struct
@@ -125,69 +137,14 @@ public:
    u32 bufpos;
    u32 buflength;
    s32 *sndbuf;
-   s32 lastdata; //the last sample that a channel generated
    s16 *outbuf;
    u32 bufsize;
    channel_struct channels[16];
 
-   //registers
-   struct REGS {
-	   REGS()
-			: mastervol(0)
-			, ctl_left(0)
-			, ctl_right(0)
-			, ctl_ch1bypass(0)
-			, ctl_ch3bypass(0)
-			, masteren(0)
-			, soundbias(0)
-	   {}
-
-	   u8 mastervol;
-	   u8 ctl_left, ctl_right;
-	   u8 ctl_ch1bypass, ctl_ch3bypass;
-	   u8 masteren;
-	   u16 soundbias;
-
-	   enum LeftOutputMode
-	   {
-		   LOM_LEFT_MIXER=0, LOM_CH1=1, LOM_CH3=2, LOM_CH1_PLUS_CH3=3
-	   };
-
-	   enum RightOutputMode
-	   {
-		   ROM_RIGHT_MIXER=0, ROM_CH1=1, ROM_CH3=2, ROM_CH1_PLUS_CH3=3
-	   };
-
-	   struct CAP {
-		   CAP()
-			   : add(0), source(0), oneshot(0), bits8(0), active(0), dad(0), len(0)
-		   {}
-		   u8 add, source, oneshot, bits8, active;
-		   u32 dad;
-		   u16 len;
-		   struct Runtime {
-			   Runtime()
-				   : running(0), curdad(0), maxdad(0)
-			   {}
-			   u8 running;
-			   u32 curdad;
-			   u32 maxdad;
-			   double sampcnt;
-			   SPUFifo fifo;
-		   } runtime;
-	   } cap[2];
-   } regs;
-
    void reset();
    ~SPU_struct();
-   void KeyOff(int channel);
    void KeyOn(int channel);
-   void KeyProbe(int channel);
-   void ProbeCapture(int which);
    void WriteByte(u32 addr, u8 val);
-   u8 ReadByte(u32 addr);
-   u16 ReadWord(u32 addr);
-   u32 ReadLong(u32 addr);
    void WriteWord(u32 addr, u16 val);
    void WriteLong(u32 addr, u32 val);
    
@@ -209,9 +166,6 @@ void SPU_KeyOn(int channel);
 void SPU_WriteByte(u32 addr, u8 val);
 void SPU_WriteWord(u32 addr, u16 val);
 void SPU_WriteLong(u32 addr, u32 val);
-u8 SPU_ReadByte(u32 addr);
-u16 SPU_ReadWord(u32 addr);
-u32 SPU_ReadLong(u32 addr);
 void SPU_Emulate_core(void);
 void SPU_Emulate_user(bool mix = true);
 
@@ -220,7 +174,7 @@ extern int spu_core_samples;
 
 void spu_savestate(EMUFILE* os);
 bool spu_loadstate(EMUFILE* is, int size);
-
+/*
 enum WAVMode
 {
 	WAVMODE_ANY = -1,
@@ -245,7 +199,7 @@ void WAV_End();
 bool WAV_Begin(const char* fname, WAVMode mode=WAVMODE_CORE);
 bool WAV_IsRecording(WAVMode mode=WAVMODE_ANY);
 void WAV_WavSoundUpdate(void* soundData, int numSamples, WAVMode mode=WAVMODE_CORE);
-
+//*/
 // we should make this configurable eventually
 // but at least defining it somewhere is probably a step in the right direction
 //#define DESMUME_SAMPLE_RATE 44100

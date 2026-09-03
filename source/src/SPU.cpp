@@ -40,7 +40,6 @@
 #include "readwrite.h"
 #include "armcpu.h"
 #include "NDSSystem.h"
-#include "matrix.h"
 
 #include "metaspu/metaspu.h"
 
@@ -189,18 +188,16 @@ int SPU_Init(int coreid, int buffersize)
 	SPU_Reset();
 
 	//create adpcm decode accelerator lookups
-	for(i = 0; i < 16; i++)
-	{
-		for(j = 0; j < 89; j++)
-		{
+	
+	for(j = 0; j < 89; j++){
+		for(i = 0; i < 16; i++){
 			precalcdifftbl[j][i] = (((i & 0x7) * 2 + 1) * adpcmtbl[j] / 8);
 			if(i & 0x8) precalcdifftbl[j][i] = -precalcdifftbl[j][i];
 		}
 	}
-	for(i = 0; i < 8; i++)
-	{
-		for(j = 0; j < 89; j++)
-		{
+	
+	for(j = 0; j < 89; j++){
+		for(i = 0; i < 8; i++){
 			precalcindextbl[j][i] = MinMax((j + indextbl[i]), 0, 88);
 		}
 	}
@@ -247,13 +244,9 @@ void SPU_SetVolume(int volume)
 
 void SPU_Reset(void)
 {
-	int i;
-
 	SPU_core->reset();
 
 	if(SPU_user) {
-		//--DCN: Originally this was first;
-		//SPU_user->reset();
 		if(SNDCore)
 		{
 			SNDCore->DeInit();
@@ -264,7 +257,7 @@ void SPU_Reset(void)
 	}
 
 	// Reset Registers
-	for (i = 0x400; i < 0x51D; i++)
+	for (int i = 0x400; i < 0x51D; i++)
 		T1WriteByte(MMU.ARM7_REG, i, 0);
 
 	samples = 0;
@@ -278,8 +271,6 @@ void SPU_struct::reset()
 	memset(outbuf,0,bufsize*2*2);
 
 	memset((void *)channels, 0, sizeof(channel_struct) * 16);
-
-	reconstruct(&regs);
 
 	for(int i = 0; i < 16; i++)
 	{
@@ -301,8 +292,8 @@ SPU_struct::SPU_struct(int buffersize)
 
 SPU_struct::~SPU_struct()
 {
-	if(sndbuf) delete[] sndbuf;
-	if(outbuf) delete[] outbuf;
+	delete[] sndbuf;
+	delete[] outbuf;
 }
 
 void SPU_DeInit(void)
@@ -325,37 +316,13 @@ void SPU_struct::ShutUp()
 
 static FORCEINLINE void adjust_channel_timer(channel_struct *chan)
 {
-	chan->sampinc = (((double)ARM7_CLOCK) / (DESMUME_SAMPLE_RATE * 2)) / (double)(0x10000 - chan->timer);
-}
-
-void SPU_struct::KeyProbe(int chan_num)
-{
-	channel_struct &thischan = channels[chan_num];
-	if(thischan.status == CHANSTAT_STOPPED)
-	{
-		if(thischan.keyon && regs.masteren)
-			KeyOn(chan_num);
-	}
-	else if(thischan.status == CHANSTAT_PLAY)
-	{
-		if(!thischan.keyon || !regs.masteren)
-			KeyOff(chan_num);
-	}
-}
-
-void SPU_struct::KeyOff(int channel)
-{
-	//printf("keyoff%d\n",channel);
-	channel_struct &thischan = channels[channel];
-	thischan.status = CHANSTAT_STOPPED;
+	chan->sampinc = (((double)ARM7_CLOCK) / ((DESMUME_SAMPLE_RATE * 2) * (double)(0x10000 - chan->timer)));
 }
 
 void SPU_struct::KeyOn(int channel)
 {
 	channel_struct &thischan = channels[channel];
-	thischan.status = CHANSTAT_PLAY;
 
-	thischan.totlength = thischan.length + thischan.loopstart;
 	adjust_channel_timer(&thischan);
 
 	//LOG("Channel %d key on: vol = %d, datashift = %d, hold = %d, pan = %d, waveduty = %d, repeat = %d, format = %d, source address = %07X,"
@@ -442,57 +409,6 @@ void SPU_struct::WriteByte(u32 addr, u8 val)
 
 }
 
-SPUFifo::SPUFifo()
-{
-	reset();
-}
-
-void SPUFifo::reset()
-{
-	head = tail = size = 0;
-}
-
-void SPUFifo::enqueue(s16 val)
-{
-	if(size==16) return;
-	buffer[tail] = val;
-	tail++;
-	tail &= 15;
-	size++;
-}
-
-s16 SPUFifo::dequeue()
-{
-	if(size==0) return 0;
-	head++;
-	head &= 15;
-	s16 ret = buffer[head];
-	size--;
-	return ret;
-}
-
-void SPUFifo::save(EMUFILE* fp)
-{
-	u32 version = 1;
-	write32le(version,fp);
-	write32le(head,fp);
-	write32le(tail,fp);
-	write32le(size,fp);
-	for(int i=0;i<16;i++)
-		write16le(buffer[i],fp);
-}
-
-bool SPUFifo::load(EMUFILE* fp)
-{
-	u32 version;
-	if(read32le(&version,fp) != 1) return false;
-	read32le(&head,fp);
-	read32le(&tail,fp);
-	read32le(&size,fp);
-	for(int i=0;i<16;i++)
-		read16le(&buffer[i],fp);
-	return true;
-}
 void SPU_WriteByte(u32 addr, u8 val)
 {
 	addr &= 0xFFF;
@@ -854,10 +770,8 @@ template<int CHANNELS> FORCEINLINE static void SPU_Mix(SPU_struct* SPU, channel_
 		case 1: MixLR(SPU, chan, data); break;
 		case 2: MixR(SPU, chan, data); break;
 	}
-	SPU->lastdata = data;
 }
 
-//WORK
 template<int FORMAT, SPUInterpolationMode INTERPOLATE_MODE, int CHANNELS> 
 	FORCEINLINE static void ____SPU_ChanUpdate(SPU_struct* const SPU, channel_struct* const chan)
 {

@@ -27,6 +27,16 @@
 #include <assert.h>
 #include "types.h"
 
+//this was originally declared in MMU.h but we suffered some organizational problems and had to remove it
+enum MMU_ACCESS_TYPE
+{
+	MMU_AT_CODE,    //used for cpu prefetches
+	MMU_AT_DATA,    //used for cpu read/write
+	MMU_AT_GPU,     //used for gpu read/write
+	MMU_AT_DMA,     //used for dma read/write (blocks access to TCM)
+	//MMU_AT_DEBUG, //used for emulator debugging functions (bypasses some debug handling)
+};
+
 /* Type 1 Memory, faster for byte (8 bits) accesses */
 
 static INLINE u8 T1ReadByte(u8* const mem, const u32 addr)
@@ -116,46 +126,35 @@ static INLINE void T1WriteLong(u8* const mem, const u32 addr, const u32 val)
 #endif
 }
 
-/* Type 2 Memory, faster for word (16 bits) accesses */
-
-static INLINE u8 T2ReadByte(u8* const  mem, const u32 addr)
+static INLINE void T1WriteQuad(u8* const mem, const u32 addr, const u64 val)
 {
 #ifdef WORDS_BIGENDIAN
-   return mem[addr ^ 1];
+	mem[addr + 7] = (val >> 56);
+	mem[addr + 6] = (val >> 48) & 0xFF;
+	mem[addr + 5] = (val >> 40) & 0xFF;
+	mem[addr + 4] = (val >> 32) & 0xFF;
+	mem[addr + 3] = (val >> 24) & 0xFF;
+    mem[addr + 2] = (val >> 16) & 0xFF;
+    mem[addr + 1] = (val >> 8) & 0xFF;
+    mem[addr] = val & 0xFF;
 #else
-   return mem[addr];
+	*((u64 *) (mem + addr)) = val;
 #endif
 }
 
-static INLINE u16 T2ReadWord(u8* const mem, const u32 addr)
+
+static INLINE u16 HostReadWord(u8* const mem, const u32 addr)
 {
    return *((u16 *) (mem + addr));
 }
 
-static INLINE u32 T2ReadLong(u8* const mem, const u32 addr)
-{
-#ifdef WORDS_BIGENDIAN
-   return *((u16 *) (mem + addr + 2)) << 16 | *((u16 *) (mem + addr));
-#else
-   return *((u32 *) (mem + addr));
-#endif
-}
 
-static INLINE void T2WriteByte(u8* const mem, const u32 addr, const u8 val)
-{
-#ifdef WORDS_BIGENDIAN
-   mem[addr ^ 1] = val;
-#else
-   mem[addr] = val;
-#endif
-}
-
-static INLINE void T2WriteWord(u8* const mem, const u32 addr, const u16 val)
+static INLINE void HostWriteWord(u8* const mem, const u32 addr, const u16 val)
 {
    *((u16 *) (mem + addr)) = val;
 }
 
-static INLINE void T2WriteLong(u8* const mem, const u32 addr, const u32 val)
+static INLINE void HostWriteTwoWords(u8* const mem, const u32 addr, const u32 val)
 {
 #ifdef WORDS_BIGENDIAN
    *((u16 *) (mem + addr + 2)) = val >> 16;

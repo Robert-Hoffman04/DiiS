@@ -26,6 +26,7 @@
 #include "common.h"
 #include "debug.h"
 #include "armcpu.h"
+#include <time.h>
 #include <string.h>
 #include "saves.h"
 
@@ -132,14 +133,11 @@ static void rtcRecv()
 				time_t	tm;
 				time(&tm);
 				struct tm *tm_local= localtime(&tm);
-				{
-
-					if (!(rtc.regStatus1 & 0x02)) tm_local->tm_hour %= 12;
-					rtc.data[0] = ((tm_local->tm_hour < 12) ? 0x00 : 0x40) | toBCD(tm_local->tm_hour);
-					rtc.data[1] =  toBCD(tm_local->tm_min);
-					rtc.data[2] =  toBCD(tm_local->tm_sec);
-					break;
-				}
+				if (!(rtc.regStatus1 & 0x02)) tm_local->tm_hour %= 12;
+				rtc.data[0] = ((tm_local->tm_hour < 12) ? 0x00 : 0x40) | toBCD(tm_local->tm_hour);
+				rtc.data[1] =  toBCD(tm_local->tm_min);
+				rtc.data[2] =  toBCD(tm_local->tm_sec);
+				break;
 			}
 		case 4:				// freq/alarm 1
 			/*if (cmdBitsSize[0x04] == 8)
