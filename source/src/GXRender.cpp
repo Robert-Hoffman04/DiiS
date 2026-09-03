@@ -741,30 +741,31 @@ static void ReadFramebuffer(){
 	// real, opaque 2D+3D composite out to the XFB; the clear only prepares an
 	// EFB nobody has looked at yet.
 
-	// Keep the resident ping-pong 3D texture fresh whenever the merge path is
-	// switched on.  This copy must NOT clear the EFB - the legacy de-swizzle copy
-	// below still needs to read it, and it also carries the real per-pixel 3D
-	// alpha (Set3DVideoSettings no longer overrides it to a binary coverage
-	// mask - see the GX_SetDstAlpha removal there), the same value the
-	// de-swizzle turns into the DS alpha and GXMerge.cpp's sandwich draw
-	// consumes directly, both for coverage (alpha>0) and, on an
-	// MB_ALPHA_OVER band, as the real blend fraction.
+	// Phase 4: with the merge path switched on, the 3D scene is only ever
+	// *sampled* by the GX sandwich (and carries the real per-pixel 3D alpha -
+	// Set3DVideoSettings no longer overrides it to a binary coverage mask), so
+	// the only copy needed here is into the resident ping-pong slot.  This copy
+	// also clears the EFB for the next 3D frame (the legacy de-swizzle copy that
+	// used to do that is gone).  gfx3d_convertedScreen is de-swizzled lazily by
+	// GXMerge_MaterializeConverted() - only on frames that actually need the
+	// CPU-linear 3D buffer: a fallback band, display capture, or savestate.
 	if(GXMerge_Enabled()){
 		GXDBG("ReadFramebuffer: merge copy start");
 		GX_SetTexCopyDst(256, 192, GX_TF_RGBA8, GX_FALSE);
-		GX_CopyTex(GXMerge_CopyDst(), GX_FALSE);
+		GX_CopyTex(GXMerge_CopyDst(), GX_TRUE);
 		GX_PixModeSync();
-		DCInvalidateRange(GPU_screen3D, sizeof(GPU_screen3D))
-		GXDBG("ReadFramebuffer: merge GX_CopyTex + PixModeSync done");
-		GX_SetTexCopyDst(256, 192, GX_TF_RGBA8, GX_FALSE);
 		GXMerge_NoteGXRenderCopied();
 		GXDBG("ReadFramebuffer: merge copy end");
+
+		// Restore vertical de-flicker filter mode and bail - no per-frame
+		// de-swizzle.
+		GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+		GXDBG("ReadFramebuffer: exit (merge, lazy readback)");
+		return;
 	}
 
-	// Legacy path: copy to GPU_screen3D for the de-swizzle loop, and clear the
-	// EFB.  Runs unconditionally so gfx3d_convertedScreen is always a faithful
-	// copy of what GX rendered - even when merge is enabled, since any frame that
-	// does not arm falls back to this buffer.
+	// Legacy path (merge disabled): copy to GPU_screen3D and de-swizzle into
+	// gfx3d_convertedScreen every frame, clearing the EFB in the process.
 	GXDBG("ReadFramebuffer: legacy GX_CopyTex start");
 	GX_CopyTex((void*)GPU_screen3D, GX_TRUE);
 	GX_PixModeSync();

@@ -2245,6 +2245,13 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 							const u16 hofs = gpu->getHOFS(i16);
 
+							// Hardware-merge mode keeps the 3D scene only as a GX
+							// texture; de-swizzle it into gfx3d_convertedScreen now,
+							// on demand, for this fallback line's legacy per-pixel
+							// composite (idempotent within the frame).
+							if (GXMerge_Enabled())
+								GXMerge_MaterializeConverted();
+
 							gfx3d_GetLineData(l, &gpu->_3dColorLine);
 							u8* colorLine = gpu->_3dColorLine;
 
@@ -3021,9 +3028,18 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	}
 
 	//capture after displaying so that we can safely display vram before overwriting it here
-	if (gpu->core == GPU_MAIN) 
+	if (gpu->core == GPU_MAIN)
 	{
-		//BUG!!! if someone is capturing and displaying both from the fifo, then it will have been 
+		// Hardware-merge mode: display capture of the 3D layer (srcA == 3D) reads
+		// gfx3d_convertedScreen via gfx3d_GetLineData15bpp. The layer walk above
+		// only materialises it when BG0/3D is actually composited; a capture with
+		// 3D off would otherwise read a stale buffer. (A capture frame is already
+		// whole-frame-disarmed by GXMerge_FrameMergeable, so this is a cheap
+		// belt-and-braces call - usually a no-op after the walk.)
+		if (GXMerge_Enabled() && gpu->dispCapCnt.enabled)
+			GXMerge_MaterializeConverted();
+
+		//BUG!!! if someone is capturing and displaying both from the fifo, then it will have been
 		//consumed above by the display before we get here
 		//(is that even legal? I think so)
 		GPU_RenderLine_DispCapture<false>(l);

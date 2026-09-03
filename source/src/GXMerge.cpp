@@ -19,6 +19,7 @@
 */
 
 #include "GXMerge.h"
+#include "gfx3d.h"       // gfx3d_convertedScreen - Phase 4 lazy de-swizzle target
 
 #include <stdio.h>
 #include <string.h>
@@ -50,6 +51,12 @@ static int      s_slotPrevRendered = -1;
 static int      s_slotPresent      = 0;    // latched at Present
 static bool     s_haveAnyCopy      = false;
 static bool     s_gxRanThisFrame   = false;
+// Phase 4: gfx3d_convertedScreen holds a current de-swizzle of the presentable 3D
+// slot.  Cleared at the start of every non-skipped frame and after each new GX
+// copy; set true by GXMerge_MaterializeConverted() so it de-swizzles at most once
+// per frame, and only on frames that actually need the CPU-linear 3D buffer
+// (a fallback band, display capture, savestate).
+static bool     s_convertedValid   = false;
 
 // --- front-bucket 2D output (RGB555, 0x0000 == transparent) -----------------
 static u16 *s_frontScreen = NULL;    // DS_W*DS_H
@@ -199,6 +206,7 @@ void GXMerge_NoteGXRenderCopied(void)
 	s_slotCur ^= 1;                 // next frame renders into the other slot
 	s_haveAnyCopy = true;
 	s_gxRanThisFrame = true;
+	s_convertedValid = false;       // gfx3d_convertedScreen is now stale
 }
 
 void GXMerge_NoteGXRenderSkipped(void)
@@ -224,6 +232,8 @@ void GXMerge_BeginFrame(bool mainIsTop)
 	s_frameArmed = s_active && s_haveAnyCopy;
 	s_frameMainIsTop = mainIsTop;
 	s_gxRanThisFrame = false;
+	s_convertedValid = false;   // re-de-swizzle on demand for this frame
+
 	s_frameBehindContent = false;
 
 	// Phase 2: bands are now decided per scanline (GXMerge_LineMergeable in
@@ -662,10 +672,57 @@ void GXMerge_DrawStatusMarker(f32 x0, f32 y0, f32 w, f32 h)
 }
 
 //------------------------------------------------------------------------------
-// Phase 4 stub
+// Phase 4: lazy readback
 //------------------------------------------------------------------------------
+//
+// The GX 3D scene is normally only ever *sampled* by the sandwich draws, so the
+// per-frame de-swizzle that GXRender.cpp used to run every frame is gone.  A few
+// paths still need the CPU-linear RGBA (6/6/6/5) buffer the legacy compositor
+// consumes via gfx3d_GetLineData{,15bpp}:
+//   - a scanline that falls back to the legacy per-pixel setFinalColor3d path
+//     (window / OBJ-window / mixed blend targets - GPU.cpp GXMerge_LineMergeable),
+//   - display capture of the 3D layer (srcA == 3D),
+//   - savestate (SF_GFX3D chunk).
+// Each of those calls this; it de-swizzles at most once per frame (s_convertedValid)
+// and only from the slot the compositor / sandwich is presenting this frame - the
+// same expression GXMerge_Present uses.
+//
+// This is the exact inverse of GXRender.cpp's old loop: GX_TF_RGBA8 is stored in
+// 4x4 tiles, two 32-byte halves per tile (AR block then GB block).
 
 void GXMerge_MaterializeConverted(void)
 {
-	// Filled in Phase 4.  Until then GXRender.cpp keeps its own de-swizzle loop.
+	if (!s_active || s_convertedValid)
+		return;
+	s_convertedValid = true;
+
+	int slot = s_gxRanThisFrame ? s_slotPrevRendered : s_slotLastRendered;
+	if (slot < 0 || !s_tiled[slot]) {
+		// No 3D has been rendered yet - match the old behaviour of de-swizzling
+		// a zero-cleared buffer.
+		memset(gfx3d_convertedScreen, 0, DS_W * DS_H * 4);
+		DCFlushRange(gfx3d_convertedScreen, DS_W * DS_H * 4);
+		return;
+	}
+
+	const u8 *truc = s_tiled[slot];
+	DCInvalidateRange((void *)truc, DS_W * DS_H * 4);
+
+	u8 *dst = gfx3d_convertedScreen;
+	for (u32 y = 0; y < DS_H; y++) {
+		u32 yshift = (y >> 2) << 12;
+		u32 ymod   = (y % 4) << 2;
+		for (u32 x = 0; x < DS_W; x++) {
+			u32 offset = yshift + ((x >> 2) << 6) + ((ymod + (x % 4)) << 1);
+			u8 a = truc[offset];
+			u8 r = truc[offset + 1];
+			u8 g = truc[offset + 32];
+			u8 b = truc[offset + 33];
+			*dst++ = (a >> 3) & 0x1F;   // 5 bits
+			*dst++ = (b >> 2) & 0x3F;   // 6 bits
+			*dst++ = (g >> 2) & 0x3F;   // 6 bits
+			*dst++ = (r >> 2) & 0x3F;   // 6 bits
+		}
+	}
+	DCFlushRange(gfx3d_convertedScreen, DS_W * DS_H * 4);
 }

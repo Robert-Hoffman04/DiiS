@@ -45,6 +45,7 @@
 #include "readwrite.h"
 #include "GPU.h"
 #include "gfx3d.h"
+#include "GXMerge.h"
 #include "movie.h"
 #include "mic.h"
 #include "MMU_timing.h"
@@ -960,6 +961,9 @@ bool savestate_save (const char *file_name)
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
+	// Hardware-merge mode de-swizzles the GX 3D scene lazily; the SF_GFX3D chunk
+	// (gfx3d_convertedScreen) needs it materialised now.  No-op when merge is off.
+	GXMerge_MaterializeConverted();
 	savestate_WriteChunk(os,1,SF_ARM9);
 	savestate_WriteChunk(os,2,SF_ARM7);
 	savestate_WriteChunk(os,3,cp15_savestate);
