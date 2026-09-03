@@ -1,0 +1,6 @@
+# built benchmark dols and per-build logs
+dols/
+
+# per-run captures. Comparison works off these local dirs directly; to keep one
+# as a baseline in git, `git add -f tools/benchmark/results/<stamp>/results.json`.
+results/
