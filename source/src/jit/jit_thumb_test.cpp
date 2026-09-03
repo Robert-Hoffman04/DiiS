@@ -24,7 +24,10 @@
 #include <stdio.h>
 #include <string.h>
 
-#define JITT_SCRATCH 0x03801000u   // ARM7 WRAM
+#define JITT_SCRATCH 0x03801000u   // ARM7 WRAM: code
+#define JITT_DATA    0x03805000u   // ARM7 WRAM: seeded data
+#define JITT_DATA2   0x03805100u   // ARM7 WRAM: STM/LDM target
+#define JITT_STACK   0x03806000u   // ARM7 WRAM: PUSH/POP stack
 
 struct ThumbVec {
 	const char* name;
@@ -75,6 +78,31 @@ static const ThumbVec kVecs[] = {
 	{ "bcs_taken", {0x2800,0xD202},          2, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 0x20000000 },
 	{ "bgt_taken", {0x2900,0xDC02},          2, {0,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 0 }, // cmp r1,#0 -> gt ; bgt
 	{ "ble_taken", {0x2900,0xDD02},          2, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}, 0 },
+
+	// --- P2b: hi-reg, memory, PUSH/POP, LDM/STM, BX, BL --------------------
+	// data scratch at JITT_DATA (pre-seeded 0x11111111,0x22222222,0x33333333,0x44444444)
+	{ "hi_mov",    {0x4640},                 1, {0,0,0,0,0,0,0,0,0xcafef00d,0,0,0,0,0,0,0}, 0 }, // mov r0,r8
+	{ "hi_add",    {0x4480},                 1, {7,0,0,0,0,0,0,0,10,0,0,0,0,0,0,0}, 0 },         // add r0,r8
+	{ "hi_cmp",    {0x4590},                 1, {0,0,0,0,0,0,0,0,5,0,0,0,0,0,0,0}, 0 },          // cmp r0,r10 ; r0=0,r10=? r10=0
+	{ "str_ldr_w", {0x6013,0x681C},          2, {0,0xabcd1234,JITT_DATA,0,0,0,0,0,0,0,0,0,0,0,0,0} }, // str r3,[r2] ; ldr r4,[r3]?? -> use r2
+	{ "ldr_w",     {0x6810},                 1, {0,JITT_DATA,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },       // ldr r0,[r2,#0]
+	{ "ldrb",      {0x7810},                 1, {0,JITT_DATA,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },       // ldrb r0,[r2,#0]
+	{ "ldrh",      {0x8810},                 1, {0,JITT_DATA,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },       // ldrh r0,[r2,#0]
+	{ "str_w",     {0x6050,0x6810},          2, {0,JITT_DATA,0,0xdeadbeef,0,0,0,0,0,0,0,0,0,0,0,0} }, // str r0? 0x6050: str r0,[r2,#4]; then ldr r0,[r2,#4]
+	{ "ldr_regoff",{0x5888},                 1, {0,JITT_DATA,4,0,0,0,0,0,0,0,0,0,0,0,0,0} },      // ldr r0,[r1,r2]
+	{ "ldrsb",     {0x5688},                 1, {0,JITT_DATA,3,0,0,0,0,0,0,0,0,0,0,0,0,0} },      // ldrsb r0,[r1,r2]  (byte 0x44 -> +0x44)
+	{ "ldr_pcrel", {0x4801},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },             // ldr r0,[pc,#4]
+	{ "ldr_sprel", {0x9802},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,JITT_DATA,0,0} },     // ldr r0,[sp,#8]
+	{ "str_sprel", {0x9200,0x9A00},          2, {0,0,0xfeedface,0,0,0,0,0,0,0,0,0,0,JITT_DATA2,0,0} }, // str r2,[sp,#0]; ldr r2,[sp,#0]
+	{ "add_pc",    {0xA004},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },             // add r0,pc,#16
+	{ "add_sp",    {0xA810},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,0x2000,0,0} },        // add r0,sp,#64
+	{ "adj_sp_p",  {0xB004},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,0x1000,0,0} },        // add sp,#16
+	{ "adj_sp_m",  {0xB084},                 1, {0,0,0,0,0,0,0,0,0,0,0,0,0,0x1000,0,0} },        // sub sp,#16
+	{ "push_pop",  {0xB407,0x2000,0xBC07},   3, {0xa,0xb,0xc,0,0,0,0,0,0,0,0,0,0,JITT_STACK,0,0} }, // push{r0-r2}; mov r0,#0; pop{r0-r2}
+	{ "push_lr_pop_pc",{0xB500,0x46C0,0xBD00},3,{0,0,0,0,0,0,0,0,0,0,0,0,0,JITT_STACK,JITT_SCRATCH+9,0} }, // push{lr}; nop; pop{pc}
+	{ "stmia_ldmia",{0xC10C,0xCC60},         2, {0,JITT_DATA2,0xdddd,0xeeee,JITT_DATA2,0,0,0,0,0,0,0,0,0,0,0} }, // stmia r1!,{r2,r3} ; ldmia r4!,{r5,r6}
+	{ "bx_r3",     {0x4718},                 1, {0,0,0,JITT_SCRATCH+0x21,0,0,0,0,0,0,0,0,0,0,0,0} }, // bx r3 (thumb target)
+	{ "bl_call",   {0xF000,0xF803},          2, {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0} },             // bl +6
 };
 
 static void primeThumb(u32 pc)
@@ -105,6 +133,12 @@ int jitThumbSelfTest()
 		for (int j = 0; j < v.nreal; j++)
 			_MMU_write16<ARMCPU_ARM7>(JITT_SCRATCH + j * 2, v.code[j]);
 		_MMU_write16<ARMCPU_ARM7>(JITT_SCRATCH + v.nreal * 2, 0xDF00); // SWI = trace terminator
+
+		// (re)seed data scratch so both runs start from the same memory
+		for (int k = 0; k < 8; k++) {
+			_MMU_write32<ARMCPU_ARM7>(JITT_DATA  + k * 4, 0x11111111u * (k + 1));
+			_MMU_write32<ARMCPU_ARM7>(JITT_DATA2 + k * 4, 0xA0000000u | k);
+		}
 
 		// ---- JIT ----
 		jitCache.flushCache();

@@ -101,6 +101,16 @@ struct JitTraceCtx {
 	void flushDirtyRegisters();                   // stores + clears dirty
 	void emitDirtyRegisterFlush();                // stores, leaves dirty set
 	void emitEagerFlush();
+	void invalidateRegCache();                    // drop all host-reg allocations
+
+	// ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite ----
+	// eaReg / valReg are host scratch (r10..r12). r3 (cross-block cycle accum)
+	// and the packed flags are spilled/reloaded around the call.
+	void emitMemPrologue();                       // flush state, save r3, drop r6
+	void emitMemEpilogue();                       // restore r3
+	void emitSlowLoad(u8 destReg, u8 eaReg, u32 size, bool signExtend);
+	void emitSlowStore(u8 eaReg, u8 valReg, u32 size);
+	void emitSmcCheckAndBail(u8 eaReg);           // store paths: page-flag guard
 
 	// ---- exits ----
 	void emitAddCycles(u32 n);   // r3 += n  (compile-time-known)

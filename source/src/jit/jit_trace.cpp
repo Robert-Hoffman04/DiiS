@@ -217,6 +217,83 @@ void JitTraceCtx::emitEagerFlush()
 	flushDirtyRegisters();
 }
 
+void JitTraceCtx::invalidateRegCache()
+{
+	for (int i = 0; i < 15; i++) { regCache[i].allocated = false; regCache[i].dirty = false; }
+	allocatedHostRegsMask = 0;
+}
+
+// ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite --------
+// r3 holds the cross-block cycle accumulator and r6 the packed flags; both are
+// PPC-EABI volatile, so they're spilled/dropped around the call. Guest regs
+// (r14..r31) are non-volatile and survive it.
+void JitTraceCtx::emitMemPrologue()
+{
+	flushDirtyFlags();
+	flushDirtyRegisters();
+	*emitPtr++ = PPC_STW(PPC_R29, 14, 15 * 4);   // guest PC -> gpr[15]
+	*emitPtr++ = PPC_STW(PPC_R3, 1, 92);         // save cycle accumulator
+	flagsLoaded = false;                          // r6 clobbered by the call
+}
+
+void JitTraceCtx::emitMemEpilogue()
+{
+	*emitPtr++ = PPC_LWZ(PPC_R3, 1, 92);
+}
+
+void JitTraceCtx::emitSlowLoad(u8 destReg, u8 eaReg, u32 size, bool signExtend)
+{
+	u32 fn = (u32)cpu.slowRead;
+	*emitPtr++ = PPC_OR(PPC_R3, eaReg, eaReg);            // arg1 = addr
+	*emitPtr++ = PPC_LI(PPC_R4, (s32)size);               // arg2 = size
+	*emitPtr++ = PPC_LIS(PPC_R12, fn >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+	*emitPtr++ = PPC_MTCTR(PPC_R12);
+	*emitPtr++ = PPC_BCTRL();
+	*emitPtr++ = PPC_OR(destReg, PPC_R3, PPC_R3);
+	if (signExtend && size == 1) *emitPtr++ = PPC_EXTSB(destReg, destReg);
+	if (signExtend && size == 2) *emitPtr++ = PPC_EXTSH(destReg, destReg);
+}
+
+void JitTraceCtx::emitSlowStore(u8 eaReg, u8 valReg, u32 size)
+{
+	u32 fn = (u32)cpu.slowWrite;
+	*emitPtr++ = PPC_OR(PPC_R3, eaReg, eaReg);            // arg1 = addr
+	*emitPtr++ = PPC_OR(PPC_R4, valReg, valReg);          // arg2 = value
+	*emitPtr++ = PPC_LI(PPC_R5, (s32)size);               // arg3 = size
+	*emitPtr++ = PPC_LIS(PPC_R12, fn >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+	*emitPtr++ = PPC_MTCTR(PPC_R12);
+	*emitPtr++ = PPC_BCTRL();
+}
+
+// Store paths: if a compiled block currently lives on the written 1KB page,
+// bail (resume PC = this instruction) with smcHit set so the caller can call
+// JitCpuProfile::smcInvalidate. eaReg must still be live; state must already be
+// flushed (emitMemPrologue). Does not end the block -- the not-taken path
+// continues compiling.
+void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
+{
+	u32 fp = (u32)cache.smcPageFlags;
+	*emitPtr++ = PPC_RLWINM(PPC_R11, eaReg, 22, 16, 31);   // r11 = (EA>>10) & 0xFFFF
+	*emitPtr++ = PPC_LIS(PPC_R10, fp >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, fp & 0xFFFF);
+	*emitPtr++ = PPC_LBZX(PPC_R10, PPC_R10, PPC_R11);      // r10 = smcPageFlags[page]
+	*emitPtr++ = PPC_CMPWI(0, PPC_R10, 0);
+	u32* skip = emitPtr++;
+
+	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);
+	*emitPtr++ = PPC_STW(eaReg, PPC_R10, 20);              // out->smcAddress = EA
+	emitAddCycles(cyclesAccum);
+	emitResultMetadata(instrCount, 1, 1);                  // bailedOut=1, smcHit=1
+	*emitPtr++ = PPC_LIS(PPC_R4, currentPC >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, currentPC & 0xFFFF);
+	s32 ret = (s32)((u8*)cache.linkerReturnAddress - (u8*)emitPtr);
+	*emitPtr++ = PPC_B(ret);
+
+	*skip = PPC_BEQ((u32)((emitPtr - skip) * 4));
+}
+
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)
 {
 	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);           // outResult*

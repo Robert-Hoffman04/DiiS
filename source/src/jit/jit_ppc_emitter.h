@@ -232,6 +232,7 @@
 // Dynamic Register Branching
 #define PPC_MTCTR(rS)          ((31 << 26) | ((rS) << 21) | (288 << 11) | (467 << 1))
 #define PPC_BCTR()             ((19 << 26) | (20 << 21) | (528 << 1))
+#define PPC_BCTRL()            ((19 << 26) | (20 << 21) | (528 << 1) | 1)  // call via CTR
 #define PPC_BL(offset)         ((18 << 26) | ((offset) & 0x3FFFFFC) | 1)
 
 #endif // JIT_PPC_EMITTER_H
