@@ -145,7 +145,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 				*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
 				u32* toArm = emitPtr++;                                 // BEQ -> ARM bail
 				*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);   // & ~1
-				ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+				ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode), /*targetThumb=*/true);
 				*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));
 				ctx.emitInterpreterBail(ctx.instrCount);              // bit0==0: ARM switch
 				ctx.instrCount++; ctx.currentPC += 2;
@@ -521,7 +521,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			u32* toArm = emitPtr++;                                  // BEQ -> ARM-mode path
 			// bit0==1: stay THUMB (previously the only path taken)
 			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);    // & ~1
-			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode), /*targetThumb=*/true);
 			*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));
 			// bit0==0: switch to ARM. Clear CPSR.T so the C++ resume path
 			// (jit_exec.cpp / jit_differential.cpp) sees T==0 and uses
@@ -532,7 +532,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 			ctx.flagsDirty = true;
 			ctx.flushDirtyFlags();
-			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode), /*targetThumb=*/false);
 
 			ctx.instrCount++; ctx.currentPC += 2;
 			ctx.endBlock = true; ctx.blockTerminatedEarly = true;
@@ -707,7 +707,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 			ctx.flagsDirty = true;
 			ctx.flushDirtyFlags();
-			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode), /*targetThumb=*/false);
 		}
 
 		ctx.instrCount += 2; ctx.currentPC += 4;

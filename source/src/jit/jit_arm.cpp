@@ -459,7 +459,7 @@ void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
 	emitAlu(ctx, aluOp, /*S=*/false, /*testOnly=*/false, isLogical, hRn, PPC_R12, o2);
 
 	// result in PPC_R12 -> dynamic exit (no mask, no T change: stays ARM)
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForArm(op));
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForArm(op), /*targetThumb=*/false);
 	ctx.instrCount++;
 	ctx.currentPC += 4;
 	ctx.endBlock = true;
@@ -629,12 +629,12 @@ void emitLdrPcExit(JitTraceCtx& ctx, u8 valReg, u32 op)
 	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 	ctx.flagsDirty = true;
 	ctx.flushDirtyFlags();
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/true);
 
 	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
 	// bit0 == 0: stay ARM. OP_LDR still masks R15 &= 0xFFFFFFFE.
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);       // word & ~1
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;
@@ -920,12 +920,12 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 	ctx.flagsDirty = true;
 	ctx.flushDirtyFlags();
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/true);
 
 	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
 	// bit0 == 0: stay ARM (CPSR.T already 0)
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);      // & ~3
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;
@@ -1058,11 +1058,11 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 	ctx.flagsDirty = true;
 	ctx.flushDirtyFlags();
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/true);
 
 	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);           // & ~3 (CPSR.T already 0)
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;
@@ -1214,7 +1214,7 @@ void emitBlxImm(JitTraceCtx& ctx, u32 op)
 	ctx.flagsDirty = true;
 
 	emitLoadImm32(p, PPC_R12, target);
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, 3);     // OP_B / OP_BL return 3
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, 3, /*targetThumb=*/true);   // OP_B / OP_BL return 3
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;

@@ -95,6 +95,19 @@ class JITCache {
 
 		u32* linkerStubAddress;
 		u32* linkerReturnAddress;
+		// A4-P5: guarded dynamic-exit dispatch. BX/LDR-pc/POP{pc}/BLX-style exits
+		// have a runtime-computed target (can't self-patch a fixed branch), but
+		// each exit site's RESULTING mode is still a compile-time constant (the
+		// branch that got here already decided THUMB vs ARM). These two stubs do
+		// the same hash-lookup-and-jump as linkerStubAddress but never patch
+		// anything, and additionally verify the found block's cached mode bit
+		// matches the mode this exit expects before jumping -- a wrong-mode hit
+		// (e.g. a hash slot recycled for the other ISA at the same PC) falls
+		// through to linkerReturnAddress exactly like any other miss, so this is
+		// pure guarded speed-up: worst case is identical to today's unconditional
+		// return-to-C, never a wrong-mode jump. See emitDynamicExit().
+		u32* linkerStubDynamicThumbAddress;
+		u32* linkerStubDynamicArmAddress;
 		u8* smcPageFlags;
 
 		void initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr,

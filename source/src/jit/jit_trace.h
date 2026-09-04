@@ -84,6 +84,26 @@
 #define JIT_ENABLE_CHAINING 1
 #endif
 
+// A4-P5: guarded dynamic-exit dispatch. A4-P1's chaining only ever covered
+// static-target exits (B/BL, non-S data-proc->pc, fall-through) -- BX, LDR pc,
+// POP{...,pc} and BLX(imm/reg) all deliberately keep returning to C every
+// single time, because a dynamic exit's *target* is data-dependent. But its
+// *mode* (THUMB vs ARM) is still a compile-time constant at every call site
+// (see emitDynamicExit's callers), so a guarded inline cache is sound: redo
+// the hash lookup fresh on every visit (no self-patch, since there is nothing
+// fixed to patch), verify address AND cached mode both match, and only then
+// jump straight into the target block -- any mismatch falls through to
+// linkerReturnAddress exactly like today. This matters more than it sounds:
+// profiling Phantom Hourglass's boot spin-loop (a compile-time-fixed
+// 347-block footprint that A4-P1's chaining left untouched) found its hot
+// path is almost entirely BX-terminated leaf calls -- every single iteration
+// paid the full ExecuteJITTrace C round trip regardless of chaining, which is
+// exactly the "0 bench frames" A4-P1 couldn't explain. See
+// JITCache::linkerStubDynamicThumbAddress / ...ArmAddress (jit_cache.cpp).
+#ifndef JIT_ENABLE_DYNAMIC_CHAINING
+#define JIT_ENABLE_DYNAMIC_CHAINING 1
+#endif
+
 // Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top
 // nibble, conventional bits 31..28) -- which is exactly ARM CPSR's N/Z/C/V
 // layout, so PPC_REG_FLAGS can just hold the whole CPSR word.
@@ -179,8 +199,12 @@ struct JitTraceCtx {
 	// Static-target exit: chain through the linker stub (self-patches on a hit).
 	void emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles);
 	// Dynamic-target exit: pcReg holds the runtime PC (already aligned). pcReg
-	// must be a scratch (r10..r12) that survives the register flush.
-	void emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles);
+	// must be a scratch (r10..r12) that survives the register flush. targetThumb
+	// is the resume ISA this exit path leads to -- always a compile-time
+	// constant at the call site (the branch already decided it; see B6/B7c/B4's
+	// two-path bit0 dispatch), used both for the pipeline-register (r29) offset
+	// and, with JIT_ENABLE_DYNAMIC_CHAINING, to pick the matching guarded stub.
+	void emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb);
 	// Bail to the interpreter at ctx.currentPC (this instruction re-run there).
 	void emitInterpreterBail(u32 metaCount);
 

@@ -79,6 +79,8 @@ JITCache::JITCache() {
 	smcPageFlags = nullptr;
 	linkerStubAddress = nullptr;
 	linkerReturnAddress = nullptr;
+	linkerStubDynamicThumbAddress = nullptr;
+	linkerStubDynamicArmAddress = nullptr;
 	arenaOffset = 0;
 	arenaSize = 0;
 	isInitialized = false;
@@ -196,6 +198,59 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bo
 	return block;
 }
 
+// A4-P5: emit one guarded dynamic-dispatch stub (see jit_cache.h). Same hash
+// calc as the static linker stub's steps 1-3 (must match getBlock() exactly),
+// plus an extra mode-bit compare, no self-patching, no BL/mflr trick -- every
+// visit re-does the lookup fresh since the call site's target genuinely
+// varies. `expectThumb` picks which way the mode-bit check must go; the caller
+// (emitDynamicExit) already knows this at compile time for every exit site, so
+// there is no runtime mode test here, just two fixed-expectation stub bodies.
+static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
+                                   u32 maskBegin, u32* linkerReturnAddress,
+                                   bool expectThumb)
+{
+	u32* entry = emitPtr;
+
+	*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
+
+	*emitPtr++ = PPC_SRWI(PPC_R11, PPC_R4, 1);
+	*emitPtr++ = PPC_SRWI(PPC_R12, PPC_R4, 13);
+	*emitPtr++ = PPC_XOR(PPC_R11, PPC_R11, PPC_R12);
+	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 4, maskBegin, 27);
+	*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
+
+	// Guard 1: PC collision (hash-slot occupant is a different address)
+	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 0);
+	*emitPtr++ = PPC_CMPW(0, PPC_R12, PPC_R4);
+	u32* missPc = emitPtr++;
+
+	// Guard 2: mode mismatch (right address, wrong ISA cached there)
+	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 4);              // length (thumb bit + count)
+	*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 1, 31, 31);   // isolate bit31 -> 0/1
+	*emitPtr++ = PPC_CMPWI(0, PPC_R12, expectThumb ? 1 : 0);
+	u32* missMode = emitPtr++;
+
+	// Guard 3: uncompiled / "don't JIT" fallback marker (execute == nullptr)
+	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 8);
+	*emitPtr++ = PPC_CMPWI(0, PPC_R12, 0);
+	u32* missExec = emitPtr++;
+
+	// Hit: jump straight into the target block's arena code. r29/r4/flags/regs
+	// were already set up by emitDynamicExit before branching here -- no
+	// self-patch needed, this call site's target is data-dependent.
+	*emitPtr++ = PPC_MTCTR(PPC_R12);
+	*emitPtr++ = PPC_BCTR();
+
+	u32* fallback = emitPtr;
+	*missPc   = PPC_BNE((u32)((fallback - missPc) * 4));
+	*missMode = PPC_BNE((u32)((fallback - missMode) * 4));
+	*missExec = PPC_BEQ((u32)((fallback - missExec) * 4));
+	{ s32 o = (s32)((u8*)linkerReturnAddress - (u8*)emitPtr); *emitPtr++ = PPC_B(o); }
+
+	return entry;
+}
+
 void JITCache::flushCache() {
 	PROFILER_CACHE_FLUSH_START();
 	JIT_LOG_CACHE_FLUSH();
@@ -274,6 +329,14 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, (u32)&ExecuteJITTrace_Return & 0xFFFF);
 		*emitPtr++ = PPC_MTCTR(PPC_R12);
 		*emitPtr++ = PPC_BCTR();
+
+		// A4-P5: the two guarded dynamic-dispatch stubs, right after the
+		// static one (same hash calc inputs still in scope: blockTable,
+		// maskBegin, and linkerReturnAddress == missTarget above).
+		linkerStubDynamicThumbAddress =
+			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/true);
+		linkerStubDynamicArmAddress =
+			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/false);
 
 		arenaOffset = ((emitPtr - jitArena) * sizeof(u32) + 31) & ~31;
 

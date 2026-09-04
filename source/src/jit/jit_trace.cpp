@@ -367,17 +367,30 @@ void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
 	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
 }
 
-void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles)
+void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb)
 {
 	u32*& p = emitPtr;
 	emitAddCycles(cyclesAccum + termCycles);
 	flushDirtyFlags();
 	flushDirtyRegisters();
 	emitResultMetadata(metaCount, 0);
-	*p++ = PPC_OR(PPC_R29, pcReg, pcReg);
+	// r29 (guest PC / GBA R15) needs the *pipeline* value, not the bare target
+	// -- the interpreter-pipeline convention emitStaticExit also follows -- so
+	// a guarded-dispatch hit lands in the next block with r29 already correct
+	// and never has to reload it from memory (r29 is always-resident, never
+	// spilled/reloaded like r15..r28's lazy cache).
+	*p++ = PPC_ADDI(PPC_R29, pcReg, targetThumb ? 4 : 8);
 	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
+#if JIT_ENABLE_DYNAMIC_CHAINING
+	{
+		u32* stub = targetThumb ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
+		s32 o = (s32)((u8*)stub - (u8*)p);
+		*p++ = PPC_B(o);
+	}
+#else
 	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
 	*p++ = PPC_B(retOff);
+#endif
 }
 
 void JitTraceCtx::emitInterpreterBail(u32 metaCount)
