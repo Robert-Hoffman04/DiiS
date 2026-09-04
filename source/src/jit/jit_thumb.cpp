@@ -23,57 +23,9 @@
 #include <stdio.h>
 #endif
 
-// --- exit helpers --------------------------------------------------------
-// Static-target exit: chain through the linker stub (self-patches on a hit).
-static void emitStaticExit(JitTraceCtx& ctx, u32 targetPC, u32 metaCount, u32 termCycles)
-{
-	u32*& p = ctx.emitPtr;
-	JITCache& cache = ctx.cache;
-	ctx.emitAddCycles(ctx.cyclesAccum + termCycles);
-	ctx.flushDirtyFlags();
-	ctx.flushDirtyRegisters();
-	ctx.emitResultMetadata(metaCount, 0);
-	*p++ = PPC_LIS(PPC_R29, (targetPC + 4) >> 16);
-	*p++ = PPC_ORI(PPC_R29, PPC_R29, (targetPC + 4) & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R4, targetPC >> 16);
-	*p++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
-#if JIT_ENABLE_CHAINING
-	{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)p); *p++ = PPC_BL(o); }
-#endif
-	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
-}
-
-// Dynamic-target exit: `pcReg` holds the runtime thumb PC (already & ~1).
-// Returns to the C++ dispatcher (no chaining -- target unknown at compile time).
-// pcReg must survive the register flush (use a scratch: r10..r12).
-static void emitDynamicExit(JitTraceCtx& ctx, u8 pcReg, u32 metaCount, u32 termCycles)
-{
-	u32*& p = ctx.emitPtr;
-	JITCache& cache = ctx.cache;
-	ctx.emitAddCycles(ctx.cyclesAccum + termCycles);
-	ctx.flushDirtyFlags();
-	ctx.flushDirtyRegisters();
-	ctx.emitResultMetadata(metaCount, 0);
-	*p++ = PPC_OR(PPC_R29, pcReg, pcReg);
-	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
-	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
-	*p++ = PPC_B(retOff);
-}
-
-// Bail to the interpreter at ctx.currentPC (this instruction re-run there).
-static void emitInterpreterBail(JitTraceCtx& ctx, u32 metaCount)
-{
-	u32*& p = ctx.emitPtr;
-	JITCache& cache = ctx.cache;
-	ctx.flushDirtyFlags();
-	ctx.flushDirtyRegisters();
-	ctx.emitAddCycles(ctx.cyclesAccum);
-	ctx.emitResultMetadata(metaCount, 1);
-	*p++ = PPC_LIS(PPC_R4, ctx.currentPC >> 16);
-	*p++ = PPC_ORI(PPC_R4, PPC_R4, ctx.currentPC & 0xFFFF);
-	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
-	*p++ = PPC_B(retOff);
-}
+// The block-exit helpers (emitStaticExit / emitDynamicExit / emitInterpreterBail)
+// and the ARM predication helper (emitEvalCond) are JitTraceCtx methods shared
+// with jit_arm.cpp -- see jit_trace.cpp.
 
 void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 {
@@ -193,9 +145,9 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 				*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
 				u32* toArm = emitPtr++;                                 // BEQ -> ARM bail
 				*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);   // & ~1
-				emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+				ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
 				*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));
-				emitInterpreterBail(ctx, ctx.instrCount);              // bit0==0: ARM switch
+				ctx.emitInterpreterBail(ctx.instrCount);              // bit0==0: ARM switch
 				ctx.instrCount++; ctx.currentPC += 2;
 				ctx.endBlock = true; ctx.blockTerminatedEarly = true;
 				break;
@@ -569,7 +521,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			u32* toArm = emitPtr++;                                  // BEQ -> ARM-mode path
 			// bit0==1: stay THUMB (previously the only path taken)
 			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);    // & ~1
-			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
 			*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));
 			// bit0==0: switch to ARM. Clear CPSR.T so the C++ resume path
 			// (jit_exec.cpp / jit_differential.cpp) sees T==0 and uses
@@ -580,7 +532,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 			ctx.flagsDirty = true;
 			ctx.flushDirtyFlags();
-			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
 
 			ctx.instrCount++; ctx.currentPC += 2;
 			ctx.endBlock = true; ctx.blockTerminatedEarly = true;
@@ -712,7 +664,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		s32 sOff = (s32)((opcode & 0x07FF) << 21);
 		sOff >>= 20;
 		const u32 targetPC = currentPC + 4 + sOff;
-		emitStaticExit(ctx, targetPC, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
+		ctx.emitStaticExit(targetPC, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode));
 		ctx.instrCount++; ctx.currentPC += 2;
 		ctx.endBlock = true; ctx.blockTerminatedEarly = true;
 		break;
@@ -737,7 +689,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			const u8 hLR = ctx.writeReg(14, true, lockedMask);
 			*emitPtr++ = PPC_LIS(hLR, retLR >> 16);
 			*emitPtr++ = PPC_ORI(hLR, hLR, retLR & 0xFFFF);
-			emitStaticExit(ctx, targetPC, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitStaticExit(targetPC, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
 		} else {
 			// BLX (imm): word-align the target, switch to ARM. The next block is
 			// ARM mode -- until A5's ARM front-end lands the block just exits and
@@ -755,7 +707,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
 			ctx.flagsDirty = true;
 			ctx.flushDirtyFlags();
-			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
+			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
 		}
 
 		ctx.instrCount += 2; ctx.currentPC += 4;

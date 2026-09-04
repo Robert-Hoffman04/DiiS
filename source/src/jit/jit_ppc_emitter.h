@@ -178,6 +178,8 @@
 #define PPC_LIS(rD, val)		((15 << 26) | ((rD) << 21) | (0 << 16) | ((val) & 0xFFFF))
 #define PPC_ORI(rA, rS, val)	((24 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))
 #define PPC_ORIS(rA, rS, val)	((25 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))
+#define PPC_XORI(rA, rS, val)	((26 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))
+#define PPC_ANDI_(rA, rS, val)	((28 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))  // andi. (sets CR0)
 #define PPC_ADDIC(rD, rA, imm)	((13 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))
 
 // Branches

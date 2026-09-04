@@ -59,9 +59,20 @@ typedef void (*JITBlockFunc)();
 // Force 16-byte alignment to allow fast PowerPC bit-shifting
 struct __attribute__((aligned(16))) BasicBlock {
 	u32 startPC;
+	// bits 0..30: guest instruction count (0 == uncompiled/killed slot, 1 with
+	//   execute==nullptr == deliberate "don't JIT" marker). bit 31: set if the
+	//   block was compiled in THUMB mode. ARM7/ARM9 share PC-keyed tables and a
+	//   guest address can (across an ITCM/overlay reload) be legitimately
+	//   executed in either ISA; a mode-mismatched hit must recompile, not run
+	//   the wrong decoder's code. Packed here rather than as a new field to keep
+	//   the struct at 16 bytes / the table at 1 MiB.
 	u32 length;
 	JITBlockFunc execute;
     BasicBlock* nextSMC; // Intrusive pointer for SMC bucket chain
+
+	inline u32  insnCount()     const { return length & 0x7FFFFFFFu; }
+	inline bool thumbCompiled() const { return (length & 0x80000000u) != 0; }
+	inline u32  byteLength()    const { return insnCount() * (thumbCompiled() ? 2u : 4u); }
 };
 
 class JITCache {
@@ -92,7 +103,7 @@ class JITCache {
 
 		u32* allocateJITMemory(size_t numBytes);
 		void rewindJITMemory(size_t numBytes);
-		BasicBlock* registerBlock(u32 pc, u32 length, JITBlockFunc execute);
+		BasicBlock* registerBlock(u32 pc, u32 length, JITBlockFunc execute, bool thumb = true);
 		inline size_t getArenaOffset() const { return arenaOffset; }
 		void flushCache();
 		void invalidateSMCTarget(u32 targetEA);

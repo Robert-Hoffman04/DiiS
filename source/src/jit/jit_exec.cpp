@@ -53,7 +53,9 @@ static void jitMaybeReport()
 // be reported before A3's benchmark. Dumped to sd:/jit.log with the other
 // telemetry; DESMUME_JIT_TRACE_FIRST-gated, zero cost otherwise.
 #ifdef DESMUME_JIT_TRACE_FIRST
-u64 g_jit9Steps = 0, g_jit9Arm = 0, g_jit9ThumbFar = 0, g_jit9ThumbOk = 0;
+// per-ARM9-step tally: arm-jit / thumb-jit == steps the respective front-end can
+// take; region-out == a mode whose canEnter*() said no (uncompilable address).
+u64 g_jit9Steps = 0, g_jit9ArmOk = 0, g_jit9ThumbOk = 0, g_jit9RegionOut = 0;
 static void jit9ProfileReport()
 {
 	static u64 s_last = 0;
@@ -61,11 +63,11 @@ static void jit9ProfileReport()
 	s_last = g_jit9Steps;
 	const u64 t = g_jit9Steps ? g_jit9Steps : 1;
 	FILE* f = fopen("sd:/jit.log", "a");
-	if (f) { fprintf(f, "[jit] arm9 mix: %llu steps  arm=%llu%%  thumb-region-out=%llu%%  thumb-jit=%llu%%\n",
+	if (f) { fprintf(f, "[jit] arm9 mix: %llu steps  arm-jit=%llu%%  thumb-jit=%llu%%  region-out=%llu%%\n",
 	                 (unsigned long long)g_jit9Steps,
-	                 (unsigned long long)(g_jit9Arm * 100 / t),
-	                 (unsigned long long)(g_jit9ThumbFar * 100 / t),
-	                 (unsigned long long)(g_jit9ThumbOk * 100 / t));
+	                 (unsigned long long)(g_jit9ArmOk * 100 / t),
+	                 (unsigned long long)(g_jit9ThumbOk * 100 / t),
+	                 (unsigned long long)(g_jit9RegionOut * 100 / t));
 	         fclose(f); }
 }
 #endif
@@ -84,8 +86,8 @@ u32 jitRunArm7()
 	const u32 pc = cpu.instruct_adr;
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
-	if (!b || (b->execute == nullptr && b->length == 0))
-		b = jitCompileTrace(pc, jitCacheArm7, *prof);
+	if (!b || (b->execute == nullptr && b->insnCount() == 0) || !b->thumbCompiled())
+		b = jitCompileTrace(pc, jitCacheArm7, *prof, /*thumb=*/true);
 	if (!b || b->execute == nullptr) return 0;     // uncompilable / "don't JIT" -> interpreter
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
@@ -108,7 +110,7 @@ u32 jitRunArm7()
 		FILE* f = fopen("sd:/jit.log", "a");
 		if (f) { fprintf(f, "[jit] blk pc=%08x op=%04x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
 		                 (unsigned)pc, (unsigned)prof->fetch16(pc & ~1u),
-		                 (unsigned)b->length, (unsigned)r.instructions,
+		                 (unsigned)b->insnCount(), (unsigned)r.instructions,
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
 	}
@@ -121,7 +123,7 @@ u32 jitRunArm7()
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		if (b->length == 1) jitCacheArm7.registerBlock(pc, 1, nullptr);
+		if (b->insnCount() == 1) jitCacheArm7.registerBlock(pc, 1, nullptr, /*thumb=*/true);
 		cpu.R[15] = pc + 4;
 		g_jitBail0++;
 		jitMaybeReport();
@@ -178,28 +180,29 @@ u32 jitRunArm9()
 
 	armcpu_t& cpu = NDS_ARM9;
 	const u32 pc = cpu.instruct_adr;
+	const bool thumb = (cpu.CPSR.bits.T != 0);
+	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
 
 #ifdef DESMUME_JIT_TRACE_FIRST
 	g_jit9Steps++;
-	if (cpu.CPSR.bits.T == 0)            g_jit9Arm++;
-	else if (!prof->canEnterThumb(pc))   g_jit9ThumbFar++;
-	else                                 g_jit9ThumbOk++;
+	if (!canEnter)   g_jit9RegionOut++;
+	else if (thumb)  g_jit9ThumbOk++;
+	else             g_jit9ArmOk++;
 	jit9ProfileReport();
 #endif
 
-	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (A5)
-	if (!prof->canEnterThumb(pc)) return 0;        // uncompilable region
+	if (!canEnter) return 0;                       // uncompilable region / ARM off
 
 	BasicBlock* b = jitCacheArm9.getBlock(pc);
-	if (!b || (b->execute == nullptr && b->length == 0))
-		b = jitCompileTrace(pc, jitCacheArm9, *prof);
+	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
+		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
 	if (!b || b->execute == nullptr) return 0;
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm9Checked(&cpu, b, pc);
 #endif
 
-	cpu.R[15] = pc + 4;
+	cpu.R[15] = pc + (thumb ? 4 : 8);
 	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };
 
 	JITResult r;
@@ -210,8 +213,8 @@ u32 jitRunArm9()
 		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
-		if (b->length == 1) jitCacheArm9.registerBlock(pc, 1, nullptr);
-		cpu.R[15] = pc + 4;
+		if (b->insnCount() == 1) jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
+		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
 	}
 

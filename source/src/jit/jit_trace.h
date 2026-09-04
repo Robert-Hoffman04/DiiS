@@ -47,6 +47,13 @@
 // the hand-measured worst case.
 #define JIT_MAX_INSTR_RESERVE_WORDS 300
 
+// ARM (32-bit) worst case is heavier than THUMB: LDM/STM with a full {r0-r15}
+// list is 16 registers each ~10 words (address calc + emitSlow* C-call + gpr
+// store/load) plus the mem prologue/epilogue, SMC guard and predication
+// wrapper. ~1.4x the THUMB reserve. Used by jitCompileTrace() when the block is
+// ARM mode; see JIT_MAX_INSTR_RESERVE_WORDS.
+#define JIT_MAX_INSTR_RESERVE_WORDS_ARM 440
+
 // Block-to-block chaining (self-patching linker stub). Off for P3: one block
 // per armInnerLoop turn keeps the ARM9/ARM7 interleave fine-grained. Revisit
 // in P6 ("block chaining tuning").
@@ -94,6 +101,9 @@ struct JitTraceCtx {
 	u32  currentPC;
 	u32  instrCount;
 	u32  cyclesAccum;          // running compile-time cycle sum for this block
+	bool thumbMode;            // true: THUMB front-end (jit_thumb.cpp, 16-bit,
+	                           //   PC+=2). false: ARM front-end (jit_arm.cpp,
+	                           //   32-bit, PC+=4). Set by jitCompileTrace().
 	bool endBlock;
 	bool blockTerminatedEarly; // a hard exit was emitted; skip the default epilogue
 
@@ -138,17 +148,30 @@ struct JitTraceCtx {
 	void emitSlowStore(u8 eaReg, u8 valReg, u32 size);
 	void emitSmcCheckAndBail(u8 eaReg);           // store paths: page-flag guard
 
-	// ---- exits ----
+	// ---- exits (shared by jit_thumb.cpp and jit_arm.cpp) ----
 	void emitAddCycles(u32 n);   // r3 += n  (compile-time-known)
 	void emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit = 0);
 	void registerBailout(u32* branchPtr, JitBailoutCond cond);
+
+	// Static-target exit: chain through the linker stub (self-patches on a hit).
+	void emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles);
+	// Dynamic-target exit: pcReg holds the runtime PC (already aligned). pcReg
+	// must be a scratch (r10..r12) that survives the register flush.
+	void emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles);
+	// Bail to the interpreter at ctx.currentPC (this instruction re-run there).
+	void emitInterpreterBail(u32 metaCount);
+
+	// ARM predication: emit a 0/1 "condition holds" value into PPC_R11 for one of
+	// the 14 real ARM condition codes (0..13; not AL/NV). Clobbers r10, r11.
+	void emitEvalCond(u8 cond);
 };
 
-// Emit one THUMB instruction at ctx.currentPC (opcode already fetched). Sets
-// ctx.endBlock when the trace must stop here. Implemented in jit_thumb.cpp.
-void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode);
+// Emit one guest instruction at ctx.currentPC (opcode already fetched). Sets
+// ctx.endBlock when the trace must stop here.
+void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode);   // jit_thumb.cpp
+void jitArmEmitOne(JitTraceCtx& ctx, u32 opcode);     // jit_arm.cpp
 
-BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu);
+BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb);
 
 #endif // DESMUME_JIT_ARM7
 

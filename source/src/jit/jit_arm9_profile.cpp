@@ -81,7 +81,21 @@ static bool arm9_canEnterThumb(u32 pc)
 	if ((pc & 0xFFFF0000u) == 0xFFFF0000u)  return true;   // ARM9 BIOS
 	return false;
 }
-static bool arm9_canEnterArm(u32 pc)     { (void)pc; return false; }    // A5
+// ARM-mode entry: same region rule as canEnterThumb -- compile-time fetch and
+// interpreter prefetch both go through _MMU_read32<ARM9, MMU_AT_CODE>, so any
+// address that path backs with real memory is safe; the DTCM window is the sole
+// exclusion (that path returns MAIN_MEM there, not DTCM). B1 emitters are
+// ARMv4T-safe; ARMv5 edges (PC-interworking, CLZ/QADD/...) either bail or land
+// in later B-groups.
+static bool arm9_canEnterArm(u32 pc)
+{
+	if ((pc & ~0x3FFFu) == MMU.DTCMRegion) return false;
+	if (pc < 0x02000000)                    return true;   // ITCM window
+	if ((pc & 0x0F000000) == 0x02000000)    return true;   // main RAM (shared)
+	if ((pc >> 24) == 0x03)                 return true;   // shared WRAM
+	if ((pc & 0xFFFF0000u) == 0xFFFF0000u)  return true;   // ARM9 BIOS
+	return false;
+}
 
 // Per-instruction cycle cost -- must reproduce armcpu_exec<ARM9>()'s own return
 // (see thumb_instructions.cpp). Code-fetch cycles are off (Fetch() returns 1);
@@ -167,7 +181,14 @@ static u8 arm9_cyclesForThumb(u16 op)
 			return 1;
 	}
 }
-static u8 arm9_cyclesForArm(u32 op)   { (void)op; return 1; }           // A5
+// Per-ARM-instruction cycle cost, approximating armcpu_exec<ARM9>()'s return
+// (arm_instructions.cpp). B1's opcode set is exact at a flat 1: data-processing
+// (imm operand2) returns 1 (OP_*_IMM_VAL -> OP_xxx(1,3), Rd!=15); a predicated
+// instruction whose condition fails is 1 cycle (armcpu.cpp: "condition=false:
+// 1S cycle"); a NOT-taken conditional branch is 1 (its taken cost, 3, is
+// hardcoded at the exit in jit_arm.cpp, matching OP_B/OP_BL). Grows per B-group
+// (loads/stores add max(alu,mem); lists scale with the register count).
+static u8 arm9_cyclesForArm(u32 op) { (void)op; return 1; }
 
 static JitCpuProfile s_arm9Profile;
 

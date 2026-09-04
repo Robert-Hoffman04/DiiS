@@ -138,8 +138,9 @@ void JITCache::rewindJITMemory(size_t numBytes) {
 	}
 }
 
-BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute) {
+BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bool thumb) {
 	u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);
+	length = (length & 0x7FFFFFFFu) | (thumb ? 0x80000000u : 0u);
 
 	u32 evictedPC = blockTable[index].startPC;
 	PROFILER_CACHE_EVICT(evictedPC, pc);
@@ -302,9 +303,9 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 		}
 	}
 #endif
-	// Maximum trace length is (JIT_TRACE_MAX_INSTRUCTIONS+1)*2 bytes. Maximum write size is 36 bytes.
-	// Branchless minimum boundary clamping at 0
-	s32 offsetDiff = (s32)(targetEA - ((JIT_TRACE_MAX_INSTRUCTIONS + 1) * 2));
+	// Maximum trace span is (JIT_TRACE_MAX_INSTRUCTIONS+1)*4 bytes (ARM; THUMB is
+	// half). Maximum write size is 36 bytes. Branchless minimum boundary clamp at 0.
+	s32 offsetDiff = (s32)(targetEA - ((JIT_TRACE_MAX_INSTRUCTIONS + 1) * 4));
 	u32 startEA = offsetDiff & ~(offsetDiff >> 31);
 	u32 endEA = targetEA + 36;
 
@@ -317,7 +318,7 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 
 		while (curr) {
 			u32 blockStartPC = curr->startPC;
-			u32 blockEndPC = blockStartPC + (curr->length * 2);
+			u32 blockEndPC = blockStartPC + curr->byteLength();
 
 			// Overlap Detection: Write Range vs Block Range
 			if (targetEA < blockEndPC && endEA > blockStartPC) {

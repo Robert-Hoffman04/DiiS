@@ -221,22 +221,29 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 {
 	JitCpuProfile* prof = jitProfile[jitIdx];
 	const armcpu_t save = *cpu;
+	// A block's ISA == the CPU mode when it was dispatched. jitRunChecked serves
+	// both the THUMB and the ARM front-ends now, so every mode-specific step here
+	// (fetch width, pipeline offset, PC stride, the T-vs-!T loop guard) branches
+	// on this.
+	const bool thumb = (save.CPSR.bits.T != 0);
+	const u32  step  = thumb ? 2u : 4u;
 
-	// ---- interpreter reference: up to block->length steps, journalled ----
+	// ---- interpreter reference: up to block->insnCount() steps, journalled ----
 	journalArm(proc);
-	cpu->R[15] = pc + 4;
+	cpu->R[15] = pc + (thumb ? 4u : 8u);
 	cpu->instruct_adr     = pc;
-	cpu->instruction      = prof->fetch16(pc & ~1u);
-	cpu->next_instruction = pc + 2;
+	cpu->instruction      = thumb ? prof->fetch16(pc & ~1u) : prof->fetch32(pc & ~3u);
+	cpu->next_instruction = pc + step;
 
 	u32 istep = 0;
 	u32 iCycles = 0;
-	while (istep < block->length && cpu->CPSR.bits.T && !cpu->waitIRQ) {
+	while (istep < block->insnCount() &&
+	       ((bool)cpu->CPSR.bits.T == thumb) && !cpu->waitIRQ) {
 		u32 curPC = cpu->instruct_adr;
 		iCycles += execOne();
 		istep++;
 		// a taken branch / mode switch ends the comparable run
-		if (cpu->instruct_adr != curPC + 2) break;
+		if (cpu->instruct_adr != curPC + step) break;
 	}
 	u32 iR[16];
 	memcpy(iR, cpu->R, sizeof iR);
@@ -247,7 +254,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	//      JIT block for real against pristine state ----
 	journalRollback();
 	*cpu = save;
-	cpu->R[15] = pc + 4;
+	cpu->R[15] = pc + (thumb ? 4u : 8u);
 	jit_cpu_state st = { &cpu->R[0], &cpu->CPSR.val, nullptr };
 	JITResult r;
 	memset(&r, 0, sizeof r);
@@ -257,7 +264,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	if (r.instructions == 0) {
 		// JIT made no progress -- restore and let the interpreter step once
 		*cpu = save;
-		cpu->R[15] = pc + 4;
+		cpu->R[15] = pc + (thumb ? 4u : 8u);
 		u32 c = execOne();
 		return c ? c : 1;
 	}
@@ -323,13 +330,16 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 				C.mismatches++;
 				FILE* f = fopen("sd:/jit.log", "a");
 				if (f) {
-					fprintf(f, "[jit] %s DIFF @%08x len=%u ins=%u:%s\n",
-					        C.tag, pc, (unsigned)block->length, (unsigned)r.instructions, d);
+					fprintf(f, "[jit] %s DIFF @%08x %s len=%u ins=%u:%s\n",
+					        C.tag, pc, thumb ? "T" : "A",
+					        (unsigned)block->insnCount(), (unsigned)r.instructions, d);
 					if (pc != C.lastDumpPC) {
 						C.lastDumpPC = pc;
 						fprintf(f, "[jit]   opcodes:");
-						for (u32 i = 0; i < block->length; i++)
-							fprintf(f, " %04x", (unsigned)prof->fetch16(pc + i * 2));
+						for (u32 i = 0; i < block->insnCount(); i++)
+							fprintf(f, thumb ? " %04x" : " %08x",
+							        (unsigned)(thumb ? prof->fetch16(pc + i * 2)
+							                         : prof->fetch32(pc + i * 4)));
 						fprintf(f, "\n");
 					}
 					fclose(f);

@@ -347,40 +347,140 @@ void JitTraceCtx::registerBailout(u32* branchPtr, JitBailoutCond cond)
 }
 
 // =========================================================================
+// Block exits -- shared by jit_thumb.cpp and jit_arm.cpp
+// =========================================================================
+void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
+{
+	u32*& p = emitPtr;
+	const u32 pipe = targetPC + (thumbMode ? 4u : 8u);
+	emitAddCycles(cyclesAccum + termCycles);
+	flushDirtyFlags();
+	flushDirtyRegisters();
+	emitResultMetadata(metaCount, 0);
+	*p++ = PPC_LIS(PPC_R29, pipe >> 16);
+	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
+	*p++ = PPC_LIS(PPC_R4, targetPC >> 16);
+	*p++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
+#if JIT_ENABLE_CHAINING
+	{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)p); *p++ = PPC_BL(o); }
+#endif
+	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
+}
+
+void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles)
+{
+	u32*& p = emitPtr;
+	emitAddCycles(cyclesAccum + termCycles);
+	flushDirtyFlags();
+	flushDirtyRegisters();
+	emitResultMetadata(metaCount, 0);
+	*p++ = PPC_OR(PPC_R29, pcReg, pcReg);
+	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
+	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
+	*p++ = PPC_B(retOff);
+}
+
+void JitTraceCtx::emitInterpreterBail(u32 metaCount)
+{
+	u32*& p = emitPtr;
+	flushDirtyFlags();
+	flushDirtyRegisters();
+	emitAddCycles(cyclesAccum);
+	emitResultMetadata(metaCount, 1);
+	*p++ = PPC_LIS(PPC_R4, currentPC >> 16);
+	*p++ = PPC_ORI(PPC_R4, PPC_R4, currentPC & 0xFFFF);
+	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
+	*p++ = PPC_B(retOff);
+}
+
+// ARM predication: 0/1 "condition holds" -> PPC_R11. cond is 0..13. Clobbers
+// r10, r11. Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
+void JitTraceCtx::emitEvalCond(u8 cond)
+{
+	switch (cond) {
+	case 0x0: readFlag(JITF_Z, PPC_R11); break;                                           // EQ  Z
+	case 0x1: readFlag(JITF_Z, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// NE  !Z
+	case 0x2: readFlag(JITF_C, PPC_R11); break;                                           // CS  C
+	case 0x3: readFlag(JITF_C, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// CC  !C
+	case 0x4: readFlag(JITF_N, PPC_R11); break;                                           // MI  N
+	case 0x5: readFlag(JITF_N, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// PL  !N
+	case 0x6: readFlag(JITF_V, PPC_R11); break;                                           // VS  V
+	case 0x7: readFlag(JITF_V, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// VC  !V
+	case 0x8:                                                                             // HI  C & ~Z
+		readFlag(JITF_C, PPC_R10); readFlag(JITF_Z, PPC_R11);
+		*emitPtr++ = PPC_ANDC(PPC_R11, PPC_R10, PPC_R11);
+		break;
+	case 0x9:                                                                             // LS  ~(C & ~Z)
+		readFlag(JITF_C, PPC_R10); readFlag(JITF_Z, PPC_R11);
+		*emitPtr++ = PPC_ANDC(PPC_R11, PPC_R10, PPC_R11);
+		*emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
+		break;
+	case 0xA:                                                                             // GE  ~(N ^ V)
+		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
+		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
+		*emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
+		break;
+	case 0xB:                                                                             // LT  N ^ V
+		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
+		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
+		break;
+	case 0xC: case 0xD:                                                                   // GT=~LE, LE=Z|(N^V)
+		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
+		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
+		readFlag(JITF_Z, PPC_R10);
+		*emitPtr++ = PPC_OR(PPC_R11, PPC_R11, PPC_R10);
+		if (cond == 0xC) *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
+		break;
+	default:  *emitPtr++ = PPC_LI(PPC_R11, 1); break;
+	}
+}
+
+// =========================================================================
 // Trace scanner + epilogue
 // =========================================================================
-BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu)
+BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb)
 {
 	JitTraceCtx ctx{ cpu, cache };
 	ctx.startPC = ctx.currentPC = startPC;
+	ctx.thumbMode = thumb;
 
 	while (!ctx.endBlock && ctx.instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
 		if (ctx.arenaAllocated) {
 			s32 used = (s32)(ctx.emitPtr - ctx.blockStart);
 			// Must reserve room for the epilogue/bailout stubs AND the worst-case
 			// size of the instruction we're about to scan -- this check runs
-			// BEFORE jitThumbEmitOne(), so "used" only reflects instructions
-			// already emitted. See JIT_MAX_INSTR_RESERVE_WORDS for why.
+			// BEFORE the emitter, so "used" only reflects instructions already
+			// emitted. See JIT_MAX_INSTR_RESERVE_WORDS[_ARM] for why.
 			s32 budget = (s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
 			                   - (s32)ctx.bailoutCount * JIT_BAILOUT_STUB_WORDS
-			                   - JIT_MAX_INSTR_RESERVE_WORDS);
+			                   - (thumb ? JIT_MAX_INSTR_RESERVE_WORDS
+			                            : JIT_MAX_INSTR_RESERVE_WORDS_ARM));
 			if (used > budget) { ctx.endBlock = true; break; }
 		}
 
-		u16 opcode = (u16)cpu.fetch16(ctx.currentPC);
-		jitThumbEmitOne(ctx, opcode);
-
-		if (!ctx.endBlock) {
-			ctx.instrCount++;
-			ctx.currentPC   += 2;
-			ctx.cyclesAccum += cpu.cyclesForThumb(opcode);
+		if (thumb) {
+			u16 opcode = (u16)cpu.fetch16(ctx.currentPC);
+			jitThumbEmitOne(ctx, opcode);
+			if (!ctx.endBlock) {
+				ctx.instrCount++;
+				ctx.currentPC   += 2;
+				ctx.cyclesAccum += cpu.cyclesForThumb(opcode);
+			}
+		} else {
+			u32 opcode = cpu.fetch32(ctx.currentPC);
+			jitArmEmitOne(ctx, opcode);
+			if (!ctx.endBlock) {
+				ctx.instrCount++;
+				ctx.currentPC   += 4;
+				ctx.cyclesAccum += cpu.cyclesForArm(opcode);
+			}
 		}
 	}
 
 	if (ctx.instrCount == 0) {
 		// Nothing compilable at startPC -- cache a length-1 fallback so the
 		// dispatcher resolves straight to the interpreter next time.
-		return cache.registerBlock(startPC, 1, nullptr);
+		return cache.registerBlock(startPC, 1, nullptr, thumb);
 	}
 
 	// ---- jump over the deferred bailouts on any fall-through path ----
@@ -416,8 +516,9 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		ctx.flushDirtyRegisters();
 		ctx.emitResultMetadata(ctx.instrCount, 0);
 
-		*ctx.emitPtr++ = PPC_LIS(PPC_R29, (ctx.currentPC + 4) >> 16);
-		*ctx.emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, (ctx.currentPC + 4) & 0xFFFF);
+		const u32 pipe = ctx.currentPC + (thumb ? 4u : 8u);
+		*ctx.emitPtr++ = PPC_LIS(PPC_R29, pipe >> 16);
+		*ctx.emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
 		*ctx.emitPtr++ = PPC_LIS(PPC_R4, ctx.currentPC >> 16);
 		*ctx.emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, ctx.currentPC & 0xFFFF);
 #if JIT_ENABLE_CHAINING
@@ -461,7 +562,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	DCStoreRange(ctx.blockStart, actualBytes);
 	ICInvalidateRange(ctx.blockStart, actualBytes);
 
-	return cache.registerBlock(startPC, ctx.instrCount, (JITBlockFunc)ctx.blockStart);
+	return cache.registerBlock(startPC, ctx.instrCount, (JITBlockFunc)ctx.blockStart, thumb);
 }
 
 #endif // DESMUME_JIT_ARM7

@@ -142,7 +142,7 @@ int jitThumbSelfTest()
 
 		// ---- JIT ----
 		jitCacheArm7.flushCache();
-		BasicBlock* b = jitCompileTrace(JITT_SCRATCH, jitCacheArm7, *jitProfile[JIT_ARM7]);
+		BasicBlock* b = jitCompileTrace(JITT_SCRATCH, jitCacheArm7, *jitProfile[JIT_ARM7], /*thumb=*/true);
 		if (!b || !b->execute) {
 			if (f) fprintf(f, "[jit] thumb %-12s SKIP (not compiled)\n", v.name);
 			skip++;
