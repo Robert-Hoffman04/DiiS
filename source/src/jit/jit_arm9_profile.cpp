@@ -89,12 +89,20 @@ static bool arm9_canEnterThumb(u32 pc)
 // in later B-groups.
 static bool arm9_canEnterArm(u32 pc)
 {
+#ifdef DESMUME_JIT_ARM9_THUMB_ONLY
+	// A5 isolation knob: keep the ARM9 THUMB JIT but route every ARM-mode block
+	// to the interpreter, to tell an ARM-front-end (B1-B7c) bug apart from a
+	// pre-existing THUMB (A2) one.
+	(void)pc;
+	return false;
+#else
 	if ((pc & ~0x3FFFu) == MMU.DTCMRegion) return false;
 	if (pc < 0x02000000)                    return true;   // ITCM window
 	if ((pc & 0x0F000000) == 0x02000000)    return true;   // main RAM (shared)
 	if ((pc >> 24) == 0x03)                 return true;   // shared WRAM
 	if ((pc & 0xFFFF0000u) == 0xFFFF0000u)  return true;   // ARM9 BIOS
 	return false;
+#endif
 }
 
 // Per-instruction cycle cost -- must reproduce armcpu_exec<ARM9>()'s own return

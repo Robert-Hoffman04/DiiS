@@ -32,8 +32,9 @@ import statistics
 
 TARGET_HZ = 59.8261
 MODE_LABEL = {"sw": "software rasterizer", "gx": "GX hardware 3D", "merge": "GXMerge sandwich",
-              "jitoff": "ARM7 interpreter", "jiton": "ARM7 JIT"}
-MODE_ORDER = ["sw", "gx", "merge", "jitoff", "jiton"]
+              "jitoff": "ARM7 interpreter", "jiton": "ARM7 JIT",
+              "jit9off": "ARM9 interpreter", "jit9on": "ARM9 JIT"}
+MODE_ORDER = ["sw", "gx", "merge", "jitoff", "jiton", "jit9off", "jit9on"]
 REGRESSION_REL = 0.03   # >3% relative eff_fps drop vs baseline -> flag
 
 

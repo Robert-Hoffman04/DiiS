@@ -12,6 +12,9 @@
 #   bench_merge  GXMerge sandwich       DESMUME_FORCE_CORE=1 + DESMUME_FORCE_GXCOMPOSITE
 #   bench_jitoff ARM7 interpreter       DESMUME_FORCE_CORE=2, no JITDEFS (P5 A/B baseline)
 #   bench_jiton  ARM7 JIT               DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
+#   bench_jit9off ARM9 interpreter      DESMUME_FORCE_CORE=2, no JITDEFS (A3 baseline)
+#   bench_jit9on  ARM9 JIT              DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
+#                                       + DESMUME_JIT_ARM9_ON (jitArm9Enabled=true)
 #
 # Prerequisites:
 #   - devkitPPC toolchain           (DEVKITPPC / DEVKITPRO in the environment)
@@ -88,6 +91,9 @@ defs_for() {
 		# delta is purely the ARM7 core, not a renderer swap.
 		jitoff) echo "$base -DDESMUME_FORCE_CORE=2" ;;
 		jiton)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		# ARM9 JIT A/B (A3): likewise sw renderer, delta is purely the ARM9 core.
+		jit9off) echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		jit9on)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
 		*)      die "unknown mode '$1'" ;;
 	esac
 }
@@ -96,8 +102,9 @@ defs_for() {
 # renderer-only mode.
 jitdefs_for() {
 	case "$1" in
-		jiton) echo "-DDESMUME_JIT_ARM7" ;;
-		*)     echo "" ;;
+		jiton)  echo "-DDESMUME_JIT_ARM7" ;;
+		jit9on) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		*)      echo "" ;;
 	esac
 }
 

@@ -168,7 +168,16 @@ u32 jitRunArm7()
 // so a full boot+gameplay capture runs every ARM9 THUMB block through
 // jitRunArm9Checked() against the hardened harness.
 // ---------------------------------------------------------------------------
+// Default OFF -- the ARM9 JIT's blast radius is the whole game, so it stays
+// opt-in until A4 signs off the "is it worth it" benchmark + soak. The
+// benchmark's jit9on A/B mode and any manual test build define
+// DESMUME_JIT_ARM9_ON to start it enabled without touching the production
+// default (the mirror of the jitoff/jiton renderer A/B for ARM7).
+#ifdef DESMUME_JIT_ARM9_ON
+bool jitArm9Enabled = true;
+#else
 bool jitArm9Enabled = false;
+#endif
 
 u32 jitRunArm9()
 {
