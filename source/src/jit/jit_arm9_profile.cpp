@@ -207,6 +207,14 @@ static u8 arm9_cyclesForArm(u32 op)
 	// extra load/store LDRH/STRH/LDRSB/LDRSH (000, bit7&bit4, bits6..5 != 0)
 	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0)
 		return ((op >> 20) & 1) ? 3u : 2u;   // load max(3,2)=3 / STRH max(2,2)=2
+	// LDM / STM block data transfer (bits 27..25 == 100): MMU_aluMemCycles(2|1, c)
+	// with c = sum of per-word access cost. Same "assume main RAM" word = 4 as the
+	// single transfer above; c = 4*n dominates the alu term for any non-empty list.
+	if ((op & 0x0E000000u) == 0x08000000u) {
+		u32 n = (u32)__builtin_popcount(op & 0xFFFFu);
+		if (!n) n = 1;
+		return (u8)(4u * n);
+	}
 	return 1;
 }
 

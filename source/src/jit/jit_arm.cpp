@@ -22,6 +22,12 @@
  *        trace).
  *   B3b - extra load/store: LDRH / STRH / LDRSB / LDRSH (imm8 or unshifted
  *        register offset). LDRD / STRD -> B7. Shares emitLoadStoreTail.
+ *   B4  - block data transfer: LDM / STM, all four addressing modes
+ *        (IA/IB/DA/DB), optional writeback. pc in the register list makes an
+ *        LDM a block terminator with ARMv5 bit0 interworking (the common
+ *        function-return shape); STM with pc, the S (user-bank / CPSR-restore)
+ *        form, an empty list, base == pc, and base-in-list + writeback all
+ *        end the trace. cond == AL only.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -477,6 +483,123 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
 	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd);
 }
 
+// ------------------------------------------------ block data transfer (B4)
+// cond 100 P U S W L Rn register_list[16]
+//   P : 1 pre / 0 post   U : 1 increment / 0 decrement   W : writeback
+//   S : PSR / force-user-bank -> interpreter (B6)         L : load / store
+// The touched addresses are one contiguous ascending block of `n` words no
+// matter the direction; the lowest-numbered register always maps to the lowest
+// address (register i -> lowAddr + 4*slot). We always walk the list ascending;
+// the interpreter walks DA/DB descending (highest address first), so the access
+// *order* can differ -- immaterial for RAM (same addresses, same values, same
+// final state) and I/O-bank accesses are already flagged untrusted by the
+// harness. Word loads do NOT rotate an unaligned base (unlike the single LDR) --
+// OP_L_IA
+// passes the raw address to READ32 and _MMU_read32 masks it. Writeback value is
+// base +/- 4*n regardless of P. `pc` in an LDM list is a BX-style terminator on
+// ARMv5 (cpu->LDTBit): loaded_value bit0 selects the resume mode.
+void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
+{
+	const bool P = (op >> 24) & 1;
+	const bool U = (op >> 23) & 1;
+	const bool S = (op >> 22) & 1;
+	const bool W = (op >> 21) & 1;
+	const bool L = (op >> 20) & 1;
+	const u8   rn   = (op >> 16) & 0xF;
+	const u32  list = op & 0xFFFF;
+	const u32  n    = (u32)__builtin_popcount(list);
+	const bool pcInList = (list & 0x8000u) != 0;
+
+	if (S)                         { ctx.endBlock = true; return; }  // user-bank / SPSR -> B6
+	if (n == 0)                    { ctx.endBlock = true; return; }  // empty list -> interp
+	if (rn == 15)                  { ctx.endBlock = true; return; }  // base = pc, unpredictable
+	if (W && (list & (1u << rn)))  { ctx.endBlock = true; return; }  // base in list + WB -> interp
+	if (pcInList && !L)            { ctx.endBlock = true; return; }  // STM{pc} (rare) -> interp
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+
+	// low address of the contiguous block -> slot 96
+	//   IA base | IB base+4 | DA base-4*(n-1) | DB base-4*n
+	const s32 lowOff = U ? (P ? 4 : 0)
+	                     : (P ? -(s32)(4 * n) : -(s32)(4 * (n - 1)));
+	if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
+	else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
+	*p++ = PPC_STW(PPC_R12, 1, 96);
+
+	// writeback value (base +/- 4*n) -> slot 104; committed to guest memory only
+	// AFTER the access so a store's SMC-guard bail re-runs the whole LDM/STM.
+	if (W) {
+		*p++ = PPC_ADDI(PPC_R12, hRn, U ? (s32)(4 * n) : -(s32)(4 * n));
+		*p++ = PPC_STW(PPC_R12, 1, 104);
+	}
+
+	ctx.emitMemPrologue();
+	if (!L) { *p++ = PPC_LWZ(PPC_R12, 1, 96); ctx.emitSmcCheckAndBail(PPC_R12); }
+
+	// r0..r14 in ascending order at lowAddr + 4*slot
+	u32 slot = 0;
+	for (int i = 0; i < 15; i++) {
+		if (!(list & (1u << i))) continue;
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		if (slot) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
+		if (L) {
+			ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+			*p++ = PPC_STW(PPC_R10, 14, i * 4);
+		} else {
+			*p++ = PPC_LWZ(PPC_R10, 14, i * 4);
+			ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+		}
+		slot++;
+	}
+
+	if (!pcInList) {
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		return;                                 // not a terminator: block continues
+	}
+
+	// ---- LDM{...,pc}: load the top word and interwork (ARMv5 LDTBit) ----
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	if (slot) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));   // pc slot == n-1
+	ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+	*p++ = PPC_STW(PPC_R10, 1, 100);                                // stash raw popped pc
+	ctx.emitMemEpilogue();
+	ctx.invalidateRegCache();
+	if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+
+	const u32 term = ctx.cpu.cyclesForArm(op);
+	*p++ = PPC_LWZ(PPC_R12, 1, 100);                    // raw popped pc
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);     // R11 = bit0 (mode select)
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* toArm = p++;                                    // BEQ -> stay ARM (bit0 == 0)
+
+	// bit0 == 1: switch to THUMB -- set CPSR.T so the C++ resume path uses
+	// 16-bit fetch/pipeline math (the ARM7 POP{pc} bug: dropping this mode
+	// switch misdecodes the target and free-runs).
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);      // & ~1
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_LI(PPC_R10, 0x20);                        // CPSR.T (bit 5)
+	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+	ctx.flagsDirty = true;
+	ctx.flushDirtyFlags();
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
+	// bit0 == 0: stay ARM (CPSR.T already 0)
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);      // & ~3
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
@@ -503,6 +626,13 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	if ((op & 0x0C000000u) == 0x04000000u) {
 		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
 		emitSingleDataTransfer(ctx, op);
+		return;
+	}
+
+	// LDM / STM block data transfer : bits 27..25 == 100
+	if ((op & 0x0E000000u) == 0x08000000u) {
+		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
+		emitBlockDataTransfer(ctx, op);
 		return;
 	}
 
