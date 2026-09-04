@@ -188,7 +188,24 @@ static u8 arm9_cyclesForThumb(u16 op)
 // 1S cycle"); a NOT-taken conditional branch is 1 (its taken cost, 3, is
 // hardcoded at the exit in jit_arm.cpp, matching OP_B/OP_BL). Grows per B-group
 // (loads/stores add max(alu,mem); lists scale with the register count).
-static u8 arm9_cyclesForArm(u32 op) { (void)op; return 1; }
+// Per-ARM-instruction cost, ARM9 max(alu, mem) model. Data-processing = 1
+// (OP_xxx(1,3), Rd != 15); a failed predication = 1 (armcpu.cpp "1S cycle"); a
+// not-taken conditional branch = 1 (taken cost 3 is hardcoded at the exit,
+// matching OP_B/OP_BL). LDR/STR single transfer (bits 27..26 == 01) via
+// MMU_aluMemAccessCycles, assuming main RAM (word mem = 4): LDR max(3,4) = 4,
+// STR max(2,4) = 4, LDRB max(3,2) = 3, STRB max(2,2) = 2. Same "assume main
+// RAM" coarseness as arm9_cyclesForThumb -- a runtime EA penalty (v2) is the
+// real fix; the harness cycDrift telemetry tracks the error meanwhile.
+static u8 arm9_cyclesForArm(u32 op)
+{
+	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
+		const bool B = (op >> 22) & 1;
+		const bool L = (op >> 20) & 1;
+		if (!B) return 4;                     // word
+		return L ? 3 : 2;                     // byte
+	}
+	return 1;
+}
 
 static JitCpuProfile s_arm9Profile;
 

@@ -16,6 +16,10 @@
  *        (LSL/LSR/ASR/ROR #n, incl. RRX); the shifter-carry semantics match
  *        arm_instructions.cpp's *_IMM macros exactly. Shift-by-register
  *        (bit4 == 1) is deferred and ends the trace.
+ *   B3 - LDR / STR (word / byte), immediate or register(shift-by-imm) offset,
+ *        pre/post-index, writeback, unaligned-word-load rotate; pc-relative
+ *        literal folds to a constant EA. cond == AL only (predicated ends the
+ *        trace). Halfword / signed (LDRH/STRH/LDRSB/LDRSH) -> B3b.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -285,6 +289,124 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
 }
 
+// -------------------------------------------------- LDR / STR (word / byte)
+// cond 01 I P U B W L Rn Rd <offset>
+//   I : 0 imm12 offset, 1 register offset shifted by an immediate (bit4 == 0)
+//   P : 1 pre-index, 0 post-index (post always writes back; P0+W1 = LDRT/STRT)
+//   U : add / subtract    B : byte / word    W : writeback    L : load / store
+// Word loads rotate for an unaligned EA (ROR by 8*(EA&3)) -- matches OP_LDR's
+// `ROR(READ32(adr), 8*(adr&3))`. Stores and byte accesses do not. Predicated
+// transfers end the trace (B1-B3: cond == AL only) -- the memory prologue's
+// state flush + reg-cache invalidation are awkward to make conditional.
+void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
+{
+	const bool I = (op >> 25) & 1;
+	const bool P = (op >> 24) & 1;
+	const bool U = (op >> 23) & 1;
+	const bool B = (op >> 22) & 1;
+	const bool W = (op >> 21) & 1;
+	const bool L = (op >> 20) & 1;
+	const u8   rn = (op >> 16) & 0xF;
+	const u8   rd = (op >> 12) & 0xF;
+	const u32  size = B ? 1u : 4u;
+	const bool writeback = (!P) || W;
+
+	if (!P && W)              { ctx.endBlock = true; return; }   // LDRT / STRT
+	if (rd == 15)             { ctx.endBlock = true; return; }   // PC load/store -> B7
+	if (I && ((op >> 4) & 1)) { ctx.endBlock = true; return; }   // undefined
+
+	u32*& p = ctx.emitPtr;
+	const s32 immOff = U ? (s32)(op & 0xFFF) : -(s32)(op & 0xFFF);
+
+	// ---- pc-relative literal: [pc, #imm], I=0 P=1 W=0 -> EA is constant ----
+	if (rn == 15) {
+		if (I || W || !P) { ctx.endBlock = true; return; }
+		const u32 ea = ctx.currentPC + 8 + (u32)immOff;
+		ctx.ensureArena();
+		ctx.emitMemPrologue();
+		if (L) {
+			emitLoadImm32(p, PPC_R12, ea);
+			ctx.emitSlowLoad(PPC_R10, PPC_R12, size, false);
+			if (size == 4 && (ea & 3)) {
+				const u32 rl = (32u - 8u * (ea & 3)) & 31;
+				*p++ = PPC_RLWINM(PPC_R10, PPC_R10, rl, 0, 31);
+			}
+			ctx.emitMemEpilogue();
+			ctx.invalidateRegCache();
+			*p++ = PPC_STW(PPC_R10, 14, rd * 4);
+		} else {
+			emitLoadImm32(p, PPC_R12, ea);
+			*p++ = PPC_STW(PPC_R12, 1, 96);
+			ctx.emitSmcCheckAndBail(PPC_R12);
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);
+			*p++ = PPC_LWZ(PPC_R10, 14, rd * 4);
+			ctx.emitSlowStore(PPC_R12, PPC_R10, size);
+			ctx.emitMemEpilogue();
+			ctx.invalidateRegCache();
+		}
+		return;
+	}
+
+	ctx.ensureArena();
+	u32 lockedMask = 0;
+	const u8 rm = op & 0xF;
+	if (I && rm == 15) { ctx.endBlock = true; return; }
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+	u8 hRm = 0;
+	if (I) hRm = ctx.readReg(rm, lockedMask);
+	u8 hVal = 0;
+	if (!L) hVal = ctx.readReg(rd, lockedMask);
+
+	// offset -> PPC_R12 (register form); the immediate form folds into ADDI
+	if (I) (void)emitOp2(ctx, op, /*immForm=*/false, hRm);
+
+	// EA (access address) -> R11 ; WB (writeback into Rn) -> R10.
+	// register offset in R12: EA = U ? Rn + R12 : Rn - R12  (SUBF rD,rA,rB = rB-rA)
+	if (P) {                                   // pre-index
+		if      (!I) *p++ = PPC_ADDI(PPC_R11, hRn, immOff);
+		else if (U)  *p++ = PPC_ADD (PPC_R11, hRn, PPC_R12);
+		else         *p++ = PPC_SUBF(PPC_R11, PPC_R12, hRn);
+		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R11, PPC_R11);
+	} else {                                   // post-index (always writes back)
+		*p++ = PPC_OR(PPC_R11, hRn, hRn);
+		if      (!I) *p++ = PPC_ADDI(PPC_R10, hRn, immOff);
+		else if (U)  *p++ = PPC_ADD (PPC_R10, hRn, PPC_R12);
+		else         *p++ = PPC_SUBF(PPC_R10, PPC_R12, hRn);
+	}
+
+	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
+	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
+	if (!L)        *p++ = PPC_STW(hVal,   1, 100);  // store value
+
+	ctx.emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+
+	if (L) {
+		ctx.emitSlowLoad(PPC_R10, PPC_R12, size, false);
+		if (size == 4) {                            // ROR(R10, 8*(EA&3))
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31); // EA & 3
+			*p++ = PPC_LI(PPC_R11, 4);
+			*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);     // 4 - (EA&3)
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28); // ((4-x)&3)<<3 in {0,24,16,8}
+			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+		}
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		*p++ = PPC_STW(PPC_R10, 14, rd * 4);        // result last: wins if rd == rn
+	} else {
+		ctx.emitSmcCheckAndBail(PPC_R12);
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_LWZ(PPC_R10, 1, 100);
+		ctx.emitSlowStore(PPC_R12, PPC_R10, size);
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	}
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
@@ -298,6 +420,13 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 
 	// Data-processing : bits 27..26 == 00 (bit 25 selects imm vs register op2)
 	if ((op & 0x0C000000u) == 0x00000000u) { emitDataProc(ctx, op, cond); return; }
+
+	// LDR / STR single data transfer : bits 27..26 == 01
+	if ((op & 0x0C000000u) == 0x04000000u) {
+		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
+		emitSingleDataTransfer(ctx, op);
+		return;
+	}
 
 	ctx.endBlock = true;   // everything else -> interpreter (later B-groups)
 }

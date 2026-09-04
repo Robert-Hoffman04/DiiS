@@ -649,6 +649,9 @@ inline void SetupMMU() {
 
 FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
+#endif
 	//special handling for DMA: read 0 from TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{
@@ -674,8 +677,11 @@ FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u3
 	else return _MMU_ARM7_read08(addr);
 }
 
-FORCEINLINE u16 _MMU_read16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr) 
+FORCEINLINE u16 _MMU_read16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
+#endif
 	//special handling for DMA: read 0 from TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{
@@ -716,6 +722,9 @@ dunno:
 
 FORCEINLINE u32 _MMU_read32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
+#endif
 	//special handling for DMA: read 0 from TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{

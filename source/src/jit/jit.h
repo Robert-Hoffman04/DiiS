@@ -72,6 +72,16 @@ u32 jitRunArm9();
 // the journal around a reference run; never compiled into a shipping build.
 void jitDiffJournalNote(int procnum, u32 addr, u32 size);
 
+// Read side of the same harness gap: the interpreter reference run and the JIT
+// run each execute the block's loads once, so a read with a side effect (IPC
+// FIFO pop at 0x04100000, some I/O) is applied twice and the JIT sees advanced
+// state -- a false mismatch, the read-analogue of the store-double-apply bug A1
+// fixed for writes. Called from the _MMU_read* choke points; when the journal
+// is armed, a data read from the I/O bank marks the block untrusted so the
+// comparison is skipped (idempotent VRAM/palette/OAM reads stay trusted). `at`
+// is MMU_ACCESS_TYPE as int (MMU_AT_CODE reads are ignored).
+void jitDiffJournalNoteRead(int procnum, int at, u32 addr);
+
 // Boot-time proof that the journal records + rolls back correctly (the PH boot
 // path runs almost no ARM7 THUMB blocks, so the live harness alone can't
 // exercise it). Logs [jit] journal selftest ... to sd:/jit.log. Call after

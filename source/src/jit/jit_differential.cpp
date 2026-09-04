@@ -105,6 +105,19 @@ void jitDiffJournalNote(int procnum, u32 addr, u32 size)
 	}
 }
 
+void jitDiffJournalNoteRead(int procnum, int at, u32 addr)
+{
+	if (!s_journalArmed) return;
+	if (procnum != s_journalProc) return;
+	if (at == MMU_AT_CODE) return;                 // instruction fetch, no side effect
+	// I/O register bank: IPC FIFO recv (0x04100000) pops on read, and various
+	// other registers have read side effects. Conservatively distrust any block
+	// whose reference run reads there. VRAM/palette/OAM (0x05/0x06/0x07) reads
+	// are pure and stay trusted.
+	if ((addr & 0xFF000000u) == 0x04000000u)
+		s_journalUnrestorable = true;
+}
+
 static void journalArm(int proc)
 {
 	s_journalN = 0;
@@ -258,6 +271,26 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	jit_cpu_state st = { &cpu->R[0], &cpu->CPSR.val, nullptr };
 	JITResult r;
 	memset(&r, 0, sizeof r);
+
+#ifdef JIT_DIFF_DUMP_PC
+	if (pc == (u32)JIT_DIFF_DUMP_PC) {
+		static bool s_dumped = false;
+		if (!s_dumped) {
+			s_dumped = true;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) {
+				const u32* code = (const u32*)block->execute;
+				fprintf(f, "[jit] DUMP @%08x %s ins=%u r7=%08x r13=%08x:\n",
+				        pc, thumb ? "T" : "A", (unsigned)block->insnCount(),
+				        (unsigned)save.R[7], (unsigned)save.R[13]);
+				for (u32 i = 0; i < 140; i++)
+					fprintf(f, "  %3u %08x\n", i, (unsigned)code[i]);
+				fclose(f);
+			}
+		}
+	}
+#endif
+
 	ExecuteJITTrace(block->execute, &r, &st);
 	if (r.smcHit) jcache.invalidateSMCTarget(r.smcAddress);
 
