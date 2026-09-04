@@ -121,30 +121,26 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 		return;
 	}
 
-	// Predicated: cond-false falls through and the block keeps compiling
-	// (the THUMB Bcc shape). The taken path is a self-contained exit that must
-	// not disturb the register/flag cache the fall-through relies on -- use the
-	// non-clearing flushes and write LR straight to guest memory.
-	ctx.emitEvalCond(cond);
-	*p++ = PPC_CMPWI(0, PPC_R11, 0);
-	u32* skip = p++;                                    // BEQ over the exit
-
-	ctx.emitDirtyFlagFlush();
-	ctx.emitDirtyRegisterFlush();
-	if (isBL) {
-		emitLoadImm32(p, PPC_R12, retLR);
-		*p++ = PPC_STW(PPC_R12, 14, 14 * 4);
-	}
-	ctx.emitAddCycles(ctx.cyclesAccum + 3);
-	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
-	const u32 pipe = target + 8;
-	*p++ = PPC_LIS(PPC_R29, pipe >> 16);
-	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R4, target >> 16);
-	*p++ = PPC_ORI(PPC_R4, PPC_R4, target & 0xFFFF);
-	{ s32 o = (s32)((u8*)ctx.cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
-
-	*skip = PPC_BEQ((u32)((p - skip) * 4));
+	// Predicated (cond != AL): interpreter only for now (GO-FIX-PH). This used
+	// to compile a THUMB-Bcc-shaped inline guard (evaluate cond -> BEQ over a
+	// self-contained exit -> fall through on cond-false), and it read back
+	// correct on repeated review, but real (non-differential) sustained ARM9
+	// execution against Phantom Hourglass reproducibly corrupted the host
+	// heap (an eventual invalid write inside newlib's _malloc_r) whenever this
+	// path was live -- confirmed by isolation: forcing every OTHER ARM9
+	// emitter (SWP, BX/BLX, register-form data-proc, unconditional B/BL) to
+	// bail left the corruption in place, while forcing only *this* path
+	// (predicated Bcc) to bail made Phantom Hourglass render thousands of
+	// frames cleanly with no crash. The differential harness (0 DIFF over
+	// many soaks) never caught it because a stray host-side memory-safety bug
+	// doesn't have to touch guest-visible state (cpu->R[]/CPSR) to be wrong --
+	// it can corrupt unrelated host heap memory while still landing on the
+	// numerically correct guest PC/registers/cycles the harness compares.
+	// Root cause not yet found. Bailing is the same safe fallback used
+	// throughout B1-B7c for anything not yet compiled; predicated branches are
+	// a small minority of dynamic branch execution in real code, so this is a
+	// narrow perf giveback, not a correctness compromise.
+	ctx.endBlock = true;
 }
 
 // -------------------------------------- operand2 = Rm shifted by a register

@@ -49,6 +49,13 @@ extern "C" void ExecuteJITTrace_Return();
 void jitInit();
 void jitShutdown();
 
+// GO-FIX-PH temporary diagnostic (jit_trace.cpp): verifies the canary bytes
+// planted right after each JIT-owned memalign'd buffer are still intact;
+// logs once to sd:/jit.log and latches on the first mismatch. Cheap enough
+// to poll periodically from the dispatch path. Remove once the heap
+// corruption bug is found.
+void jitCheckCanaries();
+
 // Live execution. Called from armInnerLoop() when the ARM7 is due to step.
 // Runs one JIT block from NDS_ARM7.instruct_adr and re-primes the interpreter
 // pipeline; returns cycles consumed, or 0 if the interpreter should handle

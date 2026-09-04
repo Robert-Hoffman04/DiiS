@@ -16,9 +16,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <ogc/cache.h>
-#if defined(DESMUME_JIT_TRACE_FIRST) || defined(DESMUME_ARM_TIME_SPLIT)
-#include <stdio.h>
-#endif
+#include <stdio.h>   // GO-FIX-PH canary diagnostic wants this unconditionally; see below
 
 // =========================================================================
 // Lifecycle
@@ -34,6 +32,52 @@ static BasicBlock*  s_blockTable[2]   = { nullptr, nullptr };
 static BasicBlock** s_smcRegistry[2]  = { nullptr, nullptr };
 static u8*          s_smcPageFlags[2] = { nullptr, nullptr };
 static bool         s_initDone        = false;
+
+// GO-FIX-PH diagnostic: a heap corruption (invalid write inside newlib's
+// _malloc_r) surfaces after enough sustained real (non-differential) ARM9
+// JIT execution, reproduces with all chaining disabled, and does NOT
+// reproduce with the JIT off entirely -- so it's some JIT-owned buffer being
+// written past its bounds. None of these four memalign'd allocations are
+// ever resized after jitInit(), so if one of them is the culprit the overrun
+// has to come from a runtime write, not (only) code generation exceeding its
+// reservation (that path already has its own ARENA OVERRUN diagnostic and
+// it never fires for this repro). 32-byte canary directly after each real
+// allocation, checked periodically; the first mismatch pinpoints which
+// buffer and by how much. Trivially removable once the bug is found.
+#define JIT_CANARY_BYTES 32
+static u8 s_canaryPattern[JIT_CANARY_BYTES];
+struct CanarySlot { void* base; size_t realSize; const char* name; };
+static CanarySlot s_canaries[8];
+static int s_canaryCount = 0;
+static bool s_canaryTripped = false;
+
+static void jitCanaryArm(void* buf, size_t realSize, const char* name)
+{
+	if (!buf || s_canaryCount >= 8) return;
+	memcpy((u8*)buf + realSize, s_canaryPattern, JIT_CANARY_BYTES);
+	s_canaries[s_canaryCount++] = { buf, realSize, name };
+}
+
+void jitCheckCanaries()
+{
+	if (s_canaryTripped) return;
+	for (int i = 0; i < s_canaryCount; i++) {
+		u8* tail = (u8*)s_canaries[i].base + s_canaries[i].realSize;
+		if (memcmp(tail, s_canaryPattern, JIT_CANARY_BYTES) != 0) {
+			s_canaryTripped = true;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) {
+				fprintf(f, "[jit] !!! CANARY TRIPPED buf=%s base=%p realSize=%u tail=%p bytes:",
+				        s_canaries[i].name, s_canaries[i].base,
+				        (unsigned)s_canaries[i].realSize, (void*)tail);
+				for (int b = 0; b < JIT_CANARY_BYTES; b++) fprintf(f, " %02x", tail[b]);
+				fprintf(f, "\n");
+				fclose(f);
+			}
+			return;
+		}
+	}
+}
 
 static void jitFreeSlot(int i)
 {
@@ -55,13 +99,27 @@ void jitShutdown()
 
 static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile* profile)
 {
-	s_arena[i]        = (u32*)        memalign(32, arenaBytes);
-	s_blockTable[i]   = (BasicBlock*) memalign(16, HASH_TABLE_SIZE * sizeof(BasicBlock));
-	s_smcRegistry[i]  = (BasicBlock**)memalign(32, SMC_MAP_SIZE * sizeof(BasicBlock*));
-	s_smcPageFlags[i] = (u8*)         memalign(32, SMC_MAP_SIZE);
+	// GO-FIX-PH: over-allocate by JIT_CANARY_BYTES on every buffer so a
+	// canary can be armed right after each one's *logical* end -- the size
+	// passed to cache.initialize() below is unchanged, so the JIT's own
+	// bounds checks (allocateJITMemory() vs arenaSize, etc.) see exactly the
+	// same capacity as before this diagnostic was added.
+	size_t blockTableBytes  = HASH_TABLE_SIZE * sizeof(BasicBlock);
+	size_t smcRegistryBytes = SMC_MAP_SIZE * sizeof(BasicBlock*);
+	size_t smcFlagsBytes    = SMC_MAP_SIZE;
+
+	s_arena[i]        = (u32*)        memalign(32, arenaBytes        + JIT_CANARY_BYTES);
+	s_blockTable[i]   = (BasicBlock*) memalign(16, blockTableBytes   + JIT_CANARY_BYTES);
+	s_smcRegistry[i]  = (BasicBlock**)memalign(32, smcRegistryBytes  + JIT_CANARY_BYTES);
+	s_smcPageFlags[i] = (u8*)         memalign(32, smcFlagsBytes     + JIT_CANARY_BYTES);
 
 	if (!s_arena[i] || !s_blockTable[i] || !s_smcRegistry[i] || !s_smcPageFlags[i])
 		return false;
+
+	jitCanaryArm(s_arena[i],        arenaBytes,        i == JIT_ARM9 ? "arm9.arena"   : "arm7.arena");
+	jitCanaryArm(s_blockTable[i],   blockTableBytes,    i == JIT_ARM9 ? "arm9.blockTable"  : "arm7.blockTable");
+	jitCanaryArm(s_smcRegistry[i],  smcRegistryBytes,   i == JIT_ARM9 ? "arm9.smcRegistry" : "arm7.smcRegistry");
+	jitCanaryArm(s_smcPageFlags[i], smcFlagsBytes,      i == JIT_ARM9 ? "arm9.smcPageFlags": "arm7.smcPageFlags");
 
 	cache.initialize(s_arena[i], arenaBytes, s_blockTable[i], s_smcRegistry[i],
 	                 s_smcPageFlags[i], profile->smcBankMask);
@@ -72,6 +130,8 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 void jitInit()
 {
 	if (s_initDone) return;
+
+	memset(s_canaryPattern, 0xC5, JIT_CANARY_BYTES);   // GO-FIX-PH: before either slot inits
 
 	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE,      jitCacheArm7, jitBuildArm7Profile())
 	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
@@ -186,6 +246,32 @@ u8 JitTraceCtx::allocHostReg(u8 gbaReg, bool loadFromMem, u32& lockedMask)
 				oldestAge = regCache[i].age;
 				spillTarget = i;
 			}
+		}
+		// GO-FIX-PH hardening: every real ARM/THUMB instruction locks only a
+		// handful of operands (<=4) against 14 pool registers, so this should
+		// be unreachable -- but the old code indexed regCache[-1] unconditionally
+		// if it ever *was* unreachable-in-theory-but-not-in-practice, emitting
+		// a PPC_STW through a garbage host register at gpr_base-4, one word
+		// before the guest register array: a host memory write outside the
+		// guest state the differential harness compares, so a bug here can
+		// corrupt unrelated heap memory without ever showing up as a DIFF.
+		// If genuinely no eviction candidate exists, fall back to the oldest
+		// *any* allocated slot (ignoring the lock) rather than a negative index.
+		if (spillTarget < 0) {
+			for (int i = 0; i < 15; i++) {
+				if (regCache[i].allocated && regCache[i].age < oldestAge) {
+					oldestAge = regCache[i].age;
+					spillTarget = i;
+				}
+			}
+		}
+		if (spillTarget < 0) {
+			// regCache has zero allocated entries yet freeMask == 0 -- would mean
+			// lockedMask alone claims all 14 pool registers, i.e. >=14 locked
+			// operands on one instruction. Not reachable by any real emitter;
+			// bail the block rather than touch the array with a bad index.
+			endBlock = true;
+			return PPC_R10;
 		}
 		if (regCache[spillTarget].dirty)
 			*emitPtr++ = PPC_STW(regCache[spillTarget].hostReg, 14, spillTarget * 4);

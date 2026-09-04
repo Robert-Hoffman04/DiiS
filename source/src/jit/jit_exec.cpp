@@ -82,6 +82,12 @@ u32 jitRunArm7()
 	JitCpuProfile* prof = jitProfile[JIT_ARM7];
 	if (!jitArm7Enabled || !prof) return 0;
 
+	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
+	{
+		static u32 s_canaryPoll7 = 0;
+		if ((++s_canaryPoll7 & 0xFFFFu) == 0) jitCheckCanaries();
+	}
+
 	armcpu_t& cpu = NDS_ARM7;
 	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (P7)
 
@@ -188,6 +194,12 @@ u32 jitRunArm9()
 #if !defined(JIT_DIFFERENTIAL_TESTING)
 	if (!jitArm9Enabled) return 0;
 #endif
+
+	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
+	{
+		static u32 s_canaryPoll = 0;
+		if ((++s_canaryPoll & 0xFFFFu) == 0) jitCheckCanaries();
+	}
 
 	armcpu_t& cpu = NDS_ARM9;
 	const u32 pc = cpu.instruct_adr;
