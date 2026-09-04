@@ -160,6 +160,8 @@
 #define PPC_ANDC(rA, rS, rB)   ((31 << 26) | ((rS) << 21) | ((rA) << 16) | ((rB) << 11) | (60 << 1))
 #define PPC_NOR(rD, rA, rB)    ((31 << 26) | ((rA) << 21) | ((rD) << 16) | ((rB) << 11) | (124 << 1))
 #define PPC_MULLW(rD, rA, rB)  ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (235 << 1))
+#define PPC_MULHW(rD, rA, rB)  ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (75 << 1))   // signed   high 32 of rA*rB
+#define PPC_MULHWU(rD, rA, rB) ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (11 << 1))   // unsigned high 32 of rA*rB
 #define PPC_MULLI(rD, rA, imm) ((7 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))
 
 // Hardware Flag Math (XER & Zero Checks)

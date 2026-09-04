@@ -28,6 +28,10 @@
  *        function-return shape); STM with pc, the S (user-bank / CPSR-restore)
  *        form, an empty list, base == pc, and base-in-list + writeback all
  *        end the trace. cond == AL only.
+ *   B5  - multiplies: MUL / MLA (32-bit) and UMULL / SMULL / UMLAL / SMLAL
+ *        (64-bit), S bit sets N/Z only. PPC mullw + mulhw/mulhwu; the long
+ *        accumulate is an addc/adde pair. cond == AL only; pc operands and the
+ *        ARM-unpredictable long-form aliasings end the trace.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -600,6 +604,88 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	ctx.blockTerminatedEarly = true;
 }
 
+// -------------------------------------------------------------- multiply (B5)
+// short : cond 0000 00 A S  Rd   Rn   Rs 1001 Rm      Rd = Rm*Rs (+Rn if A)
+// long  : cond 0000 1U A S  RdHi RdLo Rs 1001 Rm      {RdHi:RdLo} = Rm*Rs (+acc)
+//   U : 1 signed (SMULL/SMLAL) / 0 unsigned (UMULL/UMLAL) ; A : accumulate
+// PPC mullw gives the low 32; mulhw/mulhwu the high 32. The long accumulate is
+// addc/adde on the {lo,hi} pair -- matches the interpreter's `RdHi = hiprod +
+// RdHi + CarryFrom(loprod, RdLo); RdLo += loprod`. S sets N/Z only (C, V are
+// left untouched, as in OP_MUL_S / OP_UMULL_S): short from Rd, long from the
+// 64-bit result (Z = both halves zero). Cycle cost is data-dependent on Rs in
+// the interpreter; the profile uses a fixed per-form mid estimate.
+//
+// Bails (end the trace, interpreter takes it): any operand or destination == pc;
+// long form with RdHi == RdLo or Rm aliasing either destination (ARM-unpredictable);
+// predicated (handled at the dispatch site, cond == AL only).
+void emitMultiply(JitTraceCtx& ctx, u32 op)
+{
+	const bool longForm = (op >> 23) & 1;
+	const bool sign     = (op >> 22) & 1;   // long form only
+	const bool accum    = (op >> 21) & 1;
+	const bool S        = (op >> 20) & 1;
+	const u8   rs = (op >> 8) & 0xF;
+	const u8   rm = op & 0xF;
+
+	if (rm == 15 || rs == 15) { ctx.endBlock = true; return; }
+
+	if (!longForm) {
+		const u8 rd = (op >> 16) & 0xF;
+		const u8 rn = (op >> 12) & 0xF;      // accumulator operand (MLA)
+		if (rd == 15 || (accum && rn == 15)) { ctx.endBlock = true; return; }
+
+		ctx.ensureArena();
+		u32*& p = ctx.emitPtr;
+		u32 lockedMask = 0;
+
+		const u8 hRm = ctx.readReg(rm, lockedMask);
+		const u8 hRs = ctx.readReg(rs, lockedMask);
+		u8 hRn = 0;
+		if (accum) hRn = ctx.readReg(rn, lockedMask);
+		const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+
+		*p++ = PPC_MULLW(PPC_R12, hRm, hRs);
+		if (accum) *p++ = PPC_ADD(hRd, PPC_R12, hRn);
+		else       *p++ = PPC_OR (hRd, PPC_R12, PPC_R12);
+		if (S) ctx.emitNZ(hRd);
+		return;
+	}
+
+	const u8 rdhi = (op >> 16) & 0xF;
+	const u8 rdlo = (op >> 12) & 0xF;
+	if (rdhi == 15 || rdlo == 15)           { ctx.endBlock = true; return; }
+	if (rdhi == rdlo)                       { ctx.endBlock = true; return; }
+	if (rm == rdhi || rm == rdlo)           { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	const u8 hRs = ctx.readReg(rs, lockedMask);
+	const u8 hLo = ctx.writeReg(rdlo, !accum, lockedMask);
+	const u8 hHi = ctx.writeReg(rdhi, !accum, lockedMask);
+
+	*p++ = PPC_MULLW(PPC_R11, hRm, hRs);                        // low 32
+	*p++ = sign ? PPC_MULHW(PPC_R12, hRm, hRs)
+	            : PPC_MULHWU(PPC_R12, hRm, hRs);                // high 32
+
+	if (accum) {
+		*p++ = PPC_ADDCO(hLo, PPC_R11, hLo);                    // RdLo += loprod ; XER[CA]
+		*p++ = PPC_ADDEO(hHi, PPC_R12, hHi);                    // RdHi += hiprod + CA
+	} else {
+		*p++ = PPC_OR(hLo, PPC_R11, PPC_R11);
+		*p++ = PPC_OR(hHi, PPC_R12, PPC_R12);
+	}
+
+	if (S) {
+		*p++ = PPC_OR(PPC_R8, hHi, hLo);                        // Z = (RdHi | RdLo) == 0
+		ctx.emitFlagBit(JITF_N, hHi, 1);
+		*p++ = PPC_CNTLZW(PPC_R8, PPC_R8);
+		ctx.emitFlagBit(JITF_Z, PPC_R8, 27);
+	}
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
@@ -616,6 +702,15 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
 		if (cond != COND_AL) { ctx.endBlock = true; return; }
 		emitExtraDataTransfer(ctx, op);
+		return;
+	}
+
+	// Multiply / multiply-long : bits 27..23 == 0000x, bits 7..4 == 1001
+	// (short MUL/MLA: 27..22 == 000000 ; long: 27..23 == 00001). SWP is 27..23
+	// == 00010 and stays with the later group.
+	if ((op & 0x0FC000F0u) == 0x00000090u || (op & 0x0F8000F0u) == 0x00800090u) {
+		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
+		emitMultiply(ctx, op);
 		return;
 	}
 

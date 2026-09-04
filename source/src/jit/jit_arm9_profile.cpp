@@ -215,6 +215,15 @@ static u8 arm9_cyclesForArm(u32 op)
 		if (!n) n = 1;
 		return (u8)(4u * n);
 	}
+	// Multiply / multiply-long (bits 27..23 == 0000x, bits 7..4 == 1001). The
+	// interpreter cost is data-dependent on Rs (short MUL 2..5 / MLA 3..6, long
+	// 3..6 non-accum / 4..7 accum) -- a fixed per-form mid estimate here; the
+	// harness cycDrift telemetry tracks the error.
+	if ((op & 0x0FC000F0u) == 0x00000090u || (op & 0x0F8000F0u) == 0x00800090u) {
+		const bool longForm = (op >> 23) & 1;
+		const bool accum    = (op >> 21) & 1;
+		return (u8)(longForm ? (accum ? 5 : 4) : (accum ? 4 : 3));
+	}
 	return 1;
 }
 
