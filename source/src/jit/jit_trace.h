@@ -54,11 +54,34 @@
 // ARM mode; see JIT_MAX_INSTR_RESERVE_WORDS.
 #define JIT_MAX_INSTR_RESERVE_WORDS_ARM 440
 
-// Block-to-block chaining (self-patching linker stub). Off for P3: one block
-// per armInnerLoop turn keeps the ARM9/ARM7 interleave fine-grained. Revisit
-// in P6 ("block chaining tuning").
+// Block-to-block chaining (self-patching linker stub). Was off P3..A3: one
+// block per armInnerLoop turn paid a full ExecuteJITTrace trampoline round
+// trip (18-register stmw/lmw + state reload/flush) per block, which the A3
+// benchmark showed dominates when blocks are tiny (often 1 guest instruction
+// in a tight loop) -- effectively hanging ARM-mode-heavy code (PH boot,
+// ~70-90x slower than the interpreter). On for A4-P1: a static-target exit
+// (B/BL, non-S data-proc->pc, the trace-scanner's own fall-through) now BLs
+// to cache.linkerStubAddress instead of always returning to C; the stub
+// hash-looks-up the target and, on a hit, self-patches *that call site* to a
+// direct branch straight into the target block's arena code, so repeat
+// visits to the same static edge skip the hash lookup too. This call site is
+// only ever reached with the one compile-time-constant target baked into it
+// -- the caching is sound. emitDynamicExit (BX, LDR pc, POP{pc} and friends)
+// deliberately does NOT chain: the same call site can resolve to a different
+// PC on every visit (a real indirect branch), so self-patching it would
+// wire the branch to whatever target happened to resolve first. Those exits
+// keep returning to C every time.
+//
+// This also delivers the "run many blocks per armInnerLoop turn" scheduler
+// quota (A4-P2) for free: JIT_YIELD_NUMBER below is a *cross-block* cycle
+// quota already threaded through r3 by ensureArena()'s guard at the top of
+// every block and emitAddCycles() at every exit -- with chaining on, a chain
+// of blocks now runs to ~JIT_YIELD_NUMBER guest cycles inside compiled code,
+// with zero trampoline round trips, before yielding back to jitRunArm9()/
+// jitRunArm7() and the armInnerLoop interleave. No new scheduler code needed;
+// armcpu_exec_block(quota) was already this mechanism, just gated off.
 #ifndef JIT_ENABLE_CHAINING
-#define JIT_ENABLE_CHAINING 0
+#define JIT_ENABLE_CHAINING 1
 #endif
 
 // Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top

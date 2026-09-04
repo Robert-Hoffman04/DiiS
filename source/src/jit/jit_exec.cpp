@@ -9,9 +9,11 @@
  * PC and returns the cycles consumed (0 => "not handled, use the interpreter
  * for one instruction").
  *
- * P3: one block per call, no chaining (JIT_ENABLE_CHAINING off) -- keeps the
- * ARM9/ARM7 interleave fine-grained. IRQ delivery, mode switches and anything
- * the block can't compile fall back to the interpreter between blocks.
+ * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
+ * of blocks (up to ~JIT_YIELD_NUMBER guest cycles) before returning, not just
+ * one. IRQ delivery, mode switches and anything a block can't compile still
+ * fall back to the interpreter (a chain only runs compiled static-exit edges;
+ * any dynamic exit, bailout or quota trip returns here first).
  ***************************************************************************/
 
 #include "jit.h"

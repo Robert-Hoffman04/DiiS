@@ -214,7 +214,9 @@ struct DiffCounters {
 	int   mismatches;           // capped -- gates the per-mismatch SD write
 	u64   mismatchesTotal;      // true count, for the periodic report
 	u64   notTrusted;           // comparison skipped: journal overflow / unrestorable
-	u64   countDiverge;         // JIT insn count != interp step count (not a bail)
+	u64   countDiverge;         // JIT insn count != istep -- now re-checked via an
+	                            // extended r.instructions-step reference pass
+	                            // ("CHAIN-DIFF" in the log), not just counted
 	u64   cycleDriftBlk;        // trusted blocks whose cycle counts differed
 	u64   cycleDriftAbs;        // sum |JIT - interp| cycles over those
 	u32   cycleDriftMax;        // worst single-block drift
@@ -263,9 +265,118 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	const u32 iCPSR = cpu->CPSR.val;
 	const u32 iPC   = cpu->instruct_adr;
 
-	// ---- undo every guest-RAM write the reference run made, then run the
-	//      JIT block for real against pristine state ----
+	// ---- undo every guest-RAM write the reference run made ----
 	journalRollback();
+
+	// Instruction-count blind spot: with JIT_ENABLE_CHAINING a static-exit
+	// chain can run through more than one compiled block per ExecuteJITTrace
+	// call, so the eventual guest-instruction count is data-dependent (whatever
+	// static exits the chain actually takes) -- not known until the code runs,
+	// unlike istep above (bounded to just the one block found at pc). Without
+	// this, the per-block compare below would be skipped for essentially every
+	// chained dispatch, leaving chaining's actual new risk (linker-stub
+	// plumbing, cross-block r3/r4/r29 threading, metadata accumulation)
+	// completely unchecked.
+	//
+	// Fix this with a *trial* JIT run: journalled and rolled back exactly like
+	// the reference pass above, purely to learn the chain's real length and
+	// result before anything touches memory for real. An earlier version of
+	// this check ran the extended interpreter comparison *after* the real
+	// (authoritative, non-journalled) run below and compared against
+	// already-mutated memory -- for read-modify-write guest code (observed:
+	// an SWP-based spinlock helper in PH's boot) the second pass then read back
+	// what the real run had just written, producing false CHAIN-DIFF reports
+	// that were an artifact of the check, not a chaining bug. Running the JIT
+	// twice from an identical (save) register/memory snapshot is deterministic,
+	// so the trial's result is exactly what the real run below will produce.
+	*cpu = save;
+	cpu->R[15] = pc + (thumb ? 4u : 8u);
+	jit_cpu_state stTrial = { &cpu->R[0], &cpu->CPSR.val, nullptr };
+	JITResult rTrial;
+	memset(&rTrial, 0, sizeof rTrial);
+	journalArm(proc);
+	ExecuteJITTrace(block->execute, &rTrial, &stTrial);
+	const bool trialTrustable = !s_journalOverflow && !s_journalUnrestorable;
+	u32 tR[16];
+	memcpy(tR, cpu->R, sizeof tR);
+	const u32 tCPSR = cpu->CPSR.val;
+	const u32 tNPC  = rTrial.nextPC;
+	journalRollback();
+
+	if (rTrial.instructions != 0 && rTrial.instructions != istep && !rTrial.bailedOut) {
+		C.countDiverge++;
+
+		if (trialTrustable) {
+			*cpu = save;
+			cpu->R[15]            = pc + (thumb ? 4u : 8u);
+			cpu->instruct_adr     = pc;
+			cpu->instruction      = thumb ? prof->fetch16(pc & ~1u) : prof->fetch32(pc & ~3u);
+			cpu->next_instruction = pc + step;
+			journalArm(proc);
+			u32 istep2 = 0;
+#ifdef JIT_DIFF_CHAIN_TRAIL
+			u32 trailPC[JIT_DIFF_CHAIN_TRAIL], trailOp[JIT_DIFF_CHAIN_TRAIL];
+			u32 trailN = 0;
+#endif
+			// Free-run: no same-instruction PC-delta guard here, unlike the
+			// bounded loop above -- a multi-block chain is *expected* to take
+			// a branch at every block boundary.
+			while (istep2 < rTrial.instructions && !cpu->waitIRQ) {
+#ifdef JIT_DIFF_CHAIN_TRAIL
+				if (trailN < JIT_DIFF_CHAIN_TRAIL) {
+					trailPC[trailN] = cpu->instruct_adr;
+					trailOp[trailN] = cpu->instruction;
+					trailN++;
+				}
+#endif
+				execOne();
+				istep2++;
+			}
+			const bool trustable2 = !s_journalOverflow && !s_journalUnrestorable;
+			if (!trustable2) C.notTrusted++;
+			journalRollback();
+
+			if (istep2 == rTrial.instructions && trustable2) {
+				char d[320]; size_t k = 0; d[0] = 0;
+				for (int i = 0; i < 15; i++)
+					if (tR[i] != cpu->R[i] && k + 32 < sizeof d)
+						k += snprintf(d + k, sizeof d - k, " R%d j=%08x i=%08x", i, tR[i], cpu->R[i]);
+				if ((tCPSR & 0xF0000000u) != (cpu->CPSR.val & 0xF0000000u) && k + 24 < sizeof d)
+					k += snprintf(d + k, sizeof d - k, " NZCV j=%x i=%x", tCPSR >> 28, cpu->CPSR.val >> 28);
+				if (tNPC != cpu->instruct_adr && k + 24 < sizeof d)
+					k += snprintf(d + k, sizeof d - k, " PC j=%08x i=%08x", tNPC, cpu->instruct_adr);
+
+				bool realMismatch = false;
+				for (int i = 0; i < 15 && !realMismatch; i++) realMismatch = (tR[i] != cpu->R[i]);
+				if ((tCPSR & 0xF0000000u) != (cpu->CPSR.val & 0xF0000000u)) realMismatch = true;
+				if (tNPC != cpu->instruct_adr) realMismatch = true;
+
+				if (realMismatch && d[0]) {
+					C.mismatchesTotal++;
+					if (C.mismatches < JIT_DIFF_MAX_LOGS) {
+						C.mismatches++;
+						FILE* f = fopen("sd:/jit.log", "a");
+						if (f) {
+							fprintf(f, "[jit] %s CHAIN-DIFF @%08x %s ins=%u blk0len=%u:%s\n",
+							        C.tag, pc, thumb ? "T" : "A", (unsigned)rTrial.instructions,
+							        (unsigned)block->insnCount(), d);
+#ifdef JIT_DIFF_CHAIN_TRAIL
+							fprintf(f, "[jit]   trail:");
+							for (u32 ti = 0; ti < trailN; ti++)
+								fprintf(f, " [%08x]%08x", (unsigned)trailPC[ti], (unsigned)trailOp[ti]);
+							fprintf(f, "\n");
+#endif
+							fclose(f);
+						}
+					}
+				}
+			}
+		} else {
+			C.notTrusted++;
+		}
+	}
+
+	// ---- run the JIT block for real against pristine state ----
 	*cpu = save;
 	cpu->R[15] = pc + (thumb ? 4u : 8u);
 	jit_cpu_state st = { &cpu->R[0], &cpu->CPSR.val, nullptr };
@@ -320,13 +431,6 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	// ---- classify the run before comparing ----
 	const bool trustable = !s_journalOverflow && !s_journalUnrestorable;
 	if (!trustable) C.notTrusted++;
-
-	// Instruction-count blind spot, surfaced instead of silent: when the JIT
-	// and interpreter step counts disagree without a clean JIT bail the
-	// register/flag compare below is skipped (needs equal counts to mean
-	// anything). Counting it lets ARM9 sign-off see whether it is exercised.
-	if (r.instructions != istep && !r.bailedOut)
-		C.countDiverge++;
 
 	if (r.instructions == istep && !r.bailedOut && trustable) {
 		char d[320]; size_t k = 0; d[0] = 0;
