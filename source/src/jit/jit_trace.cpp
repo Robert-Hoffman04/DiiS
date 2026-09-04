@@ -23,44 +23,61 @@
 // =========================================================================
 // Lifecycle
 // =========================================================================
-JitCpuProfile* jitActiveProfile = nullptr;
+JitCpuProfile* jitProfile[2] = { nullptr, nullptr };
 
 extern JitCpuProfile* jitBuildArm7Profile();   // jit_arm7_profile.cpp
+extern JitCpuProfile* jitBuildArm9Profile();   // jit_arm9_profile.cpp
 
-static u32*         s_arena        = nullptr;
-static BasicBlock*  s_blockTable   = nullptr;
-static BasicBlock** s_smcRegistry  = nullptr;
-static u8*          s_smcPageFlags = nullptr;
+// One backing-store set per core, indexed [JIT_ARM9]=0 / [JIT_ARM7]=1.
+static u32*         s_arena[2]        = { nullptr, nullptr };
+static BasicBlock*  s_blockTable[2]   = { nullptr, nullptr };
+static BasicBlock** s_smcRegistry[2]  = { nullptr, nullptr };
+static u8*          s_smcPageFlags[2] = { nullptr, nullptr };
+static bool         s_initDone        = false;
+
+static void jitFreeSlot(int i)
+{
+	free(s_arena[i]);        s_arena[i]        = nullptr;
+	free(s_blockTable[i]);   s_blockTable[i]   = nullptr;
+	free(s_smcRegistry[i]);  s_smcRegistry[i]  = nullptr;
+	free(s_smcPageFlags[i]); s_smcPageFlags[i] = nullptr;
+}
 
 void jitShutdown()
 {
-	jitCache.destroy();
-	free(s_arena);        s_arena = nullptr;
-	free(s_blockTable);   s_blockTable = nullptr;
-	free(s_smcRegistry);  s_smcRegistry = nullptr;
-	free(s_smcPageFlags); s_smcPageFlags = nullptr;
-	jitActiveProfile = nullptr;
+	jitCacheArm7.destroy();
+	jitCacheArm9.destroy();
+	jitFreeSlot(JIT_ARM7);
+	jitFreeSlot(JIT_ARM9);
+	jitProfile[JIT_ARM7] = jitProfile[JIT_ARM9] = nullptr;
+	s_initDone = false;
+}
+
+static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile* profile)
+{
+	s_arena[i]        = (u32*)        memalign(32, arenaBytes);
+	s_blockTable[i]   = (BasicBlock*) memalign(16, HASH_TABLE_SIZE * sizeof(BasicBlock));
+	s_smcRegistry[i]  = (BasicBlock**)memalign(32, SMC_MAP_SIZE * sizeof(BasicBlock*));
+	s_smcPageFlags[i] = (u8*)         memalign(32, SMC_MAP_SIZE);
+
+	if (!s_arena[i] || !s_blockTable[i] || !s_smcRegistry[i] || !s_smcPageFlags[i])
+		return false;
+
+	cache.initialize(s_arena[i], arenaBytes, s_blockTable[i], s_smcRegistry[i],
+	                 s_smcPageFlags[i], profile->smcBankMask);
+	jitProfile[i] = profile;
+	return true;
 }
 
 void jitInit()
 {
-	if (jitActiveProfile) return;
+	if (s_initDone) return;
 
-	JitCpuProfile* profile = jitBuildArm7Profile();
+	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE,      jitCacheArm7, jitBuildArm7Profile())
+	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 
-	s_arena        = (u32*)        memalign(32, JIT_ARENA_SIZE);
-	s_blockTable   = (BasicBlock*) memalign(16, HASH_TABLE_SIZE * sizeof(BasicBlock));
-	s_smcRegistry  = (BasicBlock**)memalign(32, SMC_MAP_SIZE * sizeof(BasicBlock*));
-	s_smcPageFlags = (u8*)         memalign(32, SMC_MAP_SIZE);
-
-	if (!s_arena || !s_blockTable || !s_smcRegistry || !s_smcPageFlags) {
-		jitShutdown();
-		return;
-	}
-
-	jitCache.initialize(s_arena, s_blockTable, s_smcRegistry, s_smcPageFlags,
-	                    profile->smcBankMask);
-	jitActiveProfile = profile;
+	if (!ok) { jitShutdown(); return; }
+	s_initDone = true;
 }
 
 // =========================================================================

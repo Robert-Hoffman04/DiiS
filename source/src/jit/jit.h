@@ -56,6 +56,13 @@ void jitShutdown();
 extern bool jitArm7Enabled;
 u32 jitRunArm7();
 
+// ARM9 counterpart. Spliced into armInnerLoop()'s ARM9 arm. Inert until the
+// ARM9 THUMB front-end lands (A2): jitArm9Enabled defaults false and the ARM9
+// profile's canEnter* return false, so this compiles nothing and always
+// returns 0. See desmumewii-arm9-jit-plan.md.
+extern bool jitArm9Enabled;
+u32 jitRunArm9();
+
 // One-shot ABI round-trip check (hand-emitted block -> trampoline -> linker
 // stub miss path -> return). Returns true on success; logs either way.
 bool jitSelfTest();

@@ -48,7 +48,20 @@
 #include <stdio.h>
 #endif
 
-JITCache jitCache;
+JITCache jitCacheArm7;
+JITCache jitCacheArm9;
+
+void jitInvalidateSMC(u32 addr)
+{
+	jitCacheArm7.invalidateSMCTarget(addr);
+	jitCacheArm9.invalidateSMCTarget(addr);
+}
+
+void jitFlushAllCaches()
+{
+	jitCacheArm7.flushCache();
+	jitCacheArm9.flushCache();
+}
 
 // P5 diagnostic: how often invalidateSMCTarget() is actually called (every
 // hooked write to bank 2/3, from any of the P4 call sites -- ARM7/ARM9/DMA)
@@ -67,6 +80,7 @@ JITCache::JITCache() {
 	linkerStubAddress = nullptr;
 	linkerReturnAddress = nullptr;
 	arenaOffset = 0;
+	arenaSize = 0;
 	isInitialized = false;
 	smcBankMask = 0;
 }
@@ -75,11 +89,12 @@ JITCache::~JITCache() {
     destroy();
 }
 
-void JITCache::initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr,
-                          u8* smcFlagsPtr, u32 trackedBankMask) {
+void JITCache::initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr,
+                          BasicBlock** smcRegPtr, u8* smcFlagsPtr, u32 trackedBankMask) {
 	if (isInitialized) return;
 
 	jitArena = arenaPtr;
+	arenaSize = arenaBytes;
 	blockTable = blockPtr;
 	smcRegistry = smcRegPtr;
 	smcPageFlags = smcFlagsPtr;
@@ -95,14 +110,15 @@ void JITCache::destroy() {
 	smcRegistry = nullptr;
 	smcPageFlags = nullptr;
 	arenaOffset = 0;
+	arenaSize = 0;
 	isInitialized = false;
 }
 
 u32* JITCache::allocateJITMemory(size_t numBytes) {
 	numBytes = (numBytes + 31) & ~31;
 
-	// If this allocation exceeds our 512KB arena, flush the cache
-	if (arenaOffset + numBytes > JIT_ARENA_SIZE) {
+	// If this allocation exceeds this cache's arena, flush it
+	if (arenaOffset + numBytes > arenaSize) {
 		flushCache();
 	}
 
@@ -270,6 +286,9 @@ void JITCache::flushCache() {
 
 // SMC eviction handler
 void JITCache::invalidateSMCTarget(u32 targetEA) {
+	// Reachable from MMU write hooks that can fire before jitInit() (and, with
+	// two caches now, via jitInvalidateSMC() even if only one is up).
+	if (!isInitialized) return;
 	g_jitSmcChecks++;
 #ifdef DESMUME_JIT_TRACE_FIRST
 	{

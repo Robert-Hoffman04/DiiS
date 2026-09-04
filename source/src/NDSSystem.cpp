@@ -1673,7 +1673,12 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #ifdef DESMUME_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 #endif
+#ifdef DESMUME_JIT_ARM7
+				u32 jit9Cycles = jitRunArm9();
+				arm9 += (jit9Cycles ? jit9Cycles : armcpu_exec<ARMCPU_ARM9>());
+#else
 				arm9 += armcpu_exec<ARMCPU_ARM9>();
+#endif
 #ifdef DESMUME_ARM_TIME_SPLIT
 				g_arm9Ticks += gettime() - _t0;
 				splitMaybeReport();

@@ -1,0 +1,267 @@
+# ARM9 trace-JIT — the priority target (ARMv5TE, THUMB first)
+
+Status: **A0 landed** (branch `arm9-jit-infra`, 2026-09-03). The JIT core is
+de-singletonised (`jitCacheArm7` / `jitCacheArm9`, `jitProfile[2]`), a real ARM9
+`JitCpuProfile` skeleton is built, `jitRunArm9()` is spliced into
+`armInnerLoop`'s ARM9 arm but inert (`jitArm9Enabled=false`, `canEnter*` false),
+SMC hooks fan out to both caches, and the CP15 TCM-relocation flush is wired.
+Verified: JIT-off `.dol` byte-identical (2246048); JIT-on + differential builds
+clean; a 150 s PH differential soak is behaviourally identical to the
+pre-refactor baseline (selftest PASS, 0 mismatches, 0 arena overruns, no crash).
+Next: A1 (harness memory snapshot + cycle compare) and A2 (enable ARM9 THUMB).
+
+Reprioritised 2026-09-03: the ARM9 is where the
+~3× bottleneck lives ([desmumewii-perf-opportunities.md](desmumewii-perf-opportunities.md)
+§1.2), and the ARM7 JIT has so far shown only performance *parity* on Phantom
+Hourglass (arm7-jit plan, P5). So ARM9 moves ahead of the remaining ARM7 phases.
+
+This supersedes the "P8 *(separate effort)*" line in
+[desmumewii-arm7-jit-plan.md](desmumewii-arm7-jit-plan.md). The ARM7 JIT is **not
+abandoned** — it stays wired as a low-stakes continuous proving ground for the
+shared emitter core while the ARM9 front-end comes up. ARM7 P5 (runaway) and P7
+(ARM-mode front-end) continue on their own track but are **no longer on the ARM9
+critical path**.
+
+**Decisions locked (2026-09-03):**
+* **Dual-core.** Do the de-singletonise refactor; keep `jitCacheArm7` running.
+* **THUMB-only ARM9 first.** Reuse `jit_thumb.cpp` almost as-is (ARMv4T THUMB ==
+  ARMv5 THUMB + `BLX`), get a real perf number, *then* decide how hard to push
+  the ARM-mode front-end based on measured coverage.
+
+---
+
+## 1. Why this is safe enough to move up
+
+The blast-radius argument that put ARM7 first still stands — an ARM9 miscompile
+corrupts the whole game, not just audio. What changed is that the mitigations are
+now concrete and the ARM7 work already de-risked the hard 90 %:
+
+* **The shared core is battle-tested.** `JITCache` + arena + linker stub +
+  trampoline + `jit_trace.*` scanner + lazy register allocator + deferred
+  bailouts ran ~143 M ARM7 instructions with zero genuine differential
+  mismatches. `jit_thumb.cpp` passes 59/59 synthetic vectors and every THUMB
+  format is implemented.
+* **THUMB is ISA-identical.** ARMv4T THUMB and ARMv5 THUMB differ only by `BLX`.
+  `jit_thumb.cpp` is reused essentially unchanged — this is not a new front-end,
+  it is a new *profile* plus one opcode.
+* **The `JitCpuProfile` seam was built for exactly this.** `jit_cpu_state`
+  already carries per-core `gpr`/`cpsr`/`readTable` pointers; the trampoline and
+  emitted code are already CPU-neutral.
+* **Correctness is contained by construction:** every mode-affecting op is a
+  block terminator, the interpreter fallback is one branch away, and
+  `jitArm9Enabled` stays **default-off** through a multi-ROM differential soak.
+
+**The one real precondition** (§2, phase A1): the differential harness gets
+guest-memory snapshotting before it is trusted to sign off ARM9. The ARM7
+harness's store-double-apply and mode-switch blind spots are tolerable on the
+sound core; they are not on the game core. This same hardening is also the best
+remaining tool for the ARM7 P5 runaway (that investigation stalled on
+*tooling* — instrument/rebuild/rerun with no debugger — not on ideas).
+
+---
+
+## 2. Phasing
+
+| Phase | Deliverable | Exit criterion |
+|---|---|---|
+| **A0** | **De-singletonise the JIT core.** `jitCacheArm7` + `jitCacheArm9` (each its own arena, block hash, SMC registry, page-flags, linker-stub pair); `jitActiveProfile` → `jitProfile[2]`; `jitInit()` builds both; SMC hooks fan out to both caches for shared regions; add the CP15 TCM-relocation `flushCache` hook (even though nothing compiles yet). `jitRunArm9()` wired into the ARM9 arm of `armInnerLoop`, inert. | ARM7 differential soak **byte-identical** to pre-refactor; ARM9 JIT compiled, `jitArm9Enabled=false`, `canEnter*` false; JIT-off `.dol` == 2246048 |
+| **A1** | **Harden the differential harness.** Add guest-memory snapshot/restore around the interpreter reference run (scratch copy of the touched page range, or a write-log + rollback) so store-containing blocks are actually compared and "0 mismatches" means something. Fix or explicitly bound the mode-switch instruction-count blind spot. Add **per-block cycle-count comparison** (ARM9 timing feeds VCount/DMA/IRQ pacing — see §3.5). | the ARM7 soak still runs clean *with* store blocks now compared; harness reports cycle drift per block |
+| **A2** | **ARM9 THUMB front-end.** `jit_arm9_profile.cpp` (§3); enable `canEnterThumb` for ARM9; reuse `jit_thumb.cpp` + add THUMB `BLX` (imm and reg, §4); coarse cycle model v1; `jitRunArm9Checked`. Port VBA's `Profiler` and run it on 4+ retail ROMs for the ARM9 THUMB/ARM/fallback instruction mix. | jsmolka `thumb` payload passes on ARM9; zero genuine mismatches over a PH intro+gameplay capture on the hardened harness; Profiler coverage numbers reported; `jitArm9Enabled` still off |
+| **A3** | **Measure — the real "is it worth it" gate.** `tools/benchmark/benchmark.sh` gets `jit9off`/`jit9on` modes; A/B on the same scenes as the ARM7 work, ARM7 held on the interpreter. | benchmark delta reported on 3+ scenes; decision recorded on whether THUMB-only ARM9 is a real win and whether the ARM-mode front-end (A5) is now the priority |
+| **A4** | **Resolve or bound the P5-class runaway** with the hardened harness, then flip the switch. Multi-ROM differential soak; hardware validation of the arena (Broadway 32 KB I-cache, two arenas competing). | zero genuine mismatches across 4+ ROMs; runs correctly on real hardware; `jitArm9Enabled` → **default-on** if A3 showed a real win |
+| **A5** | **ARM-mode front-end** (`jit_arm.cpp`, the old ARM7 P7) — now serving both cores, ARM9 primarily — in the port order from the ARM7 plan §5.2, each group differential-tested. Then the **ARMv5TE ARM delta** (§4): CLZ, BLX, DSP multiplies, QADD family + Q flag, LDRD/STRD, PLD, BKPT, CP15/coproc = hard terminator, and the ARMv5 PC-interworking switch on LDM/LDR/data-proc. | jsmolka `arm` payload passes on ARM9; ARMv5 conformance payload passes; combined THUMB+ARM coverage and benchmark delta reported |
+
+Phases A0 and A1 have no dependency on each other or on any open ARM7 item and
+can run in parallel starting now.
+
+---
+
+## 3. `jit_arm9_profile.cpp` — the ARM9 JitCpuProfile
+
+Mirror `jit_arm7_profile.cpp`. The only file that knows DeSmuME's ARM9 memory
+map and state layout.
+
+### 3.1 State
+
+```
+state.gpr  = &NDS_ARM9.R[0];
+state.cpsr = &NDS_ARM9.CPSR.val;   // packed NZCV bits 31..28 (== ARM), Q at 27
+isaLevel   = 5;                     // ARMv5TE
+```
+
+Banked-register handling stays entirely in the interpreter, same rule as ARM7:
+any mode-affecting op (`MSR` control bits, mode-changing `BX`/`BLX`, `SWI`,
+`MOVS pc,lr`, `LDM ^`) is a block terminator.
+
+### 3.2 Compile-time fetch
+
+`fetch16/32` → `_MMU_read{16,32}<ARMCPU_ARM9, MMU_AT_CODE>(addr & ~mask)`.
+Already routes correctly (`MMU.h` 689–698, 731–738):
+
+* `(addr & 0x0F000000) == 0x02000000` → main RAM (shared)
+* `addr < 0x02000000` → **ITCM**, crudely modelled as
+  `MMU.ARM9_ITCM[addr & 0x7FFE/0x7FFC]` — the whole `0x00000000–0x01FFFFFF` range
+  mirrors a 32 KB ITCM, CP15 ITCM size ignored. The JIT inherits this for free.
+* else → `_MMU_ARM9_read*` (I/O, VRAM, palette, OAM, GBA slot, BIOS)
+* **DTCM as code returns garbage** → `canEnter*` must exclude the DTCM window.
+
+### 3.3 Runtime guest memory (slow path)
+
+`slowRead/slowWrite` → `_MMU_{read,write}{08,16,32}<ARMCPU_ARM9>` (MMU_AT_DATA):
+routes DTCM (incl. DTCM-patched-over-main-RAM priority), main RAM, shared WRAM,
+VRAM bank mapping, I/O. **v1: every ARM9 load/store emits a C-call here**,
+exactly as ARM7 v1 did. Inline fast paths are a later refinement (analogue of the
+ARM7 plan's P6), scoped after A3.
+
+`smcInvalidate` → `jitCacheArm9.invalidateSMCTarget`.
+
+### 3.4 canEnter
+
+True iff `pc` is in: ITCM window (`pc < 0x02000000`), main RAM
+(`(pc & 0x0F000000) == 0x02000000`), shared WRAM (`(pc >> 24) == 0x03`), or ARM9
+BIOS (`(pc & 0xFFFF0000) == 0xFFFF0000`). False for the DTCM window and
+everything else. For A2, `canEnterThumb` only — `canEnterArm` stays false until A5.
+
+### 3.5 Cycle model — the ARM9-specific hard part
+
+ARM7 could delete VBA's timing model wholesale; **ARM9 cannot**:
+
+* Code-fetch cycles: still off (`ACCOUNT_FOR_CODE_FETCH_CYCLES` undefined →
+  `Fetch()` returns 1). The dominant term is flat on both sides — good.
+* **Data-access cycles: modelled.** `_MMU_accesstime` (`MMU_timing.h` 258):
+  `MC=1` ITCM/DTCM/cached, `M32=2` for the ARM9 32-bit bus, `M16`, `MSLW=16` for
+  slow-wait regions. Combined via `MMU_aluMemCycles<0>` = `max(alu, mem)` (5-stage
+  pipeline approximation).
+* So an ARM9 load/store's interpreter cost is `max(alu, accesstime(runtime EA))`
+  — address-dependent, unknowable at compile time for register-indexed
+  addressing.
+
+Approach:
+
+* **v1 (A2):** assume the common case (cached / main RAM), cost
+  `max(alu, 2)` word / `max(alu, 1..2)` half/byte. Because the model is
+  `max(alu, mem)`, many loads cost just `alu` and the coarse error is often
+  *zero*; where wrong it is bounded (`MSLW` regions). The hardened harness's
+  per-block cycle compare (A1) quantifies the drift.
+* **v2 (post-A3, if drift matters):** revive VBA's `EmitDynamicNCyclePenalty`
+  (deleted for ARM7, still in `jit/upstream/`) — a short range check on the
+  computed EA adding `MSLW − M32` when the access hit a slow region.
+
+---
+
+## 4. Opcode delta over `jit_thumb.cpp`
+
+### THUMB (A2 — the only additions needed to run ARM9 THUMB)
+
+The DS ARM9 THUMB set is ARMv4T + `BLX`. Both encodings are siblings of code
+`jit_thumb.cpp` already has:
+
+* `BLX (imm)` — sibling of `BL` (Format 19, done in P2b) with H==01: adds "clear
+  CPSR.T, word-align target". **Terminator**, next block is ARM mode → until A5
+  lands, the block just exits and the interpreter takes the ARM code. Still a
+  net win (the THUMB run up to the call is native).
+* `BLX (reg)` in Format 5 — sibling of `BX Rs` (P2b) with an LR write.
+  Terminator; target bit0 picks the next block's mode.
+
+Everything else in THUMB is ARMv4T-identical on ARMv5 — `jit_thumb.cpp` is reused
+verbatim. THUMB is already interworking-aware (`POP {pc}`, `BX` consult bit0), so
+the ARMv5 PC-interworking change (§ below) does **not** affect the THUMB path.
+
+### ARM mode ARMv5TE delta (A5 — deferred)
+
+`isaLevel == 5` branches inside `jit_arm.cpp`. Interpreter already implements all
+of these (`instruction_tabdef.inc`: `OP_CLZ`, `OP_BLX_REG/IMM`, `OP_QADD/QSUB`,
+`OP_SMLA_x_y`, `OP_SMLAL_x_y`, `OP_SMLAW_x`, `OP_SMULW_x`, LDRD/STRD).
+
+| Op | Emit | Notes |
+|---|---|---|
+| `BLX (imm/reg)` | LR write + `BX`-style exit | terminator; on ARMv4T this was `cond==NV`/undefined so purely additive |
+| `CLZ Rd,Rm` | one PPC `cntlzw` | trivial |
+| `QADD/QSUB/QDADD/QDSUB` | saturating add/sub + **Q sticky flag** | PPC has no saturating add — overflow-detect + clamp, then `rlwimi` Q into CPSR **bit 27** (below the N/Z/C/V nibble the flag emitter touches — needs a dedicated merge in `jit_trace.cpp`) |
+| `SMLA<x><y>`, `SMLAW<y>`, `SMULW<y>`, `SMUL<x><y>`, `SMLAL<x><y>` | sign-extend selected halves, `mullw`/`mulhw`; accumulate forms can set Q | 16×16 / 32×16 signed DSP multiplies |
+| `LDRD`/`STRD` | even/odd pair as two 32-bit slow-path calls | check v5 alignment-fault behaviour |
+| `PLD` | nothing, advance PC | hint |
+| `MCR/MRC p15` | **hard terminator / bail** | CP15 writes reconfigure TCM/cache/protection — must go through `armcp15_moveARM2CP` (`cp15.cpp`) |
+| `MCR/MRC` other, `CDP/LDC/STC`, `BKPT` | interpreter bail | undefined-instruction / prefetch-abort |
+
+**ARMv5 PC-interworking (ARM mode, A5):** on ARMv5, `LDM`/`LDR`/data-proc writing
+PC interworks — bit0 of the value selects THUMB — whereas ARMv4 forces ARM. The
+`jit_arm.cpp` emitters (written for ARM7/ARMv4T in P7) get an `isaLevel` switch on
+every PC-writing path. Same silent-control-flow-corruption class as the ARM7
+`POP{...,PC}` bug — audit every PC-writing emitter.
+
+---
+
+## 5. SMC / cache coherency (ARM9)
+
+Cache-controller emulation is off — guest writes are immediately visible to the
+interpreter, so only the JIT block cache must be invalidated. ARM9 code lives in
+**ITCM, main RAM, shared WRAM**. Hooks:
+
+* **main RAM write, any PROCNUM** — the P4 hook (`MMU.h` 797–808) already fires
+  for ARM9 stores; A0 fans it out to `jitCacheArm9`. Covers ARM7↔ARM9 cross-CPU
+  SMC and DMA (both funnel through `_MMU_write*`).
+* **shared WRAM** — add an ARM9 analogue of the P4 `_MMU_ARM7_write*` bank-3 hook
+  in the `_MMU_ARM9_write*` path.
+* **ITCM writes** — new, ARM9-only, in `_MMU_ARM9_write*` for `addr < 0x02000000`;
+  mirror the crude `addr & 0x7FFF` model. Games load ITCM at boot then rarely
+  rewrite it, but overlay systems exist.
+* **CP15 TCM relocation / enable** (`cp15.cpp` 575–580 — `DTCMRegion`/`ITCMRegion`
+  writes; also TCM-enable bits in the control register): **flush `jitCacheArm9`
+  entirely.** A moved ITCM window silently changes which guest bytes back every
+  cached block. **Land this in A0.**
+* ARM9 DMA into ITCM/DTCM is already discarded by the MMU (`addr < 0x02000000`
+  guard in the `MMU_AT_DMA` branches) — one less path.
+
+`smcBankMask` start = `(1<<0)|(1<<2)|(1<<3)` plus the CP15-write full-flush (the
+static mask can't track relocatable TCM; a relocated DTCM sharing a tracked bank
+just costs a wasted empty-bucket walk).
+
+---
+
+## 6. Scheduler integration and blast radius
+
+`armInnerLoop` already interleaves per-instruction. Add `jitRunArm9()` to the
+ARM9 arm mirroring the ARM7 splice: one block/turn, `JIT_ENABLE_CHAINING` off,
+small cycle quota, immediate bail on `sequencer.reschedule` / `waitIRQ` /
+deliverable IRQ. IRQ delivery and `Wait4IRQ` stay in C, between blocks only.
+
+Because ARM9 is the game-logic core: `jitArm9Enabled` **default-off** until A4;
+the differential harness stays on far longer and compares per-block cycle counts;
+the A1 memory-snapshot hardening is non-negotiable.
+
+---
+
+## 7. Risks (ARM9-specific, on top of the ARM7 plan's list)
+
+* **Blast radius** — ARM9 miscompile = whole game. Mitigations: hardened harness
+  (A1), long default-off, per-phase retail soak.
+* **The P5-class runaway is still open** in the shared emitters. Mitigation: A1
+  gives it a real tool; A4 gates default-on behind resolving/bounding it; the
+  ARM7 JIT keeps exercising the same code in the meantime.
+* **ARMv5 PC-interworking** (A5) — silent control-flow corruption. Audit every
+  PC-writing emitter's `isaLevel` branch. Does not affect the A2 THUMB path.
+* **TCM relocation** invalidating cached blocks — CP15-write full-flush, landed
+  in A0.
+* **Cycle-model drift** feeding VCount/DMA/IRQ pacing → visual glitches, not just
+  audio. Per-block cycle compare from A1; v2 penalty model if A3 shows it matters.
+* **Two arenas** — MEM1/MEM2 headroom on Wii. Measure with both allocated before
+  sizing the ARM9 arena up. Broadway 32 KB I-cache now has two arenas competing —
+  keep ARM9 modest (2–4 MB), validate on hardware (A4).
+* **jsmolka payload on ARM9** — no "GBA mode" on the DS ARM9; needs the
+  harness-ROM route (ARM7 plan §5.3 route 1) retargeted to the ARM9 side.
+* **THUMB-only coverage might be lower than hoped even on ARM9.** The Profiler
+  run in A2 quantifies it *before* A3's benchmark; if THUMB alone is marginal,
+  A5 (ARM mode) jumps the queue.
+* **GPL provenance** unchanged — keep Daryl Borth's headers.
+
+---
+
+## 8. First concrete step
+
+**A0**, on a parallel branch `arm9-jit-infra` off current `arm7-jit` HEAD. Pure
+refactor: split `JITCache`/`jitActiveProfile`/`jitInit` two ways, fan out the SMC
+hooks, add the CP15 TCM-relocation flush, wire an inert `jitRunArm9()`. No
+emitter work, no behaviour change with the ARM9 JIT disabled, validated entirely
+by re-running the existing ARM7 differential soak. **A1** (harness memory
+snapshot + cycle compare) can start the same day, independently.

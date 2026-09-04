@@ -573,11 +573,19 @@ BOOL armcp15_moveARM2CP(armcp15_t *armcp15, u32 val, u8 CRn, u8 CRm, u8 opcode1,
 						case 0:
 
 							MMU.DTCMRegion = armcp15->DTCMRegion = val & 0x0FFFF000;
+#ifdef DESMUME_JIT_ARM7
+							// A moved TCM window silently changes which guest
+							// bytes back every cached ARM9 block -- drop the lot.
+							jitCacheArm9.flushCache();
+#endif
 							return TRUE;
 						case 1:
 							armcp15->ITCMRegion = val;
 							//ITCM base is not writeable!
 							MMU.ITCMRegion = 0;
+#ifdef DESMUME_JIT_ARM7
+							jitCacheArm9.flushCache();
+#endif
 							return TRUE;
 						default:
 							return FALSE;

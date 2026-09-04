@@ -61,7 +61,7 @@ extern u64 g_jitBlocksRun, g_jitInsnsRun;
 static bool blockHasMemoryStoreScan(u32 pc, u32 length)
 {
 	for (u32 i = 0; i < length; i++) {
-		u16 op = (u16)jitActiveProfile->fetch16(pc + i * 2);
+		u16 op = (u16)jitProfile[JIT_ARM7]->fetch16(pc + i * 2);
 		if ((op & 0xFE00) == 0xB400) return true;                        // PUSH
 		if ((op & 0xF800) == 0xC000) return true;                        // STMIA
 		if ((op & 0xF000) == 0x5000 && (op & 0x0E00) <= 0x0400) return true; // STR/STRB/STRH, reg offset
@@ -95,7 +95,7 @@ u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
 	// ---- interpreter reference: up to block->length steps ----
 	cpu->R[15] = pc + 4;
 	cpu->instruct_adr     = pc;
-	cpu->instruction      = jitActiveProfile->fetch16(pc & ~1u);
+	cpu->instruction      = jitProfile[JIT_ARM7]->fetch16(pc & ~1u);
 	cpu->next_instruction = pc + 2;
 
 	u32 istep = 0;
@@ -118,7 +118,7 @@ u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
 	JITResult r;
 	memset(&r, 0, sizeof r);
 	ExecuteJITTrace(block->execute, &r, &st);
-	if (r.smcHit) jitCache.invalidateSMCTarget(r.smcAddress);
+	if (r.smcHit) jitCacheArm7.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
 		// JIT made no progress -- restore and let the interpreter step once
@@ -134,11 +134,11 @@ u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
 	const u32 npc = r.nextPC;
 	cpu->instruct_adr = npc;
 	if (cpu->CPSR.bits.T) {
-		cpu->instruction      = jitActiveProfile->fetch16(npc & ~1u);
+		cpu->instruction      = jitProfile[JIT_ARM7]->fetch16(npc & ~1u);
 		cpu->next_instruction = npc + 2;
 		cpu->R[15]            = npc + 4;
 	} else {
-		cpu->instruction      = jitActiveProfile->fetch32(npc & ~3u);
+		cpu->instruction      = jitProfile[JIT_ARM7]->fetch32(npc & ~3u);
 		cpu->next_instruction = npc + 4;
 		cpu->R[15]            = npc + 8;
 	}
@@ -172,7 +172,7 @@ u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
 						s_lastDumpPC = pc;
 						fprintf(f, "[jit]   opcodes:");
 						for (u32 i = 0; i < block->length; i++)
-							fprintf(f, " %04x", (unsigned)jitActiveProfile->fetch16(pc + i * 2));
+							fprintf(f, " %04x", (unsigned)jitProfile[JIT_ARM7]->fetch16(pc + i * 2));
 						fprintf(f, "\n");
 					}
 					fclose(f);

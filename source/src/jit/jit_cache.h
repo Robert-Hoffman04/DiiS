@@ -46,7 +46,8 @@
 // Arena sized down from VBA's 8 MB: the Broadway has only 32 KB L1-I and
 // Dolphin doesn't model it, so a smaller, denser arena is the safer default
 // (see the plan, risk "Broadway I-cache vs arena"). Revisit with hardware.
-#define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB
+#define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB (ARM7)
+#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 3) // 3 MB (ARM9 is the hot core)
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
 
@@ -67,6 +68,7 @@ class JITCache {
 	private:
 		u32* jitArena;
 		size_t arenaOffset;
+		size_t arenaSize;   // this cache's arena capacity (ARM7 and ARM9 differ)
 		BasicBlock* blockTable;
 		BasicBlock** smcRegistry;
 		bool isInitialized;
@@ -84,8 +86,8 @@ class JITCache {
 		u32* linkerReturnAddress;
 		u8* smcPageFlags;
 
-		void initialize(u32* arenaPtr, BasicBlock* blockPtr, BasicBlock** smcRegPtr,
-		                u8* smcFlagsPtr, u32 trackedBankMask);
+		void initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr,
+		                BasicBlock** smcRegPtr, u8* smcFlagsPtr, u32 trackedBankMask);
 		void destroy();
 
 		u32* allocateJITMemory(size_t numBytes);
@@ -108,6 +110,17 @@ class JITCache {
 		}
 };
 
-extern JITCache jitCache;
+// One cache per emulated core -- ARM7 and ARM9 share guest address ranges
+// (main RAM 0x02xxxxxx, BIOS/ITCM 0x00xxxxxx), so blocks cannot share a
+// PC-keyed table. Each instance owns its own arena, block hash, SMC registry,
+// page-flag map and linker-stub pair.
+extern JITCache jitCacheArm7;
+extern JITCache jitCacheArm9;
+
+// SMC / coherency fan-out helpers. Shared regions (main RAM, shared WRAM) can
+// hold code for either core and can be written by either core or by DMA, so a
+// write there must invalidate in both caches. Safe to call before jitInit().
+void jitInvalidateSMC(u32 addr);   // -> both caches
+void jitFlushAllCaches();          // -> both caches (bulk memory overwrite / reset)
 
 #endif

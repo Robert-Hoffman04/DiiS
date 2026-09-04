@@ -1058,8 +1058,8 @@ static void loadstate()
 	// bypassing every _MMU_write* SMC hook above. Any block already compiled
 	// against the pre-load bytes is now stale -- there's no address-range
 	// classification possible here (fixed-size correctness > incremental
-	// perf), so just drop the whole cache.
-	jitCache.flushCache();
+	// perf), so just drop the whole cache -- both cores'.
+	jitFlushAllCaches();
 #endif
 
 	execute = 1;//!driver->EMU_IsEmulationPaused();

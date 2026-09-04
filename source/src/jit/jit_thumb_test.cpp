@@ -123,7 +123,7 @@ static void loadState(const ThumbVec& v)
 
 int jitThumbSelfTest()
 {
-	if (!jitActiveProfile) { printf("[jit] thumb selftest: no profile\n"); return -1; }
+	if (!jitProfile[JIT_ARM7]) { printf("[jit] thumb selftest: no profile\n"); return -1; }
 
 	FILE* f = fopen("sd:/jit.log", "a");
 	int pass = 0, fail = 0, skip = 0;
@@ -141,8 +141,8 @@ int jitThumbSelfTest()
 		}
 
 		// ---- JIT ----
-		jitCache.flushCache();
-		BasicBlock* b = jitCompileTrace(JITT_SCRATCH, jitCache, *jitActiveProfile);
+		jitCacheArm7.flushCache();
+		BasicBlock* b = jitCompileTrace(JITT_SCRATCH, jitCacheArm7, *jitProfile[JIT_ARM7]);
 		if (!b || !b->execute) {
 			if (f) fprintf(f, "[jit] thumb %-12s SKIP (not compiled)\n", v.name);
 			skip++;

@@ -22,7 +22,7 @@
 
 bool jitSelfTest()
 {
-	if (!jitActiveProfile) {
+	if (!jitProfile[JIT_ARM7]) {
 		printf("[jit] selftest: no active profile (jitInit failed?)\n");
 		return false;
 	}
@@ -31,8 +31,8 @@ bool jitSelfTest()
 	const u32 kNextPC = 0x02001abc;
 	const u32 kInsns  = 3;
 
-	const size_t before = jitCache.getArenaOffset();
-	u32* code = jitCache.allocateJITMemory(64);
+	const size_t before = jitCacheArm7.getArenaOffset();
+	u32* code = jitCacheArm7.allocateJITMemory(64);
 	if (!code) { printf("[jit] selftest: arena alloc failed\n"); return false; }
 
 	u32* p = code;
@@ -54,7 +54,7 @@ bool jitSelfTest()
 	// relative branch reaches it even though ExecuteJITTrace_Return itself may
 	// be >32 MB away in .text)
 	{
-		s32 off = (s32)((u8*)jitCache.linkerReturnAddress - (u8*)p);
+		s32 off = (s32)((u8*)jitCacheArm7.linkerReturnAddress - (u8*)p);
 		*p++ = PPC_B(off);
 	}
 
@@ -82,13 +82,13 @@ bool jitSelfTest()
 	         (unsigned)r.cycles, (unsigned)kCycles,
 	         (unsigned)r.nextPC, (unsigned)kNextPC,
 	         (unsigned)r.instructions, (unsigned)kInsns, (unsigned)r.bailedOut,
-	         (unsigned)jitCache.getArenaOffset(), (unsigned)JIT_ARENA_SIZE);
+	         (unsigned)jitCacheArm7.getArenaOffset(), (unsigned)JIT_ARENA_SIZE);
 	printf("%s", line);
 	FILE* f = fopen("sd:/jit.log", "a");
 	if (f) { fputs(line, f); fclose(f); }
 
 	// this was scratch: give the arena space back
-	jitCache.rewindJITMemory(jitCache.getArenaOffset() - before);
+	jitCacheArm7.rewindJITMemory(jitCacheArm7.getArenaOffset() - before);
 	return ok;
 }
 

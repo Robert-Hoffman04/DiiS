@@ -42,7 +42,7 @@ static void arm7_slowWrite(u32 addr, u32 val, u32 size)
 	}
 }
 
-static void arm7_smcInvalidate(u32 addr) { jitCache.invalidateSMCTarget(addr); }
+static void arm7_smcInvalidate(u32 addr) { jitCacheArm7.invalidateSMCTarget(addr); }
 
 static u32  arm7_swiHandler(u32 comment) { (void)comment; return 0; }   // P2/P3
 static bool arm7_canEnterThumb(u32 pc)   { (void)pc; return true; }

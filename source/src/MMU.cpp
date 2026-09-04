@@ -1107,7 +1107,7 @@ void MMU_Reset()
 	// not _MMU_write* calls -- they bypass every SMC hook. Called on every ROM
 	// (re)load via NDS_Reset(), so any block compiled against the previous
 	// ROM/session's memory contents must not survive into the new one.
-	jitCache.flushCache();
+	jitFlushAllCaches();
 #endif
 }
 
@@ -2330,6 +2330,12 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 
 	mmu_log_debug_ARM9(adr, "(write08) 0x%02X", val);
 
+#ifdef DESMUME_JIT_ARM7
+	// ARM9 code lives in ITCM (adr < 0x02000000) and shared WRAM (bank 0x03);
+	// bank 0x02 main-RAM writes are already hooked in MMU.h before dispatch.
+	if(adr < 0x02000000 || (adr >> 24) == 3) jitCacheArm9.invalidateSMCTarget(adr);
+#endif
+
 	if(adr < 0x02000000)
 	{
 		T1WriteByte(MMU.ARM9_ITCM, adr&0x7FFF, val);
@@ -2545,6 +2551,10 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 {
 
 	mmu_log_debug_ARM9(adr, "(write16) 0x%04X", val);
+
+#ifdef DESMUME_JIT_ARM7
+	if(adr < 0x02000000 || (adr >> 24) == 3) jitCacheArm9.invalidateSMCTarget(adr);
+#endif
 
 	if (adr < 0x02000000)
 	{
@@ -3021,6 +3031,10 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 {
 	mmu_log_debug_ARM9(adr, "(write32) 0x%08X", val);
+
+#ifdef DESMUME_JIT_ARM7
+	if(adr < 0x02000000 || (adr >> 24) == 3) jitCacheArm9.invalidateSMCTarget(adr);
+#endif
 
 	if(adr<0x02000000)
 	{
@@ -3700,7 +3714,7 @@ void FASTCALL _MMU_ARM7_write08(u32 adr, u8 val)
 	// P7) and thus never goes through a compiled store at all. Harmless
 	// no-op for addresses no block was ever registered against --
 	// invalidateSMCTarget() just walks an empty page-registry bucket.
-	jitCache.invalidateSMCTarget(adr);
+	jitInvalidateSMC(adr);
 #endif
 }
 
@@ -4006,7 +4020,7 @@ void FASTCALL _MMU_ARM7_write16(u32 adr, u16 val)
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
 #ifdef DESMUME_JIT_ARM7
-	jitCache.invalidateSMCTarget(adr); // see _MMU_ARM7_write08's comment
+	jitInvalidateSMC(adr); // see _MMU_ARM7_write08's comment
 #endif
 }
 //================================================= MMU ARM7 write 32
@@ -4126,7 +4140,7 @@ void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
 #ifdef DESMUME_JIT_ARM7
-	jitCache.invalidateSMCTarget(adr); // see _MMU_ARM7_write08's comment
+	jitInvalidateSMC(adr); // see _MMU_ARM7_write08's comment
 #endif
 }
 

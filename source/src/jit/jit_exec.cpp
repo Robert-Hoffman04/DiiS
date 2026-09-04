@@ -40,7 +40,7 @@ static void jitMaybeReport()
 	                 (unsigned long long)g_jitBlocksRun, (unsigned long long)g_jitInsnsRun,
 	                 (unsigned long long)g_jitAttempts, (unsigned long long)g_jitBail0,
 	                 (unsigned long long)g_jitSmcKills,
-	                 (unsigned)jitCache.getArenaOffset()); fclose(f); }
+	                 (unsigned)jitCacheArm7.getArenaOffset()); fclose(f); }
 #endif
 }
 
@@ -53,16 +53,17 @@ bool jitArm7Enabled = true;
 
 u32 jitRunArm7()
 {
-	if (!jitArm7Enabled || !jitActiveProfile) return 0;
+	JitCpuProfile* prof = jitProfile[JIT_ARM7];
+	if (!jitArm7Enabled || !prof) return 0;
 
 	armcpu_t& cpu = NDS_ARM7;
 	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (P7)
 
 	const u32 pc = cpu.instruct_adr;
 
-	BasicBlock* b = jitCache.getBlock(pc);
+	BasicBlock* b = jitCacheArm7.getBlock(pc);
 	if (!b || (b->execute == nullptr && b->length == 0))
-		b = jitCompileTrace(pc, jitCache, *jitActiveProfile);
+		b = jitCompileTrace(pc, jitCacheArm7, *prof);
 	if (!b || b->execute == nullptr) return 0;     // uncompilable / "don't JIT" -> interpreter
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
@@ -78,13 +79,13 @@ u32 jitRunArm7()
 	g_jitAttempts++;
 
 	if (r.smcHit)
-		jitCache.invalidateSMCTarget(r.smcAddress);
+		jitCacheArm7.invalidateSMCTarget(r.smcAddress);
 
 #ifdef DESMUME_JIT_TRACE_FIRST
 	if (g_jitAttempts <= 60) {
 		FILE* f = fopen("sd:/jit.log", "a");
 		if (f) { fprintf(f, "[jit] blk pc=%08x op=%04x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
-		                 (unsigned)pc, (unsigned)jitActiveProfile->fetch16(pc & ~1u),
+		                 (unsigned)pc, (unsigned)prof->fetch16(pc & ~1u),
 		                 (unsigned)b->length, (unsigned)r.instructions,
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
@@ -98,7 +99,7 @@ u32 jitRunArm7()
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		if (b->length == 1) jitCache.registerBlock(pc, 1, nullptr);
+		if (b->length == 1) jitCacheArm7.registerBlock(pc, 1, nullptr);
 		cpu.R[15] = pc + 4;
 		g_jitBail0++;
 		jitMaybeReport();
@@ -115,11 +116,11 @@ u32 jitRunArm7()
 	const u32 npc = r.nextPC;
 	cpu.instruct_adr = npc;
 	if (cpu.CPSR.bits.T) {
-		cpu.instruction      = jitActiveProfile->fetch16(npc & ~1u);
+		cpu.instruction      = prof->fetch16(npc & ~1u);
 		cpu.next_instruction = npc + 2;
 		cpu.R[15]            = npc + 4;
 	} else {
-		cpu.instruction      = jitActiveProfile->fetch32(npc & ~3u);
+		cpu.instruction      = prof->fetch32(npc & ~3u);
 		cpu.next_instruction = npc + 4;
 		cpu.R[15]            = npc + 8;
 	}
@@ -127,6 +128,67 @@ u32 jitRunArm7()
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
 	jitMaybeReport();
+
+	return r.cycles ? r.cycles : 1;
+}
+
+// ---------------------------------------------------------------------------
+// ARM9 counterpart. Structurally identical to jitRunArm7() above (same shared
+// scanner, trampoline and resume-pipeline logic) but against NDS_ARM9 /
+// jitCacheArm9 / the ARM9 profile.
+//
+// A0: jitArm9Enabled defaults false and the ARM9 profile's canEnterThumb()
+// returns false, so both guards below short-circuit and this always returns 0
+// (interpreter handles every ARM9 step, exactly as before). The body is in
+// place so A2 -- enabling the ARM9 THUMB front-end -- is just "flip the two
+// flags + fill canEnterThumb + the cycle model". The differential wrapper
+// (jitRunArm9Checked) lands in A1/A2.
+// ---------------------------------------------------------------------------
+bool jitArm9Enabled = false;
+
+u32 jitRunArm9()
+{
+	JitCpuProfile* prof = jitProfile[JIT_ARM9];
+	if (!jitArm9Enabled || !prof) return 0;
+
+	armcpu_t& cpu = NDS_ARM9;
+	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (A5)
+
+	const u32 pc = cpu.instruct_adr;
+	if (!prof->canEnterThumb(pc)) return 0;        // uncompilable region
+
+	BasicBlock* b = jitCacheArm9.getBlock(pc);
+	if (!b || (b->execute == nullptr && b->length == 0))
+		b = jitCompileTrace(pc, jitCacheArm9, *prof);
+	if (!b || b->execute == nullptr) return 0;
+
+	cpu.R[15] = pc + 4;
+	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };
+
+	JITResult r;
+	memset(&r, 0, sizeof r);
+	ExecuteJITTrace(b->execute, &r, &st);
+
+	if (r.smcHit)
+		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
+
+	if (r.instructions == 0) {
+		if (b->length == 1) jitCacheArm9.registerBlock(pc, 1, nullptr);
+		cpu.R[15] = pc + 4;
+		return 0;
+	}
+
+	const u32 npc = r.nextPC;
+	cpu.instruct_adr = npc;
+	if (cpu.CPSR.bits.T) {
+		cpu.instruction      = prof->fetch16(npc & ~1u);
+		cpu.next_instruction = npc + 2;
+		cpu.R[15]            = npc + 4;
+	} else {
+		cpu.instruction      = prof->fetch32(npc & ~3u);
+		cpu.next_instruction = npc + 4;
+		cpu.R[15]            = npc + 8;
+	}
 
 	return r.cycles ? r.cycles : 1;
 }

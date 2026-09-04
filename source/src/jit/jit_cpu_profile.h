@@ -39,7 +39,7 @@ struct jit_cpu_state {
 
 // -------------------------------------------------------------------------
 // JitCpuProfile -- one instance per emulated core, built by the per-CPU
-// jit_*_profile.cpp and published as jitActiveProfile by jitInit().
+// jit_*_profile.cpp and published into jitProfile[] by jitInit().
 // -------------------------------------------------------------------------
 struct JitCpuProfile {
 	jit_cpu_state state;
@@ -69,6 +69,10 @@ struct JitCpuProfile {
 	u32  smcBankMask;  // bit b set => guest bank (addr>>24)==b can hold JIT code
 };
 
-extern JitCpuProfile* jitActiveProfile;   // set by jitInit(); null when JIT off
+// Per-core profile slots, indexed the same way DeSmuME indexes its CPUs
+// (ARMCPU_ARM9 == 0, ARMCPU_ARM7 == 1). jitInit() publishes one entry per core
+// whose JIT is built in; a slot is null when that core's JIT is off.
+enum { JIT_ARM9 = 0, JIT_ARM7 = 1 };
+extern JitCpuProfile* jitProfile[2];
 
 #endif // DESMUME_JIT_CPU_PROFILE_H
