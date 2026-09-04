@@ -46,8 +46,15 @@
  *        The B1-B6 PC-writer audit: every pc-writing emitter (data-proc -> pc,
  *        LDR -> pc, extra ld/st -> pc, multiply -> pc, QADD -> pc) ends the
  *        trace; only LDM{pc} (B4) and BX/BLX (B6) compile a pc write, both with
- *        the ARMv5 bit0 interworking branch. LDR{pc} / MOV pc,lr interworking is
- *        a later group.
+ *        the ARMv5 bit0 interworking branch. LDR{pc} / MOV pc,lr interworking
+ *        landed in B7c.
+ *   B7c - PC-write interworking: LDR pc,[...] (ARMv5 LDTBit -- bit0 of the
+ *        loaded word selects the resume ISA, LDM{pc} shape) and non-S
+ *        data-processing writing Rd == 15 (MOV pc,lr / ADD pc,pc,rN -- a plain
+ *        ARM-mode jump to the ALU result, no mask, no mode switch, matching
+ *        OP_xxx's next_instruction = result path). Both block terminators.
+ *        S-form data-proc -> pc (SPSR restore) and any predicated PC write end
+ *        the trace.
  *   B6b - data-processing with a register operand2 shifted by a register
  *        (LSL/LSR/ASR/ROR by Rs&0xFF, bit4 == 1 && bit7 == 0). Runtime amount,
  *        so the shifter carry needs runtime branches; the value/carry edges at
@@ -392,6 +399,73 @@ void emitAlu(JitTraceCtx& ctx, u8 aluOp, bool S, bool testOnly, bool isLogical,
 	}
 }
 
+// ------------------------------------------------- data-processing -> PC (B7c)
+// A non-S data-processing op with Rd == 15: OP_xxx's `next_instruction = result`
+// path -- a plain ARM-mode jump to the ALU result, with NO word-align and NO
+// mode switch (unlike LDR pc / BX). The S-form (SPSR -> CPSR exception return)
+// and any predicated form bail at the dispatch site. Covers `MOV pc,lr`,
+// `ADD pc,pc,rN` jump tables and the like -- a real block-length win in
+// function-return-heavy ARM code. Block terminator.
+void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
+{
+	const bool immForm   = (op >> 25) & 1;
+	const u8   aluOp     = (op >> 21) & 0xF;
+	const u8   rn        = (op >> 16) & 0xF;
+	const u8   rm        = op & 0xF;
+	const u8   rs        = (op >> 8) & 0xF;
+	const bool ignoresRn = (aluOp == 13 || aluOp == 15);
+	const bool isLogical = (aluOp <= 1) || (aluOp >= 12);
+	const bool regShift  = !immForm && ((op >> 4) & 1) && !((op >> 7) & 1);
+
+	if (!immForm) {
+		if (((op >> 4) & 1) && ((op >> 7) & 1)) { ctx.endBlock = true; return; }  // not a DP encoding
+		if (rm == 15)                           { ctx.endBlock = true; return; }
+		if (!ignoresRn && rn == 15)             { ctx.endBlock = true; return; }
+		if (regShift && rs == 15)               { ctx.endBlock = true; return; }
+	}
+
+	const u32 rot = ((op >> 8) & 0xF) * 2;
+	const u32 k   = ror32(op & 0xFF, rot);
+
+	ctx.ensureArena();
+	u32 lockedMask = 0;
+
+	// compile-time-constant target (MOV/MVN #imm, ADD/SUB pc,#imm) -> static
+	// exit so the block can chain to the successor.
+	if (immForm && (aluOp == 13 || aluOp == 15 ||
+	                (rn == 15 && (aluOp == 2 || aluOp == 4)))) {
+		u32 val;
+		if      (aluOp == 13) val = k;
+		else if (aluOp == 15) val = ~k;
+		else if (aluOp == 4)  val = ctx.currentPC + 8 + k;
+		else                  val = ctx.currentPC + 8 - k;
+		ctx.emitStaticExit(val, ctx.instrCount + 1, 3);         // OP_xxx(_,3)
+		ctx.instrCount++;
+		ctx.currentPC += 4;
+		ctx.endBlock = true;
+		ctx.blockTerminatedEarly = true;
+		return;
+	}
+	if (immForm && rn == 15 && !ignoresRn) { ctx.endBlock = true; return; }
+
+	u8 hRm = 0;
+	if (!immForm)   hRm = ctx.readReg(rm, lockedMask);
+	u8 hRs = 0;
+	if (regShift)   hRs = ctx.readReg(rs, lockedMask);
+	u8 hRn = 0;
+	if (!ignoresRn) hRn = ctx.readReg(rn, lockedMask);
+
+	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, /*wantCarry=*/false);
+	emitAlu(ctx, aluOp, /*S=*/false, /*testOnly=*/false, isLogical, hRn, PPC_R12, o2);
+
+	// result in PPC_R12 -> dynamic exit (no mask, no T change: stays ARM)
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForArm(op));
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
 // --------------------------------------------------------- data-processing
 // cond .. 00 I opcode[24:21] S[20] Rn[19:16] Rd[15:12] <operand2>
 //   opcode: 0 AND 1 EOR 2 SUB 3 RSB 4 ADD 5 ADC 6 SBC 7 RSC
@@ -411,7 +485,15 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	const bool isLogical = (aluOp <= 1) || (aluOp == 8) || (aluOp == 9) || (aluOp >= 12);
 
 	if (testOnly && !S)  { ctx.endBlock = true; return; }   // MRS/MSR reg/imm -> B6
-	if (rd == 15)        { ctx.endBlock = true; return; }   // PC write -> B7
+	if (rd == 15) {
+		// ARMv5 PC write. S-form (MOVS/SUBS pc,...) restores CPSR from SPSR --
+		// an exception return, interpreter only. A predicated PC write is a
+		// conditional-branch shape (deferred). The plain non-S form is a
+		// straight ARM-mode jump to the ALU result (B7c).
+		if (S || predicated) { ctx.endBlock = true; return; }
+		emitDataProcToPc(ctx, op);
+		return;
+	}
 
 	const bool regShift = !immForm && ((op >> 4) & 1) && !((op >> 7) & 1);
 	const u8   rs       = (op >> 8) & 0xF;
@@ -523,6 +605,68 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	}
 }
 
+// --------------------------------------------------- LDR -> PC interwork (B7c)
+// A word LDR with Rd == 15. `valReg` holds the already-rotated loaded word. The
+// ARM9 (LDTBit == 1) path of OP_LDR: CPSR.T = bit0(word) ; R15 = word & ~1. Same
+// shape as the LDM{...,pc} exit -- bit0 selects the resume ISA, T is set in the
+// packed flags on the THUMB path so the C++ resume uses 16-bit pipeline math.
+// Block terminator; caller has run the memory epilogue, invalidated the reg
+// cache and committed any base writeback.
+void emitLdrPcExit(JitTraceCtx& ctx, u8 valReg, u32 op)
+{
+	u32*& p = ctx.emitPtr;
+	const u32 term = ctx.cpu.cyclesForArm(op);
+
+	*p++ = PPC_OR(PPC_R12, valReg, valReg);              // capture before any flush
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);      // R11 = bit0 (mode select)
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* toArm = p++;                                     // BEQ -> stay ARM
+
+	// bit0 == 1: ARM -> THUMB. Set CPSR.T so the resume path fetches 16-bit.
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);       // word & ~1
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_LI(PPC_R10, 0x20);                         // CPSR.T (bit 5)
+	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+	ctx.flagsDirty = true;
+	ctx.flushDirtyFlags();
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
+	// bit0 == 0: stay ARM. OP_LDR still masks R15 &= 0xFFFFFFFE.
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);       // word & ~1
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
+// LDR into PC, general (non-literal) form: the load half of emitLoadStoreTail
+// (word access, always rotate) but the loaded word interworks instead of being
+// written to a GPR slot. EA in PPC_R11, writeback value (if any) in PPC_R10.
+void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
+{
+	u32*& p = ctx.emitPtr;
+	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
+	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
+
+	ctx.emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);                 // ROR(loaded, 8*(EA&3))
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
+	*p++ = PPC_LI(PPC_R11, 4);
+	*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
+	*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+	ctx.emitMemEpilogue();
+	ctx.invalidateRegCache();
+	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+
+	emitLdrPcExit(ctx, PPC_R10, op);
+}
+
 // -------------------------------------------------- LDR / STR (word / byte)
 // cond 01 I P U B W L Rn Rd <offset>
 //   I : 0 imm12 offset, 1 register offset shifted by an immediate (bit4 == 0)
@@ -546,8 +690,10 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	const bool writeback = (!P) || W;
 
 	if (!P && W)              { ctx.endBlock = true; return; }   // LDRT / STRT
-	if (rd == 15)             { ctx.endBlock = true; return; }   // PC load/store -> B7
+	if (rd == 15 && (!L || B)){ ctx.endBlock = true; return; }   // STR pc / LDRB pc -> interp
 	if (I && ((op >> 4) & 1)) { ctx.endBlock = true; return; }   // undefined
+	// LDR pc (word): a block terminator with ARMv5 LDTBit interworking (B7c),
+	// handled after EA computation via emitLdrPcExit / emitLoadPcTail.
 
 	u32*& p = ctx.emitPtr;
 	const s32 immOff = U ? (s32)(op & 0xFFF) : -(s32)(op & 0xFFF);
@@ -567,6 +713,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 			}
 			ctx.emitMemEpilogue();
 			ctx.invalidateRegCache();
+			if (rd == 15) { emitLdrPcExit(ctx, PPC_R10, op); return; }   // LDR pc,[pc,#imm]
 			*p++ = PPC_STW(PPC_R10, 14, rd * 4);
 		} else {
 			emitLoadImm32(p, PPC_R12, ea);
@@ -608,6 +755,8 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 		else if (U)  *p++ = PPC_ADD (PPC_R10, hRn, PPC_R12);
 		else         *p++ = PPC_SUBF(PPC_R10, PPC_R12, hRn);
 	}
+
+	if (rd == 15) { emitLoadPcTail(ctx, writeback, rn, op); return; }   // LDR pc (B7c)
 
 	emitLoadStoreTail(ctx, hVal, size, L, /*signExt=*/false,
 	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd);

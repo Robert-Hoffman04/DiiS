@@ -211,6 +211,7 @@ static u8 arm9_cyclesForArm(u32 op)
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;
 		const bool L = (op >> 20) & 1;
+		if (L && !B && ((op >> 12) & 0xFu) == 15) return 5;   // LDR pc: OP_LDR's b (5) path
 		if (!B) return 4;                     // word
 		return L ? 3 : 2;                     // byte
 	}
@@ -248,6 +249,16 @@ static u8 arm9_cyclesForArm(u32 op)
 	// shifter cycle). Rd == 15 bails in the emitter. Shift-by-immediate and the
 	// immediate operand2 form stay at 1 (handled by the fall-through).
 	if (((op >> 26) & 3) == 0 && (op & 0x02000090u) == 0x00000010u) return 2;
+	// data-processing (class 00) writing Rd == 15: OP_xxx's b (PC-write) path --
+	// 3 for the immediate / shift-by-immediate operand2 forms, 4 when operand2 is
+	// shifted by a register. Multiplies / CLZ / QADD / DSP muls / BX / SWP are
+	// matched above and returned; MRS/MSR (the 10x0 control space) is excluded so
+	// it keeps its flat 1.
+	if (((op >> 26) & 3) == 0 && ((op >> 12) & 0xFu) == 15 &&
+	    !(((op >> 23) & 3) == 2 && !((op >> 20) & 1))) {
+		const bool regShift = (op & 0x02000010u) == 0x00000010u && !((op >> 7) & 1);
+		return regShift ? 4u : 3u;
+	}
 	return 1;
 }
 
