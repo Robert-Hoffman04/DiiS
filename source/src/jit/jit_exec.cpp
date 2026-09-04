@@ -203,6 +203,9 @@ u32 jitRunArm9()
 	if (!canEnter) return 0;                       // uncompilable region / ARM off
 
 	BasicBlock* b = jitCacheArm9.getBlock(pc);
+#ifdef DESMUME_JIT_TRACE_FIRST
+	const bool wasMiss = !b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb;
+#endif
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
 	if (!b || b->execute == nullptr) return 0;
@@ -218,6 +221,32 @@ u32 jitRunArm9()
 	memset(&r, 0, sizeof r);
 	ExecuteJITTrace(b->execute, &r, &st);
 
+#ifdef DESMUME_JIT_TRACE_FIRST
+	{
+		static u64 s_disp = 0, s_comp = 0, s_bail0 = 0, s_arm = 0, s_armbail0 = 0, s_lastRep = 0;
+		s_disp++;
+		if (wasMiss) s_comp++;
+		if (r.instructions == 0) s_bail0++;
+		if (!thumb) { s_arm++; if (r.instructions == 0) s_armbail0++; }
+		static int s_dump = 0;
+		if (!thumb && s_dump < 40) {
+			s_dump++;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) { fprintf(f, "[jit] a9 %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
+			                 wasMiss ? "MISS" : "hit", (unsigned)pc, (unsigned)prof->fetch32(pc),
+			                 (unsigned)b->insnCount(), (unsigned)r.instructions, (unsigned)r.bailedOut,
+			                 (unsigned)r.smcHit, (unsigned)r.cycles, (unsigned)r.nextPC); fclose(f); }
+		}
+		if (s_disp - s_lastRep >= 500000) {
+			s_lastRep = s_disp;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) { fprintf(f, "[jit] a9 tally: disp=%llu compiles=%llu bail0=%llu | arm disp=%llu arm bail0=%llu\n",
+			                 (unsigned long long)s_disp, (unsigned long long)s_comp, (unsigned long long)s_bail0,
+			                 (unsigned long long)s_arm, (unsigned long long)s_armbail0); fclose(f); }
+		}
+	}
+#endif
+
 	if (r.smcHit)
 		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
 
@@ -228,6 +257,34 @@ u32 jitRunArm9()
 	}
 
 	const u32 npc = r.nextPC;
+
+#ifdef DESMUME_JIT_TRACE_FIRST
+	// One-shot diagnostic: an ARM9 JIT block whose resume PC lands outside every
+	// executable region -- the runaway's first observable symptom. Dump the
+	// block's opcodes so the offending emitter is identifiable.
+	{
+		const bool sane = (npc < 0x02000000) ||
+		                  ((npc & 0x0F000000u) == 0x02000000u) ||
+		                  ((npc >> 24) == 0x03) ||
+		                  ((npc & 0xFF000000u) == 0xFF000000u);
+		static int s_badLogged = 0;
+		if (!sane && s_badLogged < 12) {
+			s_badLogged++;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) {
+				fprintf(f, "[jit] !!! ARM9 bad resume pc=%08x npc=%08x thumb=%d ins=%u cyc=%u len=%u ops:",
+				        (unsigned)pc, (unsigned)npc, (int)thumb,
+				        (unsigned)r.instructions, (unsigned)r.cycles, (unsigned)b->insnCount());
+				for (u32 i = 0; i < b->insnCount() && i < 34; i++)
+					fprintf(f, " %08x", (unsigned)(thumb ? prof->fetch16(pc + i * 2)
+					                                      : prof->fetch32(pc + i * 4)));
+				fprintf(f, "\n");
+				fclose(f);
+			}
+		}
+	}
+#endif
+
 	cpu.instruct_adr = npc;
 	if (cpu.CPSR.bits.T) {
 		cpu.instruction      = prof->fetch16(npc & ~1u);
