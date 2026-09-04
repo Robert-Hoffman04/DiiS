@@ -198,6 +198,12 @@ static u8 arm9_cyclesForThumb(u16 op)
 // real fix; the harness cycDrift telemetry tracks the error meanwhile.
 static u8 arm9_cyclesForArm(u32 op)
 {
+	// cond == NV: ARMv5 unconditional space. DeSmuME executes only BLX imm here
+	// (a taken branch, cost baked at the JIT exit); everything else is 1S.
+	if ((op >> 28) == 0xF) return 1;
+	// CLZ (bits 27..20 == 0x16, bits 7..4 == 0x1): OP_CLZ returns 2.
+	if ((op & 0x0FF000F0u) == 0x01600010u) return 2;
+
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;
 		const bool L = (op >> 20) & 1;
@@ -205,8 +211,12 @@ static u8 arm9_cyclesForArm(u32 op)
 		return L ? 3 : 2;                     // byte
 	}
 	// extra load/store LDRH/STRH/LDRSB/LDRSH (000, bit7&bit4, bits6..5 != 0)
-	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0)
+	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
+		// LDRD/STRD (bit20 == 0, bits6..5 >= 10): two word accesses, ~= 8 (assume
+		// main RAM, same coarseness as the LDM 4*n row).
+		if (((op >> 20) & 1) == 0 && ((op >> 5) & 3) >= 2) return 8u;
 		return ((op >> 20) & 1) ? 3u : 2u;   // load max(3,2)=3 / STRH max(2,2)=2
+	}
 	// LDM / STM block data transfer (bits 27..25 == 100): MMU_aluMemCycles(2|1, c)
 	// with c = sum of per-word access cost. Same "assume main RAM" word = 4 as the
 	// single transfer above; c = 4*n dominates the alu term for any non-empty list.

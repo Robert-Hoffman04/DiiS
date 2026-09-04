@@ -1009,28 +1009,181 @@ void emitMsr(JitTraceCtx& ctx, u32 op, bool immForm)
 	ctx.flagsDirty = true;
 }
 
+// ------------------------------------------------------------------ CLZ (B7)
+// cond 0001 0110 1111 Rd 1111 0001 Rm -- Rd = count leading zeros of Rm. PPC
+// cntlzw is an exact match, cntlzw(0) == 32 included (OP_CLZ's Rm == 0 case).
+void emitClz(JitTraceCtx& ctx, u32 op)
+{
+	const u8 rd = (op >> 12) & 0xF;
+	const u8 rm = op & 0xF;
+	if (rd == 15 || rm == 15) { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+	*p++ = PPC_CNTLZW(hRd, hRm);
+}
+
+// -------------------------------------------------------- BLX immediate (B7)
+// 1111 101H imm24 -- unconditional call with a mandatory ARM->THUMB switch.
+// DeSmuME runs it through OP_B (H == 0) / OP_BL (H == 1) with a cond == 0xF
+// branch: R14 = currentPC + 4 ; CPSR.T = 1 ; PC = (currentPC + 8 +
+// (signext24 << 2) + (H ? 2 : 0)) & ~1. Compile-time-constant THUMB target ->
+// load it into a reg, set T, dynamic exit (emitStaticExit would bake in the ARM
+// +8 pipeline; the C++ resume path derives the THUMB pipeline from CPSR.T, as
+// for LDM{pc}). Block terminator.
+void emitBlxImm(JitTraceCtx& ctx, u32 op)
+{
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const s32 sOff   = (s32)(op << 8) >> 6;                  // signext24 << 2
+	const u32 h2     = ((op >> 24) & 1) ? 2u : 0u;
+	const u32 target = (ctx.currentPC + 8 + (u32)sOff + h2) & ~1u;
+
+	const u8 hLR = ctx.writeReg(14, true, lockedMask);
+	emitLoadImm32(p, hLR, ctx.currentPC + 4);
+
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_LI(PPC_R10, 0x20);                            // CPSR.T (bit 5)
+	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+	ctx.flagsDirty = true;
+
+	emitLoadImm32(p, PPC_R12, target);
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, 3);     // OP_B / OP_BL return 3
+
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
+// -------------------------------------------------------- LDRD / STRD (B7)
+// cond 000 P U I W 0 Rn Rd xxxx 11 S 1 Rm/imm   (S: 0 LDRD / 1 STRD)
+//   I : 1 imm8 (hi<<4 | lo) offset, 0 register offset (Rm, unshifted)
+//   P : 1 pre/offset, 0 post (post always writes Rn = Rn +/- index)
+//   U : add / subtract     W : writeback (pre-index only; !P && W -> interp)
+// Two consecutive word accesses at addr / addr+4 into the pair {Rd, Rd+1}; no
+// unaligned rotate (raw READ32/WRITE32 in OP_LDRD_STRD_*). Writeback committed
+// after the access (SMC-bail = clean re-run), so bail on any Rn/Rd/Rd+1 aliasing
+// that would make ordering observable. Odd Rd / Rd >= 14 / pc base -> interp.
+void emitDoubleDataTransfer(JitTraceCtx& ctx, u32 op)
+{
+	const bool P     = (op >> 24) & 1;
+	const bool U     = (op >> 23) & 1;
+	const bool I     = (op >> 22) & 1;
+	const bool W     = (op >> 21) & 1;
+	const bool store = (op >> 5) & 1;
+	const u8   rn    = (op >> 16) & 0xF;
+	const u8   rd    = (op >> 12) & 0xF;
+	const u8   rm    = op & 0xF;
+	const bool writeback = (!P) || W;
+
+	if (!P && W)                                  { ctx.endBlock = true; return; }
+	if (rd & 1)                                   { ctx.endBlock = true; return; }  // Rd even
+	if (rd >= 14)                                 { ctx.endBlock = true; return; }  // Rd+1 == pc / Rd == pc
+	if (rn == 15)                                 { ctx.endBlock = true; return; }  // pc base -> interp
+	if (!I && rm == 15)                           { ctx.endBlock = true; return; }
+	if (writeback && (rn == rd || rn == rd + 1))  { ctx.endBlock = true; return; }
+	if (!I && (rm == rd || rm == rd + 1))         { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+	u8 hRm = 0;
+	if (!I) hRm = ctx.readReg(rm, lockedMask);
+	const s32 soff = U ? (s32)(((op >> 4) & 0xF0) | (op & 0xF))
+	                   : -(s32)(((op >> 4) & 0xF0) | (op & 0xF));
+
+	// EA -> slot 96 ; writeback value (Rn +/- index) -> slot 104
+	if (P) {
+		if      (I) *p++ = PPC_ADDI(PPC_R11, hRn, soff);
+		else if (U) *p++ = PPC_ADD (PPC_R11, hRn, hRm);
+		else        *p++ = PPC_SUBF(PPC_R11, hRm, hRn);
+		*p++ = PPC_STW(PPC_R11, 1, 96);
+		if (writeback) *p++ = PPC_STW(PPC_R11, 1, 104);
+	} else {
+		*p++ = PPC_STW(hRn, 1, 96);                          // EA = Rn (post-index)
+		if      (I) *p++ = PPC_ADDI(PPC_R11, hRn, soff);
+		else if (U) *p++ = PPC_ADD (PPC_R11, hRn, hRm);
+		else        *p++ = PPC_SUBF(PPC_R11, hRm, hRn);
+		*p++ = PPC_STW(PPC_R11, 1, 104);
+	}
+
+	ctx.emitMemPrologue();
+
+	if (store) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		ctx.emitSmcCheckAndBail(PPC_R12);
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_LWZ(PPC_R10, 14, rd * 4);
+		ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_ADDI(PPC_R12, PPC_R12, 4);
+		*p++ = PPC_LWZ(PPC_R10, 14, (rd + 1) * 4);
+		ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	} else {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+		*p++ = PPC_STW(PPC_R10, 1, 100);                     // stash word 0
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_ADDI(PPC_R12, PPC_R12, 4);
+		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);        // word 1 -> R10
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		*p++ = PPC_STW(PPC_R10, 14, (rd + 1) * 4);           // Rd+1
+		*p++ = PPC_LWZ(PPC_R11, 1, 100);
+		*p++ = PPC_STW(PPC_R11, 14, rd * 4);                 // Rd
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	}
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 {
 	const u8 cond = (u8)(op >> 28);
 
-	if (cond == COND_NV) { ctx.endBlock = true; return; }   // ARMv5 PLD/BLX-imm
+	if (cond == COND_NV) {
+		// ARMv5 unconditional-extension space. Only BLX imm actually executes
+		// (DeSmuME: cond == 0xF passes TEST_COND only for CODE == 5 == the 101
+		// branch group); PLD is a hint -> emit nothing, block keeps compiling;
+		// CPS / SETEND / RFE / SRS / coprocessor-double -> interpreter.
+		if ((op & 0x0E000000u) == 0x0A000000u) { emitBlxImm(ctx, op); return; }
+		if ((op & 0x0D70F000u) == 0x0550F000u) return;                 // PLD (nop)
+		ctx.endBlock = true;
+		return;
+	}
 
 	// B / BL : bits 27..25 == 101
 	if ((op & 0x0E000000u) == 0x0A000000u) { emitBranch(ctx, op, cond); return; }
 
-	// Extra load/store (LDRH/STRH/LDRSB/LDRSH): bits 27..25 == 000, bit7 & bit4
-	// set, bits 6..5 != 00 (00 = multiply / SWP).
+	// Extra load/store (LDRH/STRH/LDRSB/LDRSH) + LDRD/STRD: bits 27..25 == 000,
+	// bit7 & bit4 set, bits 6..5 != 00 (00 = multiply / SWP). LDRD/STRD is the
+	// bit20 == 0 && bits6..5 >= 10 corner (B7); the rest is B3b.
 	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
 		if (cond != COND_AL) { ctx.endBlock = true; return; }
-		emitExtraDataTransfer(ctx, op);
+		if (((op >> 20) & 1) == 0 && ((op >> 5) & 3) >= 2) emitDoubleDataTransfer(ctx, op);
+		else                                               emitExtraDataTransfer(ctx, op);
 		return;
 	}
 
 	// Miscellaneous (B6): BX / BLX reg, SWP / SWPB, MRS, MSR. All cond == AL only
-	// (predicated -> B-later). BKPT, CLZ, QADD, DSP muls stay with B7 (they fall
-	// through to emitDataProc's testOnly && !S guard -> end the trace).
+	// (predicated -> B-later). BKPT, QADD family, DSP muls stay with B7b (they
+	// fall through to emitDataProc's testOnly && !S guard -> end the trace).
+	if ((op & 0x0FF000F0u) == 0x01600010u) {              // CLZ (B7)
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitClz(ctx, op);
+		return;
+	}
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
 		if (cond != COND_AL) { ctx.endBlock = true; return; }
 		emitBranchExchange(ctx, op, (op & 0x20u) != 0);
