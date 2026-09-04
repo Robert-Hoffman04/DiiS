@@ -380,6 +380,9 @@ void JitTraceCtx::emitSlowStore(u8 eaReg, u8 valReg, u32 size)
 // continues compiling.
 void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 {
+#ifdef JIT_GOFIXPH_NO_SMC
+	(void)eaReg; return;   // GO-FIX-PH diagnostic: skip the inline SMC guard
+#endif
 	u32 fp = (u32)cache.smcPageFlags;
 	*emitPtr++ = PPC_RLWINM(PPC_R11, eaReg, 22, 16, 31);   // r11 = (EA>>10) & 0xFFFF
 	*emitPtr++ = PPC_LIS(PPC_R10, fp >> 16);
