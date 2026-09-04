@@ -19,6 +19,9 @@
 #if defined(DESMUME_JIT_ARM7)
 
 #include "jit_ppc_emitter.h"
+#ifdef DESMUME_ARM_TIME_SPLIT
+#include <stdio.h>
+#endif
 
 // --- exit helpers --------------------------------------------------------
 // Static-target exit: chain through the linker stub (self-patches on a hit).
@@ -293,7 +296,8 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_MULLW(hRd, hRd, hRs);
 			ctx.emitNZ(hRd);
 		}
-		else {   // op 2/3/4/7 : LSL/LSR/ASR/ROR by register
+		else {
+			// op 2/3/4/7 : LSL/LSR/ASR/ROR by register
 			// PPC slw/srw/sraw take a 6-bit shift count: amounts 32..63 give 0
 			// (slw/srw) or all-sign (sraw), matching the interpreter's >=32
 			// handling for Rd. Carry is exact for amounts 0..32; for amounts
@@ -666,7 +670,11 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			guardIsBEQ = !branchIfZero;
 		}
 
-		ctx.emitAddCycles(ctx.cyclesAccum + ctx.cpu.cyclesForThumb(opcode));
+		// Taken cost is hardcoded to 3 here (matching OP_B_COND's taken
+		// return value) rather than going through cyclesForThumb(), which
+		// now reports the NOT-taken/fall-through cost (1) for this opcode
+		// range -- see the comment on jit_arm7_profile.cpp's case 0xD.
+		ctx.emitAddCycles(ctx.cyclesAccum + 3);
 		ctx.emitDirtyFlagFlush();
 		ctx.emitDirtyRegisterFlush();
 		ctx.emitResultMetadata(ctx.instrCount + 1, 0);

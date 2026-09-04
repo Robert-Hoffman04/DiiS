@@ -59,7 +59,19 @@ static u8 arm7_cyclesForThumb(u16 op)
 	switch (op >> 12) {
 		case 0x4:
 			if ((op & 0x0FC0) == 0x0340) return 4;          // MUL (approx)
-			return 1;                                        // F4 ALU / F5 hi-reg
+			if ((op & 0x0400) == 0) {                        // F4 ALU (not hi-reg/BX)
+				const u16 aluOp = (op >> 6) & 0xF;
+				if (aluOp == 2 || aluOp == 3 || aluOp == 4 || aluOp == 7)
+					return 2;                                 // LSL/LSR/ASR/ROR by
+					                                          // register: 1S+1I on real
+					                                          // ARM7TDMI (the extra
+					                                          // internal cycle fetches
+					                                          // the shift amount from a
+					                                          // register) -- was
+					                                          // undercounted at 1 like
+					                                          // every other F4 op.
+			}
+			return 1;                                        // F4 ALU (rest) / F5 hi-reg
 		case 0x5: {                                          // F10 reg-offset ld/st
 			const u16 s = op & 0x0E00;
 			const bool load = (s == 0x0800 || s == 0x0A00 || s == 0x0C00 ||
@@ -84,9 +96,23 @@ static u8 arm7_cyclesForThumb(u16 op)
 			return (u8)(2 + 2 * n);
 		}
 		case 0xD:                                            // F16 Bcc
-			return (op & 0x0F00) == 0x0F00 ? 3 : 3;          // taken cost (approx)
+			// Interpreter's OP_B_COND returns 1 when not taken, 3 when
+			// taken (thumb_instructions.cpp) -- this value feeds the trace
+			// scanner's per-instruction cyclesAccum, which only ever
+			// applies on the NOT-taken/fall-through path (the taken exit
+			// in jit_thumb.cpp's case 26/27 hardcodes its own +3 to match
+			// the taken cost directly, since a single opcode->cycles
+			// function can't distinguish the two outcomes at compile
+			// time). Was flatly 3 for both, overcounting every
+			// not-taken conditional branch by 2 cycles -- extremely
+			// common (every loop-continuation check) and a real source
+			// of cumulative JIT-vs-interpreter timing drift.
+			return 1;
 		case 0xE:                                            // F18 B
-			return 3;
+			// OP_B_UNCOND returns 1 (thumb_instructions.cpp) -- was
+			// flatly 3 here, overcounting every unconditional branch
+			// (also extremely common) by 2 cycles.
+			return 1;
 		case 0xF:                                            // F19 BL
 			return 4;
 		case 0xA:                                            // F12 ADD PC/SP
