@@ -16,10 +16,12 @@
  *        (LSL/LSR/ASR/ROR #n, incl. RRX); the shifter-carry semantics match
  *        arm_instructions.cpp's *_IMM macros exactly. Shift-by-register
  *        (bit4 == 1) is deferred and ends the trace.
- *   B3 - LDR / STR (word / byte), immediate or register(shift-by-imm) offset,
+ *   B3  - LDR / STR (word / byte), immediate or register(shift-by-imm) offset,
  *        pre/post-index, writeback, unaligned-word-load rotate; pc-relative
  *        literal folds to a constant EA. cond == AL only (predicated ends the
- *        trace). Halfword / signed (LDRH/STRH/LDRSB/LDRSH) -> B3b.
+ *        trace).
+ *   B3b - extra load/store: LDRH / STRH / LDRSB / LDRSH (imm8 or unshifted
+ *        register offset). LDRD / STRD -> B7. Shares emitLoadStoreTail.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -289,6 +291,48 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
 }
 
+// The shared load/store tail: EA is already in PPC_R11, the writeback value (if
+// any) in PPC_R10, and the store source pre-read into hVal. Stashes them on the
+// host stack, flushes state, does the slow C-call access (+ optional word
+// rotate / sign-extend), then writes the result and the Rn writeback straight
+// to guest memory -- writeback committed AFTER the access so a store's SMC
+// guard bail is a clean interpreter re-run (no double-writeback).
+void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
+                       bool signExt, bool wordRotate, bool writeback, u8 rn, u8 rd)
+{
+	u32*& p = ctx.emitPtr;
+	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
+	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
+	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value
+
+	ctx.emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+
+	if (isLoad) {
+		ctx.emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
+		if (wordRotate) {                              // ROR(R10, 8*(EA&3))
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31); // EA & 3
+			*p++ = PPC_LI(PPC_R11, 4);
+			*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);     // 4 - (EA&3)
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28); // ((4-x)&3)<<3 in {0,24,16,8}
+			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+		}
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		*p++ = PPC_STW(PPC_R10, 14, rd * 4);        // result last: wins if rd == rn
+	} else {
+		ctx.emitSmcCheckAndBail(PPC_R12);
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_LWZ(PPC_R10, 1, 100);
+		ctx.emitSlowStore(PPC_R12, PPC_R10, size);
+		ctx.emitMemEpilogue();
+		ctx.invalidateRegCache();
+		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	}
+}
+
 // -------------------------------------------------- LDR / STR (word / byte)
 // cond 01 I P U B W L Rn Rd <offset>
 //   I : 0 imm12 offset, 1 register offset shifted by an immediate (bit4 == 0)
@@ -375,36 +419,62 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 		else         *p++ = PPC_SUBF(PPC_R10, PPC_R12, hRn);
 	}
 
-	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
-	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
-	if (!L)        *p++ = PPC_STW(hVal,   1, 100);  // store value
+	emitLoadStoreTail(ctx, hVal, size, L, /*signExt=*/false,
+	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd);
+}
 
-	ctx.emitMemPrologue();
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+// ------------------------------------------------ extra load/store (B3b)
+// cond 000 P U I W L Rn Rd hi 1 SH 1 lo   (bits 27..25 == 000, bit7 == 1, bit4 == 1)
+//   SH: 01 unsigned halfword, 10 signed byte, 11 signed halfword (00 = SWP)
+//   I : 1 immediate offset (imm8 = hi<<4 | lo), 0 register offset (Rm = lo, no shift)
+// L=0 SH=10/11 is LDRD/STRD (ARMv5E) -> deferred to B7. No unaligned rotate.
+void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
+{
+	const bool P = (op >> 24) & 1;
+	const bool U = (op >> 23) & 1;
+	const bool I = (op >> 22) & 1;
+	const bool W = (op >> 21) & 1;
+	const bool L = (op >> 20) & 1;
+	const u8   sh = (op >> 5) & 3;
+	const u8   rn = (op >> 16) & 0xF;
+	const u8   rd = (op >> 12) & 0xF;
+	const bool writeback = (!P) || W;
 
-	if (L) {
-		ctx.emitSlowLoad(PPC_R10, PPC_R12, size, false);
-		if (size == 4) {                            // ROR(R10, 8*(EA&3))
-			*p++ = PPC_LWZ(PPC_R12, 1, 96);
-			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31); // EA & 3
-			*p++ = PPC_LI(PPC_R11, 4);
-			*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);     // 4 - (EA&3)
-			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28); // ((4-x)&3)<<3 in {0,24,16,8}
-			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
-		}
-		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
-		*p++ = PPC_STW(PPC_R10, 14, rd * 4);        // result last: wins if rd == rn
+	const u8 rm = op & 0xF;
+	if (!P && W)                     { ctx.endBlock = true; return; }  // translated access
+	if (rd == 15 || rn == 15)        { ctx.endBlock = true; return; }
+	if (!L && (sh == 2 || sh == 3))  { ctx.endBlock = true; return; }  // LDRD/STRD -> B7
+	if (!I && rm == 15)              { ctx.endBlock = true; return; }
+
+	const bool signExt = L && (sh == 2 || sh == 3);
+	const u32  size     = (sh == 2) ? 1u : 2u;                  // signed byte : halfword
+	const s32  immOff   = (s32)(((op >> 4) & 0xF0) | (op & 0xF));
+	const s32  soff     = U ? immOff : -immOff;
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+	u8 hRm = 0;
+	if (!I) hRm = ctx.readReg(rm, lockedMask);
+	u8 hVal = 0;
+	if (!L) hVal = ctx.readReg(rd, lockedMask);
+
+	// EA -> R11, WB -> R10 (register offset is unshifted: EA = U ? Rn+Rm : Rn-Rm)
+	if (P) {
+		if      (I) *p++ = PPC_ADDI(PPC_R11, hRn, soff);
+		else if (U) *p++ = PPC_ADD (PPC_R11, hRn, hRm);
+		else        *p++ = PPC_SUBF(PPC_R11, hRm, hRn);
+		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R11, PPC_R11);
 	} else {
-		ctx.emitSmcCheckAndBail(PPC_R12);
-		*p++ = PPC_LWZ(PPC_R12, 1, 96);
-		*p++ = PPC_LWZ(PPC_R10, 1, 100);
-		ctx.emitSlowStore(PPC_R12, PPC_R10, size);
-		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		*p++ = PPC_OR(PPC_R11, hRn, hRn);
+		if      (I) *p++ = PPC_ADDI(PPC_R10, hRn, soff);
+		else if (U) *p++ = PPC_ADD (PPC_R10, hRn, hRm);
+		else        *p++ = PPC_SUBF(PPC_R10, hRm, hRn);
 	}
+
+	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd);
 }
 
 } // namespace
@@ -417,6 +487,14 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 
 	// B / BL : bits 27..25 == 101
 	if ((op & 0x0E000000u) == 0x0A000000u) { emitBranch(ctx, op, cond); return; }
+
+	// Extra load/store (LDRH/STRH/LDRSB/LDRSH): bits 27..25 == 000, bit7 & bit4
+	// set, bits 6..5 != 00 (00 = multiply / SWP).
+	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitExtraDataTransfer(ctx, op);
+		return;
+	}
 
 	// Data-processing : bits 27..26 == 00 (bit 25 selects imm vs register op2)
 	if ((op & 0x0C000000u) == 0x00000000u) { emitDataProc(ctx, op, cond); return; }

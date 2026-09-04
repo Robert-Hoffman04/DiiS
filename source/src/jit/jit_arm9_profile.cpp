@@ -204,6 +204,9 @@ static u8 arm9_cyclesForArm(u32 op)
 		if (!B) return 4;                     // word
 		return L ? 3 : 2;                     // byte
 	}
+	// extra load/store LDRH/STRH/LDRSB/LDRSH (000, bit7&bit4, bits6..5 != 0)
+	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0)
+		return ((op >> 20) & 1) ? 3u : 2u;   // load max(3,2)=3 / STRH max(2,2)=2
 	return 1;
 }
 
