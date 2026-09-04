@@ -14,8 +14,7 @@
  *        immediate operand2 (all 16 ALU ops, S bit); B / BL.
  *   B2 - data-processing with a register operand2 shifted by an immediate
  *        (LSL/LSR/ASR/ROR #n, incl. RRX); the shifter-carry semantics match
- *        arm_instructions.cpp's *_IMM macros exactly. Shift-by-register
- *        (bit4 == 1) is deferred and ends the trace.
+ *        arm_instructions.cpp's *_IMM macros exactly.
  *   B3  - LDR / STR (word / byte), immediate or register(shift-by-imm) offset,
  *        pre/post-index, writeback, unaligned-word-load rotate; pc-relative
  *        literal folds to a constant EA. cond == AL only (predicated ends the
@@ -36,8 +35,13 @@
  *        shape as LDM{pc}); SWP / SWPB (ordered load+store at [Rn], word form
  *        rotates); MRS Rd,CPSR (= the packed flags word); MSR CPSR_f (flags
  *        byte only). SPSR forms, any non-flag MSR field, coprocessor, SWI and
- *        BKPT end the trace. cond == AL only. Shift-by-register operand2 is
- *        still deferred (B6b).
+ *        BKPT end the trace. cond == AL only.
+ *   B6b - data-processing with a register operand2 shifted by a register
+ *        (LSL/LSR/ASR/ROR by Rs&0xFF, bit4 == 1 && bit7 == 0). Runtime amount,
+ *        so the shifter carry needs runtime branches; the value/carry edges at
+ *        0, 32, >32 and (ROR) the &0x1F wrap match arm_instructions.cpp's *_REG
+ *        macros exactly. Routed through the shared ALU core. Rn/Rm/Rs == pc
+ *        (pipeline+12 read) ends the trace.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -124,13 +128,163 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	*skip = PPC_BEQ((u32)((p - skip) * 4));
 }
 
+// -------------------------------------- operand2 = Rm shifted by a register
+// The register-specified shift form (bit4 == 1, bit7 == 0). The shift amount is
+// the low byte of Rs, read at runtime, so the shifter carry needs runtime
+// branches: the value/carry edges at amount 0, 32, >32 and (ROR) the &0x1F wrap
+// reproduce arm_instructions.cpp's LSL/LSR/ASR/ROR _REG macros exactly. Value ->
+// PPC_R12; when wantCarry, the shifter carry (0/1) -> PPC_R10. Clobbers R8/R11.
+Op2 emitOp2ShiftReg(JitTraceCtx& ctx, u32 op, u8 hRm, u8 hRs, bool wantCarry)
+{
+	u32*& p = ctx.emitPtr;
+	const u8 type = (op >> 5) & 3;   // 0 LSL, 1 LSR, 2 ASR, 3 ROR
+	Op2 r = { wantCarry ? SC_INREG : SC_UNCHANGED, false };
+
+	if (wantCarry) ctx.ensureFlagsLoaded();          // force the CPSR load onto the linear path
+	*p++ = PPC_RLWINM(PPC_R11, hRs, 0, 24, 31);      // sh = Rs & 0xFF
+
+	if (!wantCarry) {
+		switch (type) {
+		case 0:      // LSL: sh >= 32 -> 0
+		case 1: {    // LSR: sh >= 32 -> 0
+			*p++ = PPC_ANDI_(PPC_R8, PPC_R11, 0xE0);
+			u32* toZero = p++;                                  // BNE -> zero
+			*p++ = (type == 0) ? PPC_SLW(PPC_R12, hRm, PPC_R11)
+			                   : PPC_SRW(PPC_R12, hRm, PPC_R11);
+			u32* done = p++;                                    // B -> done
+			*toZero = PPC_BNE((u32)((p - toZero) * 4));
+			*p++ = PPC_LI(PPC_R12, 0);
+			*done = PPC_B((u32)((p - done) * 4));
+			break;
+		}
+		case 2: {    // ASR: SRAW covers 0..63 incl. sign-fill >= 32; clamp sh >= 32 -> 31
+			*p++ = PPC_ANDI_(PPC_R8, PPC_R11, 0xE0);
+			u32* skip = p++;                                    // BEQ -> shift
+			*p++ = PPC_LI(PPC_R11, 31);
+			*skip = PPC_BEQ((u32)((p - skip) * 4));
+			*p++ = PPC_SRAW(PPC_R12, hRm, PPC_R11);
+			break;
+		}
+		default: {   // ROR: (sh & 0x1F) == 0 -> identity, else ROR(Rm, sh & 0x1F)
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 27, 31);     // sh & 0x1F
+			*p++ = PPC_CMPWI(0, PPC_R11, 0);
+			u32* ident = p++;                                   // BEQ -> identity
+			*p++ = PPC_SUBFIC(PPC_R8, PPC_R11, 32);             // 32 - k
+			*p++ = PPC_RLWNM(PPC_R12, hRm, PPC_R8, 0, 31);      // ROL(Rm, 32-k) == ROR(Rm, k)
+			u32* done = p++;                                    // B -> done
+			*ident = PPC_BEQ((u32)((p - ident) * 4));
+			*p++ = PPC_OR(PPC_R12, hRm, hRm);
+			*done = PPC_B((u32)((p - done) * 4));
+			break;
+		}
+		}
+		return r;
+	}
+
+	// ---- carry-producing (S && logical). sh == 0 -> value = Rm, carry = old C ----
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* nz = p++;                                              // BNE -> nonzero
+	*p++ = PPC_OR(PPC_R12, hRm, hRm);
+	*p++ = PPC_EXTRACT_FLAG_BIT(PPC_R10, JITF_C);
+	u32* d0 = p++;                                              // B -> done
+	*nz = PPC_BNE((u32)((p - nz) * 4));
+
+	switch (type) {
+	case 0: {    // S_LSL_REG
+		*p++ = PPC_CMPWI(0, PPC_R11, 32);
+		u32* bGt = p++;                                         // BGT -> above32
+		u32* bEq = p++;                                         // BEQ -> eq32
+		// 1..31: val = Rm << sh ; c = bit(32-sh) = (Rm >> (32-sh)) & 1
+		*p++ = PPC_SLW(PPC_R12, hRm, PPC_R11);
+		*p++ = PPC_SUBFIC(PPC_R8, PPC_R11, 32);
+		*p++ = PPC_SRW(PPC_R10, hRm, PPC_R8);
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 0, 31, 31);
+		u32* d1 = p++;                                          // B -> done
+		*bEq = PPC_BEQ((u32)((p - bEq) * 4));
+		// sh == 32: val = 0 ; c = bit0(Rm)
+		*p++ = PPC_LI(PPC_R12, 0);
+		*p++ = PPC_RLWINM(PPC_R10, hRm, 0, 31, 31);
+		u32* d2 = p++;                                          // B -> done
+		*bGt = PPC_BGT((u32)((p - bGt) * 4));
+		// sh > 32: val = 0 ; c = 0
+		*p++ = PPC_LI(PPC_R12, 0);
+		*p++ = PPC_LI(PPC_R10, 0);
+		*d1 = PPC_B((u32)((p - d1) * 4));
+		*d2 = PPC_B((u32)((p - d2) * 4));
+		break;
+	}
+	case 1: {    // S_LSR_REG
+		*p++ = PPC_CMPWI(0, PPC_R11, 32);
+		u32* bGt = p++;                                         // BGT -> above32
+		u32* bEq = p++;                                         // BEQ -> eq32
+		// 1..31: val = Rm >> sh ; c = bit(sh-1)
+		*p++ = PPC_SRW(PPC_R12, hRm, PPC_R11);
+		*p++ = PPC_ADDI(PPC_R8, PPC_R11, -1);
+		*p++ = PPC_SRW(PPC_R10, hRm, PPC_R8);
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 0, 31, 31);
+		u32* d1 = p++;                                          // B -> done
+		*bEq = PPC_BEQ((u32)((p - bEq) * 4));
+		// sh == 32: val = 0 ; c = bit31(Rm)
+		*p++ = PPC_LI(PPC_R12, 0);
+		*p++ = PPC_RLWINM(PPC_R10, hRm, 1, 31, 31);
+		u32* d2 = p++;                                          // B -> done
+		*bGt = PPC_BGT((u32)((p - bGt) * 4));
+		// sh > 32: val = 0 ; c = 0
+		*p++ = PPC_LI(PPC_R12, 0);
+		*p++ = PPC_LI(PPC_R10, 0);
+		*d1 = PPC_B((u32)((p - d1) * 4));
+		*d2 = PPC_B((u32)((p - d2) * 4));
+		break;
+	}
+	case 2: {    // S_ASR_REG
+		*p++ = PPC_CMPWI(0, PPC_R11, 32);
+		u32* bGe = p++;                                         // BGE -> ge32
+		// 1..31: val = (s32)Rm >> sh ; c = bit(sh-1)
+		*p++ = PPC_SRAW(PPC_R12, hRm, PPC_R11);
+		*p++ = PPC_ADDI(PPC_R8, PPC_R11, -1);
+		*p++ = PPC_SRW(PPC_R10, hRm, PPC_R8);
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 0, 31, 31);
+		u32* d1 = p++;                                          // B -> done
+		*bGe = PPC_BGE((u32)((p - bGe) * 4));
+		// sh >= 32: val = sign-fill ; c = bit31(Rm)
+		*p++ = PPC_SRAWI(PPC_R12, hRm, 31);
+		*p++ = PPC_RLWINM(PPC_R10, hRm, 1, 31, 31);
+		*d1 = PPC_B((u32)((p - d1) * 4));
+		break;
+	}
+	default: {   // S_ROR_REG : sh != 0 here
+		// sh5 = sh & 0x1F ; sh5 == 0 -> val = Rm, c = bit31(Rm)
+		//                   else     -> val = ROR(Rm, sh5), c = bit(sh5-1)
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 27, 31);
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		u32* rot = p++;                                         // BNE -> rot
+		*p++ = PPC_OR(PPC_R12, hRm, hRm);
+		*p++ = PPC_RLWINM(PPC_R10, hRm, 1, 31, 31);
+		u32* d1 = p++;                                          // B -> done
+		*rot = PPC_BNE((u32)((p - rot) * 4));
+		*p++ = PPC_SUBFIC(PPC_R8, PPC_R11, 32);
+		*p++ = PPC_RLWNM(PPC_R12, hRm, PPC_R8, 0, 31);
+		*p++ = PPC_ADDI(PPC_R8, PPC_R11, -1);
+		*p++ = PPC_SRW(PPC_R10, hRm, PPC_R8);
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 0, 31, 31);
+		*d1 = PPC_B((u32)((p - d1) * 4));
+		break;
+	}
+	}
+	*d0 = PPC_B((u32)((p - d0) * 4));
+	return r;
+}
+
 // ---------------------------------------------------- operand2 -> PPC_R12
-// hRm is valid only for the register form. Returns the carry state; when
+// hRm/hRs are valid only for the register form. Returns the carry state; when
 // SC_INREG the carry bit (0/1) is left in PPC_R10.
-Op2 emitOp2(JitTraceCtx& ctx, u32 op, bool immForm, u8 hRm)
+Op2 emitOp2(JitTraceCtx& ctx, u32 op, bool immForm, u8 hRm, u8 hRs, bool wantCarry)
 {
 	u32*& p = ctx.emitPtr;
 	Op2 r = { SC_UNCHANGED, false };
+
+	if (!immForm && ((op >> 4) & 1))                 // register-specified shift
+		return emitOp2ShiftReg(ctx, op, hRm, hRs, wantCarry);
 
 	if (immForm) {
 		const u32 rot = ((op >> 8) & 0xF) * 2;
@@ -247,13 +401,19 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (testOnly && !S)  { ctx.endBlock = true; return; }   // MRS/MSR reg/imm -> B6
 	if (rd == 15)        { ctx.endBlock = true; return; }   // PC write -> B7
 
+	const bool regShift = !immForm && ((op >> 4) & 1) && !((op >> 7) & 1);
+	const u8   rs       = (op >> 8) & 0xF;
+
 	if (!immForm) {
-		// Register form: bit4==1 is either a shift-by-register (deferred) or a
-		// multiply / SWP / (signed|half) load-store / BX / CLZ / QADD which are
-		// not data-processing at all -- all end the trace here.
-		if ((op >> 4) & 1)         { ctx.endBlock = true; return; }
-		if (rm == 15)              { ctx.endBlock = true; return; }   // PC operand
-		if (rn == 15 && !ignoresRn){ ctx.endBlock = true; return; }
+		// bit4 == 1 && bit7 == 1 is the multiply / SWP / (signed|half) load-store
+		// / BX / CLZ / QADD encoding space -- routed before here, so a stray one
+		// ends the trace. bit4 == 1 && bit7 == 0 is a shift-by-register (B6b).
+		if (((op >> 4) & 1) && ((op >> 7) & 1)) { ctx.endBlock = true; return; }
+		if (rm == 15)                           { ctx.endBlock = true; return; }   // PC operand
+		if (rn == 15 && !ignoresRn)             { ctx.endBlock = true; return; }
+		// shift-by-register reading pc: the interpreter sees pipeline + 12 for a
+		// pc operand of a register-shifted instruction. Rare / UNPREDICTABLE -> bail.
+		if (regShift && rs == 15)               { ctx.endBlock = true; return; }
 	}
 
 	// The immediate form's ADR / MOV / MVN cases fold to a compile-time constant.
@@ -273,6 +433,8 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	// the taken path).
 	u8 hRm = 0;
 	if (!immForm) hRm = ctx.readReg(rm, lockedMask);
+	u8 hRs = 0;
+	if (regShift) hRs = ctx.readReg(rs, lockedMask);
 	u8 hRn = 0;
 	if (!ignoresRn && rn != 15) hRn = ctx.readReg(rn, lockedMask);
 	u8 hRd = 0;
@@ -301,7 +463,7 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 		return;
 	}
 
-	const Op2 o2 = emitOp2(ctx, op, immForm, hRm);
+	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, S && isLogical);
 	emitAlu(ctx, aluOp, S, testOnly, isLogical, hRn, hRd, o2);
 
 	if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
@@ -419,7 +581,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (!L) hVal = ctx.readReg(rd, lockedMask);
 
 	// offset -> PPC_R12 (register form); the immediate form folds into ADDI
-	if (I) (void)emitOp2(ctx, op, /*immForm=*/false, hRm);
+	if (I) (void)emitOp2(ctx, op, /*immForm=*/false, hRm, /*hRs=*/0, /*wantCarry=*/false);
 
 	// EA (access address) -> R11 ; WB (writeback into Rn) -> R10.
 	// register offset in R12: EA = U ? Rn + R12 : Rn - R12  (SUBF rD,rA,rB = rB-rA)

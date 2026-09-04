@@ -229,6 +229,11 @@ static u8 arm9_cyclesForArm(u32 op)
 		const bool accum    = (op >> 21) & 1;
 		return (u8)(longForm ? (accum ? 5 : 4) : (accum ? 4 : 3));
 	}
+	// Data-processing, register operand2 shifted by a register (class 00, bit25 == 0,
+	// bit7 == 0, bit4 == 1): OP_xxx_<shift>_REG returns 2 (1S + 1I for the extra
+	// shifter cycle). Rd == 15 bails in the emitter. Shift-by-immediate and the
+	// immediate operand2 form stay at 1 (handled by the fall-through).
+	if (((op >> 26) & 3) == 0 && (op & 0x02000090u) == 0x00000010u) return 2;
 	return 1;
 }
 

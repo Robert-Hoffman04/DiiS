@@ -183,6 +183,7 @@
 #define PPC_XORI(rA, rS, val)	((26 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))
 #define PPC_ANDI_(rA, rS, val)	((28 << 26) | ((rS) << 21) | ((rA) << 16) | ((val) & 0xFFFF))  // andi. (sets CR0)
 #define PPC_ADDIC(rD, rA, imm)	((13 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))
+#define PPC_SUBFIC(rD, rA, imm)	((8 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))   // rD = SIMM - rA
 
 // Branches
 #define PPC_CMPWI(cr, rA, imm)	((11 << 26) | ((cr) << 23) | ((rA) << 16) | ((imm) & 0xFFFF))
