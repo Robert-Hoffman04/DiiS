@@ -32,6 +32,12 @@
  *        (64-bit), S bit sets N/Z only. PPC mullw + mulhw/mulhwu; the long
  *        accumulate is an addc/adde pair. cond == AL only; pc operands and the
  *        ARM-unpredictable long-form aliasings end the trace.
+ *   B6  - misc: BX / BLX reg (block terminator, ARMv5 bit0 interworking, same
+ *        shape as LDM{pc}); SWP / SWPB (ordered load+store at [Rn], word form
+ *        rotates); MRS Rd,CPSR (= the packed flags word); MSR CPSR_f (flags
+ *        byte only). SPSR forms, any non-flag MSR field, coprocessor, SWI and
+ *        BKPT end the trace. cond == AL only. Shift-by-register operand2 is
+ *        still deferred (B6b).
  * Everything else ends the trace cleanly at that PC (the interpreter takes
  * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
  * file, and jit_thumb.cpp for the shared idioms.
@@ -686,6 +692,161 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 	}
 }
 
+// ---------------------------------------------------------- BX / BLX reg (B6)
+// cond 0001 0010 1111 1111 1111 00L1 Rm   (L: 0 = BX, 1 = BLX). Block terminator
+// with ARMv5 bit0 interworking -- identical shape to LDM{...,pc} (B4): bit0 of Rm
+// selects the resume ISA. BLX also writes R14 = the ARM return address first.
+void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
+{
+	const u8 rm = op & 0xF;
+	if (rm == 15) { ctx.endBlock = true; return; }          // BX pc: unpredictable
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	*p++ = PPC_OR(PPC_R12, hRm, hRm);                        // capture target pre-flush
+
+	if (isBlx) {
+		const u8 hLR = ctx.writeReg(14, true, lockedMask);
+		emitLoadImm32(p, hLR, ctx.currentPC + 4);            // OP_BLX_REG: R14 = next_instruction
+	}
+
+	// Flush every dirty guest reg/flag NOW, while the two exit paths below still
+	// share one code position: flushDirtyRegisters() clears the dirty bits, so
+	// the per-path emitDynamicExit() calls won't each need to re-flush (only the
+	// first would, silently dropping the writeback on the other path). Preceding
+	// in-block instructions (e.g. `AND R0,R0,#x` before `BX lr`) leave dirty regs
+	// that MUST be persisted here.
+	ctx.flushDirtyFlags();
+	ctx.flushDirtyRegisters();
+
+	const u32 term = ctx.cpu.cyclesForArm(op);
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);          // R11 = bit0 (mode select)
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* toArm = p++;                                         // BEQ -> stay ARM
+
+	// bit0 == 1: switch to THUMB (set CPSR.T so the C++ resume path uses 16-bit
+	// fetch/pipeline math -- the ARM7 POP{pc} bug otherwise).
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);           // & ~1
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_LI(PPC_R10, 0x20);                             // CPSR.T (bit 5)
+	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+	ctx.flagsDirty = true;
+	ctx.flushDirtyFlags();
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);           // & ~3 (CPSR.T already 0)
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term);
+
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
+// --------------------------------------------------------------- SWP/SWPB (B6)
+// cond 00010 B 00 Rn Rd 0000 1001 Rm   -- an ordered load-then-store at [Rn]:
+//   Rd = ROR(mem[Rn], 8*(Rn&3)) (word) / mem[Rn] (byte) ; mem[Rn] = Rm
+// The word form rotates the loaded value exactly like OP_LDR / OP_SWP. Not a
+// terminator. The SMC guard runs before either access, so a bail is a clean
+// re-run (both accesses redo; RAM idempotent, I/O flagged untrusted).
+void emitSwap(JitTraceCtx& ctx, u32 op)
+{
+	const bool B  = (op >> 22) & 1;
+	const u8   rn = (op >> 16) & 0xF;
+	const u8   rd = (op >> 12) & 0xF;
+	const u8   rm = op & 0xF;
+	const u32  size = B ? 1u : 4u;
+
+	if (rn == 15 || rd == 15 || rm == 15) { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	*p++ = PPC_STW(hRn, 1, 96);                              // EA
+	*p++ = PPC_STW(hRm, 1, 100);                             // store value
+
+	ctx.emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	ctx.emitSmcCheckAndBail(PPC_R12);
+
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	ctx.emitSlowLoad(PPC_R10, PPC_R12, size, false);
+	if (!B) {                                                // ROR(loaded, 8*(EA&3))
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);      // EA & 3
+		*p++ = PPC_LI(PPC_R11, 4);
+		*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);          // 4 - (EA&3)
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);      // ((4-x)&3) << 3
+		*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+	}
+	*p++ = PPC_STW(PPC_R10, 1, 104);                         // stash loaded value
+
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	*p++ = PPC_LWZ(PPC_R10, 1, 100);
+	ctx.emitSlowStore(PPC_R12, PPC_R10, size);
+
+	ctx.emitMemEpilogue();
+	ctx.invalidateRegCache();
+	*p++ = PPC_LWZ(PPC_R11, 1, 104);
+	*p++ = PPC_STW(PPC_R11, 14, rd * 4);                     // Rd = loaded value (last)
+}
+
+// ------------------------------------------------------------- MRS / MSR (B6)
+// MRS Rd, CPSR : cond 00010 0 00 1111 Rd 0000 0000 0000 -- Rd = whole CPSR word.
+// PPC_REG_FLAGS holds exactly that (the non-flag bits are unchanged since block
+// entry; only BX / MSR touch them and both are handled here). SPSR form -> interp.
+void emitMrs(JitTraceCtx& ctx, u32 op)
+{
+	if ((op >> 22) & 1) { ctx.endBlock = true; return; }    // MRS SPSR -> interp
+	const u8 rd = (op >> 12) & 0xF;
+	if (rd == 15) { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_OR(hRd, PPC_REG_FLAGS, PPC_REG_FLAGS);
+}
+
+// MSR CPSR_f, <Rm | #imm> : only the flags byte (field mask == 0b1000, R == 0) is
+// compilable -- any control/extension/status byte, or SPSR, ends the trace (mode
+// switch + full CPSR reload). Writes bits 31..24 of the operand into the packed
+// flags. The interpreter also calls changeCPSR() -> NDS_Reschedule() here; a
+// flags-only write can't touch I/F/mode so there is no IRQ-unmask edge -- only a
+// scheduler nudge the outer emulation loop performs regularly anyway.
+void emitMsr(JitTraceCtx& ctx, u32 op, bool immForm)
+{
+	if ((op >> 22) & 1)            { ctx.endBlock = true; return; }   // SPSR
+	if (((op >> 16) & 0xF) != 0x8) { ctx.endBlock = true; return; }   // not flags-only
+
+	u8 rm = 0;
+	if (!immForm) { rm = op & 0xF; if (rm == 15) { ctx.endBlock = true; return; } }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	ctx.ensureFlagsLoaded();
+	if (immForm) {
+		const u32 k = ror32(op & 0xFF, ((op >> 8) & 0xF) * 2);
+		emitLoadImm32(p, PPC_R12, k);
+		*p++ = PPC_RLWIMI(PPC_REG_FLAGS, PPC_R12, 0, 0, 7);
+	} else {
+		const u8 hRm = ctx.readReg(rm, lockedMask);
+		*p++ = PPC_RLWIMI(PPC_REG_FLAGS, hRm, 0, 0, 7);
+	}
+	ctx.flagsDirty = true;
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
@@ -705,9 +866,34 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 		return;
 	}
 
+	// Miscellaneous (B6): BX / BLX reg, SWP / SWPB, MRS, MSR. All cond == AL only
+	// (predicated -> B-later). BKPT, CLZ, QADD, DSP muls stay with B7 (they fall
+	// through to emitDataProc's testOnly && !S guard -> end the trace).
+	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitBranchExchange(ctx, op, (op & 0x20u) != 0);
+		return;
+	}
+	if ((op & 0x0FB00FF0u) == 0x01000090u) {              // SWP / SWPB
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitSwap(ctx, op);
+		return;
+	}
+	if ((op & 0x0FBF0FFFu) == 0x010F0000u) {              // MRS Rd, CPSR/SPSR
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitMrs(ctx, op);
+		return;
+	}
+	if ((op & 0x0FB0FFF0u) == 0x0120F000u ||              // MSR CPSR/SPSR, register
+	    (op & 0x0FB0F000u) == 0x0320F000u) {              // MSR CPSR/SPSR, immediate
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitMsr(ctx, op, (op & 0x02000000u) != 0);
+		return;
+	}
+
 	// Multiply / multiply-long : bits 27..23 == 0000x, bits 7..4 == 1001
 	// (short MUL/MLA: 27..22 == 000000 ; long: 27..23 == 00001). SWP is 27..23
-	// == 00010 and stays with the later group.
+	// == 00010 and handled just above.
 	if ((op & 0x0FC000F0u) == 0x00000090u || (op & 0x0F8000F0u) == 0x00800090u) {
 		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
 		emitMultiply(ctx, op);

@@ -215,6 +215,11 @@ static u8 arm9_cyclesForArm(u32 op)
 		if (!n) n = 1;
 		return (u8)(4u * n);
 	}
+	// BX / BLX register (misc space) -- OP_BX / OP_BLX_REG return 3.
+	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) return 3;
+	// SWP / SWPB : MMU_aluMemCycles(4, read + write); "assume main RAM" per-access
+	// word = 4, byte = 2 (same coarseness as the single-transfer rows above).
+	if ((op & 0x0FB00FF0u) == 0x01000090u) return ((op >> 22) & 1) ? 4u : 8u;
 	// Multiply / multiply-long (bits 27..23 == 0000x, bits 7..4 == 1001). The
 	// interpreter cost is data-dependent on Rs (short MUL 2..5 / MLA 3..6, long
 	// 3..6 non-accum / 4..7 accum) -- a fixed per-form mid estimate here; the
