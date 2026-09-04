@@ -16,7 +16,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <ogc/cache.h>
-#ifdef DESMUME_JIT_TRACE_FIRST
+#if defined(DESMUME_JIT_TRACE_FIRST) || defined(DESMUME_ARM_TIME_SPLIT)
 #include <stdio.h>
 #endif
 

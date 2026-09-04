@@ -1612,6 +1612,50 @@ static void splitMaybeReport()
 	                 (unsigned long long)g_arm7WaitIRQHits,
 	                 (unsigned long long)g_arm7RunHits); fclose(f); }
 }
+
+// Trailing-window PC/register recorder: cheap (no I/O) every dispatch, so it
+// can run at full speed indefinitely instead of needing a pre-guessed
+// run-count window. The instant PC leaves the valid NDS ARM7 address space,
+// the whole ring is dumped once, giving full per-instruction visibility
+// right up to (and past) the exact moment of divergence with no guessing.
+struct Arm7TraceEntry { u64 run; u32 pc; u32 r0,r3,r4,r13,r14,op,cpsr; u8 t; };
+#define ARM7_TRACE_RING 8192
+static Arm7TraceEntry s_arm7Ring[ARM7_TRACE_RING];
+static bool s_arm7Dumped = false;
+static bool arm7PcLooksValid(u32 pc)
+{
+	u32 bank = (pc >> 24) & 0xFF;
+	return bank == 0x00 || bank == 0x02 || bank == 0x03;
+}
+static void arm7TraceRecordAndCheck()
+{
+	Arm7TraceEntry& e = s_arm7Ring[g_arm7RunHits % ARM7_TRACE_RING];
+	e.run = g_arm7RunHits;
+	e.pc  = NDS_ARM7.instruct_adr;
+	e.t   = (u8)NDS_ARM7.CPSR.bits.T;
+	e.r0  = NDS_ARM7.R[0];
+	e.r3  = NDS_ARM7.R[3];
+	e.r4  = NDS_ARM7.R[4];
+	e.r13 = NDS_ARM7.R[13];
+	e.r14 = NDS_ARM7.R[14];
+	e.op  = NDS_ARM7.instruction;
+	e.cpsr = NDS_ARM7.CPSR.val;
+	if (s_arm7Dumped || arm7PcLooksValid(e.pc)) return;
+	s_arm7Dumped = true;
+	FILE* f = fopen("sd:/split.log", "a");
+	if (!f) return;
+	fprintf(f, "=== ARM7 PC WENT INVALID at run=%llu pc=%08x -- dumping trailing %d-entry ring ===\n",
+	        (unsigned long long)e.run, (unsigned)e.pc, ARM7_TRACE_RING);
+	u64 oldest = (e.run >= ARM7_TRACE_RING) ? (e.run - ARM7_TRACE_RING + 1) : 0;
+	for (u64 r = oldest; r <= e.run; r++) {
+		Arm7TraceEntry& s = s_arm7Ring[r % ARM7_TRACE_RING];
+		if (s.run != r) continue;   // ring not yet wrapped this far back
+		fprintf(f, "run=%llu pc=%08x T=%d CPSR=%08x R0=%08x R3=%08x R4=%08x R13=%08x R14=%08x op=%08x\n",
+		        (unsigned long long)s.run, (unsigned)s.pc, (int)s.t, (unsigned)s.cpsr,
+		        (unsigned)s.r0, (unsigned)s.r3, (unsigned)s.r4, (unsigned)s.r13, (unsigned)s.r14, (unsigned)s.op);
+	}
+	fclose(f);
+}
 #endif
 
 template<bool doarm9, bool doarm7>
@@ -1648,29 +1692,7 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #ifdef DESMUME_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 				g_arm7RunHits++;
-				// Per-dispatch PC/mode/R14 trace, gated to a narrow g_arm7RunHits
-				// window -- ARM7_PC_DUMP_LO/HI below are investigation-specific
-				// (set to bracket whatever divergence is being chased this time)
-				// and are meant to be edited per use, not a fixed default.
-				// `cached` is armcpu_t::instruction (what will actually execute,
-				// already pre-fetched per the armcpu_prefetch<> convention);
-				// `fresh` is a live re-read of the same address -- comparing the
-				// two catches a stale-prefetch/self-modifying-code artifact
-				// instead of chasing a phantom in the interpreter/JIT itself.
-#define ARM7_PC_DUMP_LO 64000
-#define ARM7_PC_DUMP_HI 66500
-				if (g_arm7RunHits >= ARM7_PC_DUMP_LO && g_arm7RunHits <= ARM7_PC_DUMP_HI) {
-					FILE* f = fopen("sd:/split.log", "a");
-					if (f) { fprintf(f, "arm7pc run=%llu pc=%08x T=%d R14=%08x cached=%08x fresh=%08x\n",
-					                 (unsigned long long)g_arm7RunHits,
-					                 (unsigned)NDS_ARM7.instruct_adr,
-					                 (int)NDS_ARM7.CPSR.bits.T,
-					                 (unsigned)NDS_ARM7.R[14],
-					                 (unsigned)NDS_ARM7.instruction,
-					                 NDS_ARM7.CPSR.bits.T
-					                     ? (unsigned)_MMU_read16<ARMCPU_ARM7, MMU_AT_CODE>(NDS_ARM7.instruct_adr & ~1u)
-					                     : (unsigned)_MMU_read32<ARMCPU_ARM7, MMU_AT_CODE>(NDS_ARM7.instruct_adr & ~3u)); fclose(f); }
-				}
+				arm7TraceRecordAndCheck();
 #endif
 #ifdef DESMUME_JIT_ARM7
 				u32 jitCycles = jitRunArm7();
