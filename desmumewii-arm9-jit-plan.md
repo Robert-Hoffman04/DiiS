@@ -1,14 +1,46 @@
 # ARM9 trace-JIT — the priority target (ARMv5TE, THUMB first)
 
-Status: **A0 landed** (branch `arm9-jit-infra`, 2026-09-03). The JIT core is
-de-singletonised (`jitCacheArm7` / `jitCacheArm9`, `jitProfile[2]`), a real ARM9
-`JitCpuProfile` skeleton is built, `jitRunArm9()` is spliced into
-`armInnerLoop`'s ARM9 arm but inert (`jitArm9Enabled=false`, `canEnter*` false),
-SMC hooks fan out to both caches, and the CP15 TCM-relocation flush is wired.
-Verified: JIT-off `.dol` byte-identical (2246048); JIT-on + differential builds
-clean; a 150 s PH differential soak is behaviourally identical to the
-pre-refactor baseline (selftest PASS, 0 mismatches, 0 arena overruns, no crash).
-Next: A1 (harness memory snapshot + cycle compare) and A2 (enable ARM9 THUMB).
+Status: **A2 landed** (branch `arm9-jit-infra`, 2026-09-03). A0 de-singletonised
+the JIT core (`jitCacheArm7` / `jitCacheArm9`, `jitProfile[2]`), built a real ARM9
+`JitCpuProfile` skeleton, spliced an inert `jitRunArm9()` into `armInnerLoop`'s
+ARM9 arm, fanned the SMC hooks out to both caches and wired the CP15
+TCM-relocation flush. A1 hardened the differential harness (write-log journal +
+reverse rollback, `untrusted=`/`countDiv=`/`cycDrift=` telemetry, boot
+self-test). A2 brought up the ARM9 THUMB front-end:
+
+* `jit_arm9_profile.cpp` — `arm9_canEnterThumb` is a real region check (ITCM /
+  main RAM / shared WRAM / ARM9 BIOS; DTCM window excluded because the ARM9
+  `MMU_AT_CODE` path returns MAIN_MEM there, not DTCM, so a block scanned from a
+  DTCM-shadowed address would compile the wrong bytes). `arm9_cyclesForThumb`
+  reproduces `armcpu_exec<ARM9>()`'s own per-op cost with the ARM9 data-access
+  model: `max(alu, mem)`, main-RAM word = 4 / half-byte = 2 (M32 = 2 on the
+  32-bit bus), lists = `max(alu, 4·n)`. v1 assumes main RAM; the harness's
+  `cycDrift` quantifies the error.
+* THUMB `BLX` — `jit_thumb.cpp` case 8 (BLX reg, sibling of BX Rs + unconditional
+  LR write) and case 30 (BLX imm, sibling of BL with word-aligned target + clear
+  CPSR.T; exits to the interpreter for the ARM code until A5). Also fixes a
+  latent ARM7 bug: `0x47xx` with bit 7 set was silently compiled as plain BX,
+  dropping the LR write — DeSmuME's shared THUMB table executes BLX on ARM7 too.
+* `jitRunArm9Checked` — the A1 journal generalised: `jitRunChecked()` is now
+  shared by both cores (core threaded as an `armcpu_exec<>` fn-ptr), the journal
+  decodes ARM9 RAM (DTCM / ITCM / main / shared WRAM), ARM9 stats report under
+  the `diff9` tag. In a `JIT_DIFFERENTIAL_TESTING` build the ARM9 JIT runs
+  regardless of `jitArm9Enabled` (still default-off for production) so a full
+  capture exercises it.
+* Profiler — `jit_exec.cpp` tallies every ARM9 step as ARM / THUMB-region-out /
+  THUMB-JIT and reports the mix (the VBA `Profiler` port).
+
+Verified: JIT-off `.dol` byte-identical (2246048); JIT-on 2306720 (+1728 over A0
+— BLX + real cycle model, harness code still out); differential build links
+clean (2303296). 150 s PH differential soak: `selftest PASS`, `journal selftest
+PASS`, **0 DIFF / 0 diff9 DIFF / 0 ARENA OVERRUN**, clean exit. Profiler:
+**PH's boot/intro is ~99–100 % ARM-mode on the ARM9** — THUMB rounds to 0 %, so
+neither core ran ≥100 k THUMB blocks (no `diff alive` / `diff9 alive` line), the
+same "boot is ARM-heavy" result the ARM7 P5 soak hit. The ARM9 THUMB path is
+code-complete, non-regressing and crash-free, but **live THUMB coverage is still
+unverified** — needs gameplay past the intro (input automation) or the jsmolka
+`thumb` payload retargeted to the ARM9. Next: finish A2's coverage (jsmolka /
+gameplay capture) then A3 (benchmark gate).
 
 Reprioritised 2026-09-03: the ARM9 is where the
 ~3× bottleneck lives ([desmumewii-perf-opportunities.md](desmumewii-perf-opportunities.md)
@@ -65,8 +97,8 @@ remaining tool for the ARM7 P5 runaway (that investigation stalled on
 | Phase | Deliverable | Exit criterion |
 |---|---|---|
 | **A0** | **De-singletonise the JIT core.** `jitCacheArm7` + `jitCacheArm9` (each its own arena, block hash, SMC registry, page-flags, linker-stub pair); `jitActiveProfile` → `jitProfile[2]`; `jitInit()` builds both; SMC hooks fan out to both caches for shared regions; add the CP15 TCM-relocation `flushCache` hook (even though nothing compiles yet). `jitRunArm9()` wired into the ARM9 arm of `armInnerLoop`, inert. | ARM7 differential soak **byte-identical** to pre-refactor; ARM9 JIT compiled, `jitArm9Enabled=false`, `canEnter*` false; JIT-off `.dol` == 2246048 |
-| **A1** | **Harden the differential harness.** Add guest-memory snapshot/restore around the interpreter reference run (scratch copy of the touched page range, or a write-log + rollback) so store-containing blocks are actually compared and "0 mismatches" means something. Fix or explicitly bound the mode-switch instruction-count blind spot. Add **per-block cycle-count comparison** (ARM9 timing feeds VCount/DMA/IRQ pacing — see §3.5). | the ARM7 soak still runs clean *with* store blocks now compared; harness reports cycle drift per block |
-| **A2** | **ARM9 THUMB front-end.** `jit_arm9_profile.cpp` (§3); enable `canEnterThumb` for ARM9; reuse `jit_thumb.cpp` + add THUMB `BLX` (imm and reg, §4); coarse cycle model v1; `jitRunArm9Checked`. Port VBA's `Profiler` and run it on 4+ retail ROMs for the ARM9 THUMB/ARM/fallback instruction mix. | jsmolka `thumb` payload passes on ARM9; zero genuine mismatches over a PH intro+gameplay capture on the hardened harness; Profiler coverage numbers reported; `jitArm9Enabled` still off |
+| **A1** ✅ | **Harden the differential harness.** *Done:* write-log + reverse rollback (`jitDiffJournalNote()` in the three `_MMU_write*` choke points, replayed in `jitRunArm7Checked()`); non-RAM writes bounded via `s_journalUnrestorable` + `untrusted=` counter (replaces the blanket "any store opcode ⇒ skip"); instruction-count divergence surfaced as `countDiv=`; per-block cycle compare → `cycDrift=N blk (sum= max=)`. Boot-time `jitDiffJournalSelfTest()` proves record/overlap/rollback/overflow/unrestorable since the PH boot path runs too few ARM7 THUMB blocks to exercise it live. | ✅ journal selftest PASS; 90 s PH soak identical to A0; JIT-off/JIT-on `.dol` sizes unchanged |
+| **A2** 🟡 | **ARM9 THUMB front-end.** *Done:* `jit_arm9_profile.cpp` region check + real `max(alu,mem)` cycle model; THUMB `BLX` imm+reg in `jit_thumb.cpp` (also fixes a latent ARM7 BLX-reg-as-BX bug); `jitRunArm9Checked` sharing `jitRunChecked()` with the ARM7 path, journal generalised to ARM9 RAM, `diff9` telemetry; Profiler (ARM/THUMB-region-out/THUMB-JIT mix). ARM9 JIT runs in the differential build regardless of `jitArm9Enabled`. *Pending:* live THUMB coverage — PH intro is ~99–100 % ARM-mode, so needs a gameplay capture or the jsmolka `thumb` payload retargeted to ARM9. | ✅ builds clean, JIT-off byte-identical, 150 s PH soak 0 DIFF / 0 diff9 DIFF / 0 overruns, both self-tests PASS; ⬜ jsmolka `thumb` on ARM9; ⬜ genuine THUMB mismatch count from a THUMB-bearing capture; `jitArm9Enabled` still off |
 | **A3** | **Measure — the real "is it worth it" gate.** `tools/benchmark/benchmark.sh` gets `jit9off`/`jit9on` modes; A/B on the same scenes as the ARM7 work, ARM7 held on the interpreter. | benchmark delta reported on 3+ scenes; decision recorded on whether THUMB-only ARM9 is a real win and whether the ARM-mode front-end (A5) is now the priority |
 | **A4** | **Resolve or bound the P5-class runaway** with the hardened harness, then flip the switch. Multi-ROM differential soak; hardware validation of the arena (Broadway 32 KB I-cache, two arenas competing). | zero genuine mismatches across 4+ ROMs; runs correctly on real hardware; `jitArm9Enabled` → **default-on** if A3 showed a real win |
 | **A5** | **ARM-mode front-end** (`jit_arm.cpp`, the old ARM7 P7) — now serving both cores, ARM9 primarily — in the port order from the ARM7 plan §5.2, each group differential-tested. Then the **ARMv5TE ARM delta** (§4): CLZ, BLX, DSP multiplies, QADD family + Q flag, LDRD/STRD, PLD, BKPT, CP15/coproc = hard terminator, and the ARMv5 PC-interworking switch on LDM/LDR/data-proc. | jsmolka `arm` payload passes on ARM9; ARMv5 conformance payload passes; combined THUMB+ARM coverage and benchmark delta reported |

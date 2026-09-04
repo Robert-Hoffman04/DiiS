@@ -159,15 +159,18 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		break;
 	}
 
-	// ============================================ F4 (0x4000-0x43FF) / F5+BX
+	// ============================================ F4 (0x4000-0x43FF) / F5+BX/BLX
 	case 8: {
 		if (opcode & 0x0400) {
-			// ---- 0x4400-0x47FF : Format 5 hi-reg ops + BX --------------
-			const u8 sub = (opcode >> 8) & 0x03;   // 0=ADD 1=CMP 2=MOV 3=BX
+			// ---- 0x4400-0x47FF : Format 5 hi-reg ops + BX/BLX ----------
+			const u8 sub = (opcode >> 8) & 0x03;   // 0=ADD 1=CMP 2=MOV 3=BX/BLX
 			ctx.ensureArena();
 
-			if (sub == 3) {                          // BX Rs
+			if (sub == 3) {                          // BX Rs / BLX Rs (bit7 = L)
+				const bool isBlx = (opcode & 0x0080) != 0;   // ARMv5 (ARM9): BLX reg
 				const u8 rs = (opcode >> 3) & 0x0F;
+				// Capture Rm into a scratch first -- before any writeReg()
+				// touches the register cache (the P2b hi-reg rd==rs hazard).
 				if (rs == 15) {
 					u32 v = (currentPC + 4) & ~1u;
 					*emitPtr++ = PPC_LIS(PPC_R12, v >> 16);
@@ -175,6 +178,16 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 				} else {
 					u8 hRs = ctx.readReg(rs, lockedMask);
 					*emitPtr++ = PPC_OR(PPC_R12, hRs, hRs);
+				}
+				if (isBlx) {
+					// OP_BLX_THUMB: R14 = next_instruction | 1, unconditionally
+					// (same value whichever mode bit0 selects), so emit it
+					// before the branch to keep the dirty-reg flush consistent
+					// on both the THUMB and the ARM (interpreter-bail) paths.
+					const u32 retLR = (currentPC + 2) | 1;
+					const u8 hLR = ctx.writeReg(14, true, lockedMask);
+					*emitPtr++ = PPC_LIS(hLR, retLR >> 16);
+					*emitPtr++ = PPC_ORI(hLR, hLR, retLR & 0xFFFF);
 				}
 				*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);  // bit0
 				*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
@@ -705,24 +718,46 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		break;
 	}
 
-	// ================================================ F19 : BL (prefix+suffix)
+	// ================================ F19 : BL / BLX (imm) (prefix + suffix)
 	case 30: {
 		if ((currentPC >> 10) != ((currentPC + 2) >> 10)) { ctx.endBlock = true; break; }
 		const u16 lo = (u16)ctx.cpu.fetch16(currentPC + 2);
-		if ((lo & 0xF800) != 0xF800) { ctx.endBlock = true; break; }
+		const bool isBl  = (lo & 0xF800) == 0xF800;   // H==11 suffix -> BL
+		const bool isBlx = (lo & 0xF801) == 0xE800;   // H==01 suffix, bit0==0 -> BLX
+		if (!isBl && !isBlx) { ctx.endBlock = true; break; }
 		ctx.ensureArena();
 
 		s32 sOff = (s32)((opcode & 0x07FF) << 21);
 		sOff >>= 9;
 		sOff |= (lo & 0x07FF) << 1;
-		const u32 targetPC = currentPC + 4 + sOff;
 		const u32 retLR = (currentPC + 4) | 1;
 
-		const u8 hLR = ctx.writeReg(14, true, lockedMask);
-		*emitPtr++ = PPC_LIS(hLR, retLR >> 16);
-		*emitPtr++ = PPC_ORI(hLR, hLR, retLR & 0xFFFF);
+		if (isBl) {
+			const u32 targetPC = currentPC + 4 + sOff;
+			const u8 hLR = ctx.writeReg(14, true, lockedMask);
+			*emitPtr++ = PPC_LIS(hLR, retLR >> 16);
+			*emitPtr++ = PPC_ORI(hLR, hLR, retLR & 0xFFFF);
+			emitStaticExit(ctx, targetPC, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
+		} else {
+			// BLX (imm): word-align the target, switch to ARM. The next block is
+			// ARM mode -- until A5's ARM front-end lands the block just exits and
+			// the C++ resume path (which checks CPSR.T) runs the ARM code. The
+			// THUMB run up to the call is still native.
+			const u32 targetPC = (currentPC + 4 + sOff) & ~3u;
+			const u8 hLR = ctx.writeReg(14, true, lockedMask);
+			*emitPtr++ = PPC_LIS(hLR, retLR >> 16);
+			*emitPtr++ = PPC_ORI(hLR, hLR, retLR & 0xFFFF);
+			*emitPtr++ = PPC_LIS(PPC_R12, targetPC >> 16);
+			*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, targetPC & 0xFFFF);
+			// clear CPSR.T (bit 5) so the resume path uses ARM fetch/pipeline
+			ctx.ensureFlagsLoaded();
+			*emitPtr++ = PPC_LI(PPC_R10, 0x20);
+			*emitPtr++ = PPC_ANDC(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+			ctx.flagsDirty = true;
+			ctx.flushDirtyFlags();
+			emitDynamicExit(ctx, PPC_R12, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
+		}
 
-		emitStaticExit(ctx, targetPC, ctx.instrCount + 2, ctx.cpu.cyclesForThumb(opcode));
 		ctx.instrCount += 2; ctx.currentPC += 4;
 		ctx.endBlock = true; ctx.blockTerminatedEarly = true;
 		break;

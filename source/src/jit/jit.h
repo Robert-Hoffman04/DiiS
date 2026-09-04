@@ -63,6 +63,22 @@ u32 jitRunArm7();
 extern bool jitArm9Enabled;
 u32 jitRunArm9();
 
+#if defined(JIT_DIFFERENTIAL_TESTING)
+// Differential-harness guest-memory journal (jit_differential.cpp). The three
+// MMU write choke points (_MMU_write08/16/32 in MMU.h) call this *before*
+// mutating memory, so the interpreter reference run inside jitRunArm*Checked()
+// can be rolled back byte-for-byte and store-containing blocks are actually
+// compared. A no-op (one predictable-branch load) unless the harness has armed
+// the journal around a reference run; never compiled into a shipping build.
+void jitDiffJournalNote(int procnum, u32 addr, u32 size);
+
+// Boot-time proof that the journal records + rolls back correctly (the PH boot
+// path runs almost no ARM7 THUMB blocks, so the live harness alone can't
+// exercise it). Logs [jit] journal selftest ... to sd:/jit.log. Call after
+// MMU_Init().
+bool jitDiffJournalSelfTest();
+#endif
+
 // One-shot ABI round-trip check (hand-emitted block -> trampoline -> linker
 // stub miss path -> return). Returns true on success; logs either way.
 bool jitSelfTest();

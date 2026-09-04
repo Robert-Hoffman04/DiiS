@@ -48,6 +48,28 @@ static void jitMaybeReport()
 #include "jit_differential.h"
 #endif
 
+// A2 coverage profiler (the port of VBA's Profiler): per-ARM9-step tally of
+// ARM vs THUMB vs JIT-compilable-THUMB, so the THUMB-only front-end's reach can
+// be reported before A3's benchmark. Dumped to sd:/jit.log with the other
+// telemetry; DESMUME_JIT_TRACE_FIRST-gated, zero cost otherwise.
+#ifdef DESMUME_JIT_TRACE_FIRST
+u64 g_jit9Steps = 0, g_jit9Arm = 0, g_jit9ThumbFar = 0, g_jit9ThumbOk = 0;
+static void jit9ProfileReport()
+{
+	static u64 s_last = 0;
+	if (g_jit9Steps - s_last < 2000000) return;
+	s_last = g_jit9Steps;
+	const u64 t = g_jit9Steps ? g_jit9Steps : 1;
+	FILE* f = fopen("sd:/jit.log", "a");
+	if (f) { fprintf(f, "[jit] arm9 mix: %llu steps  arm=%llu%%  thumb-region-out=%llu%%  thumb-jit=%llu%%\n",
+	                 (unsigned long long)g_jit9Steps,
+	                 (unsigned long long)(g_jit9Arm * 100 / t),
+	                 (unsigned long long)(g_jit9ThumbFar * 100 / t),
+	                 (unsigned long long)(g_jit9ThumbOk * 100 / t));
+	         fclose(f); }
+}
+#endif
+
 // Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
 bool jitArm7Enabled = true;
 
@@ -137,30 +159,45 @@ u32 jitRunArm7()
 // scanner, trampoline and resume-pipeline logic) but against NDS_ARM9 /
 // jitCacheArm9 / the ARM9 profile.
 //
-// A0: jitArm9Enabled defaults false and the ARM9 profile's canEnterThumb()
-// returns false, so both guards below short-circuit and this always returns 0
-// (interpreter handles every ARM9 step, exactly as before). The body is in
-// place so A2 -- enabling the ARM9 THUMB front-end -- is just "flip the two
-// flags + fill canEnterThumb + the cycle model". The differential wrapper
-// (jitRunArm9Checked) lands in A1/A2.
+// A2: the ARM9 profile's canEnterThumb() is now a real region check and the
+// THUMB emitter table is reused as-is (+ BLX). In a normal build jitArm9Enabled
+// still defaults false -- ARM9 blast radius = whole game -- so this returns 0
+// until A4 flips it. In a JIT_DIFFERENTIAL_TESTING build the enable is bypassed
+// so a full boot+gameplay capture runs every ARM9 THUMB block through
+// jitRunArm9Checked() against the hardened harness.
 // ---------------------------------------------------------------------------
 bool jitArm9Enabled = false;
 
 u32 jitRunArm9()
 {
 	JitCpuProfile* prof = jitProfile[JIT_ARM9];
-	if (!jitArm9Enabled || !prof) return 0;
+	if (!prof) return 0;
+#if !defined(JIT_DIFFERENTIAL_TESTING)
+	if (!jitArm9Enabled) return 0;
+#endif
 
 	armcpu_t& cpu = NDS_ARM9;
-	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (A5)
-
 	const u32 pc = cpu.instruct_adr;
+
+#ifdef DESMUME_JIT_TRACE_FIRST
+	g_jit9Steps++;
+	if (cpu.CPSR.bits.T == 0)            g_jit9Arm++;
+	else if (!prof->canEnterThumb(pc))   g_jit9ThumbFar++;
+	else                                 g_jit9ThumbOk++;
+	jit9ProfileReport();
+#endif
+
+	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (A5)
 	if (!prof->canEnterThumb(pc)) return 0;        // uncompilable region
 
 	BasicBlock* b = jitCacheArm9.getBlock(pc);
 	if (!b || (b->execute == nullptr && b->length == 0))
 		b = jitCompileTrace(pc, jitCacheArm9, *prof);
 	if (!b || b->execute == nullptr) return 0;
+
+#if defined(JIT_DIFFERENTIAL_TESTING)
+	return jitRunArm9Checked(&cpu, b, pc);
+#endif
 
 	cpu.R[15] = pc + 4;
 	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };

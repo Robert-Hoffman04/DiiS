@@ -170,6 +170,9 @@ int NDS_Init( void) {
 #ifdef DESMUME_JIT_SELFTEST
 	jitThumbSelfTest();
 #endif
+#ifdef JIT_DIFFERENTIAL_TESTING
+	jitDiffJournalSelfTest();
+#endif
 #endif
 
 	if (SPU_Init(SNDCORE_DUMMY, 740) != 0)

@@ -777,6 +777,9 @@ dunno:
 
 FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u8 val)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNote(PROCNUM, addr, 1);
+#endif
 	//special handling for DMA: discard writes to TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{
@@ -819,6 +822,9 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 
 FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u16 val)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNote(PROCNUM, addr, 2);
+#endif
 	//special handling for DMA: discard writes to TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{
@@ -856,6 +862,9 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 
 FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u32 val)
 {
+#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+	jitDiffJournalNote(PROCNUM, addr, 4);
+#endif
 	//special handling for DMA: discard writes to TCM
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_DMA)
 	{
