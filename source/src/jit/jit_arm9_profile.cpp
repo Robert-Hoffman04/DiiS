@@ -203,6 +203,10 @@ static u8 arm9_cyclesForArm(u32 op)
 	if ((op >> 28) == 0xF) return 1;
 	// CLZ (bits 27..20 == 0x16, bits 7..4 == 0x1): OP_CLZ returns 2.
 	if ((op & 0x0FF000F0u) == 0x01600010u) return 2;
+	// QADD / QSUB / QDADD / QDSUB and the SM* DSP multiplies: all return 2
+	// (the Rd == 15 PC-write path, which returns 3, bails in the emitter).
+	if ((op & 0x0F900FF0u) == 0x01000050u) return 2;
+	if ((op & 0x0F900090u) == 0x01000080u) return 2;
 
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;

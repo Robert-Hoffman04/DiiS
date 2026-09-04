@@ -36,6 +36,18 @@
  *        rotates); MRS Rd,CPSR (= the packed flags word); MSR CPSR_f (flags
  *        byte only). SPSR forms, any non-flag MSR field, coprocessor, SWI and
  *        BKPT end the trace. cond == AL only.
+ *   B7  - ARMv5TE delta, part 1: CLZ (cntlzw), BLX immediate (NV-space, always
+ *        ARM->THUMB), PLD (hint, no-op), LDRD / STRD (register pair, two word
+ *        accesses).
+ *   B7b - ARMv5TE delta, part 2: QADD / QSUB / QDADD / QDSUB with saturation and
+ *        the sticky CPSR.Q flag (bit 27); the SM* signed-halfword DSP multiplies
+ *        (SMUL / SMLA / SMLAL / SMULW / SMLAW <x><y>). Q on overflow is set via
+ *        PPC add/subf XER[OV]; SMLAL replicates OP_SMLAL_*'s exact accumulate.
+ *        The B1-B6 PC-writer audit: every pc-writing emitter (data-proc -> pc,
+ *        LDR -> pc, extra ld/st -> pc, multiply -> pc, QADD -> pc) ends the
+ *        trace; only LDM{pc} (B4) and BX/BLX (B6) compile a pc write, both with
+ *        the ARMv5 bit0 interworking branch. LDR{pc} / MOV pc,lr interworking is
+ *        a later group.
  *   B6b - data-processing with a register operand2 shifted by a register
  *        (LSL/LSR/ASR/ROR by Rs&0xFF, bit4 == 1 && bit7 == 0). Runtime amount,
  *        so the shifter carry needs runtime branches; the value/carry edges at
@@ -1146,6 +1158,190 @@ void emitDoubleDataTransfer(JitTraceCtx& ctx, u32 op)
 	}
 }
 
+// --------------------------------------------- Q sticky flag helper (B7b)
+// CPSR.Q is conventional bit 27 (== IBM/rlwinm bit 4) of the packed CPSR word.
+// It is sticky -- only ever set, never cleared here -- so `if (ovfReg bit31)
+// Q = 1`. ovfReg holds the saturation/overflow condition as 0/1 in bit 31.
+// Emitted as a forward-skip so Q is untouched when there was no overflow.
+void emitStickyQ(JitTraceCtx& ctx, u8 ovfReg)
+{
+	u32*& p = ctx.emitPtr;
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_CMPWI(0, ovfReg, 0);
+	u32* skip = p++;                                    // BEQ -> no set
+	*p++ = PPC_LI(PPC_R8, 1);
+	*p++ = PPC_RLWIMI(PPC_REG_FLAGS, PPC_R8, 27, 4, 4); // FLAGS bit 4 (IBM) = CPSR bit 27
+	*skip = PPC_BEQ((u32)((p - skip) * 4));
+	ctx.flagsDirty = true;
+}
+
+// Saturate hRes in place to 0x7FFFFFFF / 0x80000000 by the sign of the raw
+// result: 0x80000000 + (hRes >> 31 arithmetically) == the interpreter's
+// `0x80000000 - BIT31(res)`. Clobbers R8, R11.
+void emitSaturate(u32*& p, u8 hRes)
+{
+	*p++ = PPC_SRAWI(PPC_R8, hRes, 31);                 // 0 or 0xFFFFFFFF
+	*p++ = PPC_LIS(PPC_R11, 0x8000);                    // 0x80000000
+	*p++ = PPC_ADD(hRes, PPC_R8, PPC_R11);              // 0x80000000 + (0 | -1)
+}
+
+// ----------------------------------------- QADD / QSUB / QDADD / QDSUB (B7b)
+// cond 0001 0 D S 0 Rn Rd 0000 0101 Rm   (bits 22..21 = D:S select the four)
+//   QADD  Rd = sat(Rn + Rm)         QSUB  Rd = sat(Rm - Rn)
+//   QDADD Rd = sat(sat(Rn<<1) + Rm) QDSUB Rd = sat(Rm - sat(Rn<<1))
+// Note the operand order: Rn = bits 19..16, Rm = bits 3..0, and QSUB/QDSUB
+// compute Rm - (Rn term), not the other way. Q (CPSR bit 27) is set sticky on
+// any saturation, including the QD* doubling step. PPC add/subf with OE give
+// XER[OV] == the ARM signed overflow/underflow the interpreter's
+// SIGNED_OVERFLOW / SIGNED_UNDERFLOW compute. cond == AL only; Rd == 15 (a
+// non-interworking word-aligned PC write) -> interp.
+void emitQArith(JitTraceCtx& ctx, u32 op)
+{
+	const bool doubled = (op >> 22) & 1;
+	const bool isSub   = (op >> 21) & 1;
+	const u8   rn = (op >> 16) & 0xF;
+	const u8   rd = (op >> 12) & 0xF;
+	const u8   rm = op & 0xF;
+	if (rn == 15 || rd == 15 || rm == 15) { ctx.endBlock = true; return; }
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRn = ctx.readReg(rn, lockedMask);
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+	ctx.ensureFlagsLoaded();
+
+	u8 term = hRn;                                      // the Rn-side addend/subtrahend
+	if (doubled) {
+		// R12 = Rn << 1 ; saturate + Q if the sign changed
+		*p++ = PPC_RLWINM(PPC_R12, hRn, 1, 0, 30);
+		*p++ = PPC_XOR(PPC_R11, hRn, PPC_R12);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 1, 31, 31); // sign-differs (0/1)
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		u32* noDbl = p++;                               // BEQ -> no doubling saturation
+		emitSaturate(p, PPC_R12);
+		*p++ = PPC_LI(PPC_R8, 1);
+		*p++ = PPC_RLWIMI(PPC_REG_FLAGS, PPC_R8, 27, 4, 4);
+		ctx.flagsDirty = true;
+		*noDbl = PPC_BEQ((u32)((p - noDbl) * 4));
+		term = PPC_R12;
+	}
+
+	if (isSub) *p++ = PPC_SUBFCO(hRd, term, hRm);       // Rm - term
+	else       *p++ = PPC_ADDCO (hRd, hRm, term);       // Rm + term
+	*p++ = PPC_MFXER(PPC_R8);
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R8, 2, 31, 31);      // XER[OV] -> 0/1
+
+	// on overflow: replace hRd with the saturated value AND set Q
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* noSat = p++;                                   // BEQ -> keep hRd, Q untouched
+	emitSaturate(p, hRd);
+	*p++ = PPC_LI(PPC_R8, 1);
+	*p++ = PPC_RLWIMI(PPC_REG_FLAGS, PPC_R8, 27, 4, 4);
+	*noSat = PPC_BEQ((u32)((p - noSat) * 4));
+	ctx.flagsDirty = true;
+}
+
+// ---------------- sign-extended half of a register -> dst (B7b DSP muls) ----
+inline void emitSHalf(u32*& p, u8 dst, u8 src, bool high)
+{
+	if (high) *p++ = PPC_SRAWI(dst, src, 16);           // HWORD: (s32)src >> 16
+	else      *p++ = PPC_EXTSH(dst, src);               // LWORD: sign-extend low 16
+}
+
+// ------------------------ SMUL / SMLA / SMLAL / SMULW / SMLAW  <x><y>  (B7b)
+// The ARMv5TE signed 16-bit-halfword multiply family. Encoding (bits 27..20):
+//   0x10 SMLA<x><y>   Rd16 = half_x(Rm) * half_y(Rs) + Ra12          Q on ovf
+//   0x12 SMLAW<y> / SMULW<y>  (bit5): Rd16 = (half_y(Rs) * Rm) >> 16 (+Ra12)
+//   0x14 SMLAL<x><y>  {Rd16:Ra12} += sign_ext_64(half_x(Rm) * half_y(Rs))
+//   0x16 SMUL<x><y>   Rd16 = half_x(Rm) * half_y(Rs)
+//   x = bit5 (Rm half), y = bit6 (Rs half); 0 = low ("B"), 1 = high ("T").
+// half*half fits in 32 bits so PPC mullw's low word is the exact product; the
+// SM*W forms need the 48-bit product (mullw + mulhw) shifted right 16. The
+// SMLAL accumulate matches OP_SMLAL_*'s exact (bug-compatible) arithmetic:
+// RdLo_new = tmpLo + RdLo ; RdHi_new = RdHi + RdLo_new + (tmp<0 ? -1 : 0).
+// cond == AL only; any pc operand / ARM-unpredictable RdHi==RdLo / Rm-aliases-
+// Rd(Lo|Hi) -> interp.
+void emitDspMul(JitTraceCtx& ctx, u32 op)
+{
+	const u8   kind = (u8)((op >> 21) & 3);   // 0 SMLA, 1 SMLAW/SMULW, 2 SMLAL, 3 SMUL
+	const bool xHigh = (op >> 5) & 1;
+	const bool yHigh = (op >> 6) & 1;
+	const u8   rm = op & 0xF;                 // bits 3..0
+	const u8   rs = (op >> 8) & 0xF;          // bits 11..8
+	const u8   ra = (op >> 12) & 0xF;         // bits 15..12  (accumulator / RdLo)
+	const u8   rd = (op >> 16) & 0xF;         // bits 19..16  (result / RdHi)
+	const bool wide  = (kind == 1);           // SMLAW / SMULW : Rs half * full Rm >> 16
+	const bool accW  = wide && !((op >> 5) & 1);   // SMLAW (bit5 == 0) vs SMULW (bit5 == 1)
+
+	if (rm == 15 || rs == 15 || rd == 15) { ctx.endBlock = true; return; }
+	const bool hasAcc = (kind == 0) || (kind == 2) || (wide && accW);
+	if (hasAcc && ra == 15) { ctx.endBlock = true; return; }
+	if (kind == 2) {                          // SMLAL<x><y>
+		if (ra == rd || rm == ra || rm == rd) { ctx.endBlock = true; return; }
+	}
+
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+
+	const u8 hRm = ctx.readReg(rm, lockedMask);
+	const u8 hRs = ctx.readReg(rs, lockedMask);
+
+	if (wide) {
+		// tmp = (half_y(Rs) * (s32)Rm) >> 16   -> R11
+		emitSHalf(p, PPC_R10, hRs, yHigh);
+		*p++ = PPC_MULLW(PPC_R11, PPC_R10, hRm);        // lo 32
+		*p++ = PPC_MULHW(PPC_R12, PPC_R10, hRm);        // hi 32 (signed)
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 16, 16, 31); // lo >>u 16
+		*p++ = PPC_RLWIMI(PPC_R11, PPC_R12, 16, 0, 15);  // | (hi << 16)  -> {hi:lo} >> 16
+		if (accW) {                                     // SMLAW: + Ra, Q on signed ovf
+			const u8 hRa = ctx.readReg(ra, lockedMask);
+			const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+			*p++ = PPC_ADDCO(hRd, PPC_R11, hRa);
+			*p++ = PPC_MFXER(PPC_R8);
+			*p++ = PPC_RLWINM(PPC_R8, PPC_R8, 2, 31, 31);
+			emitStickyQ(ctx, PPC_R8);
+		} else {                                        // SMULW: just the shifted product
+			const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+			*p++ = PPC_OR(hRd, PPC_R11, PPC_R11);
+		}
+		return;
+	}
+
+	// half_x(Rm) * half_y(Rs) -> R12  (fits in 32 bits)
+	emitSHalf(p, PPC_R11, hRm, xHigh);
+	emitSHalf(p, PPC_R12, hRs, yHigh);
+	*p++ = PPC_MULLW(PPC_R12, PPC_R11, PPC_R12);        // tmp (32-bit)
+
+	if (kind == 3) {                                    // SMUL<x><y>
+		const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+		*p++ = PPC_OR(hRd, PPC_R12, PPC_R12);
+		return;
+	}
+	if (kind == 0) {                                    // SMLA<x><y> : + Ra, Q on ovf
+		const u8 hRa = ctx.readReg(ra, lockedMask);
+		const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+		*p++ = PPC_ADDCO(hRd, PPC_R12, hRa);
+		*p++ = PPC_MFXER(PPC_R8);
+		*p++ = PPC_RLWINM(PPC_R8, PPC_R8, 2, 31, 31);
+		emitStickyQ(ctx, PPC_R8);
+		return;
+	}
+
+	// kind == 2 : SMLAL<x><y> -- 64-bit accumulate, no flags
+	//   RdLo(ra)_new = tmpLo + RdLo ;  RdHi(rd)_new = RdHi + RdLo_new + sign(tmp)
+	*p++ = PPC_SRAWI(PPC_R11, PPC_R12, 31);             // R11 = (tmp < 0 ? -1 : 0)
+	const u8 hLo = ctx.writeReg(ra, false, lockedMask); // needs old RdLo
+	const u8 hHi = ctx.writeReg(rd, false, lockedMask); // needs old RdHi
+	*p++ = PPC_ADD(PPC_R10, PPC_R12, hLo);              // R10 = RdLo_new = tmpLo + RdLo_old
+	*p++ = PPC_ADD(hHi, hHi, PPC_R10);                  // RdHi += RdLo_new
+	*p++ = PPC_ADD(hHi, hHi, PPC_R11);                  // RdHi += sign(tmp)
+	*p++ = PPC_OR(hLo, PPC_R10, PPC_R10);               // RdLo = RdLo_new
+}
+
 } // namespace
 
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
@@ -1176,12 +1372,22 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 		return;
 	}
 
-	// Miscellaneous (B6): BX / BLX reg, SWP / SWPB, MRS, MSR. All cond == AL only
-	// (predicated -> B-later). BKPT, QADD family, DSP muls stay with B7b (they
-	// fall through to emitDataProc's testOnly && !S guard -> end the trace).
+	// Miscellaneous (B6/B7/B7b): BX / BLX reg, SWP / SWPB, MRS, MSR, CLZ, the
+	// QADD family and the SM* DSP multiplies. All cond == AL only (predicated ->
+	// B-later). BKPT still falls through to emitDataProc's testOnly && !S guard.
 	if ((op & 0x0FF000F0u) == 0x01600010u) {              // CLZ (B7)
 		if (cond != COND_AL) { ctx.endBlock = true; return; }
 		emitClz(ctx, op);
+		return;
+	}
+	if ((op & 0x0F900FF0u) == 0x01000050u) {              // QADD / QSUB / QDADD / QDSUB (B7b)
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitQArith(ctx, op);
+		return;
+	}
+	if ((op & 0x0F900090u) == 0x01000080u) {              // SM{UL,LA,LAL,ULW,LAW}<x><y> (B7b)
+		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		emitDspMul(ctx, op);
 		return;
 	}
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
