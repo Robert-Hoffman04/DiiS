@@ -15,6 +15,11 @@
 #   bench_jit9off ARM9 interpreter      DESMUME_FORCE_CORE=2, no JITDEFS (A3 baseline)
 #   bench_jit9on  ARM9 JIT              DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
 #                                       + DESMUME_JIT_ARM9_ON (jitArm9Enabled=true)
+#   bench_jitfull full JIT + GXMerge    DESMUME_FORCE_CORE=1 + DESMUME_FORCE_GXCOMPOSITE
+#                                       + DESMUME_JIT_ARM7 + DESMUME_JIT_ARM9_ON
+#                                       (both cores JIT'd, real GXMerge renderer
+#                                       instead of the sw core used by the A/B pairs
+#                                       above - "how fast is it for real" number)
 #
 # Prerequisites:
 #   - devkitPPC toolchain           (DEVKITPPC / DEVKITPRO in the environment)
@@ -29,7 +34,8 @@
 #     --no-build           reuse tools/benchmark/dols/*.dol
 #     --clean              `make clean` before the first build
 #     --duration N         seconds per run          (default 90; scenes.conf 'dur=' wins)
-#     --modes "sw gx"      subset of renderers      (default "sw gx merge")
+#     --modes "sw gx"      subset of renderers      (default "sw gx merge";
+#                          also available: jitoff jiton jit9off jit9on jitfull)
 #     --scenes "vsd ph"    subset of scene ids from scenes.conf
 #     --no-compare         skip the diff against the previous run
 #
@@ -94,6 +100,9 @@ defs_for() {
 		# ARM9 JIT A/B (A3): likewise sw renderer, delta is purely the ARM9 core.
 		jit9off) echo "$base -DDESMUME_FORCE_CORE=2" ;;
 		jit9on)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		# Full JIT: both cores JIT'd, GXMerge doing the actual compositing -
+		# not an A/B baseline, this is the "real" fast-path configuration.
+		jitfull) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
 		*)      die "unknown mode '$1'" ;;
 	esac
 }
@@ -102,9 +111,10 @@ defs_for() {
 # renderer-only mode.
 jitdefs_for() {
 	case "$1" in
-		jiton)  echo "-DDESMUME_JIT_ARM7" ;;
-		jit9on) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		*)      echo "" ;;
+		jiton)   echo "-DDESMUME_JIT_ARM7" ;;
+		jit9on)  echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		jitfull) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		*)       echo "" ;;
 	esac
 }
 

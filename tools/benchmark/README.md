@@ -6,9 +6,20 @@ run so a change's perf cost is visible.
 
 | dol | renderer | build defines |
 |---|---|---|
-| `bench_sw`    | all-CPU software rasterizer | `DESMUME_FORCE_CORE=2` |
-| `bench_gx`    | stock GX hardware 3D        | `DESMUME_FORCE_CORE=1` |
-| `bench_merge` | GXMerge 3-draw sandwich     | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` |
+| `bench_sw`      | all-CPU software rasterizer            | `DESMUME_FORCE_CORE=2` |
+| `bench_gx`      | stock GX hardware 3D                   | `DESMUME_FORCE_CORE=1` |
+| `bench_merge`   | GXMerge 3-draw sandwich                | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` |
+| `bench_jitoff`  | ARM7 interpreter (JIT A/B baseline)    | `DESMUME_FORCE_CORE=2` |
+| `bench_jiton`   | ARM7 JIT (JIT A/B)                     | `DESMUME_FORCE_CORE=2` + `DESMUME_JIT_ARM7` |
+| `bench_jit9off` | ARM9 interpreter (JIT A/B baseline)    | `DESMUME_FORCE_CORE=2` |
+| `bench_jit9on`  | ARM9 JIT (JIT A/B)                     | `DESMUME_FORCE_CORE=2` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
+| `bench_jitfull` | full JIT (ARM7 + ARM9) over GXMerge    | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
+
+The `jit*off`/`jit*on` pairs deliberately keep the software rasterizer fixed so
+the only delta between the two builds is the CPU core under test. `jitfull`
+isn't an A/B pair — it's both cores JIT'd, running the real GXMerge renderer,
+so it reads as the "how fast does this actually go" number rather than an
+isolated core comparison.
 
 ## How it works
 
@@ -52,6 +63,7 @@ The original SD `test.nds` is backed up and restored afterwards. `results/` and
 tools/benchmark/benchmark.sh                 # full matrix, ~13 min for 2 scenes
 tools/benchmark/benchmark.sh --scenes vsd    # just one scene
 tools/benchmark/benchmark.sh --modes "sw gx" --no-build
+tools/benchmark/benchmark.sh --modes jitfull  # full JIT, GXMerge renderer
 tools/benchmark/benchmark.sh --duration 120  # longer runs (slow host / long windows)
 ```
 
