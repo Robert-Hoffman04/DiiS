@@ -26,4 +26,4 @@ copy so the DeSmuMEWii port in `source/src/jit/` can be diffed against its
 origin. The compiled port files (`jit_*.{h,cpp,S}` one level up) are derived
 from these and carry their own headers noting the port.
 
-See `desmumewii-arm7-jit-plan.md` in the repo root for the port plan.
+See the repo root for the port plan.
