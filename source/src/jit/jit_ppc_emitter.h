@@ -93,7 +93,10 @@
 // R28 : Lazily allocated host pool for GBA R0-R14.
 // R29 : PPC_REG_PC (GBA R15 / Pipeline PC).
 // R30 : PPC_R30_PAGES (gbaReadTable Base Pointer)
-// R31 : Scratch
+// R31 : PPC_R31_ICOUNT -- resident guest-instruction-count accumulator (P12).
+//       Non-volatile, never allocated (outside the 0x1FFF8000 pool mask) and
+//       never used as emitter scratch; the trampoline zeroes it on entry and
+//       stores it to out->instructions on return.
 // -------------------------------------------------------------------------
 #define PPC_R3   3
 #define PPC_R4   4
@@ -109,7 +112,7 @@
 #define PPC_R29  29  // GBA PC
 
 #define PPC_R30_TABLE 30  // gbaReadTable Base Pointer (Non-volatile, no overlap with GBA registers)
-#define PPC_R31 31  // General scratch
+#define PPC_R31 31  // PPC_R31_ICOUNT -- resident guest-instruction-count accumulator (P12)
 
 // -------------------------------------------------------------------------
 // PACKED FLAGS

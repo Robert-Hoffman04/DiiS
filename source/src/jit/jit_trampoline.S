@@ -32,6 +32,10 @@
  *   r15..r28 lazily-cached guest R0..R14
  *   r29      guest R15 / pipeline PC
  *   r30      guest read page table base (nullptr until P6)
+ *   r31      resident guest-instruction-count accumulator (P12): every block's
+ *            clean/bail exit does `addi 31,31,count` instead of a load/add/store
+ *            round-trip through out->instructions; the trampoline zeroes it on
+ *            entry and writes it back to out->instructions once, here, on return.
  *   r6       packed N/Z/C/V
  *   r3       cycle accumulator (out); r4  next PC (out) / scratch
  ***************************************************************************/
@@ -61,6 +65,8 @@ ExecuteJITTrace:
 
     lwz 29, 60(14)             # r29 = guest R15 (pipeline PC), loaded eagerly
 
+    li 31, 0                    # P12: resident guest-instruction-count accumulator
+
     mtctr 3                     # enter the compiled block via CTR (never a call:
     li 3, 0                     #   the trace may chain through further blocks
     bctr                       #   via the linker stub before returning here)
@@ -73,15 +79,16 @@ ExecuteJITTrace:
     .type ExecuteJITTrace_Return, @function
 ExecuteJITTrace_Return:
     lwz 10, 88(1)              # r10 = JITResult* out
-    stw 3, 0(10)              # out->cycles  (r3)
-    stw 4, 4(10)              # out->nextPC  (r4)
+    stw 3, 0(10)              # out->cycles       (r3)
+    stw 4, 4(10)              # out->nextPC       (r4)
+    stw 31, 8(10)            # out->instructions (r31, P12 resident accumulator)
 
     lwz 10, 80(1)             # r10 = guest gpr base
     stw 29, 60(10)            # flush guest R15 (PC)
 
     # By contract, guest R0..R14 and the packed flags were already flushed by
     # the trace before it reached this landing pad; the trampoline owns only
-    # the PC it eagerly loaded.
+    # the PC it eagerly loaded and the r31 instruction-count accumulator.
 
     lmw 14, 8(1)              # restore host non-volatiles
     lwz 0, 132(1)            # saved host LR (128 + 4)

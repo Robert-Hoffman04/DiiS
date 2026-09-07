@@ -405,14 +405,27 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)
 {
-	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);           // outResult*
-	*emitPtr++ = PPC_LWZ(PPC_R11, PPC_R10, 8);
-	*emitPtr++ = PPC_ADDI(PPC_R11, PPC_R11, count);
-	*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 8);      // instructions += count
-	*emitPtr++ = PPC_LI(PPC_R11, bailedOut);
-	*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 12);     // bailedOut
-	*emitPtr++ = PPC_LI(PPC_R11, smcHit);
-	*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 16);     // smcHit
+	// P12: the guest-instruction count lives in the resident r31 accumulator for
+	// the whole (possibly chained) trace -- one addi here vs. the old
+	// load/add/store round-trip through out->instructions at every block
+	// boundary. The trampoline zeroes r31 on entry and writes it back to
+	// out->instructions once, on return.
+	if (count) *emitPtr++ = PPC_ADDI(PPC_R31, PPC_R31, (s32)count);
+
+	// bailedOut / smcHit are already 0 on a clean exit (every caller memsets the
+	// JITResult and no chained block un-clears them -- any bail is terminal), so
+	// only the bail paths emit these stores.
+	if (bailedOut || smcHit) {
+		*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);           // outResult*
+		if (bailedOut) {
+			*emitPtr++ = PPC_LI(PPC_R11, bailedOut);
+			*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 12); // bailedOut
+		}
+		if (smcHit) {
+			*emitPtr++ = PPC_LI(PPC_R11, smcHit);
+			*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 16); // smcHit
+		}
+	}
 }
 
 void JitTraceCtx::emitAddCycles(u32 n)

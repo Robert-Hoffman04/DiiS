@@ -42,10 +42,11 @@ bool jitSelfTest()
 	// r4 = next-PC sentinel
 	*p++ = PPC_LIS(PPC_R4, kNextPC >> 16);
 	*p++ = PPC_ORI(PPC_R4, PPC_R4, kNextPC & 0xFFFF);
-	// out = 88(r1): instructions@8, bailedOut@12, smcHit@16, smcAddress@20
+	// P12: guest-instruction count is the resident r31 accumulator, stored back
+	// to out->instructions by the trampoline on return.
+	*p++ = PPC_LI(PPC_R31, kInsns);
+	// out = 88(r1): bailedOut@12, smcHit@16, smcAddress@20
 	*p++ = PPC_LWZ(PPC_R10, 1, 88);
-	*p++ = PPC_LI(PPC_R11, kInsns);
-	*p++ = PPC_STW(PPC_R11, PPC_R10, 8);
 	*p++ = PPC_LI(PPC_R11, 0);
 	*p++ = PPC_STW(PPC_R11, PPC_R10, 12);
 	*p++ = PPC_STW(PPC_R11, PPC_R10, 16);

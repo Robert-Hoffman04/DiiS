@@ -193,6 +193,9 @@ struct JitTraceCtx {
 
 	// ---- exits (shared by jit_thumb.cpp and jit_arm.cpp) ----
 	void emitAddCycles(u32 n);   // r3 += n  (compile-time-known)
+	// count -> r31 (resident instruction accumulator, flushed to out->instructions
+	// by the trampoline). bailedOut / smcHit stores are emitted only when nonzero
+	// (a clean exit leaves the caller's memset-zeroed fields alone).
 	void emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit = 0);
 	void registerBailout(u32* branchPtr, JitBailoutCond cond);
 
