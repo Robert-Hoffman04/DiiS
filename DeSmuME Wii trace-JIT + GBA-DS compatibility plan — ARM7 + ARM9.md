@@ -205,6 +205,22 @@ Every optimization must preserve:
 - ARM/THUMB transitions
 - interpreter bailout correctness
 
+### Progress
+
+**P12 slice 1 (landed):** guest-instruction count is now a resident non-volatile
+host register (r31) for the whole trace, not a load/add/store through
+`out->instructions` per block; `bailedOut`/`smcHit` stores emit only on bail
+paths. `emitResultMetadata()` clean path: 8 emitted PPC instructions → 1.
+Validated 0-DIFF; ARM7-JIT SM64DS A/B 12.61 → 12.67 fps (+0.5%).
+
+**Measured picture:** on SM64DS (ARM9-bound, ARM9 on the interpreter) the ARM7
+JIT is still a net ~4.5% whole-frame regression — the remaining fixed costs are
+the trampoline's `stmw`/`lmw` per C↔JIT transition and `flushDirtyRegisters` +
+lazy reload at every chained block boundary. Those need a fixed guest→host
+mapping or cross-boundary residency (careful, measurement-heavy — §23). ARM7-JIT
+frame value is likely capped until the ARM9 JIT is viable in `jitfull`, which is
+blocked on the §16 host-heap-corruption bug.
+
 ---
 
 ## 6. Memory fast paths
@@ -997,7 +1013,7 @@ The default architecture remains direct emission plus chaining.
 | 9  | ARM32 front-end on ARM9                                          | done            |
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
-| 12 | Persistent JIT state + trampoline amortization                   | next            |
+| 12 | Persistent JIT state + trampoline amortization                   | slice 1 landed (r31 icount); more in §5 |
 | 13 | Inline memory fast paths                                         | next            |
 | 14 | Cached page descriptors                                          | next            |
 | 15 | LDM/STM and sequential memory optimization                       | next            |
