@@ -59,7 +59,8 @@ void jitCheckCanaries();
 // Live execution. Called from armInnerLoop() when the ARM7 is due to step.
 // Runs one JIT block from NDS_ARM7.instruct_adr and re-primes the interpreter
 // pipeline; returns cycles consumed, or 0 if the interpreter should handle
-// this instruction (ARM mode / uncompilable / disabled).
+// this instruction (uncompilable region / "don't JIT" / disabled). Both THUMB
+// and ARM mode are compiled (P11).
 extern bool jitArm7Enabled;
 u32 jitRunArm7();
 

@@ -613,6 +613,19 @@ void emitLdrPcExit(JitTraceCtx& ctx, u8 valReg, u32 op)
 	u32*& p = ctx.emitPtr;
 	const u32 term = ctx.cpu.cyclesForArm(op);
 
+	// ARMv4 (ARM7, LDTBit == 0): LDR/LDM to pc is `MOV pc,(value)` -- R15 = value
+	// & 0xFFFFFFFC, no interworking, T unchanged (OP_LDR's else branch).
+	if (ctx.cpu.isaLevel < 5) {
+		*p++ = PPC_OR(PPC_R12, valReg, valReg);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);  // word & ~3
+		ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+		ctx.instrCount++;
+		ctx.currentPC += 4;
+		ctx.endBlock = true;
+		ctx.blockTerminatedEarly = true;
+		return;
+	}
+
 	*p++ = PPC_OR(PPC_R12, valReg, valReg);              // capture before any flush
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);      // R11 = bit0 (mode select)
 	*p++ = PPC_CMPWI(0, PPC_R11, 0);
@@ -902,6 +915,20 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
 
 	const u32 term = ctx.cpu.cyclesForArm(op);
+
+	// ARMv4 (ARM7, LDTBit == 0): `LDM {..,pc}` is MOV pc,(loaded) -- R15 = word &
+	// 0xFFFFFFFC, no interworking, T unchanged (OP_LDMIA's else branch).
+	if (ctx.cpu.isaLevel < 5) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 100);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);  // & ~3
+		ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+		ctx.instrCount++;
+		ctx.currentPC += 4;
+		ctx.endBlock = true;
+		ctx.blockTerminatedEarly = true;
+		return;
+	}
+
 	*p++ = PPC_LWZ(PPC_R12, 1, 100);                    // raw popped pc
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);     // R11 = bit0 (mode select)
 	*p++ = PPC_CMPWI(0, PPC_R11, 0);
@@ -1492,12 +1519,15 @@ void emitDspMul(JitTraceCtx& ctx, u32 op)
 void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 {
 	const u8 cond = (u8)(op >> 28);
+	const bool v5 = (ctx.cpu.isaLevel >= 5);   // ARMv5TE (ARM9); false on ARM7 (ARMv4T)
 
 	if (cond == COND_NV) {
 		// ARMv5 unconditional-extension space. Only BLX imm actually executes
 		// (DeSmuME: cond == 0xF passes TEST_COND only for CODE == 5 == the 101
 		// branch group); PLD is a hint -> emit nothing, block keeps compiling;
-		// CPS / SETEND / RFE / SRS / coprocessor-double -> interpreter.
+		// CPS / SETEND / RFE / SRS / coprocessor-double -> interpreter. On ARMv4T
+		// the whole NV space is UNDEFINED -> interpreter.
+		if (!v5) { ctx.endBlock = true; return; }
 		if ((op & 0x0E000000u) == 0x0A000000u) { emitBlxImm(ctx, op); return; }
 		if ((op & 0x0D70F000u) == 0x0550F000u) return;                 // PLD (nop)
 		ctx.endBlock = true;
@@ -1512,7 +1542,10 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	// bit20 == 0 && bits6..5 >= 10 corner (B7); the rest is B3b.
 	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
 		if (cond != COND_AL) { ctx.endBlock = true; return; }
-		if (((op >> 20) & 1) == 0 && ((op >> 5) & 3) >= 2) emitDoubleDataTransfer(ctx, op);
+		if (((op >> 20) & 1) == 0 && ((op >> 5) & 3) >= 2) {
+			if (!v5) { ctx.endBlock = true; return; }       // LDRD/STRD: ARMv5E only
+			emitDoubleDataTransfer(ctx, op);
+		}
 		else                                               emitExtraDataTransfer(ctx, op);
 		return;
 	}
@@ -1521,23 +1554,24 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	// QADD family and the SM* DSP multiplies. All cond == AL only (predicated ->
 	// B-later). BKPT still falls through to emitDataProc's testOnly && !S guard.
 	if ((op & 0x0FF000F0u) == 0x01600010u) {              // CLZ (B7)
-		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		if (cond != COND_AL || !v5) { ctx.endBlock = true; return; }   // ARMv5 only
 		emitClz(ctx, op);
 		return;
 	}
 	if ((op & 0x0F900FF0u) == 0x01000050u) {              // QADD / QSUB / QDADD / QDSUB (B7b)
-		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		if (cond != COND_AL || !v5) { ctx.endBlock = true; return; }   // ARMv5TE only
 		emitQArith(ctx, op);
 		return;
 	}
 	if ((op & 0x0F900090u) == 0x01000080u) {              // SM{UL,LA,LAL,ULW,LAW}<x><y> (B7b)
-		if (cond != COND_AL) { ctx.endBlock = true; return; }
+		if (cond != COND_AL || !v5) { ctx.endBlock = true; return; }   // ARMv5TE only
 		emitDspMul(ctx, op);
 		return;
 	}
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
-		if (cond != COND_AL) { ctx.endBlock = true; return; }
-		emitBranchExchange(ctx, op, (op & 0x20u) != 0);
+		const bool isBlx = (op & 0x20u) != 0;
+		if (cond != COND_AL || (isBlx && !v5)) { ctx.endBlock = true; return; }  // BLX: ARMv5 only
+		emitBranchExchange(ctx, op, isBlx);
 		return;
 	}
 	if ((op & 0x0FB00FF0u) == 0x01000090u) {              // SWP / SWPB

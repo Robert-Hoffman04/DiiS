@@ -89,20 +89,21 @@ u32 jitRunArm7()
 	}
 
 	armcpu_t& cpu = NDS_ARM7;
-	if (cpu.CPSR.bits.T == 0) return 0;            // ARM mode -> interpreter (P7)
-
 	const u32 pc = cpu.instruct_adr;
+	const bool thumb = (cpu.CPSR.bits.T != 0);     // P11: ARM mode is JITted too
+	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
+	if (!canEnter) return 0;                       // uncompilable region -> interpreter
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
-	if (!b || (b->execute == nullptr && b->insnCount() == 0) || !b->thumbCompiled())
-		b = jitCompileTrace(pc, jitCacheArm7, *prof, /*thumb=*/true);
+	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
+		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
 	if (!b || b->execute == nullptr) return 0;     // uncompilable / "don't JIT" -> interpreter
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm7Checked(&cpu, b, pc);
 #endif
 
-	cpu.R[15] = pc + 4;                            // THUMB pipeline the block expects
+	cpu.R[15] = pc + (thumb ? 4 : 8);             // pipeline offset the block expects
 	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };
 
 	JITResult r;
@@ -116,8 +117,9 @@ u32 jitRunArm7()
 #ifdef DESMUME_JIT_TRACE_FIRST
 	if (g_jitAttempts <= 60) {
 		FILE* f = fopen("sd:/jit.log", "a");
-		if (f) { fprintf(f, "[jit] blk pc=%08x op=%04x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
-		                 (unsigned)pc, (unsigned)prof->fetch16(pc & ~1u),
+		if (f) { fprintf(f, "[jit] blk %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
+		                 thumb ? "T" : "A", (unsigned)pc,
+		                 (unsigned)(thumb ? prof->fetch16(pc & ~1u) : prof->fetch32(pc & ~3u)),
 		                 (unsigned)b->insnCount(), (unsigned)r.instructions,
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
@@ -131,8 +133,8 @@ u32 jitRunArm7()
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		if (b->insnCount() == 1) jitCacheArm7.registerBlock(pc, 1, nullptr, /*thumb=*/true);
-		cpu.R[15] = pc + 4;
+		if (b->insnCount() == 1) jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
+		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
 		jitMaybeReport();
 		return 0;
