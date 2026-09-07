@@ -72,6 +72,11 @@
 
 #include "jit_ppc_emitter.h"
 
+// §16 predicated-branch coverage counters (defined in jit_exec.cpp). Declared at
+// file scope so the reference from the anonymous-namespace emitter below resolves
+// to the real global, not a namespace-local symbol.
+extern u64 g_jitPredBcc7, g_jitPredBcc9;
+
 namespace {
 
 // Materialise a 32-bit constant into host register r (1 or 2 words).
@@ -131,22 +136,31 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	// load/modify/store); both are gone now (flags ride r30, the trampoline
 	// writes them once; the count is an addi r31), which is the most likely
 	// reason the corruption predates and does not survive P12.
-	// Gated so the default build is unchanged until proven safe. BLcc is a
-	// deliberate second step (staged rollout, matching P15's loads-first): its
-	// taken path also writes guest R14, so land plain Bcc clean first.
+	// Gated so the default build is unchanged until proven safe. Both Bcc and
+	// (§16 step 2) BLcc compile. BLcc's taken path additionally writes guest
+	// R14 = retLR: it does so with a *direct* store to the gpr backing slot,
+	// emitted after emitDirtyRegisterFlush (which would otherwise re-flush a
+	// stale cached R14 over it) and touching only scratch r11 -- so the taken
+	// path never mutates the compile-time register cache and the cond-false
+	// fall-through keeps compiling with its allocator state untouched, exactly
+	// like the register-write-free THUMB F16 path.
 #if !defined(JIT_ARM_PRED_BRANCH)
 	ctx.endBlock = true;
 #else
-	if (isBL) { ctx.endBlock = true; (void)retLR; return; }
+	(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
 
 	ctx.emitEvalCond(cond);                              // r11 = (cond holds) ? 1 : 0
 	*p++ = PPC_CMPWI(0, PPC_R11, 0);
 	u32* guard = p++;                                    // BEQ over the taken exit
 
 	// --- taken path: exit the block at `target` (byte-for-byte the THUMB F16 shape) ---
-	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND taken cost
+	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND / OP_BL taken cost
 	ctx.emitDirtyFlagFlush();                            // no-op (P12), kept for shape
 	ctx.emitDirtyRegisterFlush();                        // non-clearing: fall-through re-flushes
+	if (isBL) {                                          // guest R14 = return address
+		emitLoadImm32(p, PPC_R11, retLR);
+		*p++ = PPC_STW(PPC_R11, 14, 14 * 4);            // direct: bypass + override the cache
+	}
 	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
 	const u32 pipe = target + 8;
 	*p++ = PPC_LIS(PPC_R29, pipe   >> 16);

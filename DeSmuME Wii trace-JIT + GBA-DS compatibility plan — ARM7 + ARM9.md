@@ -226,8 +226,8 @@ would keep guest R0–R14 resident across a chain. That needs either cross-block
 register allocation (out of scope) or a fixed guest→host mapping. Measured ARM7
 chain length on SM64DS is ~2 blocks / ~5 guest instructions — short, in part
 because predicated ARM branches bail to the interpreter by default and force a
-trampoline round-trip (`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` —
-ARM9-validated, ARM7 pending an ARM7 `diff` pass; §16). A fixed mapping's
+trampoline round-trip (`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` +
+`BLcc` — ARM9-validated, ARM7 pending the armwrestler gate; §16). A fixed mapping's
 unconditional 15-register trampoline load/store
 would lose against the current lazy allocator at that chain length. Not
 justified by current evidence.
@@ -236,9 +236,9 @@ justified by current evidence.
 still a ~4.4% whole-frame regression. The dominant remaining cost is the sheer
 number of trampoline round-trips (short chains) plus the trampoline's own
 `stmw`/`lmw`. ARM7-JIT frame value is likely capped until (a) predicated ARM
-branches compile by default for ARM7 (the `Bcc` codegen exists behind
-`-DJIT_ARM_PRED_BRANCH`; §16) and/or (b) the ARM9 JIT is viable in `jitfull`
-(also §16).
+branches compile by default for ARM7 (the `Bcc` + `BLcc` codegen exists behind
+`-DJIT_ARM_PRED_BRANCH`, ARM9-validated; ARM7 default-on rides the armwrestler
+gate; §16) and/or (b) the ARM9 JIT is viable in `jitfull` (also §16).
 
 ---
 
@@ -368,8 +368,10 @@ shared `jit_arm.cpp` front-end (`arm7_canEnterArm` / a real `arm7_cyclesForArm`
 cond==NV space) and the ARMv4-vs-ARMv5 `LDR pc` / `LDM {..,pc}` interworking
 difference (ARM7 `LDTBit == 0`: `R15 = word & ~3`, no mode switch) on
 `cpu.isaLevel`. Predicated ARM branches bail to the interpreter by default;
-`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` (ARM9-validated — §16), not yet
-default-on for ARM7 (needs an ARM7 `diff` pass).
+`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` and `BLcc` (ARM9-validated at
+~1.3 B instructions — §16), not yet default-on for ARM7 (rides on the
+armwrestler / arm7wrestler gates, roadmap #17/#18 — SM64DS can't soak the ARM7
+ARM-mode path).
 
 **Validated (SM64DS, headless Dolphin):**
 - 210s differential soak: ARM7 `diff` 400K blocks / 1.67M insns, **0 mismatches**,
@@ -829,9 +831,19 @@ Maintain host-side protections:
 
 ### Predicated branch compilation — status (§16 re-open)
 
-Predicated `Bcc` (cond ≠ AL) now **compiles**, gated behind `-DJIT_ARM_PRED_BRANCH`
-(`jit_arm.cpp` `emitBranch`). Default build unchanged — the flag is the isolation
-the bailout used to be, not a permanent hide.
+Predicated `Bcc` **and `BLcc`** (cond ≠ AL) now **compile**, gated behind
+`-DJIT_ARM_PRED_BRANCH` (`jit_arm.cpp` `emitBranch`). Default build unchanged —
+the flag is the isolation the bailout used to be, not a permanent hide.
+
+`BLcc`'s taken path additionally writes guest R14 = return address. It does so
+with a **direct store to the gpr backing slot**, emitted *after*
+`emitDirtyRegisterFlush` (which would otherwise re-flush a stale cached R14 over
+it) and touching only scratch r11 — so the taken path never mutates the
+compile-time register cache and the cond-false fall-through keeps compiling with
+its allocator state untouched, exactly like the register-write-free `Bcc` /
+THUMB-F16 path. Coverage counters `g_jitPredBcc7` / `g_jitPredBcc9`
+(`jit_exec.cpp`, split by `isaLevel`) are surfaced in the ARM7, ARM9 and
+differential telemetry lines.
 
 The 2026-09-04 corruption (`1973b69`: a compiled predicated branch eventually
 smashed newlib `_malloc_r` state under sustained PH ARM9 execution; never
@@ -842,32 +854,41 @@ them once; count is `addi r31`). The rebuilt path is shaped byte-for-byte like
 the THUMB F16 conditional branch (`jit_thumb.cpp` case 26/27), which has soaked
 clean on ARM9 for hundreds of millions of instructions, and has no such stores.
 
-Validation (SM64DS, ~99.99 % ARM mode on ARM9 — heavy predicated-branch traffic):
+Validation — all on **SM64DS** (~99.99 % ARM mode on ARM9 → heavy
+predicated-branch traffic; the sanctioned soak/bench ROM):
 
-- **Differential**: 17.4 M `diff9` blocks / 521.7 M ARM instructions, **0
-  mismatches** (guest R[], CPSR N/Z/C/V, PC).
-- **Host-memory instrumented soak** (`-DJIT_HEAP_WATCH`: buffer-canary poll
-  every 1 K dispatches + after every compile, plus a 96 × 4 KB scattered heap
-  minefield, round-robin verified): 161 M+ ARM9 instructions / 202 K distinct
-  blocks, **0 CANARY / 0 HEAP MINE / 0 ARENA OVERRUN**, no Broadway exception.
-  Earlier instrumented soaks add ~100 M more instructions, same result.
-- **A/B vs bailing** (SM64DS castle-courtyard bench, `jit9on`): predicated
-  `Bcc` cuts ARM9 compile churn ~7× and zero-progress bails ~20× (bailing ends
-  every block at the branch → block fragmentation + code-cache thrash). Frame
-  effect is large: ARM9 interpreter **13.30** eff.fps → ARM9 JIT with predicated
-  `Bcc` bailing **11.20** (a regression, cv 4.1 %) → ARM9 JIT with predicated
-  `Bcc` compiled **14.48** (cv 1.1 %). Compiling predicated branches is what
-  turns the ARM9 JIT from a −16 % loss into a +9 % win on this scene.
-- PH is unusable as an oracle here: headless forced boot wedges in an early IPC
-  spinlock after ~350 blocks, never reaching sustained ARM9 execution.
+- **Differential, `Bcc` only** (`307854c`): 17.4 M `diff9` blocks / 521.7 M ARM
+  instructions, **0 mismatches** (guest R[], CPSR N/Z/C/V, PC).
+- **Differential, `Bcc` + `BLcc`**: 25.9 M `diff9` blocks / 788.7 M ARM
+  instructions, **0 mismatches**. ARM9 is 99 % ARM mode → the `BLcc` taken path
+  (guest-R14 write) is exercised heavily.
+- **Host-memory instrumented soak, `Bcc` + `BLcc`** (`-DJIT_HEAP_WATCH`:
+  buffer-canary poll every 1 K dispatches + after every compile, plus a
+  96 × 4 KB scattered heap minefield, round-robin verified; `jit9on`):
+  ~96 M ARM9 instructions / 7.97 M blocks / 9.8 M attempts / ~81 K predicated
+  compiles, **0 CANARY / 0 HEAP MINE / 0 ARENA OVERRUN / 0 bad-resume**, no
+  Broadway exception, arena stable at 716 KB, `arm bail0 = 0`. Earlier
+  `Bcc`-only instrumented soaks add ~260 M more instructions, same result.
+- **A/B vs bailing** (castle-courtyard bench, `jit9on`): predicated `Bcc`
+  cuts ARM9 compile churn ~7× and zero-progress bails ~20× (bailing ends every
+  block at the branch → block fragmentation + code-cache thrash). Frame effect
+  is large: ARM9 interpreter **13.30** eff.fps → ARM9 JIT with predicated `Bcc`
+  bailing **11.20** (a regression, cv 4.1 %) → ARM9 JIT with predicated `Bcc`
+  compiled **14.48** (cv 1.1 %). Compiling predicated branches is what turns
+  the ARM9 JIT from a −16 % loss into a +9 % win on this scene.
 
 Remaining before `-DJIT_ARM_PRED_BRANCH` becomes default:
 
-- predicated `BL` still bails (its taken path also writes guest R14 — a second
-  step, matching P15's loads-first staging).
-- ARM7 differential coverage (validation so far is ARM9; ARM7 JIT ships
-  default-on so predicated `Bcc` there needs its own `diff` pass).
-- the `armwrestler` / `arm7wrestler` ROM gates (roadmap #17 / #18).
+- **ARM7 gate.** ARM9 is validated at ~1.3 B instructions (above); the
+  `emitBranch` predicated path is byte-identical for both cores (only
+  `cyclesForArm` and `isaLevel` differ). SM64DS cannot soak the ARM7 side —
+  its ARM7 runs almost no ARM-mode JIT code (~800 predicated-branch compiles,
+  no sustained execution: the ARM7 `diff` telemetry never reaches its 100 K
+  report threshold). So ARM7 enablement rides on the armwrestler / arm7wrestler
+  gates below rather than a SM64DS `diff` pass. Keep the flag opt-in for now.
+- the `armwrestler` / `arm7wrestler` ROM gates (roadmap #17 / #18) — needs
+  input-injection or framebuffer-capture harness support (both ROMs are
+  menu/button driven with no logging).
 
 The `JIT_HEAP_WATCH` instrumentation (`jit_trace.cpp` / `jit_exec.cpp`) is
 `#ifdef`-gated, zero-cost when undefined, and stays in as standing §16 tooling.

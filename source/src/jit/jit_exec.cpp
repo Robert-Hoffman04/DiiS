@@ -30,6 +30,11 @@ u64 g_jitBlocksRun = 0;   // blocks that executed >= 1 guest instruction
 u64 g_jitInsnsRun  = 0;
 u64 g_jitAttempts  = 0;   // getBlock/compile attempts that reached ExecuteJITTrace
 u64 g_jitBail0     = 0;   // attempts that bailed with 0 instructions
+// §16: predicated ARM B/BL taken-exit paths emitted (compile-time), split by
+// core. Non-zero only in a -DJIT_ARM_PRED_BRANCH build; proves coverage of the
+// predicated-branch path in a differential / soak run.
+u64 g_jitPredBcc7  = 0;
+u64 g_jitPredBcc9  = 0;
 extern u64 g_jitSmcKills; // jit_cache.cpp -- real (non-empty-bucket) SMC invalidations
 static void jitMaybeReport()
 {
@@ -38,11 +43,12 @@ static void jitMaybeReport()
 	if (g_jitAttempts - s_lastReport < 50000) return;
 	s_lastReport = g_jitAttempts;
 	FILE* f = fopen("sd:/jit.log", "a");
-	if (f) { fprintf(f, "[jit] alive: %llu run (%llu insns), %llu attempts, %llu bail0, %llu smcKills, arena=%u\n",
+	if (f) { fprintf(f, "[jit] alive: %llu run (%llu insns), %llu attempts, %llu bail0, %llu smcKills, arena=%u, predBcc a7=%llu a9=%llu\n",
 	                 (unsigned long long)g_jitBlocksRun, (unsigned long long)g_jitInsnsRun,
 	                 (unsigned long long)g_jitAttempts, (unsigned long long)g_jitBail0,
 	                 (unsigned long long)g_jitSmcKills,
-	                 (unsigned)jitCacheArm7.getArenaOffset()); fclose(f); }
+	                 (unsigned)jitCacheArm7.getArenaOffset(),
+	                 (unsigned long long)g_jitPredBcc7, (unsigned long long)g_jitPredBcc9); fclose(f); }
 #endif
 }
 

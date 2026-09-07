@@ -491,15 +491,17 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	g_jitInsnsRun += r.instructions;
 	if (C.blocksRun - C.lastReport >= 100000) {
 		C.lastReport = C.blocksRun;
+		extern u64 g_jitPredBcc7, g_jitPredBcc9;
 		FILE* f = fopen("sd:/jit.log", "a");
 		if (f) {
 			fprintf(f, "[jit] %s alive: %llu blocks, %llu insns, %llu mismatches (%d logged); "
-			           "untrusted=%llu countDiv=%llu cycDrift=%llu blk (sum=%llu max=%u)\n",
+			           "untrusted=%llu countDiv=%llu cycDrift=%llu blk (sum=%llu max=%u) predBcc a7=%llu a9=%llu\n",
 			        C.tag, (unsigned long long)C.blocksRun, (unsigned long long)C.insnsRun,
 			        (unsigned long long)C.mismatchesTotal, C.mismatches,
 			        (unsigned long long)C.notTrusted, (unsigned long long)C.countDiverge,
 			        (unsigned long long)C.cycleDriftBlk, (unsigned long long)C.cycleDriftAbs,
-			        (unsigned)C.cycleDriftMax);
+			        (unsigned)C.cycleDriftMax,
+			        (unsigned long long)g_jitPredBcc7, (unsigned long long)g_jitPredBcc9);
 			fclose(f);
 		}
 	}
