@@ -676,6 +676,79 @@ TCM                    → ARM9 memory mapping
 
 RockWrestler should become a **formal automated regression gate**, not merely a manual debugging ROM.
 
+### Status: automated, headless, running (§19) -- 10/23 pre-existing interpreter fails found, 0 new from the JIT
+
+Vendored + patched into `tools/rockwrestler/` (see `PROVENANCE.md`). Unlike
+`armwrestler`/`arm7wrestler`, upstream RockWrestler is `-nostartfiles` C++
+with its own trivial per-CPU `entry.s` and single-section linker scripts --
+no libnds, so none of `arm7wrestler`'s crt0/linker version-mismatch work was
+needed; the installed devkitARM toolchain builds it unmodified.
+
+All real per-instruction CPU test content runs on the **ARM9**
+(upstream's own design -- see UPSTREAM-README.md); the ARM7 side only
+cooperates via its pre-existing, already non-interactive `arm7_waitloop`.
+So only `src9/framework/menu.cpp`/`menu.s` needed the same treatment as
+§17/§18: `cpp_menu()`'s interactive A/B/up/down loop replaced with a flat
+walk over every real test across the five category submenus (skipping
+"INITIAL STATE", which is register dumps with no pass/fail), results
+tallied into the same slot-2/`ExpMemory` convention (running/failed counts
++ a capped fail log, this time storing each failure's own `MenuEntry.text`
+pointer rather than a separate name table, since the test set doesn't
+change at runtime), and `fail_test`/`timeout_test`/`timeout_rw` no longer
+wait for a B-button press before returning to the menu. No interworking
+hazard here of the kind §18 hit: every driver-level call and CPU-state
+test in this ROM runs on ARM9 (ARMv5), where the naive `pop {..,pc}`
+idiom is architecturally correct.
+
+Interpreter baseline: **10/23 fail**, byte-identical against a
+`-DJIT_ARM7 -DJIT_ARM_PRED_BRANCH` build (same 10 failures, same detail
+codes) -- **zero new failures from the JIT**, the direct question this
+gate exists to answer for the roadmap. Unlike §18, this needed no SM64DS
+corroboration run: RockWrestler's own dedicated test matrix already
+directly exercises the condition-code/LDM-STM/interworking edge cases a
+soak could only exercise incidentally.
+
+The 10 failures are pre-existing **interpreter**-level gaps, not a JIT
+regression (they reproduce identically with no JIT flags at all) --
+tracked here as concrete findings, not fixed in this pass:
+
+- **`SMLALxy` (case 0x000)**: basic `smlalbb r1,r2,r3,r4` (7*18) gives the
+  wrong 64-bit accumulate result. Same instruction family §18 already
+  flagged as a plausible gap on ARM7 (there: `SMLABB`/`BT`/`TB`/`TT` not
+  raising undefined-instruction); this is the accumulate-form failing to
+  *compute* correctly on ARM9, suggesting a shared, aged multiply code path.
+- **`LDM / STM` (case 0x004)**: `ldmia r1!, {r1}` (writeback register also
+  in the load list) doesn't give real hardware's documented
+  writeback-wins-over-loaded-value result. Notably, §18's ARM7 interpreter
+  baseline got this *same* edge case *right* -- suggesting the ARM7 and
+  ARM9 LDM interpreters diverge on this specific case, not just a single
+  shared bug.
+- **`IPCSYNC` (0x000)**, **`IPCFIFO` (0x001)**, **`IPCFIFO IRQ` (0x000)**:
+  the most basic cross-CPU IPCSYNC value handshake and an IPCFIFO
+  IRQ-driven wait both time out. `WRAM CNT`/`VRAM CNT` (both `timeout_rw`)
+  depend on the same IPCFIFO "rw mode" channel these tests exercise
+  directly, so plausibly the same underlying gap cascading downstream --
+  not independently confirmed.
+- **`DIV 32/32` (case 0x015=21)** / **`DIV 64/32` (case 0x011=17)**: both
+  are the same *deliberate* div-by-zero-result-sign-extension test family
+  (see the test data's own comments), but the two division modes expect
+  *opposite* sign-extension behavior on real hardware and the emulated
+  DIVCNT controller doesn't reproduce that mode-dependent asymmetry.
+- **`TCM` (case 0x000)**: right at the first check, reading back
+  `DTCMcontrol` after setting it doesn't match (masked to the
+  architecturally-relevant bits) -- a CP15 TCM-control readback gap.
+
+None of this closes the §25 default-on bar's "RockWrestler passes" line
+(that means all 23, not just JIT-parity on the current 10 failures) --
+it establishes RockWrestler as a running, byte-diffable gate with a known,
+characterized starting baseline for whoever picks up those 10 findings.
+
+Run it: `tools/rockwrestler/build.sh`, stage `out/rockwrestler.nds` as
+`sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ROCKWRESTLER_PROBE
+-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` build (add
+`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH` to JITDEFS for the JIT path;
+omit for the interpreter baseline), pull `sd:/rockwrestler.log`.
+
 ---
 
 # 9. DS reference matrix
@@ -1339,7 +1412,7 @@ The default architecture remains direct emission plus chaining.
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
-| 19 | RockWrestler automated DS conformance gate                       | next            |
+| 19 | RockWrestler automated DS conformance gate                       | done: headless via slot-2 I/O (§8.4), no crt0 workaround needed (upstream is `-nostartfiles`) -- interpreter baseline 10/23 fail (SMLALxy, LDM/STM base-in-list, IPCSYNC/IPCFIFO/IPCFIFO IRQ, DIV 32/32 + 64/32 sign-extension, TCM/CP15 readback -- all pre-existing interpreter gaps, characterized in §8.4); `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures |
 | 20 | GBA compatibility architecture                                   | next            |
 | 21 | GBA reference baseline: DS-side melonDS + GBA reference emulator | next            |
 | 22 | GBA memory/cartridge/BIOS/peripheral implementation              | next            |

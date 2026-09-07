@@ -59,6 +59,10 @@
 #endif
 #endif
 
+#ifdef DESMUME_ROCKWRESTLER_PROBE
+#include "addons.h"
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -295,6 +299,19 @@ int main(int argc, char **argv){
 	// -DDESMUME_JIT_ARM7 at all, not forcing this flag off here.
 	jitArm9Enabled = false;
 #endif
+#endif
+
+#ifdef DESMUME_ROCKWRESTLER_PROBE
+	// §19 rockwrestler gate -- same slot-2 addon trick as §17/§18, same
+	// 8MB-vs-64KB MEM1 exhaustion fix applies here for the same reason.
+	addonsChangePak(NDS_ADDON_EXPMEMORY);
+	extern u32 expMemSize;
+	expMemSize = 64 * 1024;
+	// Unlike §17/§18: both CPUs are real content here (IPCSYNC/IPCFIFO/
+	// WRAMCNT/VRAMCNT/TCM genuinely exercise ARM7+ARM9 together), so
+	// jitArm7Enabled/jitArm9Enabled are deliberately left at their
+	// defaults -- an interpreter-only baseline run means building without
+	// -DDESMUME_JIT_ARM7 at all, not forcing either flag off here.
 #endif
 
 	printf("Initializing virtual Nintendo DS...\n");
@@ -1066,6 +1083,84 @@ static void arm7wrestler_probe_tick()
 }
 #endif // DESMUME_ARM7WRESTLER_PROBE
 
+#ifdef DESMUME_ROCKWRESTLER_PROBE
+//---------------------------------------------------------------------------
+// §19 RockWrestler gate (-DDESMUME_ROCKWRESTLER_PROBE).
+//
+// Same slot-2/ExpMemory mechanism as armwrestler_probe_tick()/
+// arm7wrestler_probe_tick() above, with RockWrestler's own layout (see the
+// autorun block in tools/rockwrestler/src9/framework/menu.cpp): a single
+// unified running/failed count (RockWrestler has no ARM/THUMB split -- all
+// tests here run in ARM state on ARM9) and a fail log whose name pointer
+// is a live **ARM9** address, read back through _MMU_read08<ARMCPU_ARM9>
+// like armwrestler's (not arm7wrestler's ARM7 one).
+//---------------------------------------------------------------------------
+extern u8* expMemory;
+
+// Local copy of the other probes' le32() (each is scoped inside its own
+// -DDESMUME_*_PROBE, which this build may not have) -- same byte-
+// reassembly reasoning, see armwrestler_probe_tick()'s comment.
+static inline u32 le32_rw(const u8* p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static char s_rwLine[2048];
+static int  s_rwLineLen = 0;
+static u32  s_rwQuitAtFrame = 0;
+
+static void rockwrestler_probe_tick()
+{
+	static bool haveResult = false;
+	static u32  frame = 0;
+	if (quit_game) return;
+	frame++;
+
+	if (!haveResult) {
+		u32 sentinel = expMemory ? le32_rw(expMemory) : 0;
+		if (sentinel != 0x31574B52u && frame < 600) return;   // not ready yet
+
+		char* p = s_rwLine;
+		char* end = s_rwLine + sizeof(s_rwLine);
+		if (!expMemory) {
+			p += snprintf(p, end - p, "[rockwrestler] expMemory is NULL (addon not selected) at frame %u\n", frame);
+		} else if (sentinel != 0x31574B52u) {
+			u32 total = le32_rw(expMemory + 0x04);
+			u32 fail  = le32_rw(expMemory + 0x08);
+			p += snprintf(p, end - p, "[rockwrestler] TIMEOUT at frame %u, sentinel=0x%08x (want 0x31574b52)\n", frame, sentinel);
+			p += snprintf(p, end - p, "  partial: %u/%u fail\n", fail, total);
+		} else {
+			u32 total = le32_rw(expMemory + 0x04);
+			u32 fail  = le32_rw(expMemory + 0x08);
+			u32 logCount = le32_rw(expMemory + 0x0C);
+			if (logCount > 32) logCount = 32;
+			p += snprintf(p, end - p, "[rockwrestler] %u/%u fail\n", fail, total);
+			for (u32 i = 0; i < logCount && end - p > 48; i++) {
+				u32 namePtr = le32_rw(expMemory + 0x10 + i * 8);
+				s32 detail  = (s32)le32_rw(expMemory + 0x10 + i * 8 + 4);
+				char name[32]; u32 n = 0;
+				while (n < sizeof(name) - 1) {
+					u8 c = _MMU_read08<ARMCPU_ARM9>(namePtr + n);
+					if (!c) break;
+					name[n++] = (char)c;
+				}
+				name[n] = 0;
+				p += snprintf(p, end - p, "  FAIL %-24s detail=0x%03x nameptr=0x%08x\n", name, (unsigned)detail, namePtr);
+			}
+		}
+		s_rwLineLen = (int)(p - s_rwLine);
+		haveResult = true;
+		s_rwQuitAtFrame = frame + 600;   // ~10s of grace at 60fps before quitting
+	}
+
+	if ((frame & 31) == 0 || frame >= s_rwQuitAtFrame) {
+		FILE* f = fopen("sd:/rockwrestler.log", "w");
+		if (f) { fwrite(s_rwLine, 1, (size_t)s_rwLineLen, f); fclose(f); }
+	}
+	if (frame >= s_rwQuitAtFrame) quit_game = true;
+}
+#endif // DESMUME_ROCKWRESTLER_PROBE
+
 void DSExec(){
 
 	PAD_ScanPads();
@@ -1160,6 +1255,9 @@ void DSExec(){
 #endif
 #ifdef DESMUME_ARM7WRESTLER_PROBE
 	arm7wrestler_probe_tick();
+#endif
+#ifdef DESMUME_ROCKWRESTLER_PROBE
+	rockwrestler_probe_tick();
 #endif
 
 	if(showfps) ShowFPS();
