@@ -566,9 +566,27 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 // to guest memory -- writeback committed AFTER the access so a store's SMC
 // guard bail is a clean interpreter re-run (no double-writeback).
 void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
-                       bool signExt, bool wordRotate, bool writeback, u8 rn, u8 rd)
+                       bool signExt, bool wordRotate, bool writeback, u8 rn, u8 rd,
+                       u32& lockedMask)
 {
 	u32*& p = ctx.emitPtr;
+
+	// P14: inline RAM load. EA is in PPC_R11; move it to the helper's r12 and,
+	// on a descriptor hit, load straight into rd's host register with the
+	// register cache intact. rd == rn + writeback is LDR-UNPREDICTABLE and the
+	// slow tail's "result last wins" ordering is easier to keep there, so only
+	// the non-aliased forms take the fast path.
+	if (isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
+		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);
+		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
+		(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
+		if (writeback) {
+			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
+			*p++ = PPC_LWZ(hRnW, 1, 104);
+		}
+		return;
+	}
+
 	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value
@@ -793,7 +811,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (rd == 15) { emitLoadPcTail(ctx, writeback, rn, op); return; }   // LDR pc (B7c)
 
 	emitLoadStoreTail(ctx, hVal, size, L, /*signExt=*/false,
-	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd);
+	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd, lockedMask);
 }
 
 // ------------------------------------------------ extra load/store (B3b)
@@ -847,7 +865,7 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
 		else        *p++ = PPC_SUBF(PPC_R10, hRm, hRn);
 	}
 
-	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd);
+	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd, lockedMask);
 }
 
 // ------------------------------------------------ block data transfer (B4)
@@ -893,6 +911,29 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	//   IA base | IB base+4 | DA base-4*(n-1) | DB base-4*n
 	const s32 lowOff = U ? (P ? 4 : 0)
 	                     : (P ? -(s32)(4 * n) : -(s32)(4 * (n - 1)));
+
+	// P15: inline LDM (non-pc). One page guard for the whole run, one descriptor
+	// resolve, then n sequential lwbrx into the registers' host slots -- no
+	// prologue, no per-register C call, register cache intact. STM keeps the
+	// slow path (SMC guard + differential-journal plumbing per word is deferred);
+	// LDM{...,pc} keeps the slow path (block-terminator interworking).
+	if (ctx.cpu.pageDescBase && L && !pcInList) {
+		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
+		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
+		if (W) {                                        // WB value from hRn, before any spill
+			*p++ = PPC_ADDI(PPC_R10, hRn, U ? (s32)(4 * n) : -(s32)(4 * n));
+			*p++ = PPC_STW(PPC_R10, 1, 104);
+		}
+		u8 regs[15]; u32 nn = 0;
+		for (int i = 0; i < 15; i++) if (list & (1u << i)) regs[nn++] = (u8)i;
+		ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+		if (W) {
+			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
+			*p++ = PPC_LWZ(hRnW, 1, 104);
+		}
+		return;
+	}
+
 	if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
 	else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
 	*p++ = PPC_STW(PPC_R12, 1, 96);

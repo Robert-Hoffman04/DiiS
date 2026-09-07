@@ -76,6 +76,27 @@ struct JitCpuProfile {
 	// ARM9 (its TCM windows overlay this range and are CP15-relocatable), so the
 	// ARM9 keeps the slow path until a later tier handles the TCM check.
 	u32  mainMemBase;
+
+	// P14 cached page descriptors: a flat {hostBase, mask} table, one entry per
+	// 1 MB guest page in [pageDescLo, pageDescHi], captured at jitInit. Non-zero
+	// pageDescBase enables the emitter's inline load path: a runtime EA whose
+	// page index is in the window resolves through this table (hostBase +
+	// (EA & mask)) and loads inline with the register cache intact; an EA
+	// outside the window bails to the interpreter for that one instruction.
+	// The window must contain only pages that are pure RAM (no read/write side
+	// effects) and statically mapped for the life of the run. ARM7: [0x20,0x3F]
+	// -- main RAM + shared WRAM + ARM7 ERAM, all fixed in this build. Left 0 on
+	// the ARM9 (TCM overlays / CP15 relocation).
+	u32  pageDescBase;   // host address of JitPageDesc[pageDescHi - pageDescLo + 1]
+	u32  pageDescLo;     // inclusive low page index (addr >> 20)
+	u32  pageDescHi;     // inclusive high page index
+};
+
+// One cached page descriptor (see JitCpuProfile::pageDescBase). LAYOUT IS ABI:
+// the emitter indexes this as an 8-byte stride and loads base at +0, mask at +4.
+struct JitPageDesc {
+	u32 hostBase;   // host address backing this guest page (0 => not mapped)
+	u32 mask;       // in-page offset mask (guest addr & mask), low bits included
 };
 
 // Per-core profile slots, indexed the same way DeSmuME indexes its CPUs

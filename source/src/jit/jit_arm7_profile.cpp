@@ -191,6 +191,12 @@ static u8 arm7_cyclesForArm(u32 op)
 	return 1;
 }
 
+// P14 cached page descriptors -- see jitBuildArm7Profile(). Static storage: the
+// table outlives the profile and is captured once (the ARM7 RAM window mapping
+// is fixed for the life of an NDS_Init in this build).
+enum { ARM7_PAGE_DESC_LO = 0x20, ARM7_PAGE_DESC_HI = 0x3F };
+static JitPageDesc s_arm7Pages[ARM7_PAGE_DESC_HI - ARM7_PAGE_DESC_LO + 1];
+
 static JitCpuProfile s_arm7Profile;
 
 JitCpuProfile* jitBuildArm7Profile()
@@ -215,6 +221,21 @@ JitCpuProfile* jitBuildArm7Profile()
 	// MMU_Init() (NDS_Init runs it before jitInit) and never reallocated -- a
 	// state load memcpys into the existing buffer.
 	s_arm7Profile.mainMemBase = (u32)(uintptr_t)MMU.MAIN_MEM;
+
+	// P14: cached page descriptors for the ARM7's directly-mapped RAM window,
+	// pages 0x20..0x3F: main RAM (0x02xxxxxx), shared WRAM (0x030xxxxx..0x037xxxxx)
+	// and ARM7 ERAM (0x038xxxxx..0x03Fxxxxx). DeSmuME's MMU_MEM/MMU_MASK tables
+	// for these ARM7 pages are fixed for the life of an NDS_Init in this build
+	// (REG_WRAMCNT updates only the WRAMSTAT mirror byte, not the ARM7 page map),
+	// so a one-time capture here is safe. If a future change makes WRAMCNT remap
+	// the ARM7 window, this table must be rebuilt on that write.
+	for (u32 pg = ARM7_PAGE_DESC_LO; pg <= ARM7_PAGE_DESC_HI; pg++) {
+		s_arm7Pages[pg - ARM7_PAGE_DESC_LO].hostBase = (u32)(uintptr_t)MMU.MMU_MEM[ARMCPU_ARM7][pg];
+		s_arm7Pages[pg - ARM7_PAGE_DESC_LO].mask     = MMU.MMU_MASK[ARMCPU_ARM7][pg];
+	}
+	s_arm7Profile.pageDescBase = (u32)(uintptr_t)s_arm7Pages;
+	s_arm7Profile.pageDescLo   = ARM7_PAGE_DESC_LO;
+	s_arm7Profile.pageDescHi   = ARM7_PAGE_DESC_HI;
 
 	s_arm7Profile.isaLevel    = 4;                          // ARMv4T
 	// DS ARM7 executes from main RAM (0x02xxxxxx) and WRAM / shared WRAM

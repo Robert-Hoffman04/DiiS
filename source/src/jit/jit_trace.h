@@ -191,6 +191,40 @@ struct JitTraceCtx {
 	void emitSlowStore(u8 eaReg, u8 valReg, u32 size);
 	void emitSmcCheckAndBail(u8 eaReg);           // store paths: page-flag guard
 
+	// ---- P14/P15 cached page descriptors --------------------------------
+	// Guard EA (PPC_R12) against the descriptor page window (+ optionally that
+	// EA + spanBytes stays in the same 1 MB page), bail to the interpreter on a
+	// miss, then resolve: PPC_R10 <- hostBase, PPC_R11 <- (EA & mask) with low
+	// bits cleared to `alignMe` (29 => &~3, 30 => &~1, 31 => none). Clobbers
+	// r10, r11; EA stays in r12.
+	void emitPageResolve(u32 spanBytes, u8 alignMe);
+
+	// ---- P14 inline RAM load via cached page descriptors ------------------
+	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a
+	// page-window guard (out of window -> interpreter bail at currentPC), then
+	// resolves the EA through JitCpuProfile's descriptor table and loads `size`
+	// bytes into rd's host register with emitSlowLoad's byte-swap / sign-extend /
+	// unaligned-word-rotate semantics. The destination host register is allocated
+	// *after* the guard (a bail never dirties rd). No memory prologue, no C call,
+	// register cache otherwise left intact. Returns false without emitting
+	// anything when the profile has no descriptor table -- the caller then emits
+	// its own slow path. wordRotate applies OP_LDR's unaligned-word ROR (ARM
+	// callers pass true for a word load; THUMB callers pass false to match
+	// jit_thumb.cpp's non-rotating slow path). Clobbers r10, r11, r12.
+	bool emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool wordRotate, u32& lockedMask);
+
+	// ---- P15 inline sequential block load (LDM / POP / LDMIA) ------------
+	// eaReg MUST be PPC_R12 and holds the *low* guest address of the contiguous
+	// word run (callers already fold IA/IB/DA/DB into this). regs is the
+	// ascending list of destination guest registers (0..14, never 15), n its
+	// length (>= 1). Emits a single page-window guard covering the whole run
+	// (out of window, or the run straddles a 1 MB page -> one interpreter bail
+	// for the whole instruction), one descriptor resolve, then n sequential
+	// lwbrx into the registers' host slots -- the register cache stays intact.
+	// LDM/LDMIA word loads do NOT rotate an unaligned base (matches OP_L_IA).
+	// Returns false without emitting when disabled. Clobbers r10, r11, r12.
+	bool emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lockedMask);
+
 	// ---- exits (shared by jit_thumb.cpp and jit_arm.cpp) ----
 	void emitAddCycles(u32 n);   // r3 += n  (compile-time-known)
 	// count -> r31 (resident instruction accumulator, flushed to out->instructions

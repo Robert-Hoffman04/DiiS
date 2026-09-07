@@ -296,6 +296,12 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.ensureArena();
 		const u8 rd = (opcode >> 8) & 0x07;
 		const u32 ea = ((currentPC + 4) & ~3u) + ((opcode & 0xFF) << 2);
+		if (ctx.cpu.pageDescBase) {                       // P14 inline RAM load
+			*emitPtr++ = PPC_LIS(PPC_R12, ea >> 16);
+			*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, ea & 0xFFFF);
+			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
+			break;
+		}
 		ctx.emitMemPrologue();
 		*emitPtr++ = PPC_LIS(PPC_R12, ea >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, ea & 0xFFFF);
@@ -348,6 +354,12 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 
 		if (regOff) *emitPtr++ = PPC_ADD(PPC_R12, hRb, hRo);
 		else        *emitPtr++ = PPC_ADDI(PPC_R12, hRb, (s32)immOff);
+
+		if (isLoad && ctx.cpu.pageDescBase) {            // P14 inline RAM load
+			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, /*wordRotate=*/false, lockedMask);
+			break;
+		}
+
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);           // save EA
 		if (isStore) *emitPtr++ = PPC_STW(hVal, 1, 100); // save value
 
@@ -380,6 +392,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		u8 hVal = 0;
 		if (!isLoad) hVal = ctx.readReg(rd, lockedMask);
 		*emitPtr++ = PPC_ADDI(PPC_R12, hSp, (s32)immOff);
+		if (isLoad && ctx.cpu.pageDescBase) {            // P14 inline RAM load
+			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
+			break;
+		}
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
 		if (!isLoad) *emitPtr++ = PPC_STW(hVal, 1, 100);
 		ctx.emitMemPrologue();
@@ -437,6 +453,23 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		if (nregs == 0) { ctx.endBlock = true; break; }
 
 		ctx.ensureArena();
+
+		// P15: inline POP without pc. One page guard, sequential lwbrx, register
+		// cache intact. PUSH keeps the slow path (store); POP{...,pc} keeps it
+		// (block-terminator interworking).
+		if (ctx.cpu.pageDescBase && isPop && !Rbit) {
+			const u8 hSpP = ctx.readReg(13, lockedMask);
+			*emitPtr++ = PPC_STW(hSpP, 1, 104);                       // stash raw old SP
+			*emitPtr++ = PPC_RLWINM(PPC_R12, hSpP, 0, 0, 29);         // word-aligned low addr
+			u8 regs[8]; u32 nn = 0;
+			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
+			ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+			const u8 hSp2 = ctx.writeReg(13, /*fullOverwrite=*/true, lockedMask);
+			*emitPtr++ = PPC_LWZ(hSp2, 1, 104);
+			*emitPtr++ = PPC_ADDI(hSp2, hSp2, 4 * nregs);
+			break;
+		}
+
 		u8 hSp;
 		if (!isPop) {
 			// Compute the prospective post-decrement, word-aligned base into a
@@ -550,6 +583,19 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.ensureArena();
 		const u8 hRb = ctx.readReg(rb, lockedMask);
 		*emitPtr++ = PPC_OR(PPC_R12, hRb, hRb);
+
+		// P15: inline LDMIA. One page guard for the run, then sequential lwbrx;
+		// register cache intact. STMIA keeps the slow path.
+		if (ctx.cpu.pageDescBase && isLoad) {
+			u8 regs[8]; u32 nn = 0;
+			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
+			ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+			const u8 hRb2 = ctx.writeReg(rb, /*fullOverwrite=*/true, lockedMask);
+			*emitPtr++ = PPC_OR(hRb2, PPC_R12, PPC_R12);   // R12 still = raw base
+			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(nn * 4));
+			break;
+		}
+
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
 		ctx.emitMemPrologue();
 		if (!isLoad) { *emitPtr++ = PPC_LWZ(PPC_R12, 1, 96); ctx.emitSmcCheckAndBail(PPC_R12); }

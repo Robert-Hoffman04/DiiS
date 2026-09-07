@@ -396,6 +396,120 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 	*skip = PPC_BEQ((u32)((emitPtr - skip) * 4));
 }
 
+// emitInterpreterBail whose emitted (runtime-only) state flush must not disturb
+// the compile-time dirty bookkeeping the fall-through fast path still relies on.
+static void bailPreservingDirty(JitTraceCtx& ctx, u32 metaCount)
+{
+	const bool fd = ctx.flagsDirty;
+	bool sv[15];
+	for (int i = 0; i < 15; i++) sv[i] = ctx.regCache[i].dirty;
+	ctx.emitInterpreterBail(metaCount);
+	ctx.flagsDirty = fd;
+	for (int i = 0; i < 15; i++) ctx.regCache[i].dirty = sv[i];
+}
+
+// P14/P15 shared: guard EA (PPC_R12) against the cached-descriptor page window,
+// optionally also that EA + spanBytes stays in the same 1 MB page, bail to the
+// interpreter (at currentPC) on a miss, then resolve the descriptor. On return
+// PPC_R10 = hostBase and PPC_R11 = (EA & mask) with the low bits cleared to
+// `alignMe` (29 => &~3, 30 => &~1, 31 => no clear). EA stays in PPC_R12.
+// Clobbers r10, r11.
+void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
+{
+	u32*& p = emitPtr;
+	const u32 lo   = cpu.pageDescLo;
+	const u32 span = cpu.pageDescHi - cpu.pageDescLo;
+
+	// lo <= (EA >> 20) <= hi
+	*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
+	*p++ = PPC_ADDI(PPC_R10, PPC_R10, -(s32)lo);        // page - lo
+	*p++ = PPC_CMPLI(0, PPC_R10, span);                 // unsigned > span => out of window
+	{
+		u32* inRange = p++;
+		bailPreservingDirty(*this, instrCount);
+		*inRange = PPC_BLE((u32)((p - inRange) * 4));
+	}
+
+	// whole run in one 1 MB page: (EA + spanBytes) >> 20 == EA >> 20
+	if (spanBytes) {
+		*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
+		*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);          // reload page (r10 was page-lo)
+		*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+		u32* samePage = p++;
+		bailPreservingDirty(*this, instrCount);
+		*samePage = PPC_BEQ((u32)((p - samePage) * 4));
+		*p++ = PPC_ADDI(PPC_R10, PPC_R10, -(s32)lo);    // back to page - lo
+	}
+
+	// descriptor = pageDescBase[(page - lo) * 8] : { hostBase@+0, mask@+4 }
+	*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 3, 0, 28);      // (page - lo) * 8
+	if ((s32)(s16)cpu.pageDescBase == (s32)cpu.pageDescBase) {
+		*p++ = PPC_ADDI(PPC_R11, PPC_R10, (s32)cpu.pageDescBase);
+	} else {
+		*p++ = PPC_LIS(PPC_R11, cpu.pageDescBase >> 16);
+		if (cpu.pageDescBase & 0xFFFF) *p++ = PPC_ORI(PPC_R11, PPC_R11, cpu.pageDescBase & 0xFFFF);
+		*p++ = PPC_ADD(PPC_R11, PPC_R11, PPC_R10);
+	}
+	*p++ = PPC_LWZ(PPC_R10, PPC_R11, 0);                // hostBase
+	*p++ = PPC_LWZ(PPC_R11, PPC_R11, 4);                // mask
+	*p++ = PPC_AND(PPC_R11, PPC_R12, PPC_R11);          // EA & mask (unaligned)
+	if (alignMe < 31) *p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, alignMe);
+}
+
+// P14: inline RAM load. See jit_trace.h. eaReg == PPC_R12 by contract.
+bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool wordRotate, u32& lockedMask)
+{
+	if (!cpu.pageDescBase) return false;
+	(void)eaReg;                                  // contract: EA is in PPC_R12
+	u32*& p = emitPtr;
+
+	emitPageResolve(/*spanBytes=*/0, size == 4 ? 29 : size == 2 ? 30 : 31);
+
+	// destination host reg allocated *after* the guard so a bail never dirties rd
+	const u8 hDst = writeReg(rd, /*fullOverwrite=*/true, lockedMask);
+
+	if (size == 4) {
+		*p++ = PPC_LWBRX(hDst, PPC_R10, PPC_R11);
+		// ARM OP_LDR rotates an unaligned word: ROR(word, 8 * (EA & 3)). THUMB's
+		// load paths in DeSmuME do not (jit_thumb.cpp's slow path skips it), so
+		// the caller passes wordRotate to match its own slow path exactly.
+		if (wordRotate) {
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31); // x = EA & 3
+			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);         // 4 - x
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28); // ((4 - x) & 3) << 3  in {0,24,16,8}
+			*p++ = PPC_RLWNM(hDst, hDst, PPC_R11, 0, 31);   // ROL by that == ROR by 8*x
+		}
+	} else if (size == 2) {
+		*p++ = PPC_LHBRX(hDst, PPC_R10, PPC_R11);
+		if (signExt) *p++ = PPC_EXTSH(hDst, hDst);
+	} else {
+		*p++ = PPC_LBZX(hDst, PPC_R10, PPC_R11);
+		if (signExt) *p++ = PPC_EXTSB(hDst, hDst);
+	}
+	return true;
+}
+
+// P15: inline sequential block load (LDM / POP / LDMIA). See jit_trace.h.
+bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lockedMask)
+{
+	if (!cpu.pageDescBase) return false;
+	(void)eaReg;                                  // contract: low EA is in PPC_R12
+	u32*& p = emitPtr;
+
+	emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29);   // LDM: no unaligned rotate
+
+	// r10 = hostBase, r11 = aligned page offset of the low word. Walk ascending;
+	// each destination host reg is allocated here (after the guard) so a bail
+	// never dirties them.
+	for (u32 k = 0; k < n; k++) {
+		const u8 hgi = writeReg(regs[k], /*fullOverwrite=*/true, lockedMask);
+		*p++ = PPC_LWBRX(hgi, PPC_R10, PPC_R11);
+		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R11, PPC_R11, 4);
+	}
+	return true;
+}
+
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)
 {
 	// P12: the guest-instruction count lives in the resident r31 accumulator for

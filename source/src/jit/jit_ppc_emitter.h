@@ -195,6 +195,7 @@
 
 // Branches
 #define PPC_CMPWI(cr, rA, imm)	((11 << 26) | ((cr) << 23) | ((rA) << 16) | ((imm) & 0xFFFF))
+#define PPC_CMPLI(cr, rA, uimm)	((10 << 26) | ((cr) << 23) | ((rA) << 16) | ((uimm) & 0xFFFF))  // cmpli: unsigned rA vs UIMM
 #define PPC_BNE(offset)			((16 << 26) | (4 << 21) | (2 << 16) | ((offset) & 0xFFFC))
 #define PPC_BEQ(offset)			((16 << 26) | (12 << 21) | (2 << 16) | ((offset) & 0xFFFC))
 #define PPC_BGE(offset)			((16 << 26) | (4 << 21) | (0 << 16) | ((offset) & 0xFFFC))
