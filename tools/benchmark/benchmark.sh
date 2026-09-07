@@ -110,12 +110,20 @@ defs_for() {
 # JITDEFS (separate Makefile var from TESTDEFS) for a mode; empty for every
 # renderer-only mode.
 jitdefs_for() {
+	local base
 	case "$1" in
-		jiton)   echo "-DDESMUME_JIT_ARM7" ;;
-		jit9on)  echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		jitfull) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		*)       echo "" ;;
+		jiton)   base="-DDESMUME_JIT_ARM7" ;;
+		jit9on)  base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		jitfull) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		*)       base="" ;;
 	esac
+	# BENCH_EXTRA_JITDEFS: append experimental JIT flags to every JIT mode without
+	# editing the mode table (e.g. BENCH_EXTRA_JITDEFS=-DJIT_ARM_PRED_BRANCH for
+	# the §16 predicated-branch A/B). Empty by default -> no behaviour change.
+	if [ -n "$base" ] && [ -n "${BENCH_EXTRA_JITDEFS:-}" ]; then
+		base="$base ${BENCH_EXTRA_JITDEFS}"
+	fi
+	echo "$base"
 }
 
 LAST_JITDEFS="__unset__"   # forces a clean before the first build_mode call

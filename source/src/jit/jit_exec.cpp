@@ -85,7 +85,11 @@ u32 jitRunArm7()
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
 	{
 		static u32 s_canaryPoll7 = 0;
+#ifdef JIT_HEAP_WATCH
+		if ((++s_canaryPoll7 & 0x3FFu) == 0) jitCheckCanaries();
+#else
 		if ((++s_canaryPoll7 & 0xFFFFu) == 0) jitCheckCanaries();
+#endif
 	}
 
 	armcpu_t& cpu = NDS_ARM7;
@@ -198,9 +202,15 @@ u32 jitRunArm9()
 #endif
 
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
+	// JIT_HEAP_WATCH tightens the interval from 64K to 1K dispatches for §16
+	// host-memory-safety soaks (predicated-branch corruption hunt).
 	{
 		static u32 s_canaryPoll = 0;
+#ifdef JIT_HEAP_WATCH
+		if ((++s_canaryPoll & 0x3FFu) == 0) jitCheckCanaries();
+#else
 		if ((++s_canaryPoll & 0xFFFFu) == 0) jitCheckCanaries();
+#endif
 	}
 
 	armcpu_t& cpu = NDS_ARM9;

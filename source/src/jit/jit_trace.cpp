@@ -58,8 +58,64 @@ static void jitCanaryArm(void* buf, size_t realSize, const char* name)
 	s_canaries[s_canaryCount++] = { buf, realSize, name };
 }
 
+#ifdef JIT_HEAP_WATCH
+// §16 heap minefield: scatter poisoned blocks through the general heap at init
+// so a wild host store from JIT codegen (the class of bug behind the predicated
+// -Bcc corruption, which smashed newlib _malloc_r state and which the 4 buffer
+// canaries above never detected) has a decent chance of landing on a mine we
+// can then name. Each mine is filled with a byte derived from its own address.
+enum { JIT_MINE_COUNT = 96, JIT_MINE_BYTES = 4096 };
+static u8*  s_mines[JIT_MINE_COUNT];
+static int  s_mineCount = 0;
+static bool s_mineTripped = false;
+
+static u8 jitMineByte(const u8* p, size_t off)
+{
+	uintptr_t a = (uintptr_t)p + off;
+	return (u8)(0xA5 ^ (a >> 4) ^ (a >> 12));
+}
+
+static void jitArmMinefield()
+{
+	for (int i = 0; i < JIT_MINE_COUNT; i++) {
+		u8* m = (u8*)malloc(JIT_MINE_BYTES);
+		if (!m) break;
+		for (size_t k = 0; k < JIT_MINE_BYTES; k++) m[k] = jitMineByte(m, k);
+		s_mines[s_mineCount++] = m;
+	}
+}
+
+static void jitCheckMinefield()
+{
+	if (s_mineTripped || s_mineCount == 0) return;
+	// One full mine per call, round-robin -- full sweep every s_mineCount calls,
+	// cheap enough to run on the 1K-dispatch poll without throttling the soak.
+	static u32 rot = 0;
+	int i = (int)(rot++ % (u32)s_mineCount);
+	const u8* m = s_mines[i];
+	for (size_t k = 0; k < JIT_MINE_BYTES; k++) {
+		if (m[k] != jitMineByte(m, k)) {
+			s_mineTripped = true;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) {
+				fprintf(f, "[jit] !!! HEAP MINE HIT mine=%d base=%p off=%u got=%02x want=%02x ctx:",
+				        i, (void*)m, (unsigned)k, m[k], jitMineByte(m, k));
+				size_t s = k > 8 ? k - 8 : 0;
+				for (size_t j = s; j < s + 24 && j < JIT_MINE_BYTES; j++) fprintf(f, " %02x", m[j]);
+				fprintf(f, "\n");
+				fclose(f);
+			}
+			return;
+		}
+	}
+}
+#endif
+
 void jitCheckCanaries()
 {
+#ifdef JIT_HEAP_WATCH
+	jitCheckMinefield();
+#endif
 	if (s_canaryTripped) return;
 	for (int i = 0; i < s_canaryCount; i++) {
 		u8* tail = (u8*)s_canaries[i].base + s_canaries[i].realSize;
@@ -137,6 +193,9 @@ void jitInit()
 	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 
 	if (!ok) { jitShutdown(); return; }
+#ifdef JIT_HEAP_WATCH
+	jitArmMinefield();
+#endif
 	s_initDone = true;
 }
 
@@ -783,6 +842,12 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	cache.rewindJITMemory(rewind);
 	DCStoreRange(ctx.blockStart, actualBytes);
 	ICInvalidateRange(ctx.blockStart, actualBytes);
+
+#ifdef JIT_HEAP_WATCH
+	// §16: check the buffer canaries on every compile, not just the 1K-dispatch
+	// poll -- a corrupting block is most likely to trip one right after it emits.
+	jitCheckCanaries();
+#endif
 
 	return cache.registerBlock(startPC, ctx.instrCount, (JITBlockFunc)ctx.blockStart, thumb);
 }

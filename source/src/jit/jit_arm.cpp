@@ -121,26 +121,46 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 		return;
 	}
 
-	// Predicated (cond != AL): interpreter only for now (GO-FIX-PH). This used
-	// to compile a THUMB-Bcc-shaped inline guard (evaluate cond -> BEQ over a
-	// self-contained exit -> fall through on cond-false), and it read back
-	// correct on repeated review, but real (non-differential) sustained ARM9
-	// execution against Phantom Hourglass reproducibly corrupted the host
-	// heap (an eventual invalid write inside newlib's _malloc_r) whenever this
-	// path was live -- confirmed by isolation: forcing every OTHER ARM9
-	// emitter (SWP, BX/BLX, register-form data-proc, unconditional B/BL) to
-	// bail left the corruption in place, while forcing only *this* path
-	// (predicated Bcc) to bail made Phantom Hourglass render thousands of
-	// frames cleanly with no crash. The differential harness (0 DIFF over
-	// many soaks) never caught it because a stray host-side memory-safety bug
-	// doesn't have to touch guest-visible state (cpu->R[]/CPSR) to be wrong --
-	// it can corrupt unrelated host heap memory while still landing on the
-	// numerically correct guest PC/registers/cycles the harness compares.
-	// Root cause not yet found. Bailing is the same safe fallback used
-	// throughout B1-B7c for anything not yet compiled; predicated branches are
-	// a small minority of dynamic branch execution in real code, so this is a
-	// narrow perf giveback, not a correctness compromise.
+	// Predicated (cond != AL). Historically (GO-FIX-PH) this bailed to the
+	// interpreter: a compiled version reproducibly corrupted the host heap in
+	// sustained PH ARM9 runs and manual review never found the defect. §16
+	// re-opens it, rebuilt on the post-P12 emitter and shaped byte-for-byte
+	// like the THUMB F16 conditional branch (jit_thumb.cpp case 26/27), which
+	// has soaked clean on ARM9 for 64M+ blocks. The pre-P12 taken path did two
+	// pointer-based stores (packed flags -> *cpsr, and an out->instructions
+	// load/modify/store); both are gone now (flags ride r30, the trampoline
+	// writes them once; the count is an addi r31), which is the most likely
+	// reason the corruption predates and does not survive P12.
+	// Gated so the default build is unchanged until proven safe. BLcc is a
+	// deliberate second step (staged rollout, matching P15's loads-first): its
+	// taken path also writes guest R14, so land plain Bcc clean first.
+#if !defined(JIT_ARM_PRED_BRANCH)
 	ctx.endBlock = true;
+#else
+	if (isBL) { ctx.endBlock = true; (void)retLR; return; }
+
+	ctx.emitEvalCond(cond);                              // r11 = (cond holds) ? 1 : 0
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* guard = p++;                                    // BEQ over the taken exit
+
+	// --- taken path: exit the block at `target` (byte-for-byte the THUMB F16 shape) ---
+	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND taken cost
+	ctx.emitDirtyFlagFlush();                            // no-op (P12), kept for shape
+	ctx.emitDirtyRegisterFlush();                        // non-clearing: fall-through re-flushes
+	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
+	const u32 pipe = target + 8;
+	*p++ = PPC_LIS(PPC_R29, pipe   >> 16);
+	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe   & 0xFFFF);
+	*p++ = PPC_LIS(PPC_R4,  target >> 16);
+	*p++ = PPC_ORI(PPC_R4,  PPC_R4,  target & 0xFFFF);
+#if JIT_ENABLE_CHAINING
+	{ s32 o = (s32)((u8*)ctx.cache.linkerStubAddress   - (u8*)p); *p++ = PPC_BL(o); }
+#endif
+	{ s32 o = (s32)((u8*)ctx.cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o);  }
+
+	// --- cond-false falls through: keep compiling the block ---
+	*guard = PPC_BEQ((u32)((p - guard) * 4));
+#endif
 }
 
 // -------------------------------------- operand2 = Rm shifted by a register
