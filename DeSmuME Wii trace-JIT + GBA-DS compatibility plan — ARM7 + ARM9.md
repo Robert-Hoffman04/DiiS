@@ -386,8 +386,10 @@ ARM-mode path).
   anomalies over 50M checks.
 - Cycle model is coarse v1: ~23% of ARM7 blocks show cycle drift, bounded at
   ≤13 cyc/block (harness treats ARM7 cycle drift as advisory). Refinement later.
-- Still outstanding: `armwrestler` / `arm7wrestler` instruction ROMs (not yet
-  on hand).
+- `armwrestler` now runs headless (§8.2, §17) -- ARM7 differential coverage
+  is still thin (see §16's predicated-branch status above); `arm7wrestler`
+  itself (a *different*, ARM7-focused ROM -- armwrestler's own ARM7 side is
+  a no-op stub) is still not on hand.
 
 ### 7.2 ARM7-specific validation
 
@@ -441,6 +443,49 @@ Primary purpose:
 - baseline ARM7/ARM CPU confidence
 
 It should be run before interpreting higher-level DS test failures.
+
+### Status: automated, headless, running (§17)
+
+`armwrestler` is menu/button-driven and reports only by drawing to the DS
+screen -- unusable in a headless soak by itself. `tools/armwrestler/` vendors
+it (PROVENANCE.md) patched to auto-run every ARM9 ARM and THUMB test with no
+input and report results through **slot-2 expansion RAM** (`0x09000000`+,
+desmumewii's `ExpMemory` addon -- flat host RAM, no flash/SRAM protocol) --
+the same "write results where the emulator can just read them" trick a
+custom melonDS build could use identically, since melonDS emulates the same
+GBA-slot address space. `-DDESMUME_ARMWRESTLER_PROBE` (`main.cpp`) selects
+the addon, disables the ARM7 JIT (armwrestler's ARM7 side is a one-instruction
+idle stub -- nothing to test there), polls slot-2 once per frame, and dumps
+`sd:/armwrestler.log` (ARM + THUMB pass/fail counts, plus each failure's
+instruction name and raw bitmask) on completion.
+
+Building this surfaced and fixed one bug and found two more:
+
+- **Fixed**: `ExpMemory`'s default 8MB allocation, combined with the JIT
+  subsystem's arena/table allocations simply being compiled in
+  (`-DDESMUME_JIT_ARM7`, the master flag -- independent of whether either
+  core's JIT is runtime-enabled), exhausts the Wii's MEM1 and freezes the
+  emulator before even the first SMC-tracked memory access. Confirmed by
+  elimination, not guessed: reproduced identically with ARM9 JIT off, with
+  ARM7 JIT off, and with predicated branches off -- and disappeared outright
+  when `expMemSize` was cut from 8MB to 64KB (all this probe needs), with
+  nothing else changed. Left shrunk permanently in `main.cpp`, not just for
+  the diagnosis.
+- **Found** (interpreter baseline: ARM 0/67 fail, THUMB 1/10 fail -- the one
+  THUMB fail is `ADD` with a `BAD_Rd` bitmask, almost certainly the
+  `ADD Rd,PC,#imm` pipeline-offset test, a known-finicky case rather than a
+  JIT-caused issue since the interpreter alone reproduces it): the ARM9 JIT
+  (`jit9on`) adds two **new** failures beyond that baseline --
+  **ARM `SMLAL`** (`BAD_Rd`, the B5 64-bit signed multiply-accumulate path)
+  and **THUMB `LDR`** (`BAD_Rd` x2, register- and immediate-offset forms).
+  Confirmed via ablation to be **pre-existing and unrelated to §16**: byte-
+  identical failure set with `-DJIT_ARM_PRED_BRANCH` defined and undefined.
+  Not yet root-caused -- next JIT correctness work, tracked here rather than
+  chased under §16/§17's own budget.
+
+Run it: `tools/armwrestler/build.sh`, stage `out/armwrestler.nds` as
+`sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ARMWRESTLER_PROBE
+-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` build, pull `sd:/armwrestler.log`.
 
 ---
 
@@ -884,11 +929,15 @@ Remaining before `-DJIT_ARM_PRED_BRANCH` becomes default:
   `cyclesForArm` and `isaLevel` differ). SM64DS cannot soak the ARM7 side —
   its ARM7 runs almost no ARM-mode JIT code (~800 predicated-branch compiles,
   no sustained execution: the ARM7 `diff` telemetry never reaches its 100 K
-  report threshold). So ARM7 enablement rides on the armwrestler / arm7wrestler
-  gates below rather than a SM64DS `diff` pass. Keep the flag opt-in for now.
-- the `armwrestler` / `arm7wrestler` ROM gates (roadmap #17 / #18) — needs
-  input-injection or framebuffer-capture harness support (both ROMs are
-  menu/button driven with no logging).
+  report threshold), and `armwrestler`'s own ARM7 side is a no-op idle stub
+  (§8.2/§17) — no ARM7 ARM-mode-heavy workload is on hand yet. `arm7wrestler`
+  (a genuinely different, ARM7-focused ROM, source-only, not yet built) is
+  the real candidate. Keep the flag opt-in for now.
+- `armwrestler` itself now runs headless (roadmap #17, §8.2) and cleared for
+  ARM9: 0 new failures under predicated `Bcc`/`BLcc` beyond the pre-existing,
+  unrelated ARM9-JIT ARM `SMLAL` / THUMB `LDR` bugs it found (confirmed by
+  ablation to reproduce identically with `-DJIT_ARM_PRED_BRANCH` undefined).
+  `arm7wrestler` (roadmap #18) is still not on hand.
 
 The `JIT_HEAP_WATCH` instrumentation (`jit_trace.cpp` / `jit_exec.cpp`) is
 `#ifdef`-gated, zero-cost when undefined, and stays in as standing §16 tooling.
@@ -1162,8 +1211,8 @@ The default architecture remains direct emission plus chaining.
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
-| 17 | `armwrestler` automated regression gate                          | next            |
-| 18 | `arm7wrestler` automated regression gate                         | next            |
+| 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang, found pre-existing ARM9 JIT bugs (SMLAL, THUMB LDR) not yet root-caused |
+| 18 | `arm7wrestler` automated regression gate                         | next (armwrestler's own ARM7 side is a no-op stub -- needs Arisotura's separate arm7wrestler, source-only, not yet built) |
 | 19 | RockWrestler automated DS conformance gate                       | next            |
 | 20 | GBA compatibility architecture                                   | next            |
 | 21 | GBA reference baseline: DS-side melonDS + GBA reference emulator | next            |

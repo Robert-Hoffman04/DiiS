@@ -45,6 +45,13 @@
 #include "GXMerge.h"
 #include "rasterize.h"
 
+#ifdef DESMUME_ARMWRESTLER_PROBE
+#include "addons.h"
+#if defined(DESMUME_JIT_ARM7)
+#include "jit/jit.h"
+#endif
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -236,11 +243,38 @@ int main(int argc, char **argv){
 
 	cflash_disk_image_file = NULL;
 
+#ifdef DESMUME_ARMWRESTLER_PROBE
+	// Slot-2 = flat host RAM (see armwrestler_probe_tick() below) instead of
+	// the default CFlash passthrough, before MMU_Init()/addonsInit() runs.
+	addonsChangePak(NDS_ADDON_EXPMEMORY);
+	// ExpMemory_reset() allocates expMemSize with `new` every NDS_Reset();
+	// left at its 8MB default, a build with the JIT subsystem compiled in
+	// (-DDESMUME_JIT_ARM7 -- the master flag, regardless of whether either
+	// core's JIT is runtime-enabled) reliably freezes very early, before
+	// even the first SMC-tracked memory access -- confirmed to be memory
+	// exhaustion (the JIT's own arena/table allocations plus this 8MB
+	// together overrun the Wii's MEM1), not a JIT execution bug: shrinking
+	// this to what the probe actually uses (a few hundred bytes; 64 KB is
+	// generous headroom) makes the freeze disappear outright, with no other
+	// change. Left permanently small rather than only diagnostically --
+	// there is no reason for this probe to ever want 8MB of slot-2 RAM.
+	extern u32 expMemSize;
+	expMemSize = 64 * 1024;
+#if defined(DESMUME_JIT_ARM7)
+	// armwrestler's ARM7 side (armwrestler-arm7.asm) is a one-instruction
+	// stub -- `arm7_main: b arm7_main`, an intentional idle spin -- ARM7 is
+	// never used for anything real here, so there is nothing for its JIT to
+	// usefully compile. Leave it interpreted; free either way, and one less
+	// variable when reading a result.
+	jitArm7Enabled = false;
+#endif
+#endif
+
 	printf("Initializing virtual Nintendo DS...\n");
 
 	if (CheckBios(device)) // See if we have external bios files
 		printf("Found external BIOS files.  Will Use!\n");
-	else 
+	else
 		printf("No external BIOS files found.\n");
 
 	// Initialize the DS!
@@ -821,6 +855,107 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 }
 #endif // DESMUME_BENCH
 
+#ifdef DESMUME_ARMWRESTLER_PROBE
+//---------------------------------------------------------------------------
+// §17 armwrestler gate (-DDESMUME_ARMWRESTLER_PROBE).
+//
+// The patched armwrestler ROM (see the plan doc / tools/) auto-runs every
+// ARM9 ARM and THUMB CPU test with no input and harvests pass/fail results
+// into slot-2 expansion RAM (0x09000000+, the "Memory Expansion Pak" addon --
+// see addonsChangePak() below) rather than only drawing them to a screen no
+// headless run can see. expMemory (addons/expMemory.cpp) backs that guest
+// range with flat host RAM 1:1 (ExpMemory_write32 at guest 0x09000000+N is
+// exactly expMemory[N]), so the header/counts are readable directly; the
+// per-failure log stores each test's *name string pointer* as a live ARM9
+// address (it points into the loaded ROM image, ordinary guest memory), so
+// pulling the readable name back out goes through _MMU_read08<ARMCPU_ARM9>
+// like any other guest memory access.
+//
+// Polled once per frame from DSExec(); "AWR1" (0x31525741 LE) is written by
+// the ROM's auto-run driver only after every counter write has landed, so a
+// single sentinel check per frame can't observe a half-written header.
+//---------------------------------------------------------------------------
+extern u8* expMemory;
+
+// expMemory is guest (little-endian ARM9) memory; the Wii host is
+// big-endian, so a raw memcpy into a u32 reads the bytes in the wrong order.
+// The guest itself writes correctly (ARM STR is just a byte-addressable
+// store) -- this is purely about reassembling those bytes on this host.
+static inline u32 le32(const u8* p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+// Dolphin's own SD-card emulation appears to cache writes and only commit
+// them through to the backing host .raw file periodically, not synchronously
+// on the guest's fclose() -- a single late write followed immediately by
+// killing the process can leave the directory entry allocated but the data
+// clusters unflushed (reads back as erased 0xFF). Reopen-and-rewrite the
+// same file every ~30 frames for a while after the result is known, instead
+// of writing once and quitting immediately, so there are several chances to
+// land inside whatever flush cadence Dolphin actually uses; quit only after
+// that grace window.
+static char s_awLine[2048];
+static int  s_awLineLen = 0;
+static u32  s_awQuitAtFrame = 0;
+
+static void armwrestler_probe_tick()
+{
+	static bool haveResult = false;
+	static u32  frame = 0;
+	if (quit_game) return;
+	frame++;
+
+	if (!haveResult) {
+		u32 sentinel = expMemory ? le32(expMemory) : 0;
+		if (sentinel != 0x31525741u && frame < 600) return;   // not ready yet
+
+		char* p = s_awLine;
+		char* end = s_awLine + sizeof(s_awLine);
+		if (!expMemory) {
+			p += snprintf(p, end - p, "[armwrestler] expMemory is NULL (addon not selected) at frame %u\n", frame);
+		} else if (sentinel != 0x31525741u) {
+			u32 armTotal = le32(expMemory + 0x04);
+			u32 armFail  = le32(expMemory + 0x08);
+			u32 tmbTotal = le32(expMemory + 0x0C);
+			u32 tmbFail  = le32(expMemory + 0x10);
+			p += snprintf(p, end - p, "[armwrestler] TIMEOUT at frame %u, sentinel=0x%08x (want 0x31525741)\n", frame, sentinel);
+			p += snprintf(p, end - p, "  partial: ARM %u/%u fail, THUMB %u/%u fail\n", armFail, armTotal, tmbFail, tmbTotal);
+		} else {
+			u32 armTotal = le32(expMemory + 0x04);
+			u32 armFail  = le32(expMemory + 0x08);
+			u32 tmbTotal = le32(expMemory + 0x0C);
+			u32 tmbFail  = le32(expMemory + 0x10);
+			u32 logCount = le32(expMemory + 0x14);
+			if (logCount > 32) logCount = 32;
+			p += snprintf(p, end - p, "[armwrestler] ARM %u/%u fail, THUMB %u/%u fail\n",
+			              armFail, armTotal, tmbFail, tmbTotal);
+			for (u32 i = 0; i < logCount && end - p > 48; i++) {
+				u32 namePtr = le32(expMemory + 0x18 + i * 8);
+				u32 mask    = le32(expMemory + 0x18 + i * 8 + 4);
+				char name[32]; u32 n = 0;
+				while (n < sizeof(name) - 1) {
+					u8 c = _MMU_read08<ARMCPU_ARM9>(namePtr + n);
+					if (!c) break;
+					name[n++] = (char)c;
+				}
+				name[n] = 0;
+				p += snprintf(p, end - p, "  FAIL %-8s mask=0x%08x nameptr=0x%08x\n", name, mask, namePtr);
+			}
+		}
+		s_awLineLen = (int)(p - s_awLine);
+		haveResult = true;
+		s_awQuitAtFrame = frame + 600;   // ~10s of grace at 60fps before quitting
+	}
+
+	if ((frame & 31) == 0 || frame >= s_awQuitAtFrame) {
+		FILE* f = fopen("sd:/armwrestler.log", "w");
+		if (f) { fwrite(s_awLine, 1, (size_t)s_awLineLen, f); fclose(f); }
+	}
+	if (frame >= s_awQuitAtFrame) quit_game = true;
+}
+#endif // DESMUME_ARMWRESTLER_PROBE
+
 void DSExec(){
 
 	PAD_ScanPads();
@@ -910,6 +1045,9 @@ void DSExec(){
 	if (!SkipFrameTracker) Draw(); // only update when !Frame skip tracker
 #endif
 
+#ifdef DESMUME_ARMWRESTLER_PROBE
+	armwrestler_probe_tick();
+#endif
 
 	if(showfps) ShowFPS();
 }
