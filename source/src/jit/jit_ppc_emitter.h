@@ -63,11 +63,9 @@
 // R3  : execute arg in / Block epilogue return value (cycles out).
 // R4  : gbaRegs arg in / Block epilogue return value (next PC out) / instruction-local scratch.
 // R5  : flags arg in / Live busPrefetchCount accumulator.
-// R6  : PPC_REG_FLAGS -- all four GBA condition flags (N/Z/C/V) packed into one register
-//       (lazily loaded, whole-register dirty-tracked). Bits 0-3 in IBM/rlwinm numbering
-//       (i.e. the top nibble, conventional bits 31-28) hold N,Z,C,V respectively; the
-//       low 28 bits are unused don't-care space and are never read. See PACKED FLAGS
-//       below for the insertion/extraction convention shared by the emitter.
+// R6  : General scratch (was PPC_REG_FLAGS pre-P12; the packed flags moved to the
+//       non-volatile r30 so they stay resident across chained blocks and survive
+//       the slow-memory C calls without a spill).
 // R7  : General scratch
 // R8  : General scratch
 // R9  : General scratch
@@ -92,7 +90,14 @@
 // R27 : Lazily allocated host pool for GBA R0-R14.
 // R28 : Lazily allocated host pool for GBA R0-R14.
 // R29 : PPC_REG_PC (GBA R15 / Pipeline PC).
-// R30 : PPC_R30_PAGES (gbaReadTable Base Pointer)
+// R30 : PPC_REG_FLAGS (P12) -- packed N/Z/C/V, resident for the whole trace.
+//       Bits 0-3 in IBM/rlwinm numbering (top nibble, conventional bits 31-28)
+//       hold N,Z,C,V; the low 28 bits mirror the rest of the guest CPSR word so
+//       r30 == the guest CPSR. Non-volatile: the trampoline loads it from *cpsr
+//       on entry and stores it back on return, and it survives the slow-memory
+//       C calls, so no block ever loads or flushes flags itself. (Was the
+//       gbaReadTable base, unused until P6; a P6 fast path re-derives that from
+//       the compile-time-constant profile pointer or a spare frame slot.)
 // R31 : PPC_R31_ICOUNT -- resident guest-instruction-count accumulator (P12).
 //       Non-volatile, never allocated (outside the 0x1FFF8000 pool mask) and
 //       never used as emitter scratch; the trampoline zeroes it on entry and
@@ -101,7 +106,7 @@
 #define PPC_R3   3
 #define PPC_R4   4
 #define PPC_R5   5
-#define PPC_R6   6   // PPC_REG_FLAGS -- packed N/Z/C/V (see below)
+#define PPC_R6   6   // General scratch (freed at P12 -- packed flags moved to r30)
 #define PPC_R7   7   // General scratch
 #define PPC_R8   8   // General scratch
 #define PPC_R9   9   // General scratch
@@ -111,7 +116,7 @@
 
 #define PPC_R29  29  // GBA PC
 
-#define PPC_R30_TABLE 30  // gbaReadTable Base Pointer (Non-volatile, no overlap with GBA registers)
+#define PPC_R30  30  // PPC_REG_FLAGS (P12) -- packed N/Z/C/V == guest CPSR, resident whole trace
 #define PPC_R31 31  // PPC_R31_ICOUNT -- resident guest-instruction-count accumulator (P12)
 
 // -------------------------------------------------------------------------
@@ -138,7 +143,7 @@
 #define FLAG_BIT_C 2
 #define FLAG_BIT_V 3
 
-#define PPC_REG_FLAGS PPC_R6
+#define PPC_REG_FLAGS PPC_R30   // P12: non-volatile, resident for the whole trace (see the register map)
 
 // Merge a flag bit directly into PPC_REG_FLAGS, in one instruction, without disturbing
 // the other three packed flags. srcReg/sh are exactly the register and rotate amount

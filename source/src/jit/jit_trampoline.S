@@ -32,11 +32,14 @@
  *   r15..r28 lazily-cached guest R0..R14
  *   r29      guest R15 / pipeline PC
  *   r30      guest read page table base (nullptr until P6)
+ *   r30      packed N/Z/C/V == guest CPSR (P12): resident for the whole trace,
+ *            non-volatile so it survives the slow-memory C calls. Loaded from
+ *            *cpsr on entry, stored back once, here, on return -- every exit
+ *            path lands here, so no block ever loads or flushes flags itself.
  *   r31      resident guest-instruction-count accumulator (P12): every block's
  *            clean/bail exit does `addi 31,31,count` instead of a load/add/store
  *            round-trip through out->instructions; the trampoline zeroes it on
  *            entry and writes it back to out->instructions once, here, on return.
- *   r6       packed N/Z/C/V
  *   r3       cycle accumulator (out); r4  next PC (out) / scratch
  ***************************************************************************/
 
@@ -56,8 +59,8 @@ ExecuteJITTrace:
     stmw 14, 8(1)               # save host non-volatiles r14..r31
 
     lwz 14, 0(5)                # r14 = st->gpr
-    lwz 10, 4(5)                # r10 = st->cpsr
-    lwz 30, 8(5)                # r30 = st->readTable
+    lwz 10, 4(5)                # r10 = st->cpsr    (st->readTable at 8(5) is unread until P6)
+    lwz 30, 0(10)              # P12: r30 = *cpsr -- PPC_REG_FLAGS, resident for the whole trace
 
     stw 14, 80(1)              # [80] guest gpr base
     stw 10, 84(1)              # [84] guest cpsr pointer
@@ -86,9 +89,12 @@ ExecuteJITTrace_Return:
     lwz 10, 80(1)             # r10 = guest gpr base
     stw 29, 60(10)            # flush guest R15 (PC)
 
-    # By contract, guest R0..R14 and the packed flags were already flushed by
-    # the trace before it reached this landing pad; the trampoline owns only
-    # the PC it eagerly loaded and the r31 instruction-count accumulator.
+    lwz 9, 84(1)             # P12: *cpsr = r30 (PPC_REG_FLAGS, resident whole trace).
+    stw 30, 0(9)            #   every exit path lands here, so no block flushes flags itself.
+
+    # By contract, guest R0..R14 were already flushed by the trace before it
+    # reached this landing pad; the trampoline owns the PC it eagerly loaded,
+    # the r31 instruction-count accumulator and the r30 packed-flags word.
 
     lmw 14, 8(1)              # restore host non-volatiles
     lwz 0, 132(1)            # saved host LR (128 + 4)

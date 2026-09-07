@@ -159,12 +159,13 @@ void JitTraceCtx::ensureArena()
 	*emitPtr++ = PPC_BGE(0);
 }
 
-// ---- packed flags: PPC_REG_FLAGS (r6) holds the whole guest CPSR word -----
+// ---- packed flags: PPC_REG_FLAGS (r30, P12) holds the whole guest CPSR word --
+// r30 is non-volatile and loaded from *cpsr by the trampoline on entry, so the
+// flags are already resident on every path -- ensureFlagsLoaded() has nothing to
+// emit. It stays a call so the flag helpers read naturally and a future
+// lazy-load scheme could slot back in here.
 void JitTraceCtx::ensureFlagsLoaded()
 {
-	if (flagsLoaded) return;
-	*emitPtr++ = PPC_LWZ(PPC_R9, 1, 84);              // r9 = &CPSR
-	*emitPtr++ = PPC_LWZ(PPC_REG_FLAGS, PPC_R9, 0);   // r6 = CPSR
 	flagsLoaded = true;
 }
 
@@ -190,20 +191,13 @@ u8 JitTraceCtx::readFlag(u8 flagIdx, u32 dstReg)
 	return (u8)dstReg;
 }
 
-void JitTraceCtx::flushDirtyFlags()
-{
-	if (!flagsDirty) return;
-	*emitPtr++ = PPC_LWZ(PPC_R9, 1, 84);
-	*emitPtr++ = PPC_STW(PPC_REG_FLAGS, PPC_R9, 0);
-	flagsDirty = false;
-}
-
-void JitTraceCtx::emitDirtyFlagFlush()
-{
-	if (!flagsDirty) return;
-	*emitPtr++ = PPC_LWZ(PPC_R9, 1, 84);
-	*emitPtr++ = PPC_STW(PPC_REG_FLAGS, PPC_R9, 0);
-}
+// P12: the packed flags live in the non-volatile r30 for the whole trace and
+// the trampoline stores r30 -> *cpsr on the single shared return path that every
+// exit (clean, chained, bailed, quota-yield, SMC) funnels through, so no block
+// writes the CPSR word back itself. These stay as no-ops rather than being
+// deleted at every call site.
+void JitTraceCtx::flushDirtyFlags()  { flagsDirty = false; }
+void JitTraceCtx::emitDirtyFlagFlush() {}
 
 void JitTraceCtx::emitNZ(u32 srcReg)
 {
@@ -330,16 +324,15 @@ void JitTraceCtx::invalidateRegCache()
 }
 
 // ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite --------
-// r3 holds the cross-block cycle accumulator and r6 the packed flags; both are
-// PPC-EABI volatile, so they're spilled/dropped around the call. Guest regs
-// (r14..r31) are non-volatile and survive it.
+// r3 holds the cross-block cycle accumulator and is PPC-EABI volatile, so it's
+// spilled/reloaded around the call. Guest regs (r14..r31) -- including the P12
+// resident r30 packed flags and r31 instruction count -- are non-volatile and
+// survive the call untouched, so the flags no longer need a spill here.
 void JitTraceCtx::emitMemPrologue()
 {
-	flushDirtyFlags();
 	flushDirtyRegisters();
-	*emitPtr++ = PPC_STW(PPC_R29, 14, 15 * 4);   // guest PC -> gpr[15]
+	*emitPtr++ = PPC_STW(PPC_R29, 14, 15 * 4);   // guest PC -> gpr[15] (in case the C path peeks)
 	*emitPtr++ = PPC_STW(PPC_R3, 1, 92);         // save cycle accumulator
-	flagsLoaded = false;                          // r6 clobbered by the call
 }
 
 void JitTraceCtx::emitMemEpilogue()
