@@ -266,8 +266,21 @@ shared `jit_arm.cpp` front-end (`arm7_canEnterArm` / a real `arm7_cyclesForArm`
 cond==NV space) and the ARMv4-vs-ARMv5 `LDR pc` / `LDM {..,pc}` interworking
 difference (ARM7 `LDTBit == 0`: `R15 = word & ~3`, no mode switch) on
 `cpu.isaLevel`. Predicated ARM branches still bail to the interpreter (the same
-unresolved concern as ARM9 — section 16). Pending 7.2 hardware differential
-validation.
+unresolved concern as ARM9 — section 16).
+
+**Validated (SM64DS, headless Dolphin):**
+- 210s differential soak: ARM7 `diff` 400K blocks / 1.67M insns, **0 mismatches**,
+  0 `DIFF` / 0 `CHAIN-DIFF` / 0 `ARENA OVERRUN`. ARM9 `diff9` 59.8M blocks
+  unchanged from baseline (the `isaLevel` gate is inert for ARMv5TE — no
+  regression).
+- 240s non-differential production-path soak (chaining on, no harness): 8.2M
+  block runs / 39M guest insns, ARM-mode blocks confirmed executing (`blk A`),
+  **canary poll never latched** (the same host-heap-corruption detector that
+  caught the ARM9 predicated-Bcc bug), 0 SMC-kill anomalies over 50M checks.
+- Cycle model is coarse v1: ~23% of ARM7 blocks show cycle drift, bounded at
+  ≤13 cyc/block (harness treats ARM7 cycle drift as advisory). Refinement later.
+- Still outstanding: `armwrestler` / `arm7wrestler` instruction ROMs (not yet
+  on hand).
 
 ### 7.2 ARM7-specific validation
 
@@ -983,7 +996,7 @@ The default architecture remains direct emission plus chaining.
 | 8  | Benchmark gate 1                                                 | done            |
 | 9  | ARM32 front-end on ARM9                                          | done            |
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
-| 11 | ARM front-end on ARM7                                            | landed; pending 7.2 hw validation |
+| 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
 | 12 | Persistent JIT state + trampoline amortization                   | next            |
 | 13 | Inline memory fast paths                                         | next            |
 | 14 | Cached page descriptors                                          | next            |
