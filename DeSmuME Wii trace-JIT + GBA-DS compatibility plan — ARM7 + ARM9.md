@@ -207,19 +207,35 @@ Every optimization must preserve:
 
 ### Progress
 
-**P12 slice 1 (landed):** guest-instruction count is now a resident non-volatile
-host register (r31) for the whole trace, not a load/add/store through
-`out->instructions` per block; `bailedOut`/`smcHit` stores emit only on bail
-paths. `emitResultMetadata()` clean path: 8 emitted PPC instructions → 1.
-Validated 0-DIFF; ARM7-JIT SM64DS A/B 12.61 → 12.67 fps (+0.5%).
+Two pieces of guest state that need no per-block liveness analysis are now
+resident in reserved non-volatile host registers for the whole trace, synced to
+memory only by the trampoline (which every exit path funnels through):
 
-**Measured picture:** on SM64DS (ARM9-bound, ARM9 on the interpreter) the ARM7
-JIT is still a net ~4.5% whole-frame regression — the remaining fixed costs are
-the trampoline's `stmw`/`lmw` per C↔JIT transition and `flushDirtyRegisters` +
-lazy reload at every chained block boundary. Those need a fixed guest→host
-mapping or cross-boundary residency (careful, measurement-heavy — §23). ARM7-JIT
-frame value is likely capped until the ARM9 JIT is viable in `jitfull`, which is
-blocked on the §16 host-heap-corruption bug.
+- **P12 slice 1 — instruction count (r31).** Was a load/add/store through
+  `out->instructions` per block; now one `addi`. `emitResultMetadata()` clean
+  path 8 PPC instructions → 1. SM64DS A/B 12.61 → 12.67 fps.
+- **P12 slice 2 — packed CPSR flags (r30).** Was loaded from `*cpsr` on first
+  flag use per block, flushed on exit, and spilled/reloaded around every memory
+  op. Now resident and callee-saved: no block loads or flushes it. SM64DS A/B
+  12.67 → 12.71 fps.
+
+Both validated 0-DIFF (ARM7 + ARM9), 0 CANARY / OVERRUN.
+
+**GPR residency across chained blocks — deferred (§23).** The third piece of §5
+would keep guest R0–R14 resident across a chain. That needs either cross-block
+register allocation (out of scope) or a fixed guest→host mapping. Measured ARM7
+chain length on SM64DS is ~2 blocks / ~5 guest instructions — short, because
+predicated ARM branches bail to the interpreter (§16) and force a trampoline
+round-trip. A fixed mapping's unconditional 15-register trampoline load/store
+would lose against the current lazy allocator at that chain length. Not
+justified by current evidence.
+
+**Measured picture:** on SM64DS (ARM9-bound, ARM9 interpreted) the ARM7 JIT is
+still a ~4.4% whole-frame regression. The dominant remaining cost is the sheer
+number of trampoline round-trips (short chains) plus the trampoline's own
+`stmw`/`lmw`. ARM7-JIT frame value is likely capped until (a) predicated ARM
+branches compile (unblocks longer chains — §16) and/or (b) the ARM9 JIT is
+viable in `jitfull` (also §16).
 
 ---
 
@@ -1013,7 +1029,7 @@ The default architecture remains direct emission plus chaining.
 | 9  | ARM32 front-end on ARM9                                          | done            |
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
-| 12 | Persistent JIT state + trampoline amortization                   | slice 1 landed (r31 icount); more in §5 |
+| 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
 | 13 | Inline memory fast paths                                         | next            |
 | 14 | Cached page descriptors                                          | next            |
 | 15 | LDM/STM and sequential memory optimization                       | next            |
