@@ -285,6 +285,35 @@ mapping generation
 
 Invalidate/rebuild descriptors when mappings change.
 
+**Progress (P14):**
+- **Landed:** a flat `JitPageDesc { hostBase, mask }` table
+  (`JitCpuProfile::pageDescBase/Lo/Hi`). The ARM7 captures DeSmuME's own
+  `MMU.MMU_MEM` / `MMU.MMU_MASK` entries for pages `0x20..0x3F` (main RAM,
+  shared WRAM, ARM7 ERAM) at `jitInit` -- in this fork those ARM7 page-table
+  entries never move (`REG_WRAMCNT` only updates the WRAMSTAT mirror byte), so
+  a one-time capture is safe; a comment flags the rebuild point if that ever
+  changes. Left 0 on the ARM9 (CP15-relocatable TCM overlays 0x02xxxxxx).
+- `JitTraceCtx::emitPageResolve()` emits a runtime page-window guard (an EA
+  outside the window, or a run that straddles a 1 MB page, bails to the
+  interpreter for that one instruction with the compile-time dirty
+  bookkeeping preserved for the fall-through), one descriptor resolve, and
+  hands back `hostBase` + aligned in-page offset.
+- `emitInlineLoad()` (single `LDR/LDRB/LDRH/LDRSB/LDRSH`, ARM + THUMB
+  F6/F9/F8/F10/F11) then emits one `lwbrx`/`lhbrx`/`lbzx` with LDR's
+  unaligned-word ROR, **register cache intact, no memory prologue, no
+  slowRead C call**.
+- **Validated:** SM64DS 220 s differential soak -- ARM7 `diff` 0 mismatches,
+  counters byte-identical to the P13 baseline (no spurious bails); ARM9
+  unaffected; 0 CANARY / 0 ARENA / 0 SMC-kill.
+- **Measured:** SM64DS ARM7-JIT A/B **12.62 -> 12.55 fps** (P14 alone), i.e.
+  frame-neutral within cv (4.6 %). As with the §6-Tier-1 general path, the
+  guard is real work and SM64DS is ARM9-bound (ARM7 is ~2 % of the frame, far
+  below the benchmark's resolution), so this cannot be shown to pay off on the
+  one available retail workload -- but unlike the Tier-1 general path it is
+  *not* a regression, the fast path *hits* (WRAM-resident code), and it is the
+  descriptor infrastructure the later phases (GBA mode §20+, longer ARM7
+  chains once §16 lands) will actually exercise. Landed on that basis.
+
 ### Tier 3 — structured memory operations
 
 Optimize:
@@ -296,6 +325,26 @@ Optimize:
 - sequential loads/stores
 
 Do not sacrifice memory-map correctness for benchmark gains.
+
+**Progress (P15):**
+- **Landed:** `emitInlineBlockLoad()` -- one `emitPageResolve()` for the whole
+  contiguous run (covering the last word too), then `n` sequential `lwbrx`
+  straight into the registers' host slots, register cache intact. One page
+  guard amortised over the whole list instead of `n` slowRead C calls. Wired
+  into ARM `LDM` (non-pc), THUMB `LDMIA`, THUMB `POP` (non-pc).
+- **Deferred:** `STM` / `PUSH` / `STMIA` keep the slow path -- an inline store
+  needs a flushing multi-page SMC guard and a per-word `jitDiffJournalNote`
+  call in `JIT_DIFFERENTIAL_TESTING` builds (the §16 trial-JIT rollback
+  requirement that bit the Tier-1 store path). `LDM{...,pc}` keeps the slow
+  path (block-terminator interworking).
+- **Validated:** SM64DS 220 s differential soak -- ARM7 `diff` 0 mismatches
+  (counters identical to baseline), ARM9 `diff9` 60.6 M blocks unaffected,
+  selftest + journal-selftest PASS, 6 M SMC checks 0 kills, 0 CANARY /
+  0 ARENA-OVERRUN.
+- **Measured:** SM64DS ARM7-JIT A/B **12.55 -> 12.58 fps** (P15 on top of
+  P14); combined P13->P15 is 12.62 -> 12.58, flat within cv. Same story as
+  P14: correctness-clean, frame-neutral, below benchmark resolution on this
+  ARM9-bound workload.
 
 ---
 
@@ -1047,8 +1096,8 @@ The default architecture remains direct emission plus chaining.
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
 | 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
 | 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
-| 14 | Cached page descriptors                                          | next            |
-| 15 | LDM/STM and sequential memory optimization                       | next            |
+| 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
+| 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
 | 17 | `armwrestler` automated regression gate                          | next            |
 | 18 | `arm7wrestler` automated regression gate                         | next            |
