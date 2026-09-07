@@ -255,6 +255,22 @@ Inline direct accesses for regions whose mapping and permissions are stable:
 - shared WRAM where safely resolved
 - other proven direct-memory regions
 
+**Progress (P13):**
+- **Landed:** pc-relative literal loads (`LDR/LDRB/LDRH rX,[pc,#imm]`) whose
+  compile-time-constant EA is in main RAM (0x0_2xxxxxx) → one `lwbrx`/`lhbrx`/
+  `lbzx` into Rd's host reg, no C call, no runtime guard. `JitCpuProfile
+  ::mainMemBase` holds `MMU.MAIN_MEM` (ARM7 only; the ARM9's relocatable TCM
+  overlays this range). 0-DIFF validated.
+- **Tried, reverted (§23):** a runtime-region-guarded general `LDR/STR` fast
+  path. 0-DIFF but **-0.7% / +0.4pp cv** on the SM64DS ARM7 A/B — the
+  `rlwinm+cmpwi+bne` guard is paid on every access and SM64DS's ARM7 is
+  entirely shared-WRAM-resident (`0x037fxxxx` for code, literals and data), so
+  the main-RAM fast path almost never fires.
+- **The real ARM7 win** is a **WRAM/SWIRAM tier** (that is where the ARM7
+  actually executes and works), but it needs WRAMCNT-aware base resolution and
+  the interpreter's own ARM7 read fast path (MMU.h) is WRAMCNT-blind while its
+  write path is not — reconcile that before inlining. Deferred.
+
 ### Tier 2 — cached page descriptors
 
 Introduce descriptors containing approximately:
@@ -1030,7 +1046,7 @@ The default architecture remains direct emission plus chaining.
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
 | 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
-| 13 | Inline memory fast paths                                         | next            |
+| 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | next            |
 | 15 | LDM/STM and sequential memory optimization                       | next            |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
