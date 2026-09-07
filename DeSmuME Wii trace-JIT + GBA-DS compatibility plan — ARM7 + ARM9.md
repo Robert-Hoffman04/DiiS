@@ -302,9 +302,12 @@ Invalidate/rebuild descriptors when mappings change.
   F6/F9/F8/F10/F11) then emits one `lwbrx`/`lhbrx`/`lbzx` with LDR's
   unaligned-word ROR, **register cache intact, no memory prologue, no
   slowRead C call**.
-- **Validated:** SM64DS 220 s differential soak -- ARM7 `diff` 0 mismatches,
-  counters byte-identical to the P13 baseline (no spurious bails); ARM9
-  unaffected; 0 CANARY / 0 ARENA / 0 SMC-kill.
+- **Validated** (P14+P15 together, one soak): SM64DS 210 s differential soak
+  (`JIT_DIFFERENTIAL_TESTING`) -- ARM7 `diff` 500 K blocks / 1.96 M insns,
+  **0 mismatches / 0 CHAIN-DIFF**; ARM9 `diff9` 64.7 M blocks / 142 M insns,
+  0 mismatches (`pageDescBase` is 0 on the ARM9 -- inert); selftest +
+  journal-selftest PASS; 0 CANARY / 0 ARENA-OVERRUN; ARM7 cycDrift bounded
+  (max 9, advisory).
 - **Measured:** SM64DS ARM7-JIT A/B **12.62 -> 12.55 fps** (P14 alone), i.e.
   frame-neutral within cv (4.6 %). As with the §6-Tier-1 general path, the
   guard is real work and SM64DS is ARM9-bound (ARM7 is ~2 % of the frame, far
@@ -337,10 +340,9 @@ Do not sacrifice memory-map correctness for benchmark gains.
   call in `JIT_DIFFERENTIAL_TESTING` builds (the §16 trial-JIT rollback
   requirement that bit the Tier-1 store path). `LDM{...,pc}` keeps the slow
   path (block-terminator interworking).
-- **Validated:** SM64DS 220 s differential soak -- ARM7 `diff` 0 mismatches
-  (counters identical to baseline), ARM9 `diff9` 60.6 M blocks unaffected,
-  selftest + journal-selftest PASS, 6 M SMC checks 0 kills, 0 CANARY /
-  0 ARENA-OVERRUN.
+- **Validated:** shares the P14 soak above (500 K ARM7 `diff` blocks /
+  64.7 M ARM9 `diff9` blocks, 0 mismatches -- LDM/LDMIA/POP inline exercised
+  during boot with per-instruction guest-state comparison).
 - **Measured:** SM64DS ARM7-JIT A/B **12.55 -> 12.58 fps** (P15 on top of
   P14); combined P13->P15 is 12.62 -> 12.58, flat within cv. Same story as
   P14: correctness-clean, frame-neutral, below benchmark resolution on this
