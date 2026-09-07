@@ -211,6 +211,11 @@ JitCpuProfile* jitBuildArm7Profile()
 	s_arm7Profile.cyclesForThumb = arm7_cyclesForThumb;
 	s_arm7Profile.cyclesForArm   = arm7_cyclesForArm;
 
+	// P13: main-RAM backing store for the inline Tier-1 fast path. Allocated by
+	// MMU_Init() (NDS_Init runs it before jitInit) and never reallocated -- a
+	// state load memcpys into the existing buffer.
+	s_arm7Profile.mainMemBase = (u32)(uintptr_t)MMU.MAIN_MEM;
+
 	s_arm7Profile.isaLevel    = 4;                          // ARMv4T
 	// DS ARM7 executes from main RAM (0x02xxxxxx) and WRAM / shared WRAM
 	// (0x03xxxxxx); those are the banks the SMC registry must track.

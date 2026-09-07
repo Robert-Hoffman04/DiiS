@@ -67,6 +67,15 @@ struct JitCpuProfile {
 
 	s32  isaLevel;     // 4 = ARMv4T (ARM7), 5 = ARMv5TE (ARM9)
 	u32  smcBankMask;  // bit b set => guest bank (addr>>24)==b can hold JIT code
+
+	// P13 Tier-1 inline memory fast path: host address of the emulated main-RAM
+	// backing store (MMU.MAIN_MEM), captured at jitInit (it never moves for the
+	// life of an NDS_Init). Non-zero enables the emitter's inline direct access
+	// for the (addr & 0x0F000000) == 0x02000000 region -- a runtime region guard
+	// plus lwbrx/stwbrx instead of the slowRead/slowWrite C call. Left 0 for the
+	// ARM9 (its TCM windows overlay this range and are CP15-relocatable), so the
+	// ARM9 keeps the slow path until a later tier handles the TCM check.
+	u32  mainMemBase;
 };
 
 // Per-core profile slots, indexed the same way DeSmuME indexes its CPUs

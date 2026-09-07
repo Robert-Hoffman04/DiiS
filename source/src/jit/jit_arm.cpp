@@ -712,6 +712,31 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 		if (I || W || !P) { ctx.endBlock = true; return; }
 		const u32 ea = ctx.currentPC + 8 + (u32)immOff;
 		ctx.ensureArena();
+
+		// P13 Tier-1: a pc-relative literal LOAD whose (compile-time-constant) EA
+		// lands in main RAM. Fold the host address into an immediate and emit one
+		// lwbrx / lhbrx / lbzx straight into Rd's cached host register -- no
+		// memory prologue, no slowRead C call, no reg-cache flush, no runtime
+		// region guard (the region is known now). ARM7 only: mainMemBase is 0 on
+		// the ARM9, whose CP15-relocatable TCM windows overlay this range.
+		if (L && rd != 15 && ctx.cpu.mainMemBase != 0 &&
+		    (ea & 0x0F000000u) == 0x02000000u) {
+			const u32 m = (size == 4) ? 0x3FFFFCu : (size == 2) ? 0x3FFFFEu : 0x3FFFFFu;
+			u32 lockedMask = 0;
+			const u8 hRd = ctx.writeReg(rd, /*fullOverwrite=*/true, lockedMask);
+			emitLoadImm32(p, PPC_R12, ctx.cpu.mainMemBase + (ea & m));
+			if (size == 4) {
+				*p++ = PPC_LWBRX(hRd, 0, PPC_R12);
+				if (ea & 3)                                     // OP_LDR's ROR(word, 8*(adr&3))
+					*p++ = PPC_RLWINM(hRd, hRd, (32u - 8u * (ea & 3)) & 31, 0, 31);
+			} else if (size == 2) {
+				*p++ = PPC_LHBRX(hRd, 0, PPC_R12);
+			} else {
+				*p++ = PPC_LBZX(hRd, 0, PPC_R12);
+			}
+			return;
+		}
+
 		ctx.emitMemPrologue();
 		if (L) {
 			emitLoadImm32(p, PPC_R12, ea);
