@@ -369,9 +369,10 @@ cond==NV space) and the ARMv4-vs-ARMv5 `LDR pc` / `LDM {..,pc}` interworking
 difference (ARM7 `LDTBit == 0`: `R15 = word & ~3`, no mode switch) on
 `cpu.isaLevel`. Predicated ARM branches bail to the interpreter by default;
 `-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` and `BLcc` (ARM9-validated at
-~1.3 B instructions — §16), not yet default-on for ARM7 (rides on the
-armwrestler / arm7wrestler gates, roadmap #17/#18 — SM64DS can't soak the ARM7
-ARM-mode path).
+~1.3 B instructions — §16). Both its CPU-correctness gates are now clear
+(armwrestler + arm7wrestler, roadmap #17/#18, §8.2/§8.3 — 0 new failures on
+either); still opt-in pending the broader §25 default-on bar, not because of
+an open correctness gate on this flag specifically.
 
 **Validated (SM64DS, headless Dolphin):**
 - 210s differential soak: ARM7 `diff` 400K blocks / 1.67M insns, **0 mismatches**,
@@ -386,10 +387,11 @@ ARM-mode path).
   anomalies over 50M checks.
 - Cycle model is coarse v1: ~23% of ARM7 blocks show cycle drift, bounded at
   ≤13 cyc/block (harness treats ARM7 cycle drift as advisory). Refinement later.
-- `armwrestler` now runs headless (§8.2, §17) -- ARM7 differential coverage
-  is still thin (see §16's predicated-branch status above); `arm7wrestler`
-  itself (a *different*, ARM7-focused ROM -- armwrestler's own ARM7 side is
-  a no-op stub) is still not on hand.
+- `armwrestler` and `arm7wrestler` both now run headless (§8.2/§17,
+  §8.3/§18) -- ARM7 *differential* coverage from SM64DS is still thin (see
+  §16's predicated-branch status above), but `arm7wrestler` now supplies the
+  direct ARM7 CPU-correctness signal that gap was blocking: 0 new failures
+  under `-DJIT_ARM_PRED_BRANCH` relative to the interpreter baseline.
 
 ### 7.2 ARM7-specific validation
 
@@ -538,6 +540,82 @@ It is particularly important because the ARM7 is shared conceptually between:
 - ARM7 JIT execution
 
 A failure here can contaminate several later workstreams.
+
+### Status: automated, headless, running (§18) -- ARM7 predicated-branch gate cleared
+
+`tools/arm7wrestler/` vendors [Arisotura/arm7wrestler](https://github.com/Arisotura/arm7wrestler)
+(same author lineage/no-formal-license situation as §8.2's `armwrestler`;
+see its PROVENANCE.md) -- the fork that moves the real ARM/THUMB test
+content onto the ARM7 (armwrestler's own ARM7 side is a no-op stub; this
+ROM's ARM9 side is the stub instead) and adds an `ExceptionHandler` install
+so the ROM can observe `undefined-instruction` exceptions from ARMv5-only
+opcodes on real ARM7TDMI hardware. Patched with the same auto-run + slot-2
+result-I/O technique as §8.2/§17, reusing the identical header layout so
+both ROMs' results are read by near-identical probe code
+(`-DDESMUME_ARM7WRESTLER_PROBE`, `main.cpp`).
+
+This needed its own from-scratch minimal ARM7 crt0/linker script
+(`ds_arm7_crt0.S`/`ds_arm7.ld`, adapted from `tools/armwrestler`'s ARM9 ones
+-- this devkitPro install's bundled ARM7 crt0 has a libnds version mismatch,
+see PROVENANCE.md) and, more importantly, surfaced a real bug in the ROM's
+own auto-run driver during bring-up:
+
+- **Found and fixed** (in the vendoring patch itself, before this ever
+  became a signal about desmumewii): the driver's THUMB test dispatch
+  reused the vendored ARM9 armwrestler's `mov lr,pc; bx _runtest+1` idiom,
+  which relies on the THUMB test routines' own `pop {..,pc}` return
+  interworking back to ARM based on the popped address's bit0. That's true
+  on ARMv5 (why it works for the ARM9 armwrestler) but **not** on
+  ARMv4T/ARM7TDMI, where `LDM`/`POP` with `pc` in the list loads `pc` and
+  stays in the *current* instruction set state -- only `BX` interworks
+  pre-ARMv5. Confirmed empirically: ARM Test0..5 and THUMB `_test0`
+  completed correctly, then execution silently died exactly at `_test0`'s
+  own `pop {pc}`, landing back in the ARM driver's bytes still in THUMB
+  state (decoded as garbage THUMB opcodes). desmumewii's ARM7 interpreter
+  getting this ARMv4T-vs-ARMv5 distinction right is *exactly* the kind of
+  thing this ROM exists to catch -- it just caught it in the test driver
+  first. Fixed with `_thumb_trampoline` (thumbwrestler-ds.asm): entered via
+  `bx` (which always interworks), stashes the ARM return address in r8
+  (untouched by `_runtest`/every `_testN`/`_drawresult`/`_drawtext`), calls
+  `_runtest` as an ordinary THUMB-to-THUMB `bl` (interworking-free, correct
+  on ARMv4T), then `bx r8` to interwork back to ARM explicitly.
+
+**Interpreter baseline** (no JIT compiled in): **ARM 11/67 fail, THUMB
+1/20 fail**. Cross-checked against `UPSTREAM-README.md`'s documented
+ARMv4T-vs-ARMv5 differences -- all 11 ARM fails are exactly the documented
+set: `LDM` with base-in-writeback-list ×4 (interpreter correctly matches
+real ARM7 hardware's "writeback never happens" quirk), `CLZ` ×1, `LDRD` ×1,
+`QADD` ×1, `SMLABB`/`SMLABT`/`SMLATB`/`SMLATT` ×4. The `LDM` result matches
+documented hardware behavior; `CLZ`/`LDRD`/`QADD`/`SMLAxy` executing instead
+of raising `undefined-instruction` (or being silent no-ops, per the
+README) is a plausible **interpreter**-level ARMv4T-conformance gap, not
+scoped/fixed here -- flagged for later interpreter work, out of scope for
+the JIT-gate purpose of this section. The one THUMB fail is the same
+pre-existing `ADD Rd,PC,#imm` pipeline-offset quirk §8.2 already documents
+for the ARM9 armwrestler (unrelated to any of the above).
+
+**JIT build** (`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH`, ARM9 JIT off --
+this ROM's ARM9 side is upstream's own trivial idle/vram-copy stub):
+**byte-identical output to the interpreter baseline** -- same ARM 11/67,
+THUMB 1/20, same 12 fail entries in the same order. **Zero new failures
+from compiling predicated `Bcc`/`BLcc` on ARM7.** This is the ARM7 gate §16
+was waiting on.
+
+**SM64DS differential soak** (`JIT_DIFFERENTIAL_TESTING`, ARM7+ARM9 JIT,
+predicated branches on, ~4 min headless): ARM9 `diff9` 20.3M blocks / 608.7M
+instructions, **0 mismatches**. ARM7 `diff` again never reaches its 100K
+report threshold on this workload (SM64DS's ARM7 side is boot-then-idle, as
+previously documented) -- `predBcc a7=462` compiles logged, plateauing after
+boot, consistent with §16's existing characterization of SM64DS as thin ARM7
+ARM-mode coverage. `arm7wrestler` itself remains the real ARM7 predicated-
+branch signal; SM64DS here is corroborating "no regression on the one retail
+workload available", not the primary evidence.
+
+Run it: `tools/arm7wrestler/build.sh`, stage `out/arm7wrestler.nds` as
+`sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ARM7WRESTLER_PROBE
+-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` build (add
+`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH` to JITDEFS for the JIT path;
+omit all JIT flags for the interpreter baseline), pull `sd:/arm7wrestler.log`.
 
 ---
 
@@ -960,24 +1038,32 @@ predicated-branch traffic; the sanctioned soak/bench ROM):
   compiled **14.48** (cv 1.1 %). Compiling predicated branches is what turns
   the ARM9 JIT from a −16 % loss into a +9 % win on this scene.
 
-Remaining before `-DJIT_ARM_PRED_BRANCH` becomes default:
+Status:
 
-- **ARM7 gate.** ARM9 is validated at ~1.3 B instructions (above); the
-  `emitBranch` predicated path is byte-identical for both cores (only
-  `cyclesForArm` and `isaLevel` differ). SM64DS cannot soak the ARM7 side —
-  its ARM7 runs almost no ARM-mode JIT code (~800 predicated-branch compiles,
-  no sustained execution: the ARM7 `diff` telemetry never reaches its 100 K
-  report threshold), and `armwrestler`'s own ARM7 side is a no-op idle stub
-  (§8.2/§17) — no ARM7 ARM-mode-heavy workload is on hand yet. `arm7wrestler`
-  (a genuinely different, ARM7-focused ROM, source-only, not yet built) is
-  the real candidate. Keep the flag opt-in for now.
-- `armwrestler` itself now runs headless (roadmap #17, §8.2) and cleared for
-  ARM9: 0 new failures under predicated `Bcc`/`BLcc` beyond the pre-existing,
-  unrelated ARM9-JIT ARM `SMLAL` / THUMB `LDR` bugs it found (confirmed by
-  ablation to reproduce identically with `-DJIT_ARM_PRED_BRANCH` undefined) --
-  both now root-caused and fixed (§8.2), `armwrestler` back to the clean
-  interpreter baseline (ARM 0/67, THUMB 1/10) under a full predicated-branch
-  build. `arm7wrestler` (roadmap #18) is still not on hand.
+- **ARM7 gate: cleared (§8.3, roadmap #18).** `arm7wrestler` (the genuinely
+  different, ARM7-focused ROM SM64DS's own thin ARM7 coverage couldn't
+  substitute for) is now vendored, headless, and run against both an
+  interpreter baseline and a `-DJIT_ARM_PRED_BRANCH` build: byte-identical
+  results (ARM 11/67, THUMB 1/20, same 12 fail entries) -- **zero new
+  failures from compiling predicated `Bcc`/`BLcc` on ARM7**. `emitBranch`'s
+  predicated path is byte-identical for both cores (only `cyclesForArm` and
+  `isaLevel` differ), and ARM9 was already validated at ~1.3 B instructions
+  (below) -- ARM7 now has its own direct CPU-correctness signal rather than
+  resting solely on that code-sharing argument. SM64DS's ARM7 side is still
+  boot-then-idle (its own differential soak's `predBcc a7` plateaus at 462
+  compiles after boot, `diff` never reaching its 100K report threshold) --
+  unchanged, and no longer the blocker now that `arm7wrestler` covers it.
+- `armwrestler` runs headless (roadmap #17, §8.2) and cleared for ARM9: 0 new
+  failures under predicated `Bcc`/`BLcc` beyond the pre-existing, unrelated
+  ARM9-JIT ARM `SMLAL` / THUMB `LDR` bugs it found (confirmed by ablation to
+  reproduce identically with `-DJIT_ARM_PRED_BRANCH` undefined) -- both now
+  root-caused and fixed (§8.2), `armwrestler` back to the clean interpreter
+  baseline (ARM 0/67, THUMB 1/10) under a full predicated-branch build.
+
+Both CPU-correctness gates for `-DJIT_ARM_PRED_BRANCH` are now clear. Making
+it default-on is a separate decision from clearing its gates -- see §25 for
+the full default-on bar (RockWrestler, retail soaks, host-memory hardening,
+etc. are still open) rather than treating this flag in isolation.
 
 The `JIT_HEAP_WATCH` instrumentation (`jit_trace.cpp` / `jit_exec.cpp`) is
 `#ifdef`-gated, zero-cost when undefined, and stays in as standing §16 tooling.
@@ -1245,14 +1331,14 @@ The default architecture remains direct emission plus chaining.
 | 8  | Benchmark gate 1                                                 | done            |
 | 9  | ARM32 front-end on ARM9                                          | done            |
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
-| 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler pending) |
+| 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler + arm7wrestler both clear, §8.2/§8.3) |
 | 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
 | 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
-| 18 | `arm7wrestler` automated regression gate                         | next (armwrestler's own ARM7 side is a no-op stub -- needs Arisotura's separate arm7wrestler, source-only, not yet built) |
+| 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
 | 19 | RockWrestler automated DS conformance gate                       | next            |
 | 20 | GBA compatibility architecture                                   | next            |
 | 21 | GBA reference baseline: DS-side melonDS + GBA reference emulator | next            |

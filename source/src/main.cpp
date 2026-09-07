@@ -52,6 +52,13 @@
 #endif
 #endif
 
+#ifdef DESMUME_ARM7WRESTLER_PROBE
+#include "addons.h"
+#if defined(DESMUME_JIT_ARM7)
+#include "jit/jit.h"
+#endif
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -267,6 +274,26 @@ int main(int argc, char **argv){
 	// usefully compile. Leave it interpreted; free either way, and one less
 	// variable when reading a result.
 	jitArm7Enabled = false;
+#endif
+#endif
+
+#ifdef DESMUME_ARM7WRESTLER_PROBE
+	// §18 arm7wrestler gate -- same slot-2 addon trick as §17's armwrestler
+	// probe (see the block above), same 8MB-vs-64KB MEM1 exhaustion fix
+	// applies here for the same reason.
+	addonsChangePak(NDS_ADDON_EXPMEMORY);
+	extern u32 expMemSize;
+	expMemSize = 64 * 1024;
+#if defined(DESMUME_JIT_ARM7)
+	// Opposite of §17's armwrestler probe: here the ARM7 side is the real
+	// test content and the ARM9 side (armwrestler-arm9.asm) is upstream's
+	// own trivial idle/vram-copy stub -- nothing for the ARM9 JIT to
+	// usefully compile, so turn that off. jitArm7Enabled is deliberately
+	// left alone (defaults true whenever -DDESMUME_JIT_ARM7 is compiled
+	// in) -- exercising the ARM7 JIT is the entire point of this probe; an
+	// interpreter-only baseline run means building without
+	// -DDESMUME_JIT_ARM7 at all, not forcing this flag off here.
+	jitArm9Enabled = false;
 #endif
 #endif
 
@@ -956,6 +983,89 @@ static void armwrestler_probe_tick()
 }
 #endif // DESMUME_ARMWRESTLER_PROBE
 
+#ifdef DESMUME_ARM7WRESTLER_PROBE
+//---------------------------------------------------------------------------
+// §18 arm7wrestler gate (-DDESMUME_ARM7WRESTLER_PROBE).
+//
+// Mechanically identical to armwrestler_probe_tick() above (see its comment
+// for the slot-2/ExpMemory mechanism) -- the two differences are: the
+// per-failure log's name-string pointer is a live **ARM7** address here
+// (this ROM's real test content runs on ARM7, not ARM9 -- see
+// tools/arm7wrestler/PROVENANCE.md), so it's read back through
+// _MMU_read08<ARMCPU_ARM7>; and the result file is sd:/arm7wrestler.log so
+// the two probes' outputs never collide if both happen to be staged at once.
+//---------------------------------------------------------------------------
+extern u8* expMemory;
+
+// Local copy of the armwrestler probe's le32() (that one is scoped inside
+// -DDESMUME_ARMWRESTLER_PROBE, which this build may not have) -- same
+// byte-reassembly reasoning, see that comment.
+static inline u32 le32_7(const u8* p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+static char s_aw7Line[2048];
+static int  s_aw7LineLen = 0;
+static u32  s_aw7QuitAtFrame = 0;
+
+static void arm7wrestler_probe_tick()
+{
+	static bool haveResult = false;
+	static u32  frame = 0;
+	if (quit_game) return;
+	frame++;
+
+	if (!haveResult) {
+		u32 sentinel = expMemory ? le32_7(expMemory) : 0;
+		if (sentinel != 0x31525741u && frame < 600) return;   // not ready yet
+
+		char* p = s_aw7Line;
+		char* end = s_aw7Line + sizeof(s_aw7Line);
+		if (!expMemory) {
+			p += snprintf(p, end - p, "[arm7wrestler] expMemory is NULL (addon not selected) at frame %u\n", frame);
+		} else if (sentinel != 0x31525741u) {
+			u32 armTotal = le32_7(expMemory + 0x04);
+			u32 armFail  = le32_7(expMemory + 0x08);
+			u32 tmbTotal = le32_7(expMemory + 0x0C);
+			u32 tmbFail  = le32_7(expMemory + 0x10);
+			p += snprintf(p, end - p, "[arm7wrestler] TIMEOUT at frame %u, sentinel=0x%08x (want 0x31525741)\n", frame, sentinel);
+			p += snprintf(p, end - p, "  partial: ARM %u/%u fail, THUMB %u/%u fail\n", armFail, armTotal, tmbFail, tmbTotal);
+		} else {
+			u32 armTotal = le32_7(expMemory + 0x04);
+			u32 armFail  = le32_7(expMemory + 0x08);
+			u32 tmbTotal = le32_7(expMemory + 0x0C);
+			u32 tmbFail  = le32_7(expMemory + 0x10);
+			u32 logCount = le32_7(expMemory + 0x14);
+			if (logCount > 32) logCount = 32;
+			p += snprintf(p, end - p, "[arm7wrestler] ARM %u/%u fail, THUMB %u/%u fail\n",
+			              armFail, armTotal, tmbFail, tmbTotal);
+			for (u32 i = 0; i < logCount && end - p > 48; i++) {
+				u32 namePtr = le32_7(expMemory + 0x18 + i * 8);
+				u32 mask    = le32_7(expMemory + 0x18 + i * 8 + 4);
+				char name[32]; u32 n = 0;
+				while (n < sizeof(name) - 1) {
+					u8 c = _MMU_read08<ARMCPU_ARM7>(namePtr + n);
+					if (!c) break;
+					name[n++] = (char)c;
+				}
+				name[n] = 0;
+				p += snprintf(p, end - p, "  FAIL %-8s mask=0x%08x nameptr=0x%08x\n", name, mask, namePtr);
+			}
+		}
+		s_aw7LineLen = (int)(p - s_aw7Line);
+		haveResult = true;
+		s_aw7QuitAtFrame = frame + 600;   // ~10s of grace at 60fps before quitting
+	}
+
+	if ((frame & 31) == 0 || frame >= s_aw7QuitAtFrame) {
+		FILE* f = fopen("sd:/arm7wrestler.log", "w");
+		if (f) { fwrite(s_aw7Line, 1, (size_t)s_aw7LineLen, f); fclose(f); }
+	}
+	if (frame >= s_aw7QuitAtFrame) quit_game = true;
+}
+#endif // DESMUME_ARM7WRESTLER_PROBE
+
 void DSExec(){
 
 	PAD_ScanPads();
@@ -1047,6 +1157,9 @@ void DSExec(){
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 	armwrestler_probe_tick();
+#endif
+#ifdef DESMUME_ARM7WRESTLER_PROBE
+	arm7wrestler_probe_tick();
 #endif
 
 	if(showfps) ShowFPS();
