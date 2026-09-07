@@ -1124,6 +1124,17 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 
 	if (accum) {
 		*p++ = PPC_ADDCO(hLo, PPC_R11, hLo);                    // RdLo += loprod ; XER[CA]
+		// Re-prime XER[CA] via MFXER + ADDIC before consuming it, exactly like
+		// every other ADDEO/SUBFEO user in this JIT (emitAlu's ADC/SBC/RSC,
+		// jit_thumb.cpp's ADC/SBC) -- raw XER extraction, not the packed guest-
+		// flags cache (SMLAL leaves CPSR C/V untouched). A back-to-back
+		// ADDCO->ADDEO relying on XER[CA] surviving unaided between two
+		// adjacent instructions was found to silently lose the carry (root
+		// cause not pinned to PPC vs. Dolphin's own recompiler; this is the
+		// same defensive re-materialization every proven-correct caller uses).
+		*p++ = PPC_MFXER(PPC_R10);
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 3, 31, 31);         // R10 = CA (0/1)
+		*p++ = PPC_ADDIC(PPC_R10, PPC_R10, -1);                 // XER[CA] = R10
 		*p++ = PPC_ADDEO(hHi, PPC_R12, hHi);                    // RdHi += hiprod + CA
 	} else {
 		*p++ = PPC_OR(hLo, PPC_R11, PPC_R11);

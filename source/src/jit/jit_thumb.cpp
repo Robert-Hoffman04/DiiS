@@ -355,8 +355,15 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		if (regOff) *emitPtr++ = PPC_ADD(PPC_R12, hRb, hRo);
 		else        *emitPtr++ = PPC_ADDI(PPC_R12, hRb, (s32)immOff);
 
+		// Word loads rotate for an unaligned EA (ROR by 8*(EA&3)), matching both
+		// the interpreter's OP_LDR_IMM_OFF/OP_LDR_REG_OFF and ARM mode's own
+		// emitLoadStoreTail -- byte/halfword forms don't. This THUMB path used
+		// to pass wordRotate=false unconditionally (a real bug: armwrestler's
+		// THUMB LDR test, which deliberately misaligns the EA, caught it).
+		const bool wordRotate = isLoad && size == 4;
+
 		if (isLoad && ctx.cpu.pageDescBase) {            // P14 inline RAM load
-			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, /*wordRotate=*/false, lockedMask);
+			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
 			break;
 		}
 
@@ -375,6 +382,14 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.invalidateRegCache();
 		} else {
 			ctx.emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
+			if (wordRotate) {                              // ROR(R10, 8*(EA&3))
+				*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
+				*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31); // EA & 3
+				*emitPtr++ = PPC_LI(PPC_R11, 4);
+				*emitPtr++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);     // 4 - (EA&3)
+				*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28); // ((4-x)&3)<<3
+				*emitPtr++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+			}
 			ctx.emitMemEpilogue();
 			ctx.invalidateRegCache();
 			*emitPtr++ = PPC_STW(PPC_R10, 14, rd * 4);

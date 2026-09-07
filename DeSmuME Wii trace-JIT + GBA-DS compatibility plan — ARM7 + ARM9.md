@@ -471,17 +471,55 @@ Building this surfaced and fixed one bug and found two more:
   when `expMemSize` was cut from 8MB to 64KB (all this probe needs), with
   nothing else changed. Left shrunk permanently in `main.cpp`, not just for
   the diagnosis.
-- **Found** (interpreter baseline: ARM 0/67 fail, THUMB 1/10 fail -- the one
-  THUMB fail is `ADD` with a `BAD_Rd` bitmask, almost certainly the
+- **Found and fixed** (interpreter baseline: ARM 0/67 fail, THUMB 1/10 fail --
+  the one THUMB fail is `ADD` with a `BAD_Rd` bitmask, almost certainly the
   `ADD Rd,PC,#imm` pipeline-offset test, a known-finicky case rather than a
-  JIT-caused issue since the interpreter alone reproduces it): the ARM9 JIT
-  (`jit9on`) adds two **new** failures beyond that baseline --
-  **ARM `SMLAL`** (`BAD_Rd`, the B5 64-bit signed multiply-accumulate path)
-  and **THUMB `LDR`** (`BAD_Rd` x2, register- and immediate-offset forms).
-  Confirmed via ablation to be **pre-existing and unrelated to §16**: byte-
-  identical failure set with `-DJIT_ARM_PRED_BRANCH` defined and undefined.
-  Not yet root-caused -- next JIT correctness work, tracked here rather than
-  chased under §16/§17's own budget.
+  JIT-caused issue since the interpreter alone reproduces it, and is still
+  present after both fixes below -- left alone, out of scope here): the ARM9
+  JIT (`jit9on`) added two **new** failures beyond that baseline, both now
+  fixed and reverified back down to the clean baseline (ARM 0/67, THUMB 1/10)
+  under a full `-DJIT_ARM_PRED_BRANCH` build, plus a 12.2M-block / 365.6M-insn
+  SM64DS differential soak at 0 mismatches:
+  - **ARM `SMLAL`** (`BAD_Rd`, the B5 64-bit signed multiply-accumulate path).
+    Root cause: `emitMultiply`'s accumulate chained `ADDCO`(RdLo) directly into
+    `ADDEO`(RdHi), relying on XER[CA] surviving unaided between two adjacent
+    instructions -- the carry was silently lost (confirmed instruction-by-
+    instruction: a slot-2 dump of the exact host-register inputs feeding the
+    test's `smlals` showed every input correct and RdLo exactly correct, but
+    RdHi short by precisely the missing +1 carry). Every *other* `ADDEO`/
+    `SUBFEO` consumer in this JIT (`emitAlu`'s ADC/SBC/RSC, `jit_thumb.cpp`'s
+    ADC/SBC) already re-primes XER[CA] via `MFXER` + `ADDIC` immediately before
+    consuming it rather than trusting raw adjacency; `emitMultiply` was the one
+    place that didn't. Fixed by adding the same re-priming there.
+  - **THUMB `LDR`** (`BAD_Rd` x2, register- and immediate-offset forms). Root
+    cause: the shared THUMB load/store emitter (F9/F8/F10, `jit_thumb.cpp`)
+    passed `wordRotate=false` unconditionally to both `emitInlineLoad` and its
+    slow-load path, so a word `LDR` from an unaligned EA never got the
+    ROR-by-`8*(EA&3)` that the interpreter (`OP_LDR_IMM_OFF`/`OP_LDR_REG_OFF`)
+    and ARM mode's own `emitLoadStoreTail` both apply. `LDR Rd,[PC,#imm]` (F6)
+    and `[SP,#imm]` (F11) are unaffected -- their EAs are always 4-byte
+    aligned by construction, so the rotate would be a no-op there regardless.
+    Fixed by computing `wordRotate = isLoad && size==4` and applying the same
+    ROR sequence ARM mode uses (`emitLoadStoreTail`'s post-`emitSlowLoad`
+    block) for both the inline-load and slow-load paths.
+
+  Diagnostic note: an early attempt to catch these live via a
+  `-DJIT_DIFFERENTIAL_TESTING` + armwrestler-probe combo build was unreliable
+  for *counts* (ARM/THUMB totals came back inflated ~2-3x, non-uniformly) --
+  the differential harness's guest-RAM journal/rollback (A1, `jit_differential.cpp`)
+  has no cell decode for slot-2/GBA-cart addresses (`diffJournalCellArm9`
+  returns null there), so the reference-interpreter dry run's writes to
+  `armwrestler`'s slot-2 result buffer are never rolled back while the block's
+  real, non-journalled second (and sometimes third, for CHAIN-DIFF) execution
+  writes again -- a double/triple count, not a correctness issue. It also never
+  produced a DIFF/CHAIN-DIFF log line for either bug, most likely because
+  `armwrestler`'s slot-2 writes mark the block `s_journalUnrestorable` and
+  drop it from the trusted comparison entirely. Both bugs were actually
+  root-caused with a **non-differential** single-execution probe build plus a
+  one-off ROM-side patch (`str`s right after the tested instruction, before
+  `DrawResult`'s own prologue could clobber the result registers) shipping the
+  raw pre/post register values out through slot-2 alongside the pass/fail
+  bitmask -- not committed, reproducible from this note if needed again.
 
 Run it: `tools/armwrestler/build.sh`, stage `out/armwrestler.nds` as
 `sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ARMWRESTLER_PROBE
@@ -936,8 +974,10 @@ Remaining before `-DJIT_ARM_PRED_BRANCH` becomes default:
 - `armwrestler` itself now runs headless (roadmap #17, §8.2) and cleared for
   ARM9: 0 new failures under predicated `Bcc`/`BLcc` beyond the pre-existing,
   unrelated ARM9-JIT ARM `SMLAL` / THUMB `LDR` bugs it found (confirmed by
-  ablation to reproduce identically with `-DJIT_ARM_PRED_BRANCH` undefined).
-  `arm7wrestler` (roadmap #18) is still not on hand.
+  ablation to reproduce identically with `-DJIT_ARM_PRED_BRANCH` undefined) --
+  both now root-caused and fixed (§8.2), `armwrestler` back to the clean
+  interpreter baseline (ARM 0/67, THUMB 1/10) under a full predicated-branch
+  build. `arm7wrestler` (roadmap #18) is still not on hand.
 
 The `JIT_HEAP_WATCH` instrumentation (`jit_trace.cpp` / `jit_exec.cpp`) is
 `#ifdef`-gated, zero-cost when undefined, and stays in as standing §16 tooling.
@@ -1211,7 +1251,7 @@ The default architecture remains direct emission plus chaining.
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
-| 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang, found pre-existing ARM9 JIT bugs (SMLAL, THUMB LDR) not yet root-caused |
+| 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | next (armwrestler's own ARM7 side is a no-op stub -- needs Arisotura's separate arm7wrestler, source-only, not yet built) |
 | 19 | RockWrestler automated DS conformance gate                       | next            |
 | 20 | GBA compatibility architecture                                   | next            |
