@@ -44,6 +44,7 @@
 #include "GXRender.h"
 #include "GXMerge.h"
 #include "rasterize.h"
+#include "perf_zones.h"
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 #include "addons.h"
@@ -1325,14 +1326,15 @@ void DSExec(){
 	u64 _b0 = gettime();
 	NDS_exec<TRUE>(0);
 	u64 _b1 = gettime();
-	if (!SkipFrameTracker) Draw();
+	if (!SkipFrameTracker) { PZ_SCOPE(PZ_DRAW); Draw(); }
 	u64 _b2 = gettime();
 	bench_tick(_b1 - _b0, _b2 - _b1);
 #else
 	NDS_exec<TRUE>(0);
 
-	if (!SkipFrameTracker) Draw(); // only update when !Frame skip tracker
+	if (!SkipFrameTracker) { PZ_SCOPE(PZ_DRAW); Draw(); } // only update when !Frame skip tracker
 #endif
+	pzFrameTick();
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 	armwrestler_probe_tick();

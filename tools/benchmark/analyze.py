@@ -145,6 +145,8 @@ def build_results(rundir, scenes_path):
     for fn in sorted(os.listdir(raw)):
         if not fn.endswith(".log") or fn.startswith("dolphin_"):
             continue
+        if fn.endswith(".perfzones.log"):
+            continue                       # handled by perfzones.py, not here
         base = fn[:-4]
         if "_" not in base:
             continue

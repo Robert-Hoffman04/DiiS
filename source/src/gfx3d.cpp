@@ -43,6 +43,7 @@
 #include "readwrite.h"
 #include "FIFO.h"
 #include "GPU.h"
+#include "perf_zones.h"
 #include <queue>
 
 extern u8 current3Dcore; // In main
@@ -1694,6 +1695,7 @@ static void gfx3d_execute(u8 cmd, u32 param){
 }
 
 void gfx3d_execute3D(){
+	PZ_SCOPE(PZ_GPU_GE);
 	u8	cmd = 0;
 	u32	param = 0;
 
@@ -1852,6 +1854,7 @@ static void gfx3d_doFlush(){
 
 void gfx3d_VBlankSignal(){
 	if (isSwapBuffers){
+		PZ_SCOPE(PZ_GPU_GE);
 #ifndef FLUSHMODE_HACK
 		gfx3d_doFlush();
 #endif
@@ -1873,7 +1876,7 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 		return;
 	}
 
-	gpu3D->NDS_3D_Render();
+	{ PZ_SCOPE(PZ_GPU_RENDER); gpu3D->NDS_3D_Render(); }
 }
 
 //#define _3D_LOG

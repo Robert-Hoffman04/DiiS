@@ -44,6 +44,7 @@
 #ifdef DESMUME_JIT_ARM7
 #include "jit/jit.h"
 #endif
+#include "perf_zones.h"   // no-op macros unless -DDESMUME_PERFZONES
 #ifdef DESMUME_ARM_TIME_SPLIT
 #include <ogc/lwp_watchdog.h>
 #include <stdio.h>
@@ -1363,8 +1364,11 @@ static void execHardware_hblank()
 		//this should be safe since games cannot do anything timing dependent until this next
 		//scanline begins, anyway (as this scanline was in the middle of drawing)
 		//taskSubGpu.execute(renderSubScreen,NULL);
-		GPU_RenderLine(&MainScreen, nds.VCount, frameSkipper.ShouldSkip2D());
-		GPU_RenderLine(&SubScreen, nds.VCount, frameSkipper.ShouldSkip2D());
+		{
+			PZ_SCOPE(PZ_GPU_2D);
+			GPU_RenderLine(&MainScreen, nds.VCount, frameSkipper.ShouldSkip2D());
+			GPU_RenderLine(&SubScreen, nds.VCount, frameSkipper.ShouldSkip2D());
+		}
 		//taskSubGpu.finish();
 
 		//trigger hblank dmas
@@ -1399,7 +1403,7 @@ static void execHardware_hblank()
 
 	//emulation housekeeping. for some reason we always do this at hblank,
 	//even though it sounds more reasonable to do it at hstart
-	SPU_Emulate_core();
+	{ PZ_SCOPE(PZ_SPU); SPU_Emulate_core(); }
 //	driver->AVI_SoundUpdate(SPU_core->outbuf,spu_core_samples);
 //	WAV_WavSoundUpdate(SPU_core->outbuf,spu_core_samples);
 }
@@ -1805,9 +1809,10 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #endif
 #ifdef DESMUME_JIT_ARM7
 				u32 jit9Cycles = jitRunArm9();
-				arm9 += (jit9Cycles ? jit9Cycles : armcpu_exec<ARMCPU_ARM9>());
+				if (jit9Cycles) { arm9 += jit9Cycles; }
+				else { PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #else
-				arm9 += armcpu_exec<ARMCPU_ARM9>();
+				{ PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #endif
 #ifdef DESMUME_ARM_TIME_SPLIT
 				g_arm9Ticks += gettime() - _t0;
@@ -1831,9 +1836,10 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #endif
 #ifdef DESMUME_JIT_ARM7
 				u32 jitCycles = jitRunArm7();
-				arm7 += (jitCycles ? jitCycles : armcpu_exec<ARMCPU_ARM7>()) << 1;
+				if (jitCycles) { arm7 += jitCycles << 1; }
+				else { PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
 #else
-				arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1);
+				{ PZ_SCOPE(PZ_ARM7_INTERP); arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1); }
 #endif
 #ifdef DESMUME_ARM_TIME_SPLIT
 				g_arm7Ticks += gettime() - _t0;
@@ -1865,6 +1871,8 @@ template<bool FORCE>
 void NDS_exec(s32 nb)
 {
 	LagFrameFlag=1;
+
+	pzSet(PZ_OTHER);   // perf_zones: anchor the frame; ARM/GPU hooks nest under this
 
 	sequencer.nds_vblankEnded = false;
 

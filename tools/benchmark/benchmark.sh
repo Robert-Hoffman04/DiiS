@@ -35,7 +35,8 @@
 #     --clean              `make clean` before the first build
 #     --duration N         seconds per run          (default 90; scenes.conf 'dur=' wins)
 #     --modes "sw gx"      subset of renderers      (default "sw gx merge";
-#                          also available: jitoff jiton jit9off jit9on jitfull)
+#                          also available: jitoff jiton jit9off jit9on jitfull
+#                          profile [= jitfull + perf_zones frame-time breakdown])
 #     --scenes "vsd ph"    subset of scene ids from scenes.conf
 #     --no-compare         skip the diff against the previous run
 #
@@ -103,6 +104,9 @@ defs_for() {
 		# Full JIT: both cores JIT'd, GXMerge doing the actual compositing -
 		# not an A/B baseline, this is the "real" fast-path configuration.
 		jitfull) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
+		# Same config as jitfull, plus the perf_zones frame-time accountant
+		# (dumps sd:/perfzones.log). "where does the full-JIT frame go" mode.
+		profile) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
 		*)      die "unknown mode '$1'" ;;
 	esac
 }
@@ -115,6 +119,7 @@ jitdefs_for() {
 		jiton)   base="-DDESMUME_JIT_ARM7" ;;
 		jit9on)  base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		jitfull) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		profile) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_PERFZONES" ;;
 		*)       base="" ;;
 	esac
 	# BENCH_EXTRA_JITDEFS: append experimental JIT flags to every JIT mode without
@@ -193,6 +198,7 @@ restore_rom() {
 			&& rm -f "$RUNDIR/_prev_test.nds"
 	fi
 	mdel -i "$DOLPHIN_SD" ::/bench.log 2>/dev/null || true
+	mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 }
 trap restore_rom EXIT
 
@@ -201,6 +207,7 @@ run_one() {
 	local scene="$1" mode="$2" rom="$3" dur="$4"
 	dolphin_kill; sleep 3
 	mdel -i "$DOLPHIN_SD" ::/bench.log 2>/dev/null || true
+	mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 	mcopy -o -i "$DOLPHIN_SD" "$rom" ::/DS/ROMS/test.nds \
 		|| { echo "   mcopy of $rom failed"; return 1; }
 	echo ">> $scene / $mode   $(basename "$rom")   ${dur}s"
@@ -214,6 +221,11 @@ run_one() {
 		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.log") rows"
 	else
 		echo "   !! no bench.log - see raw/dolphin_${scene}_${mode}.log"
+	fi
+	# perf_zones frame-time breakdown (only a -DDESMUME_PERFZONES build writes it)
+	if mcopy -i "$DOLPHIN_SD" ::/perfzones.log "$RUNDIR/raw/${scene}_${mode}.perfzones.log" 2>/dev/null; then
+		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.perfzones.log") perfzone rows"
+		mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 	fi
 }
 
@@ -246,5 +258,12 @@ restore_rom; trap - EXIT
 #--- analyse ------------------------------------------------------------
 echo
 python3 "$HERE/analyze.py" "$RUNDIR" $COMPARE_ARG
+
+# perf_zones frame-time breakdown, if a `profile` (-DDESMUME_PERFZONES) run
+# left any *.perfzones.log captures.
+if ls "$RUNDIR"/raw/*.perfzones.log >/dev/null 2>&1; then
+	echo
+	python3 "$HERE/perfzones.py" "$RUNDIR" --json
+fi
 echo
 echo "results: $RUNDIR"

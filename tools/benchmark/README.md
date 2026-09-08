@@ -14,6 +14,7 @@ run so a change's perf cost is visible.
 | `bench_jit9off` | ARM9 interpreter (JIT A/B baseline)    | `DESMUME_FORCE_CORE=2` |
 | `bench_jit9on`  | ARM9 JIT (JIT A/B)                     | `DESMUME_FORCE_CORE=2` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
 | `bench_jitfull` | full JIT (ARM7 + ARM9) over GXMerge    | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
+| `bench_profile` | `jitfull` + per-zone frame-time breakdown | ...as `jitfull` + `DESMUME_PERFZONES` |
 
 The `jit*off`/`jit*on` pairs deliberately keep the software rasterizer fixed so
 the only delta between the two builds is the CPU core under test. `jitfull`
@@ -42,7 +43,58 @@ is the honest "as fast as this build goes" rate for whatever is on screen.
    headless Dolphin (`-b`), waits, kills it, and pulls `sd:/bench.log` into
    `results/<stamp>_<sha>/raw/<scene>_<mode>.log`,
 3. runs `analyze.py`, which writes `results.json` + `report.md` and prints a
-   summary plus a diff against the most recent previous run under `results/`.
+   summary plus a diff against the most recent previous run under `results/`,
+4. if any `profile`-mode capture is present, runs `perfzones.py` for the
+   frame-time breakdown (below).
+
+## `profile` mode — where the full-JIT frame actually goes
+
+```sh
+tools/benchmark/benchmark.sh --modes profile --scenes sm64
+```
+
+`profile` is `jitfull` plus `-DDESMUME_PERFZONES`, which arms the `perf_zones`
+accountant (`source/src/perf_zones.{h,cpp}`). It keeps one "current zone" and
+banks Wii-timebase intervals to it, switching zone at ~12 instrumented call
+sites:
+
+| zone | site |
+|---|---|
+| `arm9_interp` / `arm7_interp` | `armcpu_exec<…>()` interpreter fallback (`NDSSystem.cpp`) |
+| `arm9_jit` / `arm7_jit` | `jitRunArm9/7()` — dispatch + trampoline + `ExecuteJITTrace` (`jit_exec.cpp`) |
+| `arm9_build` / `arm7_build` | `jitCompileTrace()` — trace scan + codegen (`jit_trace.cpp`) |
+| `gpu_ge` | `gfx3d_execute3D()` — geometry-engine FIFO (`gfx3d.cpp`) |
+| `gpu_render` | `gpu3D->NDS_3D_Render()` — GXRender / soft raster |
+| `gpu_2d` | `GPU_RenderLine()` ×2 per scanline — 2D compositor / merge line walk |
+| `spu` | `SPU_Emulate_core()` |
+| `draw` | `Draw()` — screen convert + `GXMerge_Present` + VI present (`main.cpp`) |
+| `other` | everything else — sequencer, DMA, MMU, IRQ dispatch, glue |
+
+`pzSet()` only reads the timebase when the zone *changes*, so a run of a
+million same-zone dispatches is one branch each. Cost is ~4 % of `eff_fps`
+vs a plain `jitfull` build — treat the shares as the signal, not the absolute
+ms (same caveat as `DESMUME_ARM_TIME_SPLIT`).
+
+The build dumps `sd:/perfzones.log` every 60 frames:
+
+```
+frame,wall_us,<zone>_us…,<zone>_hits…
+```
+
+`perfzones.py` windows it (same `scenes.conf` window as `analyze.py`), rolls the
+zones into CPU-ARM9 / CPU-ARM7 / GPU / SPU / GX-present / other, and writes
+`report_perfzones.md` + `results.perfzones.json`. Re-analyse or diff without
+re-running:
+
+```sh
+tools/benchmark/perfzones.py results/<stamp>
+tools/benchmark/perfzones.py results/<new> --compare results/<old>
+tools/benchmark/perfzones.py results/<stamp>/raw/sm64_profile.perfzones.log --window 300-1200
+```
+
+To add a zone: add the enum in `perf_zones.h`, a name in `perf_zones.cpp`'s
+`k_name[]`, a `PZ_SCOPE(PZ_x)` at the call site, and (optionally) a row in
+`perfzones.py`'s `GROUPS`.
 
 The original SD `test.nds` is backed up and restored afterwards. `results/` and
 `dols/` are gitignored; to keep a run as a comparison baseline in git,

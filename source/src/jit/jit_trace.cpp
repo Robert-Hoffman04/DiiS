@@ -10,6 +10,7 @@
  ***************************************************************************/
 
 #include "jit_trace.h"
+#include "../perf_zones.h"
 
 #if defined(DESMUME_JIT_ARM7)
 
@@ -958,6 +959,10 @@ void JitTraceCtx::emitEvalCond(u8 cond)
 // =========================================================================
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb)
 {
+	// perf_zones: this whole call is "JIT build" time, carved out of the
+	// enclosing ARM9_JIT / ARM7_JIT dispatch interval.
+	PZ_SCOPE(cpu.isaLevel >= 5 ? PZ_ARM9_BUILD : PZ_ARM7_BUILD);
+
 	JitTraceCtx ctx{ cpu, cache };
 	ctx.startPC = ctx.currentPC = startPC;
 	ctx.thumbMode = thumb;

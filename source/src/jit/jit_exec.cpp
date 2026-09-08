@@ -22,6 +22,7 @@
 
 #include "jit_trace.h"
 #include "../armcpu.h"
+#include "../perf_zones.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -88,6 +89,10 @@ u32 jitRunArm7()
 {
 	JitCpuProfile* prof = jitProfile[JIT_ARM7];
 	if (!jitArm7Enabled || !prof) return 0;
+
+	// perf_zones: everything below (dispatch, compile, trampoline, resume) is
+	// ARM7 JIT time; jitCompileTrace() re-tags its own interval as ARM7_BUILD.
+	PZ_SCOPE(PZ_ARM7_JIT);
 
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
 	{
@@ -207,6 +212,10 @@ u32 jitRunArm9()
 #if !defined(JIT_DIFFERENTIAL_TESTING)
 	if (!jitArm9Enabled) return 0;
 #endif
+
+	// perf_zones: dispatch + compile + trampoline + resume-pipeline is ARM9 JIT
+	// time; jitCompileTrace() re-tags its own interval as ARM9_BUILD.
+	PZ_SCOPE(PZ_ARM9_JIT);
 
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
 	// JIT_HEAP_WATCH tightens the interval from 64K to 1K dispatches for §16
