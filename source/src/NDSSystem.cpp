@@ -34,6 +34,7 @@
 #include "utils/decrypt/decrypt.h"
 #include "utils/decrypt/crc.h"
 #include "bios.h"
+#include "bios_gba.h"
 #include "debug.h"
 #include "Disassembler.h"
 #include "readwrite.h"
@@ -2056,21 +2057,15 @@ void NDS_Reset()
 		T1WriteLong(MMU.ARM7_BIOS,0x34, 0xE25EF004);
 	}
 
-	// roadmap #20 (GBA compat), §12.3 step 6: this codebase's declared BIOS
-	// strategy is function-level HLE (a future bios_gba.cpp mirroring
-	// bios.cpp's SWI-intercept pattern) -- not yet implemented, and
-	// definitely not DS's ARM7_swi_tab set above, whose handlers assume DS
+	// roadmap #20 (GBA compat), §12.3 step 6: real GBA BIOS SWI table
+	// (bios_gba.cpp/ARM7GBA_swi_tab), superseding step 5.5's `swi_tab =
+	// NULL` safety-net trap now that there's real behaviour to dispatch
+	// to. Force it back over whatever the DS logic above just decided --
+	// definitely not DS's own ARM7_swi_tab, whose handlers assume DS
 	// register/memory conventions and would be actively dangerous run
-	// against GBA state. Force swi_tab back to null for isGBA regardless of
-	// what the DS logic above just decided: the interpreter's real-SWI-trap
-	// fallback (arm_instructions.cpp/thumb_instructions.cpp, taken whenever
-	// swi_tab is null) then does exactly what real hardware's exception
-	// vector does -- jump to intVector+0x08 (0x00000008 for ARM7) -- landing
-	// in GBA_BIOS, which is legitimately zero-filled (no real/HLE BIOS
-	// content yet) rather than corrupting emulator or guest state through a
-	// mismatched DS handler.
+	// against GBA state.
 	if (gameInfo.isGBA)
-		NDS_ARM7.swi_tab = NULL;
+		NDS_ARM7.swi_tab = ARM7GBA_swi_tab;
 
 	//ARM9 BIOS IRQ HANDLER
 	if(CommonSettings.UseExtBIOS == true)
@@ -2223,6 +2218,17 @@ void NDS_Reset()
 		NDS_ARM7.R13_svc = 0x03007FE0;
 		NDS_ARM7.R13_irq = 0x03007FA0;
 		NDS_ARM7.R13_usr = 0x03007F00;
+
+		// roadmap #20 (GBA compat), §12.3 step 6: real hardware's BIOS
+		// writes a non-zero "normal cart boot" flag to this IWRAM-mirror
+		// byte (0x03007FFA) during cold boot; bios_gba.cpp's SoftReset
+		// SWI re-reads it to decide whether to jump back to the cartridge
+		// (0x08000000) or to EWRAM (0x02000000, multiboot). We skip real
+		// BIOS cold-boot execution entirely (direct boot), so nothing else
+		// would ever set this -- seed it here so a game's own SoftReset
+		// call (e.g. from a "continue"/game-over screen) resolves back to
+		// the cartridge instead of jumping into empty EWRAM.
+		MMU.GBA_IWRAM[0x7FFA] = 1;
 	}
 	else
 	{
