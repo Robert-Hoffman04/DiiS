@@ -806,54 +806,81 @@ worked around, since it's a real finding, not a harness bug.
   RockWrestler) never got past a permanently-zero slot-2 region under
   melonDS at all.
 
-### What's blocked
+### What's blocked -- root-caused to a melonDS bug, not ours
 
 With EXMEMCNT fixed, armwrestler boots, runs to completion, and reaches its
-terminal spin-loop in well under a second (confirmed via the GDB stub's `g`
-register-read command: PC parked on a two-instruction self-loop, same
-registers across repeated samples seconds apart) -- but roughly every other
-32-bit word of the slot-2 result block still reads back as the pristine
-"never written" fill (`CartRAMExpansion::Reset()`'s `memset(RAM, 0xFF,
-...)`) instead of what the ROM's own driver wrote, **reproducibly, byte-for-
-byte identical across independent runs** (ruled out as a race).
+terminal spin-loop in well under a second -- but roughly every other 32-bit
+word of the slot-2 result block reads back as the pristine "never written"
+fill (`CartRAMExpansion::Reset()`'s `memset(RAM, 0xFF, ...)`) instead of what
+the ROM's own driver wrote, **reproducibly, byte-for-byte identical across
+independent runs**. Three plausible causes on *our* side were tested and
+falsified in turn:
 
-The pattern is internally consistent with *isolated* stores (one `ldr rX,=ADDR
-/ str` per call, seconds apart -- `AW_RecordResult`'s counters) landing
-correctly, while the initial 512-byte *clear loop*'s tight, back-to-back
-`str r2,[r0],#4` sequence mostly doesn't: e.g. the ARM-fail counter
-(`+0x08`) never leaves its pristine fill at all (consistent with the clear
-loop failing to zero it, and this ROM having zero real ARM failures so
-`AW_RecordResult`'s own conditional write to that address never fires
-either) as tracked bit-for-bit precisely across two rebuilds where the only
-change was inserting `nop`s into the clear loop (which shifted a *stray
-pointer-shaped value* landing one word early -- see below -- by exactly the
-same few bytes the `nop`s shifted the ROM's code, confirming that value
-really is a live code/rodata address, not noise). Adding `nop`s between the
-clear loop's stores did **not** fix the underlying drop, ruling out a pure
-back-to-back-issue-rate theory as the whole story.
+* **melonDS's own write path is unconditional and address-independent** --
+  read directly: `NDS::ARM9Write32`'s slot-2 case splits a 32-bit store into
+  two `GBACartSlot::ROMWrite()` calls (`addr`, `addr+2`), which is a bare
+  pass-through to `CartRAMExpansion::ROMWrite()` -- no masking, no timing
+  gate, nothing that could plausibly drop specific words.
+* **EXMEMCNT flipping back mid-run** (ARM7 silently reclaiming the bus) --
+  read directly via the GDB stub after the ROM had already parked on its
+  spin-loop: `0x0000`, bit 7 still clear. Stable throughout, not the cause.
+* **CP15 write-buffer/cacheability (c2/c3) theory** -- tested by adding an
+  explicit `mcr p15,0,r0,c7,c10,4` (drain write buffer) immediately before
+  the sentinel write and rebuilding. Made **zero difference** to the
+  corruption pattern; only a stray pointer-shaped value in the dump shifted
+  by exactly the instruction's byte size (the same signature an earlier
+  `nop`-spacing experiment had already produced), confirming that value is a
+  live code/rodata address, not evidence of buffering. Falsified.
+* **melonDS's own memory/GDB-stub path itself** -- isolated by writing a
+  128-word sequential pattern directly into the same slot-2 region via the
+  GDB stub's `M` command (bypassing the ARM9 CPU and our ROM entirely), then
+  reading it back the same way: **0/128 mismatches**. The storage and
+  read/write plumbing are provably correct; the bug only appears when the
+  *CPU* is the one issuing the writes.
 
-The leading hypothesis, not yet confirmed: our from-scratch `ds_arm9_crt0.S`
-(written for §17 to route around a devkitPro/libnds crt0 mismatch, see
-`tools/armwrestler/PROVENANCE.md`) sets the CP15 control register to
-`0x00042078` -- global D-cache and I-cache both off -- but never touches the
-separate CP15 write-buffer/cacheability-by-region registers (c2/c3), which
-`DirectBoot` appears to pre-seed with firmware-realistic defaults for all
-eight MPU regions (visible in melonDS's own boot log: `PU: region N = ...`).
-On ARM946E-S, write buffering is independent of the cache-enable bits;
-if `DirectBoot` leaves the Slot-2 region (`PU: region 3 = 08000035`, base
-`0x08000000`) marked bufferable, a real ARM9 core's write buffer could
-legitimately merge or reorder-relative-to-bus a tight run of stores to nearby
-addresses the way we're seeing -- something desmumewii's `ExpMemory` addon,
-which has no write-buffer model at all, simply cannot reproduce. Not
-confirmed by directly reading back c2/c3 yet; the fix, if this is right, is
-either configuring the region as non-bufferable in the crt0 or issuing an
-explicit drain between the clear loop and the first read-back.
+That last result pointed the investigation at CPU-instruction execution
+itself, so it was captured directly rather than inferred further: extended
+the GDB client with breakpoint (`Z0`/`z0`) and single-step (`s`) support, set
+a breakpoint at `aw_clear_loop`'s first instruction (address read from the
+build's linked ELF, `arm-none-eabi-nm out/a9.out`), and single-stepped
+through the loop one instruction at a time, reading `r0`/PC and re-reading
+the just-written address after every step. (A temporary go-flag spin-wait at
+the top of `main`, released by a GDB memory write once attached, was used to
+synchronize with zero race against Qt/addon startup timing -- removed again
+once the trace was captured; not part of the committed ROM.) The trace is
+unambiguous:
 
-**Until this is resolved, the melonDS column below is not filled in with
-numbers** -- reporting counts from a demonstrably-inconsistent readback
-would be worse than leaving it blank. The automation path (CLI flag, GDB
-polling, EXMEMCNT fix) is solid and reusable for all three ROMs the moment
-the write-consistency issue is understood.
+```
+before step 0: PC=0x20049fc r0=0x9000000   (str)
+before step 1: PC=0x2004a00 r0=0x9000004   (cmp)      -- step 0 executed correctly
+before step 2: PC=0x2004a04 r0=0x9000004   (blt)      -- step 1 executed correctly
+before step 3: PC=0x20049fc r0=0x9000004   (str)      -- step 2 executed correctly (branch taken)
+before step 4: PC=0x20049fc r0=0x9000004   (str, again) -- step 3: PC/r0 UNCHANGED. No-op.
+before step 5: PC=0x2004a00 r0=0x9000008   (cmp)      -- step 4 executed correctly this time
+...
+before step 9: PC=0x2004a00 r0=0x900000c   (cmp, again) -- step 8: also a no-op
+```
+
+Roughly every third or fourth `s` command returns a normal stop-reply
+(`S05`) while leaving PC and every register completely unchanged -- the stub
+reports a step happened when it didn't. This isn't tied to a particular
+instruction (`str`, `cmp`, and `blt` have all been caught no-opping) and it
+isn't every-other -- the gap between dropped steps varies (3, then 4 in the
+trace above), which matches the *non-uniform* word-loss pattern in the
+continuous-execution dump far better than a clean alternating theory would.
+**This is a melonDS bug** -- most likely a race between the GDB stub's
+step/continue signaling and its emulation-thread scheduler, given the
+symptom (an acknowledged step that doesn't advance the target at all) rather
+than anything a CP15/cache/write-buffer model would produce. It is not
+something in our ROM, our EXMEMCNT fix, or our crt0 to work around.
+
+**Until melonDS fixes this (or someone chases the threading race further
+upstream), the melonDS column below is not filled in with numbers** --
+reporting counts from a target that demonstrably drops instruction effects
+mid-run would be worse than leaving it blank. The automation path (CLI flag,
+GDB polling, breakpoint/single-step support, EXMEMCNT fix) is solid and
+fully reusable for all three ROMs the moment melonDS's side is fixed; this
+finding is also independently worth reporting upstream.
 
 ---
 
@@ -1524,7 +1551,7 @@ The default architecture remains direct emission plus chaining.
 | 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
-| 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | in progress: §9 table filled in for DeSmuME interpreter/JIT (all 3 ROMs, byte-identical JIT results); melonDS column blocked on a write-consistency issue under melonDS's Slot-2 bus model, see §8.5 -- CLI hook + GDB-stub polling harness proven working once that's resolved |
+| 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | in progress: §9 table filled in for DeSmuME interpreter/JIT (all 3 ROMs, byte-identical JIT results); melonDS column blocked -- root-caused (§8.5) to a melonDS bug (its GDB stub/scheduler intermittently no-ops an acknowledged single-step/instruction, roughly every 3-4 steps, confirmed by direct single-step trace after ruling out our own write path, EXMEMCNT, and CP15 write-buffering), not anything in our ROMs or harness; automation path (CLI hook, GDB polling, breakpoint/single-step support) is proven and reusable the moment melonDS's side is fixed |
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
 | 19 | RockWrestler automated DS conformance gate                       | done: headless via slot-2 I/O (§8.4), no crt0 workaround needed (upstream is `-nostartfiles`) -- interpreter baseline 10/23 fail (SMLALxy, LDM/STM base-in-list, IPCSYNC/IPCFIFO/IPCFIFO IRQ, DIV 32/32 + 64/32 sign-extension, TCM/CP15 readback -- all pre-existing interpreter gaps, characterized in §8.4); `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures |
