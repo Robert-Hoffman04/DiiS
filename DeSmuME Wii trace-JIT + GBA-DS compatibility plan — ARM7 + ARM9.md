@@ -453,6 +453,51 @@ Do not sacrifice memory-map correctness for benchmark gains.
   P14: correctness-clean, frame-neutral, below benchmark resolution on this
   ARM9-bound workload.
 
+**Progress (P16 -- ARM9 inline loads, the first inline memory on the ARM9):**
+The ARM9 had *no* inline memory path -- every `LDR`/`LDRB`/`LDRH`/`LDRSB`/
+`LDRSH`/`LDM`/`POP` went through the `slowRead` C call, the same call the
+interpreter makes, so the ARM9 JIT barely beat the interpreter on the
+memory-dense SM64DS boot (~+10 %). `pageDescBase` was left 0 on the ARM9
+because the CP15-relocatable DTCM window overlays the main-RAM range and the
+flat descriptor table can't track it.
+
+- **Tried, reverted:** reusing the ARM7 `emitPageResolve` path (descriptor
+  table for pages `0x20..0x2F` + a runtime DTCM-window guard that *bails to
+  the interpreter*). 0-DIFF (93 M ARM9 insns) but **-3.4 % ARM9 JIT / -8.2 %
+  full JIT**. Two causes: (1) the DTCM bail -- the ARM9 stack lives in DTCM,
+  so every stack access round-tripped; (2) `emitPageResolve`'s bail model
+  round-trips *every* non-RAM access (I/O, VRAM) too, which the old slow path
+  handled with a plain C call inside JIT context. Per-access runtime guards
+  already lost on this target for the ARM7 (§6 Tier-1); on the CPU-bound ARM9
+  the heavier guard + the round-trips lost badly.
+- **Landed (`f1e8d74` single, `f092a2c` block):** a bespoke ARM9 two-region
+  guard (`emitArm9RegionGuard` / `emitArm9Load` / `emitArm9BlockLoad`):
+  main RAM (`(EA>>24)&0xF == 2` -> inline `lwbrx` from `MMU.MAIN_MEM`) **and**
+  DTCM (`(EA>>14) == DTCMRegion>>14` -> inline `lwbrx` from `MMU.ARM9_DTCM`)
+  are *both* loaded inline; every other region falls through to the
+  `slowRead` C call -- **not** an interpreter round-trip, so it matches the
+  old slow-path cost exactly and nothing regresses there. `DTCMRegion` is
+  baked at emit time from the live `MMU.DTCMRegion` (every path that moves it
+  -- CP15 write, savestate load, reset -- already flushes `jitCacheArm9`);
+  a window base with bits `0..13` set can never match DeSmuME's own
+  `== DTCMRegion` test, so the whole DTCM branch is then dropped at compile
+  time. Unconditional pre-guard `flushDirtyRegisters()` + post-op
+  `invalidateRegCache()` (same shape as the predicated memory ops): coherent
+  guest memory on both runtime paths. Wired into ARM + THUMB single loads and
+  ARM `LDM` / THUMB `POP` / `LDMIA` (non-pc). Stores unchanged (journal +
+  multi-page SMC guard, same as ARM7 `STM`).
+- **Validated:** armwrestler ARM9 `ARM 0/67, THUMB 1/10` -- exact baseline,
+  0 new failures (the suite that caught the last two ARM9 load bugs);
+  differential soak 705 M ARM9 insns, 0 mismatches / 0 CHAIN-DIFF / 0 CANARY
+  / 0 OVERRUN.
+- **Measured:** SM64DS, vs pre-P16 (`87745b5`): ARM9 JIT **14.56 -> 14.70**
+  (+1.0 %), full JIT (GXMerge) **37.19 -> 38.01** (+2.2 %), interpreter 13.16
+  unchanged. Single loads carried most of it (37.19 -> 37.89); block loads
+  added 37.89 -> 38.01. Modest -- `exec%` is ~98 % and the win is fewer host
+  instructions per access, not a round-trip removal -- but it is the first
+  ARM9 memory path that is a net positive, and the reverted approaches were
+  net negative.
+
 ---
 
 ## 7. ARM7 JIT
@@ -2146,19 +2191,29 @@ Optimize:
 5. trampoline overhead
 6. memory fast paths
 
-**Current position (`47fef86`): item 1, largely done.** ARM9 telemetry (§5)
-showed the ~1.9-block chain ceiling was the emitter refusing predicated
+**Current position (`f092a2c`): items 1 + 6 both advanced.** ARM9 telemetry
+(§5) showed the ~1.9-block chain ceiling was the emitter refusing predicated
 (`cond != AL`) memory ops and `BXcc lr`. Now compiled (`emitEvalCond` + BEQ
 guard over the exit, unconditional pre-guard flush, block continues):
 predicated `LDRcc`/`STRcc`/`LDRBcc`/`STRBcc`/`LDRHcc`/`STRHcc` and
 `LDMcc`/`STMcc`/`POPcc`/`PUSHcc` (`b81fa91`), plus `BXcc lr` (`47fef86`, the
 fixed retry of the reverted `c375880`). Cumulative: trampoline round-trips
 `edge` **64 % → ~14 %**, `ins/entry` **~17 → 28**; benchmark ARM9 JIT
-14.42 → 14.56, full JIT 36.17 → 37.19. What remains at item 1 is the hard tail
-(`MCR p15`, `MSR cpsr`) and the excluded sub-forms (pc-relative literal,
-`LDMcc{pc}`, `BXcc rN`), with diminishing returns — so **measure again before
-deciding whether to push further here or move to GPR residency (item 4) /
-dispatch-table work.**
+14.42 → 14.56, full JIT 36.17 → 37.19.
+
+Then **item 6 for the ARM9 for the first time** (§6 P16): a bespoke
+two-region inline load guard -- main RAM *and* the relocatable DTCM window
+both loaded inline, `slowRead` C call (no round-trip) for everything else.
+Two earlier approaches were net-negative (see §6 P16); this one is
++1.0 % ARM9 JIT / +2.2 % full JIT (37.19 → **38.01**), armwrestler-clean,
+705 M-insn soak clean.
+
+What remains at item 1 is the hard tail (`MCR p15`, `MSR cpsr`) and the
+excluded sub-forms (pc-relative literal, `LDMcc{pc}`, `BXcc rN`); at item 6,
+ARM9 inline *stores* (need the differential journal + multi-page SMC guard,
+same block as ARM7 `STM`). All with diminishing returns — so **measure again
+before deciding whether to push further here or move to GPR residency
+(item 4) / dispatch-table work.**
 
 ### Then
 
@@ -2195,7 +2250,7 @@ The default architecture remains direct emission plus chaining.
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler + arm7wrestler both clear, §8.2/§8.3) |
 | 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
-| 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
+| 13 | Inline memory fast paths                                         | ARM7 Tier-1 literal loads + P14/P15 descriptor loads; ARM9 P16 two-region loads (main RAM + DTCM inline, +2.2% full JIT); ARM7 general/WRAM tier + all inline stores deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | in progress: §9 table filled in for DeSmuME interpreter/JIT (all 3 ROMs, byte-identical JIT results); melonDS column blocked -- root-caused (§8.5) to a melonDS bug (its GDB stub/scheduler intermittently no-ops an acknowledged single-step/instruction, roughly every 3-4 steps, confirmed by direct single-step trace after ruling out our own write path, EXMEMCNT, and CP15 write-buffering), not anything in our ROMs or harness; automation path (CLI hook, GDB polling, breakpoint/single-step support) is proven and reusable the moment melonDS's side is fixed |
