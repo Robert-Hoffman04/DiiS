@@ -712,11 +712,53 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	return true;
 }
 
+// P16: ARM9 inline block load. See jit_trace.h. Low EA in PPC_R12.
+void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
+{
+	u32*& p = emitPtr;
+
+	flushDirtyRegisters();
+	flushDirtyFlags();
+	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
+
+	u32* fast[2];
+	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast);
+
+	// ---- slow: per-word slowRead C loop ----
+	emitMemPrologue();
+	for (u32 k = 0; k < n; k++) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
+		emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+		*p++ = PPC_STW(PPC_R10, 14, regs[k] * 4);
+	}
+	emitMemEpilogue();
+	u32* toEnd = p++;                                              // B over the fast block
+
+	// ---- fast: n sequential inline lwbrx ----
+	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
+	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // r10 = host addr of the low word
+	for (u32 k = 0; k < n; k++) {
+		*p++ = PPC_LWBRX(PPC_R11, 0, PPC_R10);
+		*p++ = PPC_STW(PPC_R11, 14, regs[k] * 4);
+		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
+	}
+
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);               // restore low EA (THUMB LDMIA reads it back)
+	invalidateRegCache();
+}
+
 // P15: inline sequential block load (LDM / POP / LDMIA). See jit_trace.h.
 bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lockedMask)
 {
-	if (!cpu.pageDescBase) return false;
 	(void)eaReg;                                  // contract: low EA is in PPC_R12
+	if (cpu.arm9DtcmBase) {                        // P16 ARM9 two-region path
+		(void)lockedMask;
+		emitArm9BlockLoad(regs, n);
+		return true;
+	}
+	if (!cpu.pageDescBase) return false;
 	u32*& p = emitPtr;
 
 	emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29);   // LDM: no unaligned rotate

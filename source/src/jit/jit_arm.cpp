@@ -1017,7 +1017,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// prologue, no per-register C call, register cache intact. STM keeps the
 	// slow path (SMC guard + differential-journal plumbing per word is deferred);
 	// LDM{...,pc} keeps the slow path (block-terminator interworking).
-	if (!predicated && ctx.cpu.pageDescBase && L && !pcInList) {
+	if (!predicated && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && L && !pcInList) {
 		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
 		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
 		if (W) {                                        // WB value from hRn, before any spill

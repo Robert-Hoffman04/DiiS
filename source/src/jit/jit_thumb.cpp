@@ -472,7 +472,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// P15: inline POP without pc. One page guard, sequential lwbrx, register
 		// cache intact. PUSH keeps the slow path (store); POP{...,pc} keeps it
 		// (block-terminator interworking).
-		if (ctx.cpu.pageDescBase && isPop && !Rbit) {
+		if ((ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && isPop && !Rbit) {
 			const u8 hSpP = ctx.readReg(13, lockedMask);
 			*emitPtr++ = PPC_STW(hSpP, 1, 104);                       // stash raw old SP
 			*emitPtr++ = PPC_RLWINM(PPC_R12, hSpP, 0, 0, 29);         // word-aligned low addr

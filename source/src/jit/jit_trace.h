@@ -219,6 +219,15 @@ struct JitTraceCtx {
 	// not end the block. Clobbers r10, r11, r12.
 	void emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn);
 
+	// ARM9 inline block load (LDM / POP / LDMIA, non-pc). Low guest address of
+	// the contiguous word run in PPC_R12; regs the ascending destination list
+	// (0..14), n its length. Region guard covering the whole run -> n sequential
+	// inline lwbrx, or the per-word slowRead C loop (no round-trip); results ->
+	// gpr slots, register cache invalidated. The caller still owns any base
+	// writeback (stash + post writeReg), exactly as the P15 path. Clobbers
+	// r10, r11; the low EA is restored to r12 on return.
+	void emitArm9BlockLoad(const u8* regs, u32 n);
+
 	// ---- P14 inline RAM load via cached page descriptors ------------------
 	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a
 	// page-window guard (out of window -> interpreter bail at currentPC), then
