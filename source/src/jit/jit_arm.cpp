@@ -1219,13 +1219,33 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 }
 
 // ---------------------------------------------------------- BX / BLX reg (B6)
-// cond 0001 0010 1111 1111 1111 00L1 Rm   (L: 0 = BX, 1 = BLX). Block terminator
-// with ARMv5 bit0 interworking -- identical shape to LDM{...,pc} (B4): bit0 of Rm
-// selects the resume ISA. BLX also writes R14 = the ARM return address first.
-void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
+// cond XXXX 0001 0010 1111 1111 1111 00L1 Rm   (L: 0 = BX, 1 = BLX). Block
+// terminator with ARMv5 bit0 interworking -- identical shape to LDM{...,pc}
+// (B4): bit0 of Rm selects the resume ISA. BLX also writes R14 = the ARM return
+// address first.
+//
+// Predicated (cond != AL): `BXcc lr` -- the conditional return, §5's single
+// hottest refused opcode -- compiles on ARM9 as taken-dynamic-exit + cond-false
+// fall-through (the block no longer terminates at a not-taken BXcc). The taken
+// path is the ordinary dynamic dispatch: lr's target block is nearly always
+// resident, so the guarded hash hits and the chain continues with no trampoline
+// round-trip. The dispatch gates this to isBlx == false && Rm == 14 && v5;
+// other predicated BX/BLX still end the trace.
+//
+// The state flush is UNCONDITIONAL and sits *before* the predication guard, so
+// guest memory is coherent on both the taken exit and the cond-false path, and
+// invalidateRegCache() on the fall-through makes later instructions reload from
+// it. The reverted first attempt (c375880 -> 5d00119) put the flush inside the
+// taken region: flushDirtyRegisters() cleared the compile-time dirty bits while
+// its stores were branched over on cond-false, so a guest reg written before
+// the BXcc and spilled later lost its value -> SM64DS free-run hang. Same fix
+// as the predicated LDR/STR family (b81fa91).
+void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 {
 	const u8 rm = op & 0xF;
 	if (rm == 15) { ctx.endBlock = true; return; }          // BX pc: unpredictable
+
+	const bool predicated = (cond != COND_AL);
 
 	ctx.ensureArena();
 	u32*& p = ctx.emitPtr;
@@ -1234,19 +1254,27 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	const u8 hRm = ctx.readReg(rm, lockedMask);
 	*p++ = PPC_OR(PPC_R12, hRm, hRm);                        // capture target pre-flush
 
-	if (isBlx) {
+	if (isBlx && !predicated) {
 		const u8 hLR = ctx.writeReg(14, true, lockedMask);
 		emitLoadImm32(p, hLR, ctx.currentPC + 4);            // OP_BLX_REG: R14 = next_instruction
 	}
 
-	// Flush every dirty guest reg/flag NOW, while the two exit paths below still
-	// share one code position: flushDirtyRegisters() clears the dirty bits, so
-	// the per-path emitDynamicExit() calls won't each need to re-flush (only the
-	// first would, silently dropping the writeback on the other path). Preceding
-	// in-block instructions (e.g. `AND R0,R0,#x` before `BX lr`) leave dirty regs
-	// that MUST be persisted here.
+	// Flush every dirty guest reg/flag NOW -- unconditionally, before the
+	// predication guard. flushDirtyRegisters() clears the dirty bits, so the
+	// per-path emitDynamicExit() calls won't re-flush; the preceding in-block
+	// instructions (e.g. `AND R0,R0,#x` before `BX lr`) MUST be persisted here,
+	// and a predicated BXcc's cond-false fall-through relies on this store
+	// having executed (see the header note re: c375880).
 	ctx.flushDirtyFlags();
 	ctx.flushDirtyRegisters();
+
+	u32* guard = nullptr;
+	if (predicated) {
+		(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
+		ctx.emitEvalCond(cond);                              // r11 = cond ? 1 : 0 (r12 target survives)
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;                                         // BEQ over the taken exit
+	}
 
 	const u32 term = ctx.cpu.cyclesForArm(op);
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);          // R11 = bit0 (mode select)
@@ -1266,6 +1294,12 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);           // & ~3 (CPSR.T already 0)
 	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+
+	if (predicated) {
+		*guard = PPC_BEQ((u32)((p - guard) * 4));            // cond-false: keep compiling
+		ctx.invalidateRegCache();                            // fall-through reloads from memory
+		return;
+	}
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;
@@ -1750,8 +1784,12 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	}
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
 		const bool isBlx = (op & 0x20u) != 0;
-		if (cond != COND_AL || (isBlx && !v5)) { ctx.endBlock = true; return; }  // BLX: ARMv5 only
-		emitBranchExchange(ctx, op, isBlx);
+		if (isBlx && !v5) { ctx.endBlock = true; return; }   // BLX reg: ARMv5 only
+		// Predicated: only `BXcc lr` on ARM9 (the conditional return, §5's
+		// hottest refused opcode) -- taken-exit + cond-false fall-through.
+		// Other predicated BX (polymorphic Rm) and all predicated BLX bail.
+		if (cond != COND_AL && (isBlx || !v5 || (op & 0xF) != 14)) { ctx.endBlock = true; return; }
+		emitBranchExchange(ctx, op, isBlx, cond);
 		return;
 	}
 	if ((op & 0x0FB00FF0u) == 0x01000090u) {              // SWP / SWPB
