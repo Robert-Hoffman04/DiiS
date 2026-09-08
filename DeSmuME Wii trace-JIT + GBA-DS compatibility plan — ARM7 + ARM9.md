@@ -261,9 +261,29 @@ path). SM64DS castle-courtyard:
 
 ARM data-processing already compiles predicated (`emitEvalCond` + conditional
 skip, `jit_arm.cpp`); §16 did predicated `Bcc`/`BLcc`. **Next lever: extend
-that pattern to loads / stores / `LDM`/`STM` / `BX`.** Removes the
-per-instruction interpreter round-trips *and* lengthens chains (the block no
-longer terminates at every predicated memory op).
+that pattern to the predicated non-branch memory ops** — `STRcc`/`LDRcc`/
+`LDRBcc`/`STRHcc`, `POPcc`/`PUSHcc` (`LDMcc`/`STMcc`). The block continues past
+them with no exit at all (the true `Bcc`-not-taken-style win): removes the
+per-instruction interpreter round-trip *and* lengthens chains.
+
+**`BXcc` tried and reverted (`c375880` → `5d00119`).** Compiling predicated
+`BX` as taken-dynamic-exit + fall-through was differential-clean (1.6 B ARM9
+insns) and the telemetry looked spectacular — chains **doubled** (blk0/entry
+1.8 → 4.0, ins/entry 17 → 28), round-trips `edge` 64 % → 0 % — but SM64DS
+**hung** in free-run (frame rate fell, `compiles` froze at ~1100: looping on a
+small compiled block set), a hang the differential harness's per-block rollback
+masks. Root cause: the taken path's `emitDynamicExit()` calls the *clearing*
+`flushDirtyRegisters()`, but the emitted stores are branched over on the
+cond-false path, so a guest reg written before the `BXcc` and spilled later in
+the block loses its value. `emitBranch()`'s predicated path sidesteps this by
+inlining a *non-clearing* `emitDirtyRegisterFlush()` and never calling
+`emitDynamicExit`. Any predicated op whose body runs a real state flush must
+use the `bailPreservingDirty()` save/restore idiom (`jit_trace.cpp`).
+Separately, `BXcc lr` is a conditional *return* — its taken path is a guarded
+dynamic-dispatch exit (polymorphic return address, no self-patch), no cheaper
+than the interpreter round-trip it replaces — so the non-branch ops are the
+better target regardless. Predicated `BX` can be revisited with the dirty-fix
+once the memory ops land.
 
 At a ~1.9-block chain a fixed-mapping trampoline's unconditional 15-register
 load/store still loses to the lazy allocator — **GPR residency stays deferred
@@ -2081,10 +2101,12 @@ Optimize:
 
 **Current position (`8f014e3`): item 1.** ARM9 telemetry (§5) shows the ~1.9-
 block chain ceiling is the emitter refusing predicated (`cond != AL`) memory
-ops — `BXcc`, `LDRcc`/`STRcc`/`STRHcc`, `LDMcc`/`STMcc` — so blocks terminate
-and the next instruction is interpreted one at a time. Extending the existing
-predicated-data-proc codegen (`emitEvalCond` + conditional skip) to those forms
-is a block-length win and comes before any dispatch-table work (item 3).
+ops — `LDRcc`/`STRcc`/`STRHcc`, `LDMcc`/`STMcc` (`POPcc`/`PUSHcc`) — so blocks
+terminate and the next instruction is interpreted one at a time. Extending the
+existing predicated-data-proc codegen (`emitEvalCond` + conditional skip) to
+those forms is a block-length win and comes before any dispatch-table work
+(item 3). Predicated `BXcc` was tried first and reverted (§5) — a conditional
+return's taken path is a dynamic exit, not a block continuation.
 
 ### Then
 
