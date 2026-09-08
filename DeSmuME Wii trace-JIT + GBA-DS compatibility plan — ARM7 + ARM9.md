@@ -1790,6 +1790,13 @@ predicated-branch traffic; the sanctioned soak/bench ROM):
   (60.5 % real-time). The default JIT build now gets the predicated-branch win
   automatically — no build knob. Recorded as
   `results/20260908T061701Z_94df464-dirty/`.
+- **Post-flag-removal differential soak** (`53d82bd`,
+  `tools/benchmark/diff-soak.sh`, `JIT_DIFFERENTIAL_TESTING`, SM64DS ~210 s):
+  `diff9` **16.8 M ARM9 blocks / 503.7 M instructions, 0 mismatches / 0
+  logged**, selftest + journal-selftest PASS, 0 CANARY / 0 ARENA-OVERRUN / 0
+  CHAIN-DIFF / 0 bad-resume, `predBcc a9=158` compiles exercised. Removing the
+  `#if` wrapper produces byte-identical codegen to the previously
+  1.3 B-instruction-validated flagged build, and this soak reconfirms it.
 
 Status:
 
