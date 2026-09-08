@@ -1,0 +1,71 @@
+{
+  "meta": {
+    "timestamp": "20260908T061701Z",
+    "git": "94df464-dirty",
+    "host": "11th Gen Intel(R) Core(TM) i5-1145G7 @ 2.60GHz",
+    "kernel": "Linux 6.8.0-139-generic",
+    "dolphin": "Dolphin 2606a",
+    "duration_default_s": 90,
+    "modes": "jit9off jit9on jitfull"
+  },
+  "target_hz": 59.8261,
+  "scenes": {
+    "sm64": {
+      "label": "Super Mario 64 DS (castle courtyard)",
+      "window": "300-1200",
+      "modes": {
+        "jit9off": {
+          "core": 2,
+          "gxmerge": 0,
+          "eff_fps": 13.159,
+          "pct_realtime": 21.99,
+          "slowdown": 4.547,
+          "exec_pct": 98.2,
+          "draw_pct": 1.7,
+          "fps_min": 12.94,
+          "fps_max": 13.31,
+          "fps_cv_pct": 1.2,
+          "blocks_kept": 16,
+          "blocks_total": 25,
+          "frame_lo": 300,
+          "frame_hi": 1200,
+          "block_frames": 60
+        },
+        "jit9on": {
+          "core": 2,
+          "gxmerge": 0,
+          "eff_fps": 14.429,
+          "pct_realtime": 24.12,
+          "slowdown": 4.146,
+          "exec_pct": 97.9,
+          "draw_pct": 1.9,
+          "fps_min": 14.21,
+          "fps_max": 14.58,
+          "fps_cv_pct": 1.1,
+          "blocks_kept": 17,
+          "blocks_total": 29,
+          "frame_lo": 300,
+          "frame_hi": 1200,
+          "block_frames": 60
+        },
+        "jitfull": {
+          "core": 1,
+          "gxmerge": 1,
+          "eff_fps": 36.174,
+          "pct_realtime": 60.46,
+          "slowdown": 1.654,
+          "exec_pct": 93.3,
+          "draw_pct": 6.6,
+          "fps_min": 35.42,
+          "fps_max": 36.68,
+          "fps_cv_pct": 1.4,
+          "blocks_kept": 16,
+          "blocks_total": 66,
+          "frame_lo": 300,
+          "frame_hi": 1200,
+          "block_frames": 60
+        }
+      }
+    }
+  }
+}

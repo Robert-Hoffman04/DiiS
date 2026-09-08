@@ -1766,6 +1766,14 @@ predicated-branch traffic; the sanctioned soak/bench ROM):
   bailing **11.20** (a regression, cv 4.1 %) → ARM9 JIT with predicated `Bcc`
   compiled **14.48** (cv 1.1 %). Compiling predicated branches is what turns
   the ARM9 JIT from a −16 % loss into a +9 % win on this scene.
+- **Post-flag-removal re-measure** (`94df464`, `benchmark.sh --scenes sm64
+  --modes "jit9off jit9on jitfull"`, frames 300-1200, cv ≤ 1.4 %): ARM9
+  interpreter **13.16** → ARM9 JIT **14.43** eff.fps (**+9.6 %**, was −16 %
+  with the flag off / predicated branches bailing → +31 % swing on the ARM9
+  JIT number vs the prior run); full JIT over GXMerge **36.17** eff.fps
+  (60.5 % real-time). The default JIT build now gets the predicated-branch win
+  automatically — no build knob. Recorded as
+  `results/20260908T061701Z_94df464-dirty/`.
 
 Status:
 

@@ -43,7 +43,8 @@ REGRESSION_REL = 0.03   # >3% relative eff_fps drop vs baseline -> flag
 def parse_capture(path):
     core = gxmerge = None
     rows = []
-    with open(path) as f:
+    # a SIGKILL mid-write can leave a stray non-UTF8 byte in the tail line
+    with open(path, errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
