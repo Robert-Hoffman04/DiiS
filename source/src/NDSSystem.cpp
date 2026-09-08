@@ -2215,6 +2215,12 @@ void NDS_Reset()
 void NDS_DebugForceGBAMode(bool enable)
 {
 	gameInfo.isGBA = enable;
+	// roadmap #20 (GBA compat), §12.3 step 4: MMU.isGBA is a synchronized
+	// mirror of gameInfo.isGBA -- MMU.h can't see GameInfo (circular
+	// include), so its own memory dispatchers consult this instead. See
+	// MMU.isGBA's comment in MMU.h. Any future code that sets
+	// gameInfo.isGBA from real ROMTYPE_GBA detection must set this too.
+	MMU.isGBA = enable;
 }
 
 static std::string MakeInputDisplayString(u16 pad, const std::string* Buttons, int count) {

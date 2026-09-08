@@ -312,6 +312,21 @@ struct MMU_struct
 	u8 GBA_VRAM[0x18000];     // 96 KB,  0x06000000
 	u8 GBA_OAM[0x400];        // 1 KB,   0x07000000
 
+	// roadmap #20 (GBA compat), §12.3 step 4: a synchronized mirror of
+	// gameInfo.isGBA (NDSSystem.h), NOT a second source of truth.
+	// gameInfo.isGBA stays authoritative (and survives NDS_Reset() -- see
+	// its own comment for why); this exists purely because NDSSystem.h
+	// includes MMU.h, so MMU.h can't include NDSSystem.h back to see
+	// GameInfo -- and the FORCEINLINE dispatchers just below (_MMU_read/
+	// write08/16/32) need this flag while already dereferencing MMU.*, so
+	// mirroring it here needs no new header dependency at all. Kept in
+	// sync by NDS_DebugForceGBAMode() (NDSSystem.cpp); any future code that
+	// sets gameInfo.isGBA from real ROMTYPE_GBA detection must set this
+	// too. Zeroed by MMU_Init()'s whole-struct memset; deliberately NOT
+	// touched by MMU_Reset()'s per-buffer memsets, so it persists across a
+	// soft reset exactly like gameInfo.isGBA does.
+	bool isGBA;
+
 	// VRAM mapping
 	u8 VRAM_MAP[4][32];
 	u32 LCD_VRAM_ADDR[10];
@@ -647,6 +662,17 @@ u8  FASTCALL _MMU_ARM7_read08(u32 adr);
 u16 FASTCALL _MMU_ARM7_read16(u32 adr);
 u32 FASTCALL _MMU_ARM7_read32(u32 adr);
 
+// roadmap #20 (GBA compat), §12.3 step 4: the GBA memory-map backend --
+// a parallel function set to _MMU_ARM7_* above (per §7.1's precedent of
+// ARM9/ARM7 as wholly separate hand-written functions), reached only when
+// MMU.isGBA is set. See MMU.cpp for the address-decode/mirroring logic.
+void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val);
+void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val);
+void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val);
+u8  FASTCALL _MMU_ARM7GBA_read08(u32 adr);
+u16 FASTCALL _MMU_ARM7GBA_read16(u32 adr);
+u32 FASTCALL _MMU_ARM7GBA_read32(u32 adr);
+
 extern u32 partie;
 
 extern u32 _MMU_MAIN_MEM_MASK;
@@ -664,6 +690,13 @@ inline void SetupMMU() {
 
 FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: must be the first check --
+	// GBA EWRAM/IWRAM alias the DS MAIN_MEM/ARM7_ERAM/SWIRAM address ranges
+	// below, so this has to preempt them, not follow them. See MMU.isGBA's
+	// comment. Never affects ARM9 (isGBA-mode ARM9 never executes per
+	// §12.3 step 2, but any tool/debugger/Lua code still probing ARM9 here
+	// must keep working exactly as before regardless).
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read08(addr);
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
@@ -694,6 +727,8 @@ FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u3
 
 FORCEINLINE u16 _MMU_read16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read16(addr);
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
@@ -737,6 +772,8 @@ dunno:
 
 FORCEINLINE u32 _MMU_read32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read32(addr);
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
@@ -801,6 +838,8 @@ dunno:
 
 FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u8 val)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write08(addr, val); return; }
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 1);
 #endif
@@ -846,6 +885,8 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 
 FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u16 val)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write16(addr, val); return; }
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 2);
 #endif
@@ -886,6 +927,8 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 
 FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u32 addr, u32 val)
 {
+	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
+	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write32(addr, val); return; }
 #if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 4);
 #endif

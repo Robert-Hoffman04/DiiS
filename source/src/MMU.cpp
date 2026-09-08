@@ -4323,9 +4323,151 @@ u32 FASTCALL _MMU_ARM7_read32(u32 adr)
 	return T1ReadLong_guaranteedAligned(MMU.MMU_MEM[ARMCPU_ARM7][(adr >> 20)], adr & MMU.MMU_MASK[ARMCPU_ARM7][(adr >> 20)]);
 }
 
+//================================================= GBA memory-map backend
+// roadmap #20 (GBA compat), §12.3 step 4. Reached only from MMU.h's
+// _MMU_read/write08/16/32 dispatchers when PROCNUM==ARMCPU_ARM7 &&
+// MMU.isGBA -- see those functions' comments for why the guard has to be
+// the very first thing they do.
+//
+// gbaDecodeAddr() is a pure function -- touches no globals -- verified by
+// a standalone host-native unit test (not a "replica" like steps 1-2's:
+// this is new code, not a copy of pre-existing logic) that copies this
+// function verbatim and drives every region's boundary/mirror-wrap case
+// under ASan/UBSan.
+enum GBAMemRegion
+{
+	GBA_REGION_BIOS,
+	GBA_REGION_EWRAM,
+	GBA_REGION_IWRAM,
+	GBA_REGION_PALETTE,
+	GBA_REGION_VRAM,
+	GBA_REGION_OAM,
+	// I/O (0x04000000), cartridge ROM (0x08000000+), SRAM (0x0E000000) --
+	// no backing buffer yet, deferred to §12.3 step 7 (peripherals).
+	GBA_REGION_UNMAPPED
+};
+
+struct GBADecodedAddr
+{
+	GBAMemRegion region;
+	u32 offset;
+};
+
+static GBADecodedAddr gbaDecodeAddr(u32 addr)
+{
+	switch ((addr >> 24) & 0xFF)
+	{
+		case 0x00:
+			// BIOS: 16 KB, not mirrored. Real hardware also protects BIOS
+			// reads when PC isn't executing from BIOS (returns the last-
+			// fetched BIOS opcode instead); NOT implemented this pass --
+			// a known, explicitly-flagged emulator-specific approximation,
+			// not a silently-dropped hardware requirement.
+			if (addr < 0x00004000)
+				return GBADecodedAddr{ GBA_REGION_BIOS, addr };
+			return GBADecodedAddr{ GBA_REGION_UNMAPPED, 0 };
+		case 0x02:
+			// EWRAM: 256 KB, mirrors every 0x40000 across the whole 0x02
+			// bank.
+			return GBADecodedAddr{ GBA_REGION_EWRAM, addr & 0x0003FFFF };
+		case 0x03:
+			// IWRAM: 32 KB, mirrors every 0x8000 across the whole 0x03
+			// bank.
+			return GBADecodedAddr{ GBA_REGION_IWRAM, addr & 0x00007FFF };
+		case 0x05:
+			// Palette RAM: 1 KB, mirrors every 0x400 across the whole
+			// 0x05 bank.
+			return GBADecodedAddr{ GBA_REGION_PALETTE, addr & 0x000003FF };
+		case 0x06:
+		{
+			// VRAM: 96 KB physical, mirrored every 0x20000 (128 KB) across
+			// the whole 0x06 bank; within each 128 KB period the last
+			// 32 KB (0x18000-0x1FFFF) re-mirrors the previous 32 KB
+			// (0x10000-0x17FFF) instead of reading blank -- GBATEK's
+			// documented VRAM mirroring quirk.
+			u32 m = addr & 0x0001FFFF;
+			if (m >= 0x00018000) m -= 0x00008000;
+			return GBADecodedAddr{ GBA_REGION_VRAM, m };
+		}
+		case 0x07:
+			// OAM: 1 KB, mirrors every 0x400 across the whole 0x07 bank.
+			return GBADecodedAddr{ GBA_REGION_OAM, addr & 0x000003FF };
+		default:
+			return GBADecodedAddr{ GBA_REGION_UNMAPPED, 0 };
+	}
+}
+
+// GBA_BIOS is ROM from the CPU's perspective -- writes are dropped.
+// Everything else in GBA_REGION_UNMAPPED (I/O/cartridge/SRAM, step 7) also
+// has no backing buffer yet: reads return 0, writes are no-ops. This is a
+// placeholder, not real I/O/cartridge behavior.
+static u8* gbaWritableBuffer(GBAMemRegion region)
+{
+	switch (region)
+	{
+		case GBA_REGION_EWRAM:   return MMU.GBA_EWRAM;
+		case GBA_REGION_IWRAM:   return MMU.GBA_IWRAM;
+		case GBA_REGION_PALETTE: return MMU.GBA_PALETTE;
+		case GBA_REGION_VRAM:    return MMU.GBA_VRAM;
+		case GBA_REGION_OAM:     return MMU.GBA_OAM;
+		default:                 return NULL;
+	}
+}
+
+u8 FASTCALL _MMU_ARM7GBA_read08(u32 adr)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	if (d.region == GBA_REGION_BIOS) return T1ReadByte(MMU.GBA_BIOS, d.offset);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return 0;
+	return T1ReadByte(buf, d.offset);
+}
+
+u16 FASTCALL _MMU_ARM7GBA_read16(u32 adr)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	if (d.region == GBA_REGION_BIOS) return T1ReadWord_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return 0;
+	return T1ReadWord_guaranteedAligned(buf, d.offset);
+}
+
+u32 FASTCALL _MMU_ARM7GBA_read32(u32 adr)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	if (d.region == GBA_REGION_BIOS) return T1ReadLong_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return 0;
+	return T1ReadLong_guaranteedAligned(buf, d.offset);
+}
+
+void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return;
+	T1WriteByte(buf, d.offset, val);
+}
+
+void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return;
+	T1WriteWord_guaranteedAligned(buf, d.offset, val);
+}
+
+void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val)
+{
+	GBADecodedAddr d = gbaDecodeAddr(adr);
+	u8* buf = gbaWritableBuffer(d.region);
+	if (!buf) return;
+	T1WriteLong_guaranteedAligned(buf, d.offset, val);
+}
+
 //=========================================================================================================
 
-u32 FASTCALL MMU_read32(u32 proc, u32 adr) 
+u32 FASTCALL MMU_read32(u32 proc, u32 adr)
 {
 	ASSERT_UNALIGNED((adr&3)==0);
 
