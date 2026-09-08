@@ -238,22 +238,41 @@ castle-courtyard, `DESMUME_JIT_TRACE_FIRST` a9 tally + ARM7 `alive:` lines):**
 Chains are **still ~1.9 blocks** even with predicated `Bcc`/`BLcc` compiling and
 near-zero compile/bail churn. The limiter is **not** the cycle quota
 (`JIT_YIELD_NUMBER`): raising it 64 → 128 was byte-identical on the benchmark
-(ARM9 JIT 14.43, jitfull 36.17 both unchanged). The ceiling is the **guarded
-dynamic-dispatch hash table** (`emitDynamicLinkerStub`, `jit_cache.cpp`) — a
-direct-mapped slot, so the BL→BX call/return pair and any two hot dynamic-edge
-targets that collide evict each other and fall back to the C trampoline every
-visit. That, not GPR residency and not the quota, is the next lever: a
-set-associative dynamic-dispatch table, or a return-address stack for the
-call/return pattern.
+(ARM9 JIT 14.43, jitfull 36.17 both unchanged).
+
+**Ceiling found — predicated-op coverage, not dispatch (`8f014e3`).** New
+`DESMUME_JIT_TRACE_FIRST` telemetry (`jit_exec.cpp` classifies every non-bail
+chain-end round-trip by what sits in the resume PC's block-table slot;
+`jit_trace.cpp` histograms the opcodes that hit the "nothing compilable"
+path). SM64DS castle-courtyard:
+
+- **~64 %** of ARM9 JIT dispatches are non-bail trampoline round-trips.
+- **99 %+** of those resume onto a **"don't JIT" marker** (slot has the right
+  PC but `execute == null`, `len == 1`) — the emitter refused an opcode there,
+  so it is interpreted one instruction at a time with a full C round-trip each
+  visit. **Not** collisions (`other` slot ≈ 0.6 %), **not** SMC (11 kills all
+  run), **not** the quota. The `emitDynamicLinkerStub` direct-mapped slot is
+  **not** the bottleneck — a set-associative table / return-address stack would
+  buy almost nothing.
+- The refused opcodes are almost entirely **predicated (`cond != AL`) memory
+  ops**: `BXcc lr`, `STRcc`/`LDRcc`/`LDRBcc`/`STRHcc`, `POPcc`/`PUSHcc`
+  (`LDMcc`/`STMcc`), then a tail of genuinely-hard ones (`MCR p15` cache
+  maintenance, `MSR cpsr`).
+
+ARM data-processing already compiles predicated (`emitEvalCond` + conditional
+skip, `jit_arm.cpp`); §16 did predicated `Bcc`/`BLcc`. **Next lever: extend
+that pattern to loads / stores / `LDM`/`STM` / `BX`.** Removes the
+per-instruction interpreter round-trips *and* lengthens chains (the block no
+longer terminates at every predicated memory op).
 
 At a ~1.9-block chain a fixed-mapping trampoline's unconditional 15-register
 load/store still loses to the lazy allocator — **GPR residency stays deferred
-until the dynamic-edge ceiling is lifted.**
+until chains lengthen.**
 
 **Measured picture:** on SM64DS the ARM9 JIT is now a **+9.6 % whole-frame win**
 (§16); the ARM7-only JIT A/B still needs re-measuring (was a ~4.4 % regression
 pre-predicated-branch). The dominant remaining cost is the number of trampoline
-round-trips (short chains → the dynamic-edge ceiling above) plus the
+round-trips (short chains → the predicated-op ceiling above) plus the
 trampoline's own `stmw`/`lmw`.
 
 ---
@@ -2059,6 +2078,13 @@ Optimize:
 4. persistent guest state
 5. trampoline overhead
 6. memory fast paths
+
+**Current position (`8f014e3`): item 1.** ARM9 telemetry (§5) shows the ~1.9-
+block chain ceiling is the emitter refusing predicated (`cond != AL`) memory
+ops — `BXcc`, `LDRcc`/`STRcc`/`STRHcc`, `LDMcc`/`STMcc` — so blocks terminate
+and the next instruction is interpreted one at a time. Extending the existing
+predicated-data-proc codegen (`emitEvalCond` + conditional skip) to those forms
+is a block-length win and comes before any dispatch-table work (item 3).
 
 ### Then
 
