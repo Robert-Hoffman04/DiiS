@@ -1165,14 +1165,30 @@ question):
    targets -- zero changes needed in `jit_arm.cpp`/`jit_thumb.cpp`), wired
    into `jitBuildArm7Profile()`'s call site behind the boot-mode flag. Per
    §11, this comes only after the interpreter path is validated correct.
-6. **BIOS strategy -- open question, needs an explicit decision before #2-5
-   can produce a booting GBA ROM.** Real GBA BIOS is copyrighted and can't
-   be vendored in this repo. Options: (a) an HLE BIOS (SWI table +
-   reset/IRQ vectors implemented in C++, the approach several open-source
-   GBA/DS emulators use for redistribution), or (b) requiring the user
-   supply their own dumped BIOS file at runtime (closer to real-hardware
-   fidelity for the handful of SWI calls HLE commonly gets subtly wrong).
-   Not decided; needs the user's input when this slice is picked up.
+6. **BIOS strategy -- decided: function-level HLE, matching this codebase's
+   existing DS pattern.** Real GBA BIOS is copyrighted and can't be vendored
+   in this repo. Compared mGBA's approach (an independent clean-room ARM
+   binary assembled to run *at* the BIOS address, `hle-bios.s` -> `hle-
+   bios.c`, covering `SoftReset`/`RegisterRamReset`/`Halt`/`Stop`/
+   `IntrWait`/`VBlankIntrWait`/`Div`/`DivArm`/`Sqrt`/`ArcTan`/`ArcTan2`/
+   `CpuSet`/`CpuFastSet`/`BgAffineSet`/`ObjAffineSet`/`BitUnPack`/the LZ77/
+   Huffman/RL decompression routines/`Diff8BitUnFilter`/`Diff16BitUnFilter`/
+   `MultiBoot`/sound-driver SWIs, on by default, with an optional real-BIOS-
+   file override for the handful of exact-timing/checksum edge cases it
+   doesn't reproduce bit-for-bit) against this repo's own `source/src/
+   bios.cpp`, which already does function-level HLE for the DS side today:
+   SWI opcodes are intercepted in the interpreter/JIT and a C++ handler runs
+   directly, nothing executes at the BIOS address at all, with
+   `CommonSettings.UseExtBIOS` (`NDSSystem.cpp`) already providing the
+   optional-real-BIOS-file layer on top. Decision: build `bios_gba.cpp` the
+   same way as the existing `bios.cpp` -- SWI-intercept C++ handlers for the
+   list above -- rather than mGBA's assembled-binary-at-0x0 approach, since
+   it reuses this codebase's established pattern instead of introducing a
+   new one. No BIOS file required by default; real-BIOS-file support can be
+   added later as an optional accuracy layer mirroring `UseExtBIOS`, not
+   required for this slice. Not yet implemented -- this is the strategy
+   decision only; steps 3-5 (memory map, interpreter backend, JIT profile)
+   don't depend on it and can proceed first.
 7. **Peripherals**, each its own reference-first slice per §11/§13: PPU
    (display/video registers), APU (sound registers), timers, DMA, keypad/
    input, wait states, cartridge bus/save-memory devices, relevant timing
