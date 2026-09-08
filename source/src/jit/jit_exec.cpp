@@ -258,6 +258,8 @@ u32 jitRunArm9()
 	{
 		static u64 s_disp = 0, s_comp = 0, s_bail0 = 0, s_arm = 0, s_armbail0 = 0, s_lastRep = 0;
 		static u64 s_insns = 0, s_entries = 0, s_blk0 = 0;
+		static u64 s_edge = 0, s_slotResident = 0, s_slotOther = 0, s_slotEmpty = 0,
+		          s_slotDontJit = 0, s_slotSmc = 0, s_yield = 0, s_edgeShort = 0;
 		s_disp++;
 		if (wasMiss) s_comp++;
 		if (r.instructions == 0) s_bail0++;
@@ -268,6 +270,36 @@ u32 jitRunArm9()
 		// block. s_insns/s_entries == guest instructions per trampoline
 		// round-trip; s_insns/s_blk0 == blocks per round-trip (approx chain len).
 		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += b->insnCount(); }
+		// Why did this non-bail chain exit pay a full trampoline round-trip
+		// instead of chaining on? Classify by what sits in the resume PC's
+		// direct-mapped block-table slot:
+		//   resident -> a valid same-PC block is right there; the dispatcher
+		//               should have chained in (guard too strict / self-patch
+		//               not sticking) -- cheap to fix.
+		//   other    -> a DIFFERENT PC occupies the slot: hash collision evicted
+		//               our target -> set-associative block table.
+		//   empty    -> slot never populated / flushed: genuine first-visit /
+		//               arena churn.
+		//   dontJIT  -> same PC, execute==null, len==1: the scanner found
+		//               nothing compilable there (predicated LDR/STR/POP/BX/MUL,
+		//               CP15, ...) so it is interpreted one instr at a time --
+		//               the real ARM9 ceiling. Fix = widen emitter coverage.
+		//   smc      -> same PC, execute==null, len==0: SMC-killed, recompile due.
+		if (r.instructions != 0 && !r.bailedOut && !r.smcHit) {
+			s_edge++;
+			if (r.cycles >= JIT_YIELD_NUMBER) s_yield++;
+			if (r.instructions < 4)           s_edgeShort++;
+			{
+				u32 tpc = r.nextPC & ~1u;
+				u32 idx = ((tpc >> 1) ^ (tpc >> 13)) & (HASH_TABLE_SIZE - 1);
+				const BasicBlock& sl = jitCacheArm9.debugSlot(idx);
+				if      (sl.startPC == 0)      s_slotEmpty++;
+				else if (sl.startPC != tpc)    s_slotOther++;
+				else if (sl.execute != 0)      s_slotResident++;
+				else if (sl.insnCount() == 1)  s_slotDontJit++;
+				else                           s_slotSmc++;
+			}
+		}
 		static int s_dump = 0;
 		if (!thumb && s_dump < 40) {
 			s_dump++;
@@ -289,6 +321,16 @@ u32 jitRunArm9()
 			                 (unsigned long long)(s_entries ? s_insns / (s_blk0 ? s_blk0 : 1) : 0),
 			                 (unsigned long long)(s_entries ? (s_insns * 100 / (s_blk0 ? s_blk0 : 1)) % 100 : 0),
 			                 (unsigned long long)s_entries); fclose(f); }
+			f = fopen("sd:/jit.log", "a");
+			if (f) { fprintf(f, "[jit] a9 edge: edge=%llu (%llu%% of disp) | slot: resident=%llu other=%llu"
+			                 " empty=%llu dontJIT=%llu smc=%llu | short(<4)=%llu quota=%llu\n",
+			                 (unsigned long long)s_edge,
+			                 (unsigned long long)(s_disp ? s_edge * 100 / s_disp : 0),
+			                 (unsigned long long)s_slotResident, (unsigned long long)s_slotOther,
+			                 (unsigned long long)s_slotEmpty, (unsigned long long)s_slotDontJit,
+			                 (unsigned long long)s_slotSmc,
+			                 (unsigned long long)s_edgeShort, (unsigned long long)s_yield);
+			         fclose(f); }
 		}
 	}
 #endif

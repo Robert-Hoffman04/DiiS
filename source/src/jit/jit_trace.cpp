@@ -791,6 +791,34 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	if (ctx.instrCount == 0) {
 		// Nothing compilable at startPC -- cache a length-1 fallback so the
 		// dispatcher resolves straight to the interpreter next time.
+#ifdef DESMUME_JIT_TRACE_FIRST
+		{
+			static u32 s_seen[256]; static u32 s_cnt[256]; static int s_n = 0;
+			static u64 s_tot = 0; s_tot++;
+			u32 opc = thumb ? (u32)cpu.fetch16(startPC) : cpu.fetch32(startPC);
+			int i = 0; for (; i < s_n; i++) if (s_seen[i] == opc) break;
+			if (i == s_n && s_n < 256) { s_seen[s_n] = opc; s_cnt[s_n] = 0; s_n++; }
+			if (i < 256) s_cnt[i]++;
+			if ((s_tot & 0xFFF) == 0) {
+				// bubble the top few to the front, then dump
+				for (int a = 0; a < s_n; a++)
+					for (int b2 = a + 1; b2 < s_n; b2++)
+						if (s_cnt[b2] > s_cnt[a]) {
+							u32 t = s_cnt[a]; s_cnt[a] = s_cnt[b2]; s_cnt[b2] = t;
+							t = s_seen[a]; s_seen[a] = s_seen[b2]; s_seen[b2] = t;
+						}
+				FILE* f = fopen("sd:/jit.log", "a");
+				if (f) {
+					fprintf(f, "[jit] dontJIT tot=%llu uniq=%d %s top:",
+					        (unsigned long long)s_tot, s_n, thumb ? "T" : "A");
+					for (int a = 0; a < s_n && a < 12; a++)
+						fprintf(f, " %08x=%u", (unsigned)s_seen[a], (unsigned)s_cnt[a]);
+					fprintf(f, "\n");
+					fclose(f);
+				}
+			}
+		}
+#endif
 		return cache.registerBlock(startPC, 1, nullptr, thumb);
 	}
 

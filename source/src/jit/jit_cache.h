@@ -132,6 +132,18 @@ class JITCache {
 			PROFILER_CACHE_MISS();
 			return nullptr;
 		}
+
+#ifdef DESMUME_JIT_TRACE_FIRST
+		// Raw slot peek for edge telemetry (jit_exec.cpp): unlike getBlock() this
+		// returns the slot even when a different PC occupies it, so the caller can
+		// tell a hash collision from a never-compiled / SMC-killed slot. Returns a
+		// zeroed sentinel before initialize().
+		inline const BasicBlock& debugSlot(u32 index) const {
+			static const BasicBlock kZero = {};
+			if (!blockTable) return kZero;
+			return blockTable[index & (HASH_TABLE_SIZE - 1)];
+		}
+#endif
 };
 
 // One cache per emulated core -- ARM7 and ARM9 share guest address ranges
