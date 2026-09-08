@@ -484,19 +484,36 @@ flat descriptor table can't track it.
   time. Unconditional pre-guard `flushDirtyRegisters()` + post-op
   `invalidateRegCache()` (same shape as the predicated memory ops): coherent
   guest memory on both runtime paths. Wired into ARM + THUMB single loads and
-  ARM `LDM` / THUMB `POP` / `LDMIA` (non-pc). Stores unchanged (journal +
-  multi-page SMC guard, same as ARM7 `STM`).
+  ARM `LDM` / THUMB `POP` / `LDMIA` (non-pc).
+- **Stores landed (`d4334b5`):** `emitArm9Store` / `emitArm9BlockStore`,
+  the same `emitArm9RegionGuard` as the loads. Fast path: `emitSmcCheckAndBail`
+  per written page for the main-RAM region (DTCM never holds JIT code -> no
+  guard), then `stwbrx` / `sthbrx` / `stbx` into the backing store; every
+  other region -> the `slowWrite` C call, **not** an interpreter round-trip.
+  The two pieces the plan flagged as blocking inline stores: **(1)** the
+  per-access differential journal is a new `JitCpuProfile::journalNote` hook
+  (`jitDiffJournalNote`) emitted before each inline `stwbrx` **only** in a
+  `JIT_DIFFERENTIAL_TESTING` build -- 0 in a shipping build, no emitted code;
+  **(2)** the multi-page SMC guard checks both ends of the run (<= 60 bytes,
+  at most two 1 KB pages). `PUSH` commits the guest SP decrement only *after*
+  `emitArm9BlockStore` returns, so an internal SMC bail re-runs the whole
+  `PUSH` against the original SP (the stack-corruption mode the slow `PUSH`
+  path guards). Wired: ARM `STR` / `STRB` / `STRH` + `STM`, THUMB
+  F9/F8/F10/F11 stores + `PUSH` + `STMIA` (and the F15 `LDMIA` ARM9 gate that
+  `f092a2c` left `pageDescBase`-only). Excluded (still slow): `SWP`, `STRT`,
+  `STRD`, predicated stores, pc-relative literal `STR`.
 - **Validated:** armwrestler ARM9 `ARM 0/67, THUMB 1/10` -- exact baseline,
   0 new failures (the suite that caught the last two ARM9 load bugs);
-  differential soak 705 M ARM9 insns, 0 mismatches / 0 CHAIN-DIFF / 0 CANARY
-  / 0 OVERRUN.
-- **Measured:** SM64DS, vs pre-P16 (`87745b5`): ARM9 JIT **14.56 -> 14.70**
-  (+1.0 %), full JIT (GXMerge) **37.19 -> 38.01** (+2.2 %), interpreter 13.16
-  unchanged. Single loads carried most of it (37.19 -> 37.89); block loads
-  added 37.89 -> 38.01. Modest -- `exec%` is ~98 % and the win is fewer host
-  instructions per access, not a round-trip removal -- but it is the first
-  ARM9 memory path that is a net positive, and the reverted approaches were
-  net negative.
+  differential soak 705 M ARM9 insns (loads) / 492 M (stores), 0 mismatches /
+  0 CHAIN-DIFF / 0 CANARY / 0 OVERRUN, journal selftest PASS.
+- **Measured:** SM64DS, vs pre-P16 (`87745b5`): ARM9 JIT **14.56 -> 14.86**
+  (+2.1 %), full JIT (GXMerge) **37.19 -> 39.29** (+5.6 %), interpreter 13.16
+  unchanged. Loads: 37.19 -> 38.01 (single 37.89, block +0.12). Stores:
+  38.01 -> **39.29** (+3.4 %) -- a bigger step than the loads because each
+  store was a full `slowWrite` C call and stores, while rarer than loads, are
+  not rare on the SM64DS boot path. `exec%` still ~98 %; the win is fewer host
+  instructions per access, not round-trip removal. The first ARM9 memory path
+  that is net positive -- both reverted approaches were net negative.
 
 ---
 
@@ -2191,7 +2208,7 @@ Optimize:
 5. trampoline overhead
 6. memory fast paths
 
-**Current position (`f092a2c`): items 1 + 6 both advanced.** ARM9 telemetry
+**Current position (`d4334b5`): items 1 + 6 both advanced.** ARM9 telemetry
 (§5) showed the ~1.9-block chain ceiling was the emitter refusing predicated
 (`cond != AL`) memory ops and `BXcc lr`. Now compiled (`emitEvalCond` + BEQ
 guard over the exit, unconditional pre-guard flush, block continues):
@@ -2202,18 +2219,20 @@ fixed retry of the reverted `c375880`). Cumulative: trampoline round-trips
 14.42 → 14.56, full JIT 36.17 → 37.19.
 
 Then **item 6 for the ARM9 for the first time** (§6 P16): a bespoke
-two-region inline load guard -- main RAM *and* the relocatable DTCM window
-both loaded inline, `slowRead` C call (no round-trip) for everything else.
-Two earlier approaches were net-negative (see §6 P16); this one is
-+1.0 % ARM9 JIT / +2.2 % full JIT (37.19 → **38.01**), armwrestler-clean,
-705 M-insn soak clean.
+two-region inline guard -- main RAM *and* the relocatable DTCM window both
+inline, `slowRead`/`slowWrite` C call (no round-trip) for everything else.
+Two earlier approaches were net-negative (see §6 P16); this one covers loads
+(`f1e8d74`/`f092a2c`) *and* stores (`d4334b5`, incl. the per-access
+differential-journal hook and the multi-page SMC guard the plan flagged as
+blockers): cumulative +2.1 % ARM9 JIT / +5.6 % full JIT (37.19 → **39.29**),
+armwrestler-clean, 705 M/492 M-insn soaks clean.
 
 What remains at item 1 is the hard tail (`MCR p15`, `MSR cpsr`) and the
 excluded sub-forms (pc-relative literal, `LDMcc{pc}`, `BXcc rN`); at item 6,
-ARM9 inline *stores* (need the differential journal + multi-page SMC guard,
-same block as ARM7 `STM`). All with diminishing returns — so **measure again
-before deciding whether to push further here or move to GPR residency
-(item 4) / dispatch-table work.**
+only the rare excluded store forms (`SWP`, `STRT`, `STRD`, predicated,
+pc-relative literal `STR`) and the deferred ARM7 WRAM tier. All with
+diminishing returns — so the memory path is **done** for now; next lever is
+GPR residency (item 4) / dispatch-table work.
 
 ### Then
 
@@ -2250,9 +2269,9 @@ The default architecture remains direct emission plus chaining.
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler + arm7wrestler both clear, §8.2/§8.3) |
 | 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
-| 13 | Inline memory fast paths                                         | ARM7 Tier-1 literal loads + P14/P15 descriptor loads; ARM9 P16 two-region loads (main RAM + DTCM inline, +2.2% full JIT); ARM7 general/WRAM tier + all inline stores deferred (§6/§23) |
+| 13 | Inline memory fast paths                                         | ARM7 Tier-1 literal loads + P14/P15 descriptor loads; ARM9 P16 two-region loads **and stores** (main RAM + DTCM inline, +5.6% full JIT cumulative); ARM7 general/WRAM tier + rare excluded store forms (SWP/STRT/STRD/predicated) deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
-| 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
+| 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads, all cores) + ARM9 STM/PUSH/STMIA (stores, P16); LDM{pc} / ARM7 STM deferred (§6/§16); correctness-validated |
 | 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | in progress: §9 table filled in for DeSmuME interpreter/JIT (all 3 ROMs, byte-identical JIT results); melonDS column blocked -- root-caused (§8.5) to a melonDS bug (its GDB stub/scheduler intermittently no-ops an acknowledged single-step/instruction, roughly every 3-4 steps, confirmed by direct single-step trace after ruling out our own write path, EXMEMCNT, and CP15 write-buffering), not anything in our ROMs or harness; automation path (CLI hook, GDB polling, breakpoint/single-step support) is proven and reusable the moment melonDS's side is fixed |
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
