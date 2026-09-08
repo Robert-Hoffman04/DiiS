@@ -246,7 +246,7 @@ extern u8* MMU_CART_ROM(u32 position);
 struct GameInfo
 {
 	GameInfo()
-		: romdata(NULL)
+		: romdata(NULL), isGBA(false)
 	{}
 
 	void loadData(char* buf, int size)
@@ -268,6 +268,15 @@ struct GameInfo
 	void populate();
 	char* romdata;
 	u32 romsize;
+
+	// roadmap #20 (GBA compat), §12.3 step 1: the boot-mode gate.
+	// NDS_Reset()/NDS_exec() consult this to decide whether ARM9 boots at
+	// all -- see NDS_DebugForceGBAMode() below. Nothing in NDS_LoadROM sets
+	// this yet (ROMTYPE_GBA still hard-rejects, unchanged from the previous
+	// pass): wiring real detection to this flag is deferred until the GBA
+	// memory map + BIOS strategy (§12.3 steps 3-6) exist to make an accepted
+	// load meaningful instead of ARM7 running against the wrong memory map.
+	bool isGBA;
 };
 
 typedef struct TSCalInfo
@@ -353,6 +362,14 @@ void NDS_suspendProcessingInput(bool suspend);
 int NDS_LoadROM(const char *filename, const char* logicalFilename=0);
 void NDS_FreeROM(void);
 void NDS_Reset();
+
+// roadmap #20 (GBA compat), §12.3 step 2: test/debug-only entry point for
+// the ARM9-halt mechanism. Sets gameInfo.isGBA, which NDS_Reset() and
+// NDS_exec() consult to skip ARM9 init/execution entirely. Do NOT call this
+// from ROM-loading code -- nothing yet backs it with a real GBA memory map
+// or BIOS, so ARM7 would just run against the DS memory map. Exists solely
+// so this mechanism can be exercised/verified ahead of that wiring.
+void NDS_DebugForceGBAMode(bool enable);
 int NDS_ImportSave(const char *filename);
 bool NDS_ExportSave(const char *filename);
 

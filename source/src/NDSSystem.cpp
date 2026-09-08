@@ -1822,7 +1822,17 @@ void NDS_exec(s32 nb)
 			s32 arm7 = (s32)(nds_arm7_timer-nds_timer);
 			s32 s32next = (s32)(next-nds_timer);
 
-			std::pair<s32,s32> arm9arm7 = armInnerLoop<true,true>(nds_timer_base,s32next,arm9,arm7);
+			// roadmap #20 (GBA compat), §12.3 step 2: gameInfo.isGBA picks the
+			// ARM9-off instantiation of the same template armInnerLoop<doarm9,false>
+			// already uses at its mid-loop ARM7-IRQ-wait fallback above -- when
+			// doarm9=false, the whole ARM9/jitRunArm9()/armcpu_exec<ARMCPU_ARM9>
+			// branch is eliminated at compile time, not merely skipped at runtime.
+			// gameInfo.isGBA is false on every real ROM load today (nothing sets
+			// it yet -- see NDS_DebugForceGBAMode), so this is the same call as
+			// before unless that debug hook is used.
+			std::pair<s32,s32> arm9arm7 = gameInfo.isGBA
+				? armInnerLoop<false,true>(nds_timer_base,s32next,arm9,arm7)
+				: armInnerLoop<true,true>(nds_timer_base,s32next,arm9,arm7);
 
 			arm9 = arm9arm7.first;
 			arm7 = arm9arm7.second;
@@ -2001,7 +2011,10 @@ void NDS_Reset()
 	if ((CommonSettings.UseExtBIOS == true) && (CommonSettings.BootFromFirmware == true) && (fw_success == TRUE))
 	{
 		// Copy secure area to memory if needed
-		if ((header->ARM9src >= 0x4000) && (header->ARM9src < 0x8000))
+		// roadmap #20 (GBA compat), §12.3 step 2: skip everything here that's
+		// ARM9-specific when gameInfo.isGBA -- these header fields describe a
+		// DS ARM9 binary that doesn't exist for a GBA cart.
+		if (!gameInfo.isGBA && (header->ARM9src >= 0x4000) && (header->ARM9src < 0x8000))
 		{
 			src = header->ARM9src;
 			dst = header->ARM9cpy;
@@ -2019,7 +2032,7 @@ void NDS_Reset()
 		if (firmware->patched)
 		{
 			armcpu_init(&NDS_ARM7, 0x00000008);
-			armcpu_init(&NDS_ARM9, 0xFFFF0008);
+			if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, 0xFFFF0008);
 		}
 		else
 		{
@@ -2028,23 +2041,26 @@ void NDS_Reset()
 			//armcpu_init(&NDS_ARM7, 0x00000008);
 			//armcpu_init(&NDS_ARM9, 0xFFFF0008);
 			armcpu_init(&NDS_ARM7, firmware->ARM7bootAddr);
-			armcpu_init(&NDS_ARM9, firmware->ARM9bootAddr);
+			if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, firmware->ARM9bootAddr);
 		}
 
-			_MMU_write08<ARMCPU_ARM9>(0x04000300, 0);
+			if (!gameInfo.isGBA) _MMU_write08<ARMCPU_ARM9>(0x04000300, 0);
 			_MMU_write08<ARMCPU_ARM7>(0x04000300, 0);
 	}
 	else
 	{
-		src = header->ARM9src;
-		dst = header->ARM9cpy;
-
-		for(u32 i = 0; i < (header->ARM9binSize>>2); ++i)
+		if (!gameInfo.isGBA)
 		{
-// 			_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU.CART_ROM, src));
-			_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU_CART_ROM(src),0));
-			dst += 4;
-			src += 4;
+			src = header->ARM9src;
+			dst = header->ARM9cpy;
+
+			for(u32 i = 0; i < (header->ARM9binSize>>2); ++i)
+			{
+// 				_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU.CART_ROM, src));
+				_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU_CART_ROM(src),0));
+				dst += 4;
+				src += 4;
+			}
 		}
 
 		src = header->ARM7src;
@@ -2059,12 +2075,12 @@ void NDS_Reset()
 		}
 
 		armcpu_init(&NDS_ARM7, header->ARM7exe);
-		armcpu_init(&NDS_ARM9, header->ARM9exe);
-		
-		_MMU_write08<ARMCPU_ARM9>(REG_POSTFLG, 1);
+		if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, header->ARM9exe);
+
+		if (!gameInfo.isGBA) _MMU_write08<ARMCPU_ARM9>(REG_POSTFLG, 1);
 		_MMU_write08<ARMCPU_ARM7>(REG_POSTFLG, 1);
 	}
-	
+
 	//bitbox 4k demo is so stripped down it relies on default stack values
 	//otherwise the arm7 will crash before making a sound
 	//(these according to gbatek softreset bios docs)
@@ -2073,10 +2089,14 @@ void NDS_Reset()
 	NDS_ARM7.R13_usr = 0x0380FF00;
 	NDS_ARM7.R[13] = NDS_ARM7.R13_usr;
 	//and let's set these for the arm9 while we're at it, though we have no proof
-	NDS_ARM9.R13_svc = 0x00803FC0;
-	NDS_ARM9.R13_irq = 0x00803FA0;
-	NDS_ARM9.R13_usr = 0x00803EC0;
-	NDS_ARM9.R[13] = NDS_ARM9.R13_usr;
+	// roadmap #20 (GBA compat): skip in isGBA mode -- see NDS_DebugForceGBAMode.
+	if (!gameInfo.isGBA)
+	{
+		NDS_ARM9.R13_svc = 0x00803FC0;
+		NDS_ARM9.R13_irq = 0x00803FA0;
+		NDS_ARM9.R13_usr = 0x00803EC0;
+		NDS_ARM9.R[13] = NDS_ARM9.R13_usr;
+	}
 	//n.b.: im not sure about all these, I dont know enough about arm9 svc/irq/etc modes
 	//and how theyre named in desmume to match them up correctly. i just guessed.
 
@@ -2186,6 +2206,15 @@ void NDS_Reset()
 	memcpy(FW_Mac, (MMU.fw.data + 0x36), 6);
 
 	initSchedule();
+}
+
+// roadmap #20 (GBA compat), §12.3 step 2: test/debug-only entry point -- see
+// NDSSystem.h. Sets the flag NDS_Reset()/NDS_exec() consult to hold ARM9
+// out of the boot/execution path entirely. Not called from NDS_LoadROM or
+// any other real ROM-loading path yet.
+void NDS_DebugForceGBAMode(bool enable)
+{
+	gameInfo.isGBA = enable;
 }
 
 static std::string MakeInputDisplayString(u16 pad, const std::string* Buttons, int count) {
