@@ -49,6 +49,14 @@ extern "C" void ExecuteJITTrace_Return();
 void jitInit();
 void jitShutdown();
 
+// roadmap #20 (GBA compat), §12.3 step 5: swaps jitProfile[JIT_ARM7] between
+// the DS ARM7 profile and the GBA ARM7 profile (jit_arm7gba_profile.cpp) --
+// both are built once by jitInit() and share jitCacheArm7, since only one
+// boot mode is ever live at a time. Called from NDS_DebugForceGBAMode(),
+// alongside that function's other gameInfo.isGBA/MMU.isGBA mirror updates.
+// A no-op before jitInit() has (successfully) run.
+void jitSetArm7GBAMode(bool enable);
+
 // GO-FIX-PH temporary diagnostic (jit_trace.cpp): verifies the canary bytes
 // planted right after each JIT-owned memalign'd buffer are still intact;
 // logs once to sd:/jit.log and latches on the first mismatch. Cheap enough

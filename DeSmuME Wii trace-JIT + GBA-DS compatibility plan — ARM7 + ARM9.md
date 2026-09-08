@@ -1227,12 +1227,71 @@ question):
    current DS code path verbatim-unchanged; full devkitPPC Wii `.dol` build
    compiles clean. Not exercised: still no real GBA ROM boots end-to-end
    this pass -- no `ROMTYPE_GBA` wiring, no BIOS, no JIT profile yet.
-5. **JIT `jit_arm7gba_profile.cpp`.** A third `JitCpuProfile` instantiation
-   alongside `jit_arm7_profile.cpp`/`jit_arm9_profile.cpp`, `isaLevel=4`
-   (GBA's ARM7TDMI is the same core family the existing ARM7 profile already
-   targets -- zero changes needed in `jit_arm.cpp`/`jit_thumb.cpp`), wired
-   into `jitBuildArm7Profile()`'s call site behind the boot-mode flag. Per
-   §11, this comes only after the interpreter path is validated correct.
+5. **JIT `jit_arm7gba_profile.cpp` -- landed.** A second `JitCpuProfile`
+   (`isaLevel=4`, GBA's ARM7TDMI is the same core family the existing ARM7
+   profile already targets -- zero changes needed in `jit_arm.cpp`/
+   `jit_thumb.cpp`), built by `jitBuildArm7GBAProfile()` and swapped onto the
+   *existing* `JIT_ARM7` slot rather than added as a third slot: both boot
+   modes run on the same `NDS_ARM7` register file and share one
+   `jitCacheArm7` arena/block table/SMC registry, since only one mode is
+   ever live at a time.
+
+   **Corrected a sketch inaccuracy in this section before implementing**:
+   the sketch above described wiring the choice "into `jitBuildArm7Profile()`'s
+   call site behind the boot-mode flag" -- tracing that call site
+   (`jit_trace.cpp`'s `jitInit()`, called once from `NDS_Init()`) found it
+   runs exactly once, well before any ROM is loaded and before
+   `gameInfo.isGBA` can ever be meaningfully true, so gating *that* call on
+   the flag would have just always built the DS profile. The actual, already-
+   established hook is `jitRunArm7()` (`jit_exec.cpp`) re-reading
+   `jitProfile[JIT_ARM7]` fresh on every call -- so `jitInit()` now builds
+   *both* profiles once (`s_arm7DsProfile`/`s_arm7GbaProfile`, `jit_trace.cpp`),
+   and a new `jitSetArm7GBAMode(bool)` swaps which one `jitProfile[JIT_ARM7]`
+   points at, called from `NDS_DebugForceGBAMode()` alongside its existing
+   `gameInfo.isGBA`/`MMU.isGBA` mirror updates -- the same synchronized-
+   mirror pattern step 4 established, now with a third mirror.
+
+   The GBA profile's `fetch16/32`/`slowRead`/`slowWrite` are thin wrappers
+   identical in form to the DS ARM7 profile's, calling the same templated
+   `_MMU_*<ARMCPU_ARM7,...>` functions -- traced end to end through `MMU.h`'s
+   template chain to confirm the routing difference already lives one layer
+   down, inside step 4's `MMU.isGBA`-guarded dispatchers, not in the profile
+   itself. `swiHandler` is a stub (SWI already ends every trace to the
+   interpreter today, for both existing profiles -- dead field, matched for
+   consistency). `canEnterThumb`/`canEnterArm` are unconditionally `true`,
+   mirroring the DS ARM7 profile's own policy (every GBA region is backed by
+   a real, if presently zero-filled, buffer per steps 3-4). `cyclesForThumb`/
+   `cyclesForArm` are verbatim duplicates of the DS ARM7 profile's cost
+   tables, explicitly commented as such -- `armcpu_exec<ARMCPU_ARM7>()`'s
+   cost model is one template, not specialized per boot mode, so these are
+   exactly what the interpreter also computes for GBA-mode ARM7 today; real
+   GBA wait-state timing (differs from DS's own numbers) isn't modeled by
+   the interpreter either yet and stays deferred to step 7.
+
+   **The one correctness-critical setting**: `mainMemBase` and `pageDescBase`
+   (the P13/P14 inline fast-path enablers) are left `0`. Both are DS-specific
+   by construction -- enabling either would resolve through `MMU.MAIN_MEM`/
+   `MMU.MMU_MEM[ARMCPU_ARM7]`, the DS-only tables step 4 deliberately left
+   untouched, reintroducing the same DS/GBA address-aliasing risk step 4
+   fixed at the dispatcher level, just one layer up. Leaving both `0` forces
+   every GBA access through `slowRead`/`slowWrite`, which correctly reaches
+   the GBA-aware dispatchers -- matching how the ARM9 profile already leaves
+   them `0` today for its own, different reasons.
+
+   Verified: diff review of all four touched files (new `jit_arm7gba_profile.cpp`
+   plus additive-only changes to `jit_trace.cpp`/`jit.h`/`NDSSystem.cpp`),
+   confirming `mainMemBase`/`pageDescBase` are `0` and that
+   `jitSetArm7GBAMode(false)` (the only path exercised by any real ROM today)
+   leaves `jitProfile[JIT_ARM7]` exactly as it always was; a clean full
+   devkitPPC Wii `.dol` build (the new translation unit is picked up
+   automatically -- confirmed the Makefile's `SOURCES` lists whole
+   directories, not an explicit file list, so no Makefile change was needed).
+   Not exercised: still no real GBA ROM boots end-to-end -- no `ROMTYPE_GBA`
+   wiring, no BIOS (step 6 implementation itself), no peripherals (step 7).
+   `NDS_DebugForceGBAMode(true)` now correctly points the ARM7 JIT at the GBA
+   profile and (via step 4) the GBA memory map, but there is still no
+   meaningful GBA code anywhere for it to execute (`GBA_BIOS` is
+   zero-filled).
 6. **BIOS strategy -- decided: function-level HLE, matching this codebase's
    existing DS pattern.** Real GBA BIOS is copyrighted and can't be vendored
    in this repo. Compared mGBA's approach (an independent clean-room ARM
@@ -1797,7 +1856,7 @@ The default architecture remains direct emission plus chaining.
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
 | 19 | RockWrestler automated DS conformance gate                       | done: headless via slot-2 I/O (§8.4), no crt0 workaround needed (upstream is `-nostartfiles`) -- interpreter baseline 10/23 fail (SMLALxy, LDM/STM base-in-list, IPCSYNC/IPCFIFO/IPCFIFO IRQ, DIV 32/32 + 64/32 sign-extension, TCM/CP15 readback -- all pre-existing interpreter gaps, characterized in §8.4); `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures |
-| 20 | GBA compatibility architecture                                   | in progress: full source audit done (§12.1, no native-GBA-execution scaffolding existed anywhere); found + fixed a real, GBA-independent 12 KB heap over-read in `DecryptSecureArea` (`SMALL_READ` undersized, hit on most normal encrypted-ROM loads, confirmed via isolated ASan repro against the unmodified real source and fixed); added real GBA-header detection (`ROMTYPE_GBA`, GBATEK offset-0xB2 magic) so `NDS_LoadROM` cleanly rejects a `.gba` file instead of misparsing it as a DS header (§12.2). §12.3 steps 1-2 landed: `GameInfo::isGBA` boot-mode flag + ARM9-halt mechanism (`armInnerLoop<false,true>`, reusing the existing per-CPU-gateable template rather than adding a new runtime check) -- proven ARM9-inert via a standalone ASan/UBSan replica test and a clean full build, zero behavior change for real DS ROMs since nothing yet sets the flag from a real load. Not yet wired to `ROMTYPE_GBA` detection (deliberate -- see §12.3 step 1) and no GBA execution yet. §12.3 step 6 decided: BIOS strategy is function-level HLE (`bios_gba.cpp`, matching the existing DS `bios.cpp` SWI-intercept pattern), compared against mGBA's assembled-binary-at-0x0 approach; not yet implemented. §12.3 step 3 landed: six `GBA_`-prefixed backing buffers (`GBA_BIOS`/`GBA_EWRAM`/`GBA_IWRAM`/`GBA_PALETTE`/`GBA_VRAM`/`GBA_OAM`) added to `MMU_struct`, reset-safe, purely additive diff, clean full build -- allocation only, inert until step 4 wires read/write address decoding to them. §12.3 step 4 landed: `_MMU_ARM7GBA_read/write08/16/32` (`MMU.cpp`) now back those buffers with real address decode/mirroring (BIOS/EWRAM/IWRAM/Palette/OAM/VRAM, the last with the documented GBATEK quirk-mirror), reached via a first-statement guard in `MMU.h`'s six hot-path dispatchers (placed first specifically because GBA's EWRAM/IWRAM ranges alias existing DS ARM7 fast-path checks in those same functions) gated on a new `MMU.isGBA` mirror of `gameInfo.isGBA` (needed only because `MMU.h` can't include `NDSSystem.h` back to see `GameInfo`) -- verified via a 30/30-passing ASan/UBSan host-native unit test of the pure decode function plus a clean full build. I/O/cartridge/SRAM still unmapped placeholders (step 7); BIOS read-protection-when-PC-not-in-BIOS quirk explicitly not implemented (flagged, not silent). Remaining sequenced steps: JIT `jit_arm7gba_profile.cpp` (step 5), BIOS implementation itself, peripherals (step 7) |
+| 20 | GBA compatibility architecture                                   | in progress: full source audit done (§12.1, no native-GBA-execution scaffolding existed anywhere); found + fixed a real, GBA-independent 12 KB heap over-read in `DecryptSecureArea` (`SMALL_READ` undersized, hit on most normal encrypted-ROM loads, confirmed via isolated ASan repro against the unmodified real source and fixed); added real GBA-header detection (`ROMTYPE_GBA`, GBATEK offset-0xB2 magic) so `NDS_LoadROM` cleanly rejects a `.gba` file instead of misparsing it as a DS header (§12.2). §12.3 steps 1-2 landed: `GameInfo::isGBA` boot-mode flag + ARM9-halt mechanism (`armInnerLoop<false,true>`, reusing the existing per-CPU-gateable template rather than adding a new runtime check) -- proven ARM9-inert via a standalone ASan/UBSan replica test and a clean full build, zero behavior change for real DS ROMs since nothing yet sets the flag from a real load. Not yet wired to `ROMTYPE_GBA` detection (deliberate -- see §12.3 step 1) and no GBA execution yet. §12.3 step 6 decided: BIOS strategy is function-level HLE (`bios_gba.cpp`, matching the existing DS `bios.cpp` SWI-intercept pattern), compared against mGBA's assembled-binary-at-0x0 approach; not yet implemented. §12.3 step 3 landed: six `GBA_`-prefixed backing buffers (`GBA_BIOS`/`GBA_EWRAM`/`GBA_IWRAM`/`GBA_PALETTE`/`GBA_VRAM`/`GBA_OAM`) added to `MMU_struct`, reset-safe, purely additive diff, clean full build -- allocation only, inert until step 4 wires read/write address decoding to them. §12.3 step 4 landed: `_MMU_ARM7GBA_read/write08/16/32` (`MMU.cpp`) now back those buffers with real address decode/mirroring (BIOS/EWRAM/IWRAM/Palette/OAM/VRAM, the last with the documented GBATEK quirk-mirror), reached via a first-statement guard in `MMU.h`'s six hot-path dispatchers (placed first specifically because GBA's EWRAM/IWRAM ranges alias existing DS ARM7 fast-path checks in those same functions) gated on a new `MMU.isGBA` mirror of `gameInfo.isGBA` (needed only because `MMU.h` can't include `NDSSystem.h` back to see `GameInfo`) -- verified via a 30/30-passing ASan/UBSan host-native unit test of the pure decode function plus a clean full build. I/O/cartridge/SRAM still unmapped placeholders (step 7); BIOS read-protection-when-PC-not-in-BIOS quirk explicitly not implemented (flagged, not silent). §12.3 step 5 landed: `jit_arm7gba_profile.cpp` builds a second `JitCpuProfile` swapped onto the existing `JIT_ARM7` slot (not a third slot -- both boot modes share one `NDS_ARM7`/`jitCacheArm7`) via a new `jitSetArm7GBAMode()` (`jit_trace.cpp`), called from `NDS_DebugForceGBAMode()` as a third mirror of the boot-mode flag alongside `gameInfo.isGBA`/`MMU.isGBA`; corrected the earlier sketch's assumption that `jitBuildArm7Profile()`'s one-time `jitInit()` call site (which runs once, pre-ROM-load, from `NDS_Init()`) could itself gate on the flag -- traced that it can't, and hooked the swap at `jitRunArm7()`'s per-call `jitProfile[JIT_ARM7]` read instead. Memory-access hooks reuse the same `MMU.isGBA`-guarded templated calls step 4 wired; `mainMemBase`/`pageDescBase` deliberately left `0` to avoid reintroducing step 4's DS/GBA aliasing risk via the P13/P14 inline fast paths; cycle-cost tables are verbatim, documented duplicates of the DS ARM7 profile's (same un-diverged interpreter cost model). Verified via diff review + clean full build (new file auto-picked-up by the Makefile's directory-level `SOURCES` globbing, no Makefile edit needed). Remaining sequenced steps: BIOS implementation itself (step 6 code, decision already made), peripherals (step 7) |
 | 21 | GBA reference baseline: DS-side melonDS + GBA reference emulator | next            |
 | 22 | GBA memory/cartridge/BIOS/peripheral implementation              | next            |
 | 23 | GBA conformance harness                                          | next            |

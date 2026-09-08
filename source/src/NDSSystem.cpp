@@ -2221,6 +2221,13 @@ void NDS_DebugForceGBAMode(bool enable)
 	// MMU.isGBA's comment in MMU.h. Any future code that sets
 	// gameInfo.isGBA from real ROMTYPE_GBA detection must set this too.
 	MMU.isGBA = enable;
+#ifdef DESMUME_JIT_ARM7
+	// roadmap #20 (GBA compat), §12.3 step 5: swap which JitCpuProfile
+	// jitRunArm7() sees -- see jitSetArm7GBAMode()'s comment in jit.h. A
+	// third mirror of this same flag, for the same "MMU.h/jit_trace.cpp
+	// can't see GameInfo" reason as MMU.isGBA above.
+	jitSetArm7GBAMode(enable);
+#endif
 }
 
 static std::string MakeInputDisplayString(u16 pad, const std::string* Buttons, int count) {

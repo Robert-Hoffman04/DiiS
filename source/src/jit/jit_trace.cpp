@@ -23,8 +23,20 @@
 // =========================================================================
 JitCpuProfile* jitProfile[2] = { nullptr, nullptr };
 
-extern JitCpuProfile* jitBuildArm7Profile();   // jit_arm7_profile.cpp
-extern JitCpuProfile* jitBuildArm9Profile();   // jit_arm9_profile.cpp
+extern JitCpuProfile* jitBuildArm7Profile();      // jit_arm7_profile.cpp
+extern JitCpuProfile* jitBuildArm9Profile();      // jit_arm9_profile.cpp
+extern JitCpuProfile* jitBuildArm7GBAProfile();   // jit_arm7gba_profile.cpp
+
+// roadmap #20 (GBA compat), §12.3 step 5: the DS and GBA ARM7 profiles both
+// live on the one JIT_ARM7 slot (same jitCacheArm7 arena/block table/SMC
+// registry -- only one boot mode is ever live at a time). jitInit() builds
+// both once; jitSetArm7GBAMode() below just swaps which one jitRunArm7()
+// sees via jitProfile[JIT_ARM7], which it already re-reads fresh on every
+// call. jitInit() itself cannot gate on gameInfo.isGBA -- it runs exactly
+// once, from NDS_Init(), before any ROM is loaded and before that flag can
+// ever be meaningfully true.
+static JitCpuProfile* s_arm7DsProfile  = nullptr;
+static JitCpuProfile* s_arm7GbaProfile = nullptr;
 
 // One backing-store set per core, indexed [JIT_ARM9]=0 / [JIT_ARM7]=1.
 static u32*         s_arena[2]        = { nullptr, nullptr };
@@ -150,6 +162,7 @@ void jitShutdown()
 	jitFreeSlot(JIT_ARM7);
 	jitFreeSlot(JIT_ARM9);
 	jitProfile[JIT_ARM7] = jitProfile[JIT_ARM9] = nullptr;
+	s_arm7DsProfile = s_arm7GbaProfile = nullptr;
 	s_initDone = false;
 }
 
@@ -193,10 +206,27 @@ void jitInit()
 	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 
 	if (!ok) { jitShutdown(); return; }
+
+	// §12.3 step 5: jitInitSlot() above already published the DS profile into
+	// jitProfile[JIT_ARM7] -- remember that pointer, then build the GBA
+	// profile too (struct fill only, no cache/arena work) so
+	// jitSetArm7GBAMode() has both ready to swap between.
+	s_arm7DsProfile  = jitProfile[JIT_ARM7];
+	s_arm7GbaProfile = jitBuildArm7GBAProfile();
+
 #ifdef JIT_HEAP_WATCH
 	jitArmMinefield();
 #endif
 	s_initDone = true;
+}
+
+void jitSetArm7GBAMode(bool enable)
+{
+	// Guarded: a no-op if jitInit() hasn't run yet or failed (both pointers
+	// stay null), so an early NDS_DebugForceGBAMode() call before NDS_Init()
+	// can't dereference/publish a null profile.
+	if (!s_arm7DsProfile || !s_arm7GbaProfile) return;
+	jitProfile[JIT_ARM7] = enable ? s_arm7GbaProfile : s_arm7DsProfile;
 }
 
 // =========================================================================
