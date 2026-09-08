@@ -429,6 +429,98 @@ int NDS_LoadROM(const char *filename, const char *logicalFilename)
 		return -1;
 	}
 
+	// roadmap #20 (GBA compat), §12.3 step 6: peek the GBATEK offset-0xB2
+	// magic byte -- the same byte/constant DetectRomType (header.cpp)
+	// checks, kept in sync with ROMTYPE_GBA -- to route a real .gba
+	// cartridge to its own load path *before* any of the DS-shaped
+	// decrypt/copy logic below runs (that logic assumes an NDS_header,
+	// which a GBA cart doesn't have; DecryptSecureArea's own ROMTYPE_GBA
+	// case would otherwise just reject it). Checked directly here rather
+	// than exposing DetectRomType/header.h to NDSSystem.cpp, since this is
+	// the only place that needs the classification this early, before
+	// deciding how much of the file to read.
+	{
+		u8 peek[0xB3];
+		reader->Read(file, peek, sizeof(peek));
+		// rewind to where the DS path below expects the stream to be.
+		reader->Seek(file, (type == ROM_DSGBA) ? DSGBA_LOADER_SIZE : 0, SEEK_SET);
+
+		if (peek[0xB2] == 0x96)
+		{
+			reader->DeInit(file);
+			free(noext);
+
+			// A real GBA cart is memory-mapped (unlike the DS card, which
+			// isn't) and small enough (32 MB max) to just load flat into
+			// one buffer -- DS's demand-paged Init_VMem()/MMU_CART_ROM()
+			// scheme exists for DS carts up to 512 MB+, not needed here.
+			if (MMU.CART_ROM != MMU.UNUSED_RAM)
+				NDS_FreeROM();
+
+			u32 gbaMask = size - 1;
+			gbaMask |= gbaMask >> 1;
+			gbaMask |= gbaMask >> 2;
+			gbaMask |= gbaMask >> 4;
+			gbaMask |= gbaMask >> 8;
+			gbaMask |= gbaMask >> 16;
+
+			u8* gbaData = new u8[(size_t)gbaMask + 1];
+			memset(gbaData, 0, (size_t)gbaMask + 1);   // pad past real file size
+
+			// Raw fopen, bypassing the ROMReader abstraction for this bulk
+			// read -- the same thing Init_VMem() below already does for
+			// DS's own full-ROM body (only the small header peek above
+			// goes through `reader`), so this isn't a new limitation.
+			FILE* gf = fopen(filename, "rb");
+			if (!gf) { delete[] gbaData; return -1; }
+			if (type == ROM_DSGBA) fseek(gf, DSGBA_LOADER_SIZE, SEEK_SET);
+			size_t gbaRead = fread(gbaData, 1, size, gf);
+			fclose(gf);
+			if (gbaRead != size) { delete[] gbaData; return -1; }
+
+			gameInfo.resize(size);
+
+			// Dual-purpose reuse: MMU.CART_ROM/CART_ROM_MASK is the DS
+			// card-controller's loaded-ROM storage everywhere else in this
+			// file, but nothing DS-specific can ever dereference it in GBA
+			// mode (every ARM7 memory access is intercepted by the isGBA
+			// guard in MMU.h before reaching any DS-only code path, slot-1
+			// controller emulation included) -- so it's also where
+			// _MMU_ARM7GBA_read/write* (MMU.cpp) source real cartridge-ROM
+			// reads for 0x08000000+, and setting it here is also what
+			// keeps NDS_getROMHeader() (called from NDS_Reset()/
+			// GameInfo::populate()) from returning NULL and aborting reset.
+			NDS_SetROM(gbaData, gbaMask);
+
+			// Unused for GBA (MMU_CART_ROM()'s file-paging is unreachable,
+			// per the comment above) but keeps NDS_FreeROM()'s unconditional
+			// Free_VMem() call safe without special-casing that function.
+			Init_VMem();
+
+			// gameInfo.isGBA/MMU.isGBA/the JIT profile swap -- see that
+			// function's own comments. This is the real-load call site its
+			// comment already anticipated.
+			NDS_DebugForceGBAMode(true);
+
+			NDS_Reset();
+
+			// GameInfo::populate() is skipped -- it parses DS-header-shaped
+			// fields (NDS_getROMHeader()) that are meaningless for a GBA
+			// cart. Set the cosmetic fields directly from the real GBA
+			// header instead: internal title (offset 0xA0, 12 bytes) +
+			// game code (offset 0xAC, 4 bytes).
+			gameInfo.crc = 0;
+			memset(gameInfo.ROMserial, 0, sizeof(gameInfo.ROMserial));
+			memcpy(gameInfo.ROMserial, gbaData + 0xA0, 12);
+			memset(gameInfo.ROMname, 0, sizeof(gameInfo.ROMname));
+			memcpy(gameInfo.ROMname, gbaData + 0xAC, 4);
+			INFO("\nGBA ROM loaded (%u bytes, mask 0x%08X)\n", (unsigned)size, (unsigned)gbaMask);
+			INFO("ROM serial: %s\n", gameInfo.ROMserial);
+
+			return (int)size;
+		}
+	}
+
 	//zero 25-dec-08 - this used to yield a mask which was 2x large
 	//mask = size; 
 	u32 mask = size-1; 
@@ -1938,7 +2030,10 @@ void NDS_Reset()
 		if(CommonSettings.SWIFromBIOS == true) NDS_ARM7.swi_tab = 0;
 		else NDS_ARM7.swi_tab = ARM7_swi_tab;
 
-		if (CommonSettings.PatchSWI3)
+		// roadmap #20 (GBA compat): 0x00002F08 is a DS-BIOS-specific patch
+		// offset; under 0x4000 it would otherwise land in GBA_BIOS via the
+		// isGBA-guarded dispatcher, which isn't what this patch means.
+		if (CommonSettings.PatchSWI3 && !gameInfo.isGBA)
 			_MMU_write16<ARMCPU_ARM7>(0x00002F08, 0x4770);
 
 		INFO("ARM7 BIOS is loaded.\n");
@@ -1960,6 +2055,22 @@ void NDS_Reset()
 		T1WriteLong(MMU.ARM7_BIOS,0x30, 0xE8BD500F);
 		T1WriteLong(MMU.ARM7_BIOS,0x34, 0xE25EF004);
 	}
+
+	// roadmap #20 (GBA compat), §12.3 step 6: this codebase's declared BIOS
+	// strategy is function-level HLE (a future bios_gba.cpp mirroring
+	// bios.cpp's SWI-intercept pattern) -- not yet implemented, and
+	// definitely not DS's ARM7_swi_tab set above, whose handlers assume DS
+	// register/memory conventions and would be actively dangerous run
+	// against GBA state. Force swi_tab back to null for isGBA regardless of
+	// what the DS logic above just decided: the interpreter's real-SWI-trap
+	// fallback (arm_instructions.cpp/thumb_instructions.cpp, taken whenever
+	// swi_tab is null) then does exactly what real hardware's exception
+	// vector does -- jump to intVector+0x08 (0x00000008 for ARM7) -- landing
+	// in GBA_BIOS, which is legitimately zero-filled (no real/HLE BIOS
+	// content yet) rather than corrupting emulator or guest state through a
+	// mismatched DS handler.
+	if (gameInfo.isGBA)
+		NDS_ARM7.swi_tab = NULL;
 
 	//ARM9 BIOS IRQ HANDLER
 	if(CommonSettings.UseExtBIOS == true)
@@ -2008,13 +2119,35 @@ void NDS_Reset()
 	firmware = new CFIRMWARE();
 	fw_success = firmware->load();
 
-	if ((CommonSettings.UseExtBIOS == true) && (CommonSettings.BootFromFirmware == true) && (fw_success == TRUE))
+	// roadmap #20 (GBA compat), §12.3 step 6: none of DS's firmware-vs-direct
+	// boot branching below applies to a GBA cart -- there's no DS firmware
+	// equivalent, and even the "direct" branch's ARM7 setup is driven by
+	// NDS_header fields (header->ARM7src/cpy/exe) that don't exist on a GBA
+	// header, read here from whatever our GBA loader happened to leave in
+	// MMU.CART_ROM at those byte offsets. Worse than just wrong values: the
+	// "direct" branch's copy loop actually *writes* through
+	// _MMU_write32<ARMCPU_ARM7>(dst, ...) at a bogus dst -- since that
+	// routes through the isGBA-guarded dispatcher like every other ARM7
+	// write, it would really land in GBA_EWRAM/GBA_IWRAM and corrupt real
+	// GBA state before the game even starts. So GBA mode gets its own
+	// self-contained branch instead of threading more isGBA checks through
+	// the existing one: direct-boot straight into the cartridge with no
+	// BIOS execution at all (this codebase's declared strategy -- see the
+	// plan doc's §12.3 step 6 decision -- is function-level HLE for SWI,
+	// not executing any code at the BIOS address, so there is nothing to
+	// "boot from" at 0x00000000 the way DS boots from its own BIOS/
+	// firmware). armcpu_init() already sets CPSR = SYS (0x1F: System mode,
+	// ARM state, IRQ/FIQ enabled, flags clear) for a fresh armcpu_t, which
+	// happens to already match the well-documented post-BIOS handoff CPSR
+	// (GBATEK "BIOS RAM Usage") -- no extra CPSR write needed here.
+	if (gameInfo.isGBA)
+	{
+		armcpu_init(&NDS_ARM7, 0x08000000);
+	}
+	else if ((CommonSettings.UseExtBIOS == true) && (CommonSettings.BootFromFirmware == true) && (fw_success == TRUE))
 	{
 		// Copy secure area to memory if needed
-		// roadmap #20 (GBA compat), §12.3 step 2: skip everything here that's
-		// ARM9-specific when gameInfo.isGBA -- these header fields describe a
-		// DS ARM9 binary that doesn't exist for a GBA cart.
-		if (!gameInfo.isGBA && (header->ARM9src >= 0x4000) && (header->ARM9src < 0x8000))
+		if ((header->ARM9src >= 0x4000) && (header->ARM9src < 0x8000))
 		{
 			src = header->ARM9src;
 			dst = header->ARM9cpy;
@@ -2032,7 +2165,7 @@ void NDS_Reset()
 		if (firmware->patched)
 		{
 			armcpu_init(&NDS_ARM7, 0x00000008);
-			if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, 0xFFFF0008);
+			armcpu_init(&NDS_ARM9, 0xFFFF0008);
 		}
 		else
 		{
@@ -2041,26 +2174,23 @@ void NDS_Reset()
 			//armcpu_init(&NDS_ARM7, 0x00000008);
 			//armcpu_init(&NDS_ARM9, 0xFFFF0008);
 			armcpu_init(&NDS_ARM7, firmware->ARM7bootAddr);
-			if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, firmware->ARM9bootAddr);
+			armcpu_init(&NDS_ARM9, firmware->ARM9bootAddr);
 		}
 
-			if (!gameInfo.isGBA) _MMU_write08<ARMCPU_ARM9>(0x04000300, 0);
+			_MMU_write08<ARMCPU_ARM9>(0x04000300, 0);
 			_MMU_write08<ARMCPU_ARM7>(0x04000300, 0);
 	}
 	else
 	{
-		if (!gameInfo.isGBA)
-		{
-			src = header->ARM9src;
-			dst = header->ARM9cpy;
+		src = header->ARM9src;
+		dst = header->ARM9cpy;
 
-			for(u32 i = 0; i < (header->ARM9binSize>>2); ++i)
-			{
+		for(u32 i = 0; i < (header->ARM9binSize>>2); ++i)
+		{
 // 				_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU.CART_ROM, src));
-				_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU_CART_ROM(src),0));
-				dst += 4;
-				src += 4;
-			}
+			_MMU_write32<ARMCPU_ARM9>(dst, T1ReadLong(MMU_CART_ROM(src),0));
+			dst += 4;
+			src += 4;
 		}
 
 		src = header->ARM7src;
@@ -2075,18 +2205,31 @@ void NDS_Reset()
 		}
 
 		armcpu_init(&NDS_ARM7, header->ARM7exe);
-		if (!gameInfo.isGBA) armcpu_init(&NDS_ARM9, header->ARM9exe);
+		armcpu_init(&NDS_ARM9, header->ARM9exe);
 
-		if (!gameInfo.isGBA) _MMU_write08<ARMCPU_ARM9>(REG_POSTFLG, 1);
+		_MMU_write08<ARMCPU_ARM9>(REG_POSTFLG, 1);
 		_MMU_write08<ARMCPU_ARM7>(REG_POSTFLG, 1);
 	}
 
 	//bitbox 4k demo is so stripped down it relies on default stack values
 	//otherwise the arm7 will crash before making a sound
 	//(these according to gbatek softreset bios docs)
-	NDS_ARM7.R13_svc = 0x0380FFDC;
-	NDS_ARM7.R13_irq = 0x0380FFB0;
-	NDS_ARM7.R13_usr = 0x0380FF00;
+	// roadmap #20 (GBA compat), §12.3 step 6: GBA's own post-BIOS-handoff
+	// stack pointers (GBATEK "BIOS RAM Usage") -- DS's WRAM-region values
+	// below are meaningless (and, per the isGBA-guarded dispatcher, would
+	// actually alias into GBA_IWRAM) for a GBA cart.
+	if (gameInfo.isGBA)
+	{
+		NDS_ARM7.R13_svc = 0x03007FE0;
+		NDS_ARM7.R13_irq = 0x03007FA0;
+		NDS_ARM7.R13_usr = 0x03007F00;
+	}
+	else
+	{
+		NDS_ARM7.R13_svc = 0x0380FFDC;
+		NDS_ARM7.R13_irq = 0x0380FFB0;
+		NDS_ARM7.R13_usr = 0x0380FF00;
+	}
 	NDS_ARM7.R[13] = NDS_ARM7.R13_usr;
 	//and let's set these for the arm9 while we're at it, though we have no proof
 	// roadmap #20 (GBA compat): skip in isGBA mode -- see NDS_DebugForceGBAMode.

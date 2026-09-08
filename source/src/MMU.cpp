@@ -4342,8 +4342,12 @@ enum GBAMemRegion
 	GBA_REGION_PALETTE,
 	GBA_REGION_VRAM,
 	GBA_REGION_OAM,
-	// I/O (0x04000000), cartridge ROM (0x08000000+), SRAM (0x0E000000) --
-	// no backing buffer yet, deferred to §12.3 step 7 (peripherals).
+	// Cartridge ROM (0x08000000+) got a real backing store once loading a
+	// real .gba file existed to fill one (NDS_LoadROM, NDSSystem.cpp) --
+	// see GBA_REGION_CART_ROM below. I/O (0x04000000) and SRAM
+	// (0x0E000000) still have no backing buffer, deferred to §12.3 step 7
+	// (peripherals).
+	GBA_REGION_CART_ROM,
 	GBA_REGION_UNMAPPED
 };
 
@@ -4392,15 +4396,31 @@ static GBADecodedAddr gbaDecodeAddr(u32 addr)
 		case 0x07:
 			// OAM: 1 KB, mirrors every 0x400 across the whole 0x07 bank.
 			return GBADecodedAddr{ GBA_REGION_OAM, addr & 0x000003FF };
+		case 0x08: case 0x09:   // wait-state 0
+		case 0x0A: case 0x0B:   // wait-state 1
+		case 0x0C: case 0x0D:   // wait-state 2
+			// Cartridge ROM: memory-mapped (unlike the DS card, which
+			// isn't), the same 32 MB window mirrored identically at three
+			// wait-state regions -- real hardware differs only in access
+			// timing there, not content, which this pass doesn't model
+			// (§12.3 step 7). This offset is only the window-relative
+			// address; wrapping a smaller-than-32MB cart within its own
+			// size (MMU.CART_ROM_MASK) is done by the caller, not here --
+			// keeps gbaDecodeAddr a pure function touching no globals,
+			// matching its existing verbatim-copy unit-test methodology.
+			return GBADecodedAddr{ GBA_REGION_CART_ROM, addr & 0x01FFFFFF };
 		default:
 			return GBADecodedAddr{ GBA_REGION_UNMAPPED, 0 };
 	}
 }
 
-// GBA_BIOS is ROM from the CPU's perspective -- writes are dropped.
-// Everything else in GBA_REGION_UNMAPPED (I/O/cartridge/SRAM, step 7) also
-// has no backing buffer yet: reads return 0, writes are no-ops. This is a
-// placeholder, not real I/O/cartridge behavior.
+// GBA_BIOS and cartridge ROM are both ROM from the CPU's perspective --
+// writes are dropped (see the two accessors' GBA_REGION_BIOS/CART_ROM
+// special-cases below; neither is listed here, so both fall through this
+// switch's default and every write to them is silently a no-op, same as
+// GBA_REGION_UNMAPPED). GBA_REGION_UNMAPPED itself (I/O/SRAM, step 7) has
+// no backing buffer yet: reads return 0, writes are no-ops -- a
+// placeholder, not real I/O/SRAM behavior.
 static u8* gbaWritableBuffer(GBAMemRegion region)
 {
 	switch (region)
@@ -4414,10 +4434,23 @@ static u8* gbaWritableBuffer(GBAMemRegion region)
 	}
 }
 
+// Cartridge ROM reads source MMU.CART_ROM/CART_ROM_MASK -- the same fields
+// NDS_LoadROM (NDSSystem.cpp) fills for a real .gba load, dual-purposed
+// from their usual DS card-controller role (see that function's comment).
+// The final `& CART_ROM_MASK` wrap (not done in gbaDecodeAddr -- see its
+// own comment) re-mirrors a smaller-than-32MB cart across the rest of the
+// window, matching real mask-ROM hardware. MMU.CART_ROM defaults to
+// MMU.UNUSED_RAM (4 zero bytes) with CART_ROM_MASK 0 when nothing is
+// loaded, so this is safe (reads 0) even if ever reached with no cart --
+// which shouldn't happen, since MMU.isGBA only ever becomes true once
+// NDS_LoadROM has already set both.
+static u32 gbaCartRomOffset(u32 windowOffset) { return windowOffset & MMU.CART_ROM_MASK; }
+
 u8 FASTCALL _MMU_ARM7GBA_read08(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadByte(MMU.GBA_BIOS, d.offset);
+	if (d.region == GBA_REGION_CART_ROM) return T1ReadByte(MMU.CART_ROM, gbaCartRomOffset(d.offset));
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadByte(buf, d.offset);
@@ -4427,6 +4460,7 @@ u16 FASTCALL _MMU_ARM7GBA_read16(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadWord_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	if (d.region == GBA_REGION_CART_ROM) return T1ReadWord_guaranteedAligned(MMU.CART_ROM, gbaCartRomOffset(d.offset));
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadWord_guaranteedAligned(buf, d.offset);
@@ -4436,6 +4470,7 @@ u32 FASTCALL _MMU_ARM7GBA_read32(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadLong_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	if (d.region == GBA_REGION_CART_ROM) return T1ReadLong_guaranteedAligned(MMU.CART_ROM, gbaCartRomOffset(d.offset));
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadLong_guaranteedAligned(buf, d.offset);

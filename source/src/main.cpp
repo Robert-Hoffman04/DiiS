@@ -1161,6 +1161,90 @@ static void rockwrestler_probe_tick()
 }
 #endif // DESMUME_ROCKWRESTLER_PROBE
 
+#ifdef DESMUME_GBA_BOOT_PROBE
+//---------------------------------------------------------------------------
+// roadmap #20 (GBA compat) boot probe (-DDESMUME_GBA_BOOT_PROBE).
+//
+// Unlike the armwrestler-family probes above, a real commercial GBA ROM has
+// no idea this emulator or its slot-2/ExpMemory reporting convention exist
+// -- it can't cooperate. So this probe instruments the emulator itself:
+// sampled once per frame, it tracks how far ARM7's PC has actually moved
+// through real cartridge/EWRAM/IWRAM code (proof the interpreter is
+// fetching and executing genuine GBA instructions across more than one
+// address, not stuck or silently misrouted), plus a simple EWRAM+IWRAM
+// content hash (proof real memory writes are landing -- BSS clears, stack
+// setup, etc.), and whether PC ever reached GBA_BIOS (0x00000000-
+// 0x00003FFF) -- which would mean the game hit an SWI and fell into the
+// safe-but-inert real-SWI-trap path (see NDS_Reset()'s swi_tab override,
+// NDSSystem.cpp) rather than real BIOS/HLE SWI content, since neither
+// exists yet (§12.3 step 6).
+//---------------------------------------------------------------------------
+static u32 gbaFnv1a(const u8* buf, u32 n)
+{
+	u32 h = 2166136261u;
+	for (u32 i = 0; i < n; i++) { h ^= buf[i]; h *= 16777619u; }
+	return h;
+}
+
+static u32  s_gbaSeenBios = 0, s_gbaSeenEwram = 0, s_gbaSeenIwram = 0, s_gbaSeenCart = 0, s_gbaSeenOther = 0;
+static u32  s_gbaMinCartPC = 0xFFFFFFFFu, s_gbaMaxCartPC = 0;
+static u32  s_gbaDistinctPages[64];
+static u32  s_gbaDistinctPageCount = 0;
+static bool s_gbaHaveResult = false;
+static u32  s_gbaQuitAtFrame = 0;
+static char s_gbaLine[4096];
+static int  s_gbaLineLen = 0;
+
+static void gba_boot_probe_tick()
+{
+	static u32 frame = 0;
+	if (quit_game) return;
+	frame++;
+
+	u32 pc = NDS_ARM7.R[15];
+	u32 bank = pc >> 24;
+	if (bank == 0x00) s_gbaSeenBios++;
+	else if (bank == 0x02) s_gbaSeenEwram++;
+	else if (bank == 0x03) s_gbaSeenIwram++;
+	else if (bank >= 0x08 && bank <= 0x0D) {
+		s_gbaSeenCart++;
+		if (pc < s_gbaMinCartPC) s_gbaMinCartPC = pc;
+		if (pc > s_gbaMaxCartPC) s_gbaMaxCartPC = pc;
+		u32 page = pc & ~0xFFFu;
+		bool known = false;
+		for (u32 i = 0; i < s_gbaDistinctPageCount; i++)
+			if (s_gbaDistinctPages[i] == page) { known = true; break; }
+		if (!known && s_gbaDistinctPageCount < 64) s_gbaDistinctPages[s_gbaDistinctPageCount++] = page;
+	}
+	else s_gbaSeenOther++;
+
+	const u32 QUIT_FRAME = 600;   // ~10s at 60fps -- generous for a boot sequence
+	if (!s_gbaHaveResult && frame >= QUIT_FRAME) {
+		u32 ewramHash = gbaFnv1a(MMU.GBA_EWRAM, sizeof(MMU.GBA_EWRAM));
+		u32 iwramHash = gbaFnv1a(MMU.GBA_IWRAM, sizeof(MMU.GBA_IWRAM));
+
+		char* p = s_gbaLine;
+		char* end = s_gbaLine + sizeof(s_gbaLine);
+		p += snprintf(p, end - p, "[gba_boot] frames=%u finalPC=0x%08x CPSR=0x%08x mode=0x%02x T=%d\n",
+		              frame, pc, NDS_ARM7.CPSR.val, NDS_ARM7.CPSR.bits.mode, NDS_ARM7.CPSR.bits.T);
+		p += snprintf(p, end - p, "[gba_boot] samples: bios=%u ewram=%u iwram=%u cart=%u other=%u\n",
+		              s_gbaSeenBios, s_gbaSeenEwram, s_gbaSeenIwram, s_gbaSeenCart, s_gbaSeenOther);
+		p += snprintf(p, end - p, "[gba_boot] cart PC range: 0x%08x - 0x%08x, distinct 4K pages visited: %u\n",
+		              s_gbaSeenCart ? s_gbaMinCartPC : 0, s_gbaSeenCart ? s_gbaMaxCartPC : 0, s_gbaDistinctPageCount);
+		p += snprintf(p, end - p, "[gba_boot] EWRAM hash=0x%08x IWRAM hash=0x%08x\n", ewramHash, iwramHash);
+		s_gbaLineLen = (int)(p - s_gbaLine);
+		s_gbaHaveResult = true;
+		s_gbaQuitAtFrame = frame + 60;   // brief grace window for the SD flush cadence
+	}
+
+	if (s_gbaHaveResult && ((frame & 15) == 0 || frame >= s_gbaQuitAtFrame)) {
+		FILE* f = fopen("sd:/gba_boot.log", "w");
+		if (f) { fwrite(s_gbaLine, 1, (size_t)s_gbaLineLen, f); fclose(f); }
+	}
+	if (s_gbaHaveResult && frame >= s_gbaQuitAtFrame) quit_game = true;
+}
+#endif // DESMUME_GBA_BOOT_PROBE
+
 void DSExec(){
 
 	PAD_ScanPads();
@@ -1258,6 +1342,9 @@ void DSExec(){
 #endif
 #ifdef DESMUME_ROCKWRESTLER_PROBE
 	rockwrestler_probe_tick();
+#endif
+#ifdef DESMUME_GBA_BOOT_PROBE
+	gba_boot_probe_tick();
 #endif
 
 	if(showfps) ShowFPS();
