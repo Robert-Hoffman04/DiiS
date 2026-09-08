@@ -307,7 +307,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, ea & 0xFFFF);
 		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
 		*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		break;
 	}
@@ -385,7 +384,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_LWZ(PPC_R10, 1, 100);
 			ctx.emitSlowStore(PPC_R12, PPC_R10, size);
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 		} else {
 			ctx.emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
 			if (wordRotate) {                              // ROR(R10, 8*(EA&3))
@@ -397,7 +395,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 				*emitPtr++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
 			}
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 			*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		}
 		break;
@@ -429,7 +426,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		if (isLoad) {
 			ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 			*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		} else {
 			ctx.emitSmcCheckAndBail(PPC_R12);
@@ -437,7 +433,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_LWZ(PPC_R10, 1, 100);
 			ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 		}
 		break;
 	}
@@ -583,7 +578,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			// misdecodes the first real ARM opcode as THUMB and free-runs
 			// from there -- observed as ARM7's PC escaping to a garbage
 			// 32-bit address and never recovering (see the plan memory).
-			ctx.flushDirtyRegisters();
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 100);                  // R12 = raw popped PC
 			*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);   // R11 = bit0 (mode bit)
 			*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
@@ -726,8 +720,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// now reports the NOT-taken/fall-through cost (1) for this opcode
 		// range -- see the comment on jit_arm7_profile.cpp's case 0xD.
 		ctx.emitAddCycles(ctx.cyclesAccum + 3);
-		ctx.emitDirtyFlagFlush();
-		ctx.emitDirtyRegisterFlush();
 		ctx.emitResultMetadata(ctx.instrCount + 1, 0);
 		*emitPtr++ = PPC_LIS(PPC_R29, (targetPC + 4) >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, (targetPC + 4) & 0xFFFF);

@@ -157,8 +157,6 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	// --- taken path: exit the block at `target` (byte-for-byte the THUMB F16 shape) ---
 	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND / OP_BL taken cost
-	ctx.emitDirtyFlagFlush();                            // no-op (P12), kept for shape
-	ctx.emitDirtyRegisterFlush();                        // non-clearing: fall-through re-flushes
 	if (isBL)                                            // guest R14 = return address
 		emitLoadImm32(p, ctx.hostRegFor(14), retLR);    // pinned reg; only the taken path runs this
 	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
@@ -850,16 +848,14 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	u8 hVal = 0;
 	if (!L) hVal = ctx.readReg(rd, lockedMask);
 
-	// Predicated: flush every dirty guest reg (and flags) to memory NOW, before
-	// the condition guard. The slow tail invalidates the reg cache and writes
-	// Rd/Rn straight to their gpr slots, so after this op the compile-time cache
-	// is empty on both runtime paths -- and because the pre-guard flush already
-	// spilled the live values, the cond-false path that skips the access still
-	// finds coherent guest memory to reload from.
+	// Predicated: eval the condition, BEQ over the access, keep compiling. Under
+	// GPR residency every guest register (and the packed flags) is pinned in a
+	// host register the whole trace, so the cond-false fall-through and the
+	// taken path share the same coherent state with nothing to flush or reload;
+	// the guarded access only ever mutates a pinned register, and the BEQ skips
+	// it wholesale on the false path.
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.flushDirtyRegisters();
-		ctx.flushDirtyFlags();
 		ctx.emitEvalCond(cond);                          // r11 = cond ? 1 : 0
 		*p++ = PPC_CMPWI(0, PPC_R11, 0);
 		guard = p++;                                     // BEQ over the access
@@ -888,10 +884,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd, lockedMask,
 	                  predicated);
 
-	if (guard) {
-		*guard = PPC_BEQ((u32)((p - guard) * 4));
-		ctx.invalidateRegCache();   // uniform compile-time state on both paths
-	}
+	if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 }
 
 // ------------------------------------------------ extra load/store (B3b)
@@ -937,8 +930,6 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.flushDirtyRegisters();
-		ctx.flushDirtyFlags();
 		ctx.emitEvalCond(cond);
 		*p++ = PPC_CMPWI(0, PPC_R11, 0);
 		guard = p++;
@@ -960,10 +951,7 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd,
 	                  lockedMask, predicated);
 
-	if (guard) {
-		*guard = PPC_BEQ((u32)((p - guard) * 4));
-		ctx.invalidateRegCache();
-	}
+	if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 }
 
 // ------------------------------------------------ block data transfer (B4)
@@ -1060,8 +1048,6 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.flushDirtyRegisters();
-		ctx.flushDirtyFlags();
 		ctx.emitEvalCond(cond);
 		*p++ = PPC_CMPWI(0, PPC_R11, 0);
 		guard = p++;
@@ -1283,15 +1269,11 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 		emitLoadImm32(p, hLR, ctx.currentPC + 4);            // OP_BLX_REG: R14 = next_instruction
 	}
 
-	// Flush every dirty guest reg/flag NOW -- unconditionally, before the
-	// predication guard. flushDirtyRegisters() clears the dirty bits, so the
-	// per-path emitDynamicExit() calls won't re-flush; the preceding in-block
-	// instructions (e.g. `AND R0,R0,#x` before `BX lr`) MUST be persisted here,
-	// and a predicated BXcc's cond-false fall-through relies on this store
-	// having executed (see the header note re: c375880).
-	ctx.flushDirtyFlags();
-	ctx.flushDirtyRegisters();
-
+	// Guest regs + flags are resident; the in-block instructions before this
+	// BX (e.g. `AND R0,R0,#x` before `BX lr`) are already live in their pinned
+	// registers, and a predicated BXcc's cond-false fall-through shares that
+	// same state -- nothing to flush here (this is what the c375880 revert was
+	// really about; residency dissolves the hazard).
 	u32* guard = nullptr;
 	if (predicated) {
 		(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
@@ -1321,7 +1303,6 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 
 	if (predicated) {
 		*guard = PPC_BEQ((u32)((p - guard) * 4));            // cond-false: keep compiling
-		ctx.invalidateRegCache();                            // fall-through reloads from memory
 		return;
 	}
 

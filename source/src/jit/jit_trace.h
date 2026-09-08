@@ -175,7 +175,6 @@ struct JitTraceCtx {
 	     { (void)fullOverwrite; (void)lockedMask; return hostRegFor(gbaReg); }
 	void flushDirtyRegisters()   {}              // resident: nothing to flush
 	void emitDirtyRegisterFlush() {}
-	void emitEagerFlush();
 	void invalidateRegCache()    {}              // resident: no cache to drop
 
 	// ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite ----

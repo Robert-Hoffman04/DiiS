@@ -312,12 +312,6 @@ void JitTraceCtx::emitCVfromXER(u32 scratchReg)
 // (a C call that peeks cpu.R[], the interpreter bail) reload the gpr base from
 // stack slot 80(r1).
 
-void JitTraceCtx::emitEagerFlush()
-{
-	flushDirtyFlags();
-	flushDirtyRegisters();   // no-op under residency; kept for call-site parity
-}
-
 // ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite --------
 // r3 holds the cross-block cycle accumulator and is PPC-EABI volatile, so it's
 // spilled/reloaded around the call. Every guest register (R0..R15 -> r14..r29,
@@ -553,10 +547,8 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 {
 	u32*& p = emitPtr;
 
-	// Coherent guest memory on both runtime paths, empty compile-time cache
-	// afterwards (same shape as the predicated memory ops).
-	flushDirtyRegisters();
-	flushDirtyFlags();
+	// Guest state is resident (r14..r31) so the SMC-bail / slowRead / inline
+	// paths all see coherent registers with nothing to flush.
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA for the slow path
 
 	u32* fast[2];
@@ -646,8 +638,6 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 {
 	u32*& p = emitPtr;
 
-	flushDirtyRegisters();
-	flushDirtyFlags();
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
 
 	u32* fast[2];
@@ -713,10 +703,8 @@ void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn)
 {
 	u32*& p = emitPtr;
 
-	// Coherent guest memory on every runtime path (SMC bail, slowWrite, inline),
-	// empty compile-time cache afterwards -- same shape as emitArm9Load.
-	flushDirtyRegisters();
-	flushDirtyFlags();
+	// Guest state is resident, so the SMC-bail / slowWrite / inline paths all
+	// see coherent registers -- same shape as emitArm9Load.
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA
 
 	u32* fast[2];
@@ -770,8 +758,6 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 	u32*& p = emitPtr;
 	const u32 span = 4 * (n - 1);
 
-	flushDirtyRegisters();
-	flushDirtyFlags();
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
 
 	u32* fast[2];
@@ -876,8 +862,6 @@ void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
 	u32*& p = emitPtr;
 	const u32 pipe = targetPC + (thumbMode ? 4u : 8u);
 	emitAddCycles(cyclesAccum + termCycles);
-	flushDirtyFlags();
-	flushDirtyRegisters();
 	emitResultMetadata(metaCount, 0);
 	*p++ = PPC_LIS(PPC_R29, pipe >> 16);
 	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
@@ -893,14 +877,12 @@ void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool 
 {
 	u32*& p = emitPtr;
 	emitAddCycles(cyclesAccum + termCycles);
-	flushDirtyFlags();
-	flushDirtyRegisters();
 	emitResultMetadata(metaCount, 0);
-	// r29 (guest PC / GBA R15) needs the *pipeline* value, not the bare target
-	// -- the interpreter-pipeline convention emitStaticExit also follows -- so
-	// a guarded-dispatch hit lands in the next block with r29 already correct
-	// and never has to reload it from memory (r29 is always-resident, never
-	// spilled/reloaded like r15..r28's lazy cache).
+	// r29 (guest R15 / pipeline PC) needs the *pipeline* value, not the bare
+	// target -- the interpreter-pipeline convention emitStaticExit also follows
+	// -- so a guarded-dispatch hit lands in the next block with r29 already
+	// correct. It is resident (the i=15 slot of the pinned register file), so
+	// no block ever reloads it from memory.
 	*p++ = PPC_ADDI(PPC_R29, pcReg, targetThumb ? 4 : 8);
 	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
 #if JIT_ENABLE_DYNAMIC_CHAINING
@@ -918,8 +900,9 @@ void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool 
 void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 {
 	u32*& p = emitPtr;
-	flushDirtyFlags();
-	flushDirtyRegisters();
+	// No state flush here: guest R0..R15 + flags are resident and the single
+	// trampoline landing pad this branch reaches writes them back to cpu.R[]
+	// before the interpreter resumes at currentPC.
 	emitAddCycles(cyclesAccum);
 	emitResultMetadata(metaCount, 1);
 	*p++ = PPC_LIS(PPC_R4, currentPC >> 16);
@@ -1075,8 +1058,6 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	// ---- default epilogue: fall off the end of the block ----
 	if (!ctx.blockTerminatedEarly) {
 		ctx.emitAddCycles(ctx.cyclesAccum);
-		ctx.flushDirtyFlags();
-		ctx.flushDirtyRegisters();
 		ctx.emitResultMetadata(ctx.instrCount, 0);
 
 		const u32 pipe = ctx.currentPC + (thumb ? 4u : 8u);
