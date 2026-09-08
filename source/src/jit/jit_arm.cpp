@@ -1151,10 +1151,20 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 }
 
 // ---------------------------------------------------------- BX / BLX reg (B6)
-// cond 0001 0010 1111 1111 1111 00L1 Rm   (L: 0 = BX, 1 = BLX). Block terminator
-// with ARMv5 bit0 interworking -- identical shape to LDM{...,pc} (B4): bit0 of Rm
-// selects the resume ISA. BLX also writes R14 = the ARM return address first.
-void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
+// cond XXXX 0001 0010 1111 1111 1111 00L1 Rm   (L: 0 = BX, 1 = BLX). Block
+// terminator with ARMv5 bit0 interworking -- identical shape to LDM{...,pc}
+// (B4): bit0 of Rm selects the resume ISA. BLX also writes R14 = the ARM return
+// address first.
+//
+// Predicated (cond != AL) -- e.g. `BXEQ lr`, the single hottest opcode the
+// ARM9 emitter used to refuse (§5) -- compiles as taken-exit + cond-false
+// fall-through, byte-for-byte the emitBranch() predicated Bcc/BLcc shape: eval
+// the condition, BEQ over the whole dynamic-exit sequence, keep compiling the
+// block from currentPC+4 on the not-taken path. BLXcc's R14 write is a direct
+// store to the gpr backing slot (after emitDirtyRegisterFlush, touching only
+// scratch r11) so the taken path never mutates the compile-time register cache
+// and the fall-through keeps its allocator state -- exactly as emitBranch does.
+void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 {
 	const u8 rm = op & 0xF;
 	if (rm == 15) { ctx.endBlock = true; return; }          // BX pc: unpredictable
@@ -1162,11 +1172,20 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	ctx.ensureArena();
 	u32*& p = ctx.emitPtr;
 	u32 lockedMask = 0;
+	const bool predicated = (cond != COND_AL);
 
 	const u8 hRm = ctx.readReg(rm, lockedMask);
 	*p++ = PPC_OR(PPC_R12, hRm, hRm);                        // capture target pre-flush
 
-	if (isBlx) {
+	u32* guard = nullptr;
+	if (predicated) {
+		(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
+		ctx.emitEvalCond(cond);                              // r11 = (cond holds) ? 1 : 0 (r12 target survives)
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;                                         // BEQ over the taken exit
+	}
+
+	if (isBlx && !predicated) {
 		const u8 hLR = ctx.writeReg(14, true, lockedMask);
 		emitLoadImm32(p, hLR, ctx.currentPC + 4);            // OP_BLX_REG: R14 = next_instruction
 	}
@@ -1179,6 +1198,11 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	// that MUST be persisted here.
 	ctx.flushDirtyFlags();
 	ctx.flushDirtyRegisters();
+
+	if (isBlx && predicated) {                               // R14 = return address (direct: bypass + override the cache)
+		emitLoadImm32(p, PPC_R11, ctx.currentPC + 4);
+		*p++ = PPC_STW(PPC_R11, 14, 14 * 4);
+	}
 
 	const u32 term = ctx.cpu.cyclesForArm(op);
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);          // R11 = bit0 (mode select)
@@ -1198,6 +1222,11 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx)
 	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);           // & ~3 (CPSR.T already 0)
 	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+
+	if (predicated) {
+		*guard = PPC_BEQ((u32)((p - guard) * 4));            // cond-false: keep compiling the block
+		return;
+	}
 
 	ctx.instrCount++;
 	ctx.currentPC += 4;
@@ -1682,8 +1711,13 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	}
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
 		const bool isBlx = (op & 0x20u) != 0;
-		if (cond != COND_AL || (isBlx && !v5)) { ctx.endBlock = true; return; }  // BLX: ARMv5 only
-		emitBranchExchange(ctx, op, isBlx);
+		// Predicated BX compiles as taken-exit + cond-false fall-through (§5:
+		// `BXEQ lr` was the hottest opcode the ARM9 emitter refused). ARM9 only
+		// for now -- the ARM7 (ARMv4T) differential soak needs its own baseline
+		// before widening this there; BLX reg stays ARMv5 + AL only regardless.
+		if (cond != COND_AL && (isBlx || !v5)) { ctx.endBlock = true; return; }
+		if (isBlx && !v5)                      { ctx.endBlock = true; return; }
+		emitBranchExchange(ctx, op, isBlx, cond);
 		return;
 	}
 	if ((op & 0x0FB00FF0u) == 0x01000090u) {              // SWP / SWPB
