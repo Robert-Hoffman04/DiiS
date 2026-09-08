@@ -279,11 +279,7 @@ the block loses its value. `emitBranch()`'s predicated path sidesteps this by
 inlining a *non-clearing* `emitDirtyRegisterFlush()` and never calling
 `emitDynamicExit`. Any predicated op whose body runs a real state flush must
 use the `bailPreservingDirty()` save/restore idiom (`jit_trace.cpp`).
-Separately, `BXcc lr` is a conditional *return* — its taken path is a guarded
-dynamic-dispatch exit (polymorphic return address, no self-patch), no cheaper
-than the interpreter round-trip it replaces — so the non-branch ops are the
-better target regardless. Predicated `BX` can be revisited with the dirty-fix
-once the memory ops land.
+Predicated `BX` is revisited below once the memory ops establish the fix.
 
 **Predicated non-branch memory ops landed (`b81fa91`).**
 `emitSingleDataTransfer` / `emitExtraDataTransfer` / `emitBlockDataTransfer`
@@ -303,13 +299,42 @@ Result (SM64DS, `DESMUME_JIT_TRACE_FIRST`): trampoline round-trips
 1.8 → 2.0, `compiles` grows steadily (no free-run hang — the BXcc failure
 mode). Differential soak 576 M ARM9 insns / 0 mismatches; benchmark ARM9 JIT
 14.42 → 14.53, full JIT 36.17 → 36.94 (interpreter 13.16 unchanged). The gain
-is modest because `exec%` is already ~98 %. The **remaining** `dontJIT` edges
-(still ~99 % of the 40 %) are the excluded sub-forms above plus the hard tail
-(`MCR p15`, `MSR cpsr`) — next candidates, with diminishing returns.
+is modest because `exec%` is already ~98 %.
 
-At a ~1.9-block chain a fixed-mapping trampoline's unconditional 15-register
+**Predicated `BXcc lr` landed — retry of `c375880`, fixed (`47fef86`).**
+Same `emitEvalCond` + BEQ-guard + **unconditional pre-guard flush** shape as
+the memory ops, applied to `emitBranchExchange`: taken → the ordinary dynamic
+dispatch on `lr` (nearly always a resident block → the guarded hash hits, chain
+continues, no round-trip); cond-false → the block keeps compiling instead of
+terminating. The `c375880` bug is gone because the flush is unconditional and
+its stores always execute; `invalidateRegCache()` on the fall-through makes
+later instructions reload from the coherent memory. Gated to
+`isBlx == false && Rm == 14 && v5` (the conditional-return idiom); polymorphic
+`BXcc rN` and all predicated `BLX` still end the trace, widening is a follow-up.
+
+Result: trampoline round-trips **`edge` 40 % → ~14 %** of dispatches (`BXcc lr`
+was a large chunk of the remainder), **`ins/entry` 24 → 28.4**. Differential
+soak 576 M ARM9 insns / 0 mismatches; benchmark ARM9 JIT 14.53 → 14.56, full
+JIT 36.94 → **37.19** (no hang — `c375880` was 13.26 there). Same modest fps
+delta for the same reason (`exec%` ~98 %), but dispatch overhead is now ~1/4 of
+what it was two commits ago — real headroom for later work and a concrete step
+toward the chain length that flips the GPR-residency cost/benefit (§23 item 4).
+
+The **remaining** `dontJIT` edges are the excluded sub-forms (pc-relative
+literal, `LDMcc{pc}`, `BXcc rN`) plus the hard tail (`MCR p15`, `MSR cpsr`) —
+next candidates, with diminishing returns.
+
+At a ~2-block chain a fixed-mapping trampoline's unconditional 15-register
 load/store still loses to the lazy allocator — **GPR residency stays deferred
-until chains lengthen.**
+until chains lengthen.** Note that residency would also *dissolve the entire
+predicated-op hazard class*: with every guest GPR permanently pinned there is
+no register cache, no eviction, no dirty bit and no per-block
+`flushDirtyRegisters()`, so a predicated op is just "eval cond, BEQ over the
+exit, continue" with nothing to get wrong — the `emitEvalCond` guard stays but
+the unconditional-flush / `invalidateRegCache()` scaffolding these commits add
+becomes dead code and is removed. The predicated-op work is not throwaway: it
+is the correct behaviour for the lazy allocator *and* it lengthens chains
+toward the point where residency pays off.
 
 **Measured picture:** on SM64DS the ARM9 JIT is now a **+9.6 % whole-frame win**
 (§16); the ARM7-only JIT A/B still needs re-measuring (was a ~4.4 % regression
@@ -2121,18 +2146,19 @@ Optimize:
 5. trampoline overhead
 6. memory fast paths
 
-**Current position (`b81fa91`): item 1, largely done.** ARM9 telemetry (§5)
+**Current position (`47fef86`): item 1, largely done.** ARM9 telemetry (§5)
 showed the ~1.9-block chain ceiling was the emitter refusing predicated
-(`cond != AL`) memory ops. Predicated `LDRcc`/`STRcc`/`LDRBcc`/`STRBcc`/
-`LDRHcc`/`STRHcc` and `LDMcc`/`STMcc` (`POPcc`/`PUSHcc`) now compile
-(`emitEvalCond` + BEQ guard over the access, unconditional pre-guard flush,
-block continues) — `b81fa91`, §5. Trampoline round-trips `edge` 64 % → 40 %,
-`ins/entry` ~17 → 24; benchmark +0.7 % ARM9 JIT / +2 % full JIT. Predicated
-`BXcc` was tried first and reverted (§5) — a conditional return's taken path is
-a dynamic exit, not a block continuation. What remains at item 1 is the hard
-tail (`MCR p15`, `MSR cpsr`) and the excluded sub-forms (pc-relative literal,
-`LDMcc{pc}`), with diminishing returns — so **measure again before deciding
-whether to push further here or move to dispatch-table / trampoline work.**
+(`cond != AL`) memory ops and `BXcc lr`. Now compiled (`emitEvalCond` + BEQ
+guard over the exit, unconditional pre-guard flush, block continues):
+predicated `LDRcc`/`STRcc`/`LDRBcc`/`STRBcc`/`LDRHcc`/`STRHcc` and
+`LDMcc`/`STMcc`/`POPcc`/`PUSHcc` (`b81fa91`), plus `BXcc lr` (`47fef86`, the
+fixed retry of the reverted `c375880`). Cumulative: trampoline round-trips
+`edge` **64 % → ~14 %**, `ins/entry` **~17 → 28**; benchmark ARM9 JIT
+14.42 → 14.56, full JIT 36.17 → 37.19. What remains at item 1 is the hard tail
+(`MCR p15`, `MSR cpsr`) and the excluded sub-forms (pc-relative literal,
+`LDMcc{pc}`, `BXcc rN`), with diminishing returns — so **measure again before
+deciding whether to push further here or move to GPR residency (item 4) /
+dispatch-table work.**
 
 ### Then
 
