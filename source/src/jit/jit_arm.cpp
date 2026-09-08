@@ -602,7 +602,7 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 // guard bail is a clean interpreter re-run (no double-writeback).
 void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
                        bool signExt, bool wordRotate, bool writeback, u8 rn, u8 rd,
-                       u32& lockedMask)
+                       u32& lockedMask, bool predicated = false)
 {
 	u32*& p = ctx.emitPtr;
 
@@ -610,8 +610,11 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// on a descriptor hit, load straight into rd's host register with the
 	// register cache intact. rd == rn + writeback is LDR-UNPREDICTABLE and the
 	// slow tail's "result last wins" ordering is easier to keep there, so only
-	// the non-aliased forms take the fast path.
-	if (isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
+	// the non-aliased forms take the fast path. The predicated caller forces the
+	// slow path: it needs the unconditional cache invalidation (the fast path
+	// keeps the cache, which would then differ between the taken and cond-false
+	// runtime paths) and the direct gpr-slot store of the result.
+	if (!predicated && isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
@@ -735,11 +738,18 @@ void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 //   P : 1 pre-index, 0 post-index (post always writes back; P0+W1 = LDRT/STRT)
 //   U : add / subtract    B : byte / word    W : writeback    L : load / store
 // Word loads rotate for an unaligned EA (ROR by 8*(EA&3)) -- matches OP_LDR's
-// `ROR(READ32(adr), 8*(adr&3))`. Stores and byte accesses do not. Predicated
-// transfers end the trace (B1-B3: cond == AL only) -- the memory prologue's
-// state flush + reg-cache invalidation are awkward to make conditional.
-void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
+// `ROR(READ32(adr), 8*(adr&3))`. Stores and byte accesses do not.
+//
+// Predicated (cond != AL): the general Rn/Rd form (no pc operand, no literal
+// pool) compiles as an unconditional state flush + a guarded access. The flush
+// before the guard makes guest memory coherent on BOTH the taken and the
+// cond-false path, so the slow tail's reg-cache invalidation is sound either
+// way; the block then continues (no exit -- the Bcc-not-taken-style win). The
+// pc-relative literal (Rn == 15) and any pc-destination (Rd == 15) predicated
+// form still ends the trace.
+void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 {
+	const bool predicated = (cond != COND_AL);
 	const bool I = (op >> 25) & 1;
 	const bool P = (op >> 24) & 1;
 	const bool U = (op >> 23) & 1;
@@ -754,6 +764,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (!P && W)              { ctx.endBlock = true; return; }   // LDRT / STRT
 	if (rd == 15 && (!L || B)){ ctx.endBlock = true; return; }   // STR pc / LDRB pc -> interp
 	if (I && ((op >> 4) & 1)) { ctx.endBlock = true; return; }   // undefined
+	if (predicated && rd == 15) { ctx.endBlock = true; return; } // LDRcc pc -> interp
 	// LDR pc (word): a block terminator with ARMv5 LDTBit interworking (B7c),
 	// handled after EA computation via emitLdrPcExit / emitLoadPcTail.
 
@@ -762,7 +773,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 
 	// ---- pc-relative literal: [pc, #imm], I=0 P=1 W=0 -> EA is constant ----
 	if (rn == 15) {
-		if (I || W || !P) { ctx.endBlock = true; return; }
+		if (I || W || !P || predicated) { ctx.endBlock = true; return; }
 		const u32 ea = ctx.currentPC + 8 + (u32)immOff;
 		ctx.ensureArena();
 
@@ -826,6 +837,21 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	u8 hVal = 0;
 	if (!L) hVal = ctx.readReg(rd, lockedMask);
 
+	// Predicated: flush every dirty guest reg (and flags) to memory NOW, before
+	// the condition guard. The slow tail invalidates the reg cache and writes
+	// Rd/Rn straight to their gpr slots, so after this op the compile-time cache
+	// is empty on both runtime paths -- and because the pre-guard flush already
+	// spilled the live values, the cond-false path that skips the access still
+	// finds coherent guest memory to reload from.
+	u32* guard = nullptr;
+	if (predicated) {
+		ctx.flushDirtyRegisters();
+		ctx.flushDirtyFlags();
+		ctx.emitEvalCond(cond);                          // r11 = cond ? 1 : 0
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;                                     // BEQ over the access
+	}
+
 	// offset -> PPC_R12 (register form); the immediate form folds into ADDI
 	if (I) (void)emitOp2(ctx, op, /*immForm=*/false, hRm, /*hRs=*/0, /*wantCarry=*/false);
 
@@ -846,7 +872,13 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (rd == 15) { emitLoadPcTail(ctx, writeback, rn, op); return; }   // LDR pc (B7c)
 
 	emitLoadStoreTail(ctx, hVal, size, L, /*signExt=*/false,
-	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd, lockedMask);
+	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd, lockedMask,
+	                  predicated);
+
+	if (guard) {
+		*guard = PPC_BEQ((u32)((p - guard) * 4));
+		ctx.invalidateRegCache();   // uniform compile-time state on both paths
+	}
 }
 
 // ------------------------------------------------ extra load/store (B3b)
@@ -854,8 +886,11 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op)
 //   SH: 01 unsigned halfword, 10 signed byte, 11 signed halfword (00 = SWP)
 //   I : 1 immediate offset (imm8 = hi<<4 | lo), 0 register offset (Rm = lo, no shift)
 // L=0 SH=10/11 is LDRD/STRD (ARMv5E) -> deferred to B7. No unaligned rotate.
-void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
+// Predicated (cond != AL): same shape as emitSingleDataTransfer -- unconditional
+// pre-guard flush, then a guarded cache-invalidating access, block continues.
+void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 {
+	const bool predicated = (cond != COND_AL);
 	const bool P = (op >> 24) & 1;
 	const bool U = (op >> 23) & 1;
 	const bool I = (op >> 22) & 1;
@@ -887,6 +922,15 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
 	u8 hVal = 0;
 	if (!L) hVal = ctx.readReg(rd, lockedMask);
 
+	u32* guard = nullptr;
+	if (predicated) {
+		ctx.flushDirtyRegisters();
+		ctx.flushDirtyFlags();
+		ctx.emitEvalCond(cond);
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;
+	}
+
 	// EA -> R11, WB -> R10 (register offset is unshifted: EA = U ? Rn+Rm : Rn-Rm)
 	if (P) {
 		if      (I) *p++ = PPC_ADDI(PPC_R11, hRn, soff);
@@ -900,7 +944,13 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
 		else        *p++ = PPC_SUBF(PPC_R10, hRm, hRn);
 	}
 
-	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd, lockedMask);
+	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd,
+	                  lockedMask, predicated);
+
+	if (guard) {
+		*guard = PPC_BEQ((u32)((p - guard) * 4));
+		ctx.invalidateRegCache();
+	}
 }
 
 // ------------------------------------------------ block data transfer (B4)
@@ -918,8 +968,12 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op)
 // passes the raw address to READ32 and _MMU_read32 masks it. Writeback value is
 // base +/- 4*n regardless of P. `pc` in an LDM list is a BX-style terminator on
 // ARMv5 (cpu->LDTBit): loaded_value bit0 selects the resume mode.
-void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
+// Predicated (cond != AL): the non-pc list compiles as an unconditional
+// pre-guard state flush + a guarded slow run (per-word C access + reg-cache
+// invalidation), block continues. LDM{...,pc} predicated still ends the trace.
+void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 {
+	const bool predicated = (cond != COND_AL);
 	const bool P = (op >> 24) & 1;
 	const bool U = (op >> 23) & 1;
 	const bool S = (op >> 22) & 1;
@@ -935,6 +989,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	if (rn == 15)                  { ctx.endBlock = true; return; }  // base = pc, unpredictable
 	if (W && (list & (1u << rn)))  { ctx.endBlock = true; return; }  // base in list + WB -> interp
 	if (pcInList && !L)            { ctx.endBlock = true; return; }  // STM{pc} (rare) -> interp
+	if (predicated && pcInList)    { ctx.endBlock = true; return; }  // LDMcc{pc}: terminator -> interp
 
 	ctx.ensureArena();
 	u32*& p = ctx.emitPtr;
@@ -952,7 +1007,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 	// prologue, no per-register C call, register cache intact. STM keeps the
 	// slow path (SMC guard + differential-journal plumbing per word is deferred);
 	// LDM{...,pc} keeps the slow path (block-terminator interworking).
-	if (ctx.cpu.pageDescBase && L && !pcInList) {
+	if (!predicated && ctx.cpu.pageDescBase && L && !pcInList) {
 		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
 		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
 		if (W) {                                        // WB value from hRn, before any spill
@@ -967,6 +1022,15 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 			*p++ = PPC_LWZ(hRnW, 1, 104);
 		}
 		return;
+	}
+
+	u32* guard = nullptr;
+	if (predicated) {
+		ctx.flushDirtyRegisters();
+		ctx.flushDirtyFlags();
+		ctx.emitEvalCond(cond);
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;
 	}
 
 	if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
@@ -1003,6 +1067,10 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op)
 		ctx.emitMemEpilogue();
 		ctx.invalidateRegCache();
 		if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		if (guard) {
+			*guard = PPC_BEQ((u32)((p - guard) * 4));
+			ctx.invalidateRegCache();
+		}
 		return;                                 // not a terminator: block continues
 	}
 
@@ -1653,12 +1721,12 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	// bit7 & bit4 set, bits 6..5 != 00 (00 = multiply / SWP). LDRD/STRD is the
 	// bit20 == 0 && bits6..5 >= 10 corner (B7); the rest is B3b.
 	if ((op & 0x0E000000u) == 0 && (op & 0x90u) == 0x90u && (op & 0x60u) != 0) {
-		if (cond != COND_AL) { ctx.endBlock = true; return; }
 		if (((op >> 20) & 1) == 0 && ((op >> 5) & 3) >= 2) {
-			if (!v5) { ctx.endBlock = true; return; }       // LDRD/STRD: ARMv5E only
+			if (cond != COND_AL || !v5) { ctx.endBlock = true; return; }   // LDRD/STRD: AL, ARMv5E
 			emitDoubleDataTransfer(ctx, op);
 		}
-		else                                               emitExtraDataTransfer(ctx, op);
+		else if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }  // predicated: ARM9 only
+		else                             emitExtraDataTransfer(ctx, op, cond);
 		return;
 	}
 
@@ -1717,15 +1785,15 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 
 	// LDR / STR single data transfer : bits 27..26 == 01
 	if ((op & 0x0C000000u) == 0x04000000u) {
-		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
-		emitSingleDataTransfer(ctx, op);
+		if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }   // predicated: ARM9 only
+		emitSingleDataTransfer(ctx, op, cond);
 		return;
 	}
 
 	// LDM / STM block data transfer : bits 27..25 == 100
 	if ((op & 0x0E000000u) == 0x08000000u) {
-		if (cond != COND_AL) { ctx.endBlock = true; return; }   // predicated -> B-later
-		emitBlockDataTransfer(ctx, op);
+		if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }   // predicated: ARM9 only
+		emitBlockDataTransfer(ctx, op, cond);
 		return;
 	}
 
