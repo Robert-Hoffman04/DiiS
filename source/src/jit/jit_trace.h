@@ -191,6 +191,13 @@ struct JitTraceCtx {
 	void emitSlowStore(u8 eaReg, u8 valReg, u32 size);
 	void emitSmcCheckAndBail(u8 eaReg);           // store paths: page-flag guard
 
+	// Differential-harness store journal: emit a call to JitCpuProfile::journalNote
+	// (jitDiffJournalNote) recording `size` bytes at the address in eaReg before an
+	// inline store mutates them. No-op unless the profile sets journalNote (only a
+	// JIT_DIFFERENTIAL_TESTING build does). Caller must have flushed dirty
+	// registers; r3 is saved/restored around the call. Clobbers r3, r4, r5, r12.
+	void emitJournalNote(u8 eaReg, u32 size);
+
 	// ---- P14/P15 cached page descriptors --------------------------------
 	// Guard EA (PPC_R12) against the descriptor page window (+ optionally that
 	// EA + spanBytes stays in the same 1 MB page), bail to the interpreter on a
@@ -227,6 +234,24 @@ struct JitTraceCtx {
 	// writeback (stash + post writeReg), exactly as the P15 path. Clobbers
 	// r10, r11; the low EA is restored to r12 on return.
 	void emitArm9BlockLoad(const u8* regs, u32 n);
+
+	// Full ARM9 single store: EA in PPC_R12, the value already stashed at 100(r1)
+	// (and, when `writeback`, the new base at 104(r1)). Unconditional dirty flush,
+	// then the region guard -> inline stwbrx/sthbrx/stbx into main RAM or DTCM
+	// (each behind its own SMC-page guard for main RAM + differential journal
+	// note), or the slowWrite C call for every other region (no interpreter
+	// round-trip). Register cache invalidated; writeback committed to gpr[rn].
+	// Does not end the block. Clobbers r3, r4, r5, r10, r11, r12.
+	void emitArm9Store(u32 size, bool writeback, u8 rn);
+
+	// ARM9 inline block store (STM / PUSH / STMIA, non-pc). Low guest address of
+	// the contiguous word run in PPC_R12; regs the ascending source list (0..14),
+	// n its length. Region guard covering the whole run -> n sequential inline
+	// stwbrx (SMC-guarded for main RAM, one journal note for the span), or the
+	// per-word slowWrite C loop (no round-trip). Register cache invalidated; the
+	// caller still owns any base writeback. Clobbers r3, r4, r5, r10, r11, r12;
+	// the low EA is restored to r12 on return.
+	void emitArm9BlockStore(const u8* regs, u32 n);
 
 	// ---- P14 inline RAM load via cached page descriptors ------------------
 	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a

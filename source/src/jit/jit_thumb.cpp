@@ -367,6 +367,12 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			break;
 		}
 
+		if (isStore && ctx.cpu.arm9DtcmBase) {          // P16 inline RAM store
+			*emitPtr++ = PPC_STW(hVal, 1, 100);
+			ctx.emitArm9Store(size, /*writeback=*/false, /*rn=*/0);
+			break;
+		}
+
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);           // save EA
 		if (isStore) *emitPtr++ = PPC_STW(hVal, 1, 100); // save value
 
@@ -409,6 +415,11 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		*emitPtr++ = PPC_ADDI(PPC_R12, hSp, (s32)immOff);
 		if (isLoad && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase)) {   // P14/P16 inline RAM load
 			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
+			break;
+		}
+		if (!isLoad && ctx.cpu.arm9DtcmBase) {          // P16 inline RAM store
+			*emitPtr++ = PPC_STW(hVal, 1, 100);
+			ctx.emitArm9Store(4, /*writeback=*/false, /*rn=*/0);
 			break;
 		}
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
@@ -482,6 +493,25 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			const u8 hSp2 = ctx.writeReg(13, /*fullOverwrite=*/true, lockedMask);
 			*emitPtr++ = PPC_LWZ(hSp2, 1, 104);
 			*emitPtr++ = PPC_ADDI(hSp2, hSp2, 4 * nregs);
+			break;
+		}
+
+		// P16 (ARM9): inline PUSH (incl. {..,lr}). The guest SP decrement is
+		// committed only AFTER emitArm9BlockStore returns, so its internal SMC
+		// bail re-runs the whole PUSH against the original SP -- no double
+		// decrement (the stack-corruption failure mode the slow path guards).
+		if (ctx.cpu.arm9DtcmBase && !isPop) {
+			const u8 hSpP = ctx.readReg(13, lockedMask);
+			*emitPtr++ = PPC_STW(hSpP, 1, 104);                       // stash raw old SP
+			*emitPtr++ = PPC_ADDI(PPC_R12, hSpP, -4 * nregs);
+			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);      // word-aligned low addr
+			u8 regs[9]; u32 nn = 0;
+			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
+			if (Rbit) regs[nn++] = 14;                                // lr pushed at the top
+			ctx.emitArm9BlockStore(regs, nn);
+			const u8 hSp2 = ctx.writeReg(13, /*fullOverwrite=*/true, lockedMask);
+			*emitPtr++ = PPC_LWZ(hSp2, 1, 104);
+			*emitPtr++ = PPC_ADDI(hSp2, hSp2, -4 * nregs);
 			break;
 		}
 
@@ -599,14 +629,24 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		const u8 hRb = ctx.readReg(rb, lockedMask);
 		*emitPtr++ = PPC_OR(PPC_R12, hRb, hRb);
 
-		// P15: inline LDMIA. One page guard for the run, then sequential lwbrx;
-		// register cache intact. STMIA keeps the slow path.
-		if (ctx.cpu.pageDescBase && isLoad) {
+		// P15/P16: inline LDMIA / STMIA. One region guard for the run, then n
+		// sequential lwbrx / stwbrx; register cache intact. emitArm9BlockLoad /
+		// emitArm9BlockStore both restore the raw base to R12 on return.
+		if ((ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && isLoad) {
 			u8 regs[8]; u32 nn = 0;
 			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
 			ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
 			const u8 hRb2 = ctx.writeReg(rb, /*fullOverwrite=*/true, lockedMask);
 			*emitPtr++ = PPC_OR(hRb2, PPC_R12, PPC_R12);   // R12 still = raw base
+			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(nn * 4));
+			break;
+		}
+		if (ctx.cpu.arm9DtcmBase && !isLoad) {
+			u8 regs[8]; u32 nn = 0;
+			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
+			ctx.emitArm9BlockStore(regs, nn);
+			const u8 hRb2 = ctx.writeReg(rb, /*fullOverwrite=*/true, lockedMask);
+			*emitPtr++ = PPC_OR(hRb2, PPC_R12, PPC_R12);   // R12 restored to raw base
 			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(nn * 4));
 			break;
 		}

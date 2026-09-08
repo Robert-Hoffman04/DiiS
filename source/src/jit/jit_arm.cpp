@@ -635,6 +635,17 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 		return;
 	}
 
+	// P16 (ARM9): inline main RAM / DTCM store (per-page SMC guard + differential
+	// journal note), slowWrite C call for every other region. emitArm9Store does
+	// its own dirty flush + cache invalidation and commits the writeback.
+	if (!predicated && !isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
+		*p++ = PPC_STW(hVal, 1, 100);                   // value
+		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
+		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
+		ctx.emitArm9Store(size, writeback, rn);
+		return;
+	}
+
 	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value
@@ -1012,10 +1023,9 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	const s32 lowOff = U ? (P ? 4 : 0)
 	                     : (P ? -(s32)(4 * n) : -(s32)(4 * (n - 1)));
 
-	// P15: inline LDM (non-pc). One page guard for the whole run, one descriptor
-	// resolve, then n sequential lwbrx into the registers' host slots -- no
-	// prologue, no per-register C call, register cache intact. STM keeps the
-	// slow path (SMC guard + differential-journal plumbing per word is deferred);
+	// P15/P16: inline LDM (non-pc). One page guard for the whole run, one
+	// descriptor resolve, then n sequential lwbrx into the registers' host slots
+	// -- no prologue, no per-register C call, register cache intact.
 	// LDM{...,pc} keeps the slow path (block-terminator interworking).
 	if (!predicated && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && L && !pcInList) {
 		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
@@ -1027,6 +1037,28 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 		u8 regs[15]; u32 nn = 0;
 		for (int i = 0; i < 15; i++) if (list & (1u << i)) regs[nn++] = (u8)i;
 		ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+		if (W) {
+			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
+			*p++ = PPC_LWZ(hRnW, 1, 104);
+		}
+		return;
+	}
+
+	// P16 (ARM9): inline STM (non-pc). Same shape as the LDM path -- one region
+	// guard for the whole contiguous run, then n sequential stwbrx straight from
+	// the gpr slots, with a per-span SMC guard for main RAM and one differential
+	// journal note. STM{pc} already returned above; every other region falls back
+	// to the per-word slowWrite C loop inside emitArm9BlockStore.
+	if (!predicated && ctx.cpu.arm9DtcmBase && !L) {
+		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
+		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
+		if (W) {
+			*p++ = PPC_ADDI(PPC_R10, hRn, U ? (s32)(4 * n) : -(s32)(4 * n));
+			*p++ = PPC_STW(PPC_R10, 1, 104);
+		}
+		u8 regs[15]; u32 nn = 0;
+		for (int i = 0; i < 15; i++) if (list & (1u << i)) regs[nn++] = (u8)i;
+		ctx.emitArm9BlockStore(regs, nn);
 		if (W) {
 			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
 			*p++ = PPC_LWZ(hRnW, 1, 104);

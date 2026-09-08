@@ -485,6 +485,29 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 	*skip = PPC_BEQ((u32)((emitPtr - skip) * 4));
 }
 
+// Differential-harness store journal. See jit_trace.h. eaReg holds the guest
+// address; the call records `size` pre-write bytes so jitRunArm*Checked()'s
+// interpreter reference run can be rolled back. Compiles to nothing in a
+// shipping build (cpu.journalNote == 0). Clobbers the volatile registers
+// r3..r12 (and CTR / LR); r3 is saved to and restored from 92(r1).
+void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
+{
+	if (!cpu.journalNote) return;
+	u32*& p = emitPtr;
+	const u32 fn = (u32)cpu.journalNote;
+	const s32 procnum = cpu.isaLevel >= 5 ? 0 : 1;   // ARMCPU_ARM9 : ARMCPU_ARM7
+
+	*p++ = PPC_OR(PPC_R4, eaReg, eaReg);              // arg2 = addr (before eaReg is at risk)
+	*p++ = PPC_STW(PPC_R3, 1, 92);                    // save cycle accumulator
+	*p++ = PPC_LI(PPC_R3, procnum);                   // arg1 = procnum
+	*p++ = PPC_LI(PPC_R5, (s32)size);                 // arg3 = size
+	*p++ = PPC_LIS(PPC_R12, fn >> 16);
+	*p++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+	*p++ = PPC_MTCTR(PPC_R12);
+	*p++ = PPC_BCTRL();
+	*p++ = PPC_LWZ(PPC_R3, 1, 92);
+}
+
 // emitInterpreterBail whose emitted (runtime-only) state flush must not disturb
 // the compile-time dirty bookkeeping the fall-through fast path still relies on.
 static void bailPreservingDirty(JitTraceCtx& ctx, u32 metaCount)
@@ -772,6 +795,133 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R11, PPC_R11, 4);
 	}
 	return true;
+}
+
+// value in PPC_R11, host address in PPC_R10.
+static inline void emitArm9Stw(u32*& p, u32 size)
+{
+	if (size == 4)      *p++ = PPC_STWBRX(PPC_R11, 0, PPC_R10);
+	else if (size == 2) *p++ = PPC_STHBRX(PPC_R11, 0, PPC_R10);
+	else                *p++ = PPC_STBZX (PPC_R11, 0, PPC_R10);
+}
+
+// P16: full ARM9 single store. See jit_trace.h. EA in PPC_R12, value at 100(r1).
+void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn)
+{
+	u32*& p = emitPtr;
+
+	// Coherent guest memory on every runtime path (SMC bail, slowWrite, inline),
+	// empty compile-time cache afterwards -- same shape as emitArm9Load.
+	flushDirtyRegisters();
+	flushDirtyFlags();
+	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA
+
+	u32* fast[2];
+	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
+	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast);
+
+	// ---- slow: SMC guard + slowWrite C call (no interpreter round-trip) ----
+	emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	emitSmcCheckAndBail(PPC_R12);
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	*p++ = PPC_LWZ(PPC_R10, 1, 100);
+	emitSlowStore(PPC_R12, PPC_R10, size);
+	emitMemEpilogue();
+	u32* toEnd = p++;                                              // B over the fast block(s)
+
+	// ---- fast: main RAM (SMC-guard the written page) ----
+	// r10 = region host base, r11 = aligned in-region offset, r12 = EA.
+	const bool haveDtcm = (nFast == 2);
+	*fast[nFast - 1] = PPC_B((u32)((p - fast[nFast - 1]) * 4));
+	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // host store address
+	*p++ = PPC_STW(PPC_R10, 1, 108);                               // stash across SMC / journal
+	emitSmcCheckAndBail(PPC_R12);                                  // EA still in r12
+	u32* toShared = haveDtcm ? p++ : nullptr;                      // B over the DTCM entry
+
+	// ---- fast: DTCM (never holds JIT code -> no SMC guard) ----
+	if (haveDtcm) {
+		*fast[0] = PPC_B((u32)((p - fast[0]) * 4));
+		*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
+		*p++ = PPC_STW(PPC_R10, 1, 108);
+	}
+
+	// ---- shared fast tail: differential journal note + the inline store ----
+	if (toShared) *toShared = PPC_B((u32)((p - toShared) * 4));
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);                                // EA (journal arg)
+	emitJournalNote(PPC_R12, size);
+	*p++ = PPC_LWZ(PPC_R10, 1, 108);                               // host store address
+	*p++ = PPC_LWZ(PPC_R11, 1, 100);                               // value
+	emitArm9Stw(p, size);
+
+	// ---- converge ----
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	invalidateRegCache();
+	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+}
+
+// P16: ARM9 inline block store (STM / PUSH / STMIA, non-pc). See jit_trace.h.
+// Low EA in PPC_R12; each source register is read from its gpr slot (the
+// unconditional flush below makes them coherent).
+void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
+{
+	u32*& p = emitPtr;
+	const u32 span = 4 * (n - 1);
+
+	flushDirtyRegisters();
+	flushDirtyFlags();
+	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
+
+	u32* fast[2];
+	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/span, fast);
+
+	// ---- slow: SMC guard (whole span) + per-word slowWrite C loop ----
+	emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	emitSmcCheckAndBail(PPC_R12);
+	if (span) { *p++ = PPC_LWZ(PPC_R12, 1, 96); *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)span);
+	            emitSmcCheckAndBail(PPC_R12); }                     // the run may cross a 1 KB page
+	for (u32 k = 0; k < n; k++) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
+		*p++ = PPC_LWZ(PPC_R10, 14, regs[k] * 4);
+		emitSlowStore(PPC_R12, PPC_R10, 4);
+	}
+	emitMemEpilogue();
+	u32* toEnd = p++;                                              // B over the fast block(s)
+
+	// ---- fast: main RAM (SMC-guard both ends of the span) ----
+	const bool haveDtcm = (nFast == 2);
+	*fast[nFast - 1] = PPC_B((u32)((p - fast[nFast - 1]) * 4));
+	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // host addr of the low word
+	*p++ = PPC_STW(PPC_R10, 1, 108);
+	emitSmcCheckAndBail(PPC_R12);                                  // low end (EA in r12)
+	if (span) { *p++ = PPC_LWZ(PPC_R12, 1, 96); *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)span);
+	            emitSmcCheckAndBail(PPC_R12); }                     // the run may cross a 1 KB page
+	u32* toShared = haveDtcm ? p++ : nullptr;                      // B over the DTCM entry
+
+	// ---- fast: DTCM (no SMC guard) ----
+	if (haveDtcm) {
+		*fast[0] = PPC_B((u32)((p - fast[0]) * 4));
+		*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
+		*p++ = PPC_STW(PPC_R10, 1, 108);
+	}
+
+	// ---- shared fast tail: one journal note for the span + n inline stwbrx ----
+	if (toShared) *toShared = PPC_B((u32)((p - toShared) * 4));
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	emitJournalNote(PPC_R12, 4 * n);
+	*p++ = PPC_LWZ(PPC_R10, 1, 108);
+	for (u32 k = 0; k < n; k++) {
+		*p++ = PPC_LWZ(PPC_R11, 14, regs[k] * 4);
+		*p++ = PPC_STWBRX(PPC_R11, 0, PPC_R10);
+		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
+	}
+
+	// ---- converge ----
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);                                // restore low EA for the caller
+	invalidateRegCache();
 }
 
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)

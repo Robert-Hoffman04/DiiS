@@ -55,6 +55,14 @@ struct JitCpuProfile {
 	void (*slowWrite)(u32 addr, u32 val, u32 size);
 	void (*smcInvalidate)(u32 addr);
 
+	// Differential-harness store journal (jit_differential.cpp jitDiffJournalNote).
+	// Set ONLY in a JIT_DIFFERENTIAL_TESTING build; 0 in every shipping build. An
+	// inline store writes MMU.MAIN_MEM / MMU.ARM9_DTCM straight through stwbrx,
+	// bypassing the _MMU_write* choke points that arm the trial-JIT rollback, so
+	// the P16 inline store path emits a call to this before each stwbrx to record
+	// the pre-write bytes. When 0 the emitter skips the call entirely.
+	void (*journalNote)(int procnum, u32 addr, u32 size);
+
 	// Control -- each of these ends a trace.
 	u32  (*swiHandler)(u32 comment);
 	bool (*canEnterThumb)(u32 pc);

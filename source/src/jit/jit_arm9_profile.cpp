@@ -310,6 +310,12 @@ JitCpuProfile* jitBuildArm9Profile()
 	s_arm9Profile.arm9DtcmBase      = (u32)(uintptr_t)MMU.ARM9_DTCM;
 	s_arm9Profile.arm9DtcmRegionPtr = (u32)(uintptr_t)&MMU.DTCMRegion;
 
+#if defined(JIT_DIFFERENTIAL_TESTING)
+	// P16 inline stores bypass the _MMU_write* journal choke points; feed the
+	// trial-JIT rollback directly. Null (and the call is not emitted) otherwise.
+	s_arm9Profile.journalNote = jitDiffJournalNote;
+#endif
+
 	return &s_arm9Profile;
 }
 
