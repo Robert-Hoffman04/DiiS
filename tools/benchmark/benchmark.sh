@@ -118,8 +118,8 @@ jitdefs_for() {
 		*)       base="" ;;
 	esac
 	# BENCH_EXTRA_JITDEFS: append experimental JIT flags to every JIT mode without
-	# editing the mode table (e.g. BENCH_EXTRA_JITDEFS=-DJIT_ARM_PRED_BRANCH for
-	# the §16 predicated-branch A/B). Empty by default -> no behaviour change.
+	# editing the mode table (e.g. BENCH_EXTRA_JITDEFS=-DSOME_NEW_JIT_FLAG for an
+	# A/B of a gated codegen change). Empty by default -> no behaviour change.
 	if [ -n "$base" ] && [ -n "${BENCH_EXTRA_JITDEFS:-}" ]; then
 		base="$base ${BENCH_EXTRA_JITDEFS}"
 	fi

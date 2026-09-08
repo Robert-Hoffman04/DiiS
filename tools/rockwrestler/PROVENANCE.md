@@ -96,5 +96,6 @@ completion it writes `sd:/rockwrestler.log` (total run/failed, plus each
 failing test's name and detail number) and quits. Stage
 `out/rockwrestler.nds` as `sd:/DS/ROMS/test.nds` and boot with
 `-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` for a fully headless run (add
-`-DDESMUME_JIT_ARM7` +/- `-DJIT_ARM_PRED_BRANCH` to `JITDEFS` for the JIT
-path(s); omit for the interpreter baseline).
+`-DDESMUME_JIT_ARM7` to `JITDEFS` for the JIT path; omit for the interpreter
+baseline). Predicated Bcc/BLcc compile unconditionally now -- the old
+`-DJIT_ARM_PRED_BRANCH` gate was removed once this gate cleared.

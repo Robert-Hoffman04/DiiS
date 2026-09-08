@@ -126,27 +126,29 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 		return;
 	}
 
-	// Predicated (cond != AL). Historically (GO-FIX-PH) this bailed to the
-	// interpreter: a compiled version reproducibly corrupted the host heap in
-	// sustained PH ARM9 runs and manual review never found the defect. §16
-	// re-opens it, rebuilt on the post-P12 emitter and shaped byte-for-byte
-	// like the THUMB F16 conditional branch (jit_thumb.cpp case 26/27), which
-	// has soaked clean on ARM9 for 64M+ blocks. The pre-P12 taken path did two
-	// pointer-based stores (packed flags -> *cpsr, and an out->instructions
-	// load/modify/store); both are gone now (flags ride r30, the trampoline
-	// writes them once; the count is an addi r31), which is the most likely
-	// reason the corruption predates and does not survive P12.
-	// Gated so the default build is unchanged until proven safe. Both Bcc and
-	// (§16 step 2) BLcc compile. BLcc's taken path additionally writes guest
-	// R14 = retLR: it does so with a *direct* store to the gpr backing slot,
-	// emitted after emitDirtyRegisterFlush (which would otherwise re-flush a
-	// stale cached R14 over it) and touching only scratch r11 -- so the taken
-	// path never mutates the compile-time register cache and the cond-false
-	// fall-through keeps compiling with its allocator state untouched, exactly
-	// like the register-write-free THUMB F16 path.
-#if !defined(JIT_ARM_PRED_BRANCH)
-	ctx.endBlock = true;
-#else
+	// Predicated (cond != AL): compile a taken-exit + cond-false fall-through.
+	// Historically (GO-FIX-PH) this bailed to the interpreter -- a compiled
+	// version reproducibly corrupted the host heap in sustained PH ARM9 runs and
+	// manual review never found the defect. §16 re-opened it, rebuilt on the
+	// post-P12 emitter and shaped byte-for-byte like the THUMB F16 conditional
+	// branch (jit_thumb.cpp case 26/27), which has soaked clean on ARM9 for 64M+
+	// blocks. The pre-P12 taken path did two pointer-based stores (packed flags
+	// -> *cpsr, and an out->instructions load/modify/store); both are gone now
+	// (flags ride r30, the trampoline writes them once; the count is an addi
+	// r31), which is the most likely reason the corruption predates and does not
+	// survive P12.
+	//
+	// This was gated behind -DJIT_ARM_PRED_BRANCH while it was being proven out.
+	// Both CPU-correctness gates then cleared with zero new failures: armwrestler
+	// (ARM9, §8.2) and arm7wrestler (ARM7, §8.3), plus ~1.3B-instruction ARM9
+	// differential/soak coverage (§16). The gate is now removed -- predicated
+	// Bcc/BLcc always compile. Both Bcc and BLcc compile here. BLcc's taken path
+	// additionally writes guest R14 = retLR: it does so with a *direct* store to
+	// the gpr backing slot, emitted after emitDirtyRegisterFlush (which would
+	// otherwise re-flush a stale cached R14 over it) and touching only scratch
+	// r11 -- so the taken path never mutates the compile-time register cache and
+	// the cond-false fall-through keeps compiling with its allocator state
+	// untouched, exactly like the register-write-free THUMB F16 path.
 	(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
 
 	ctx.emitEvalCond(cond);                              // r11 = (cond holds) ? 1 : 0
@@ -174,7 +176,6 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	// --- cond-false falls through: keep compiling the block ---
 	*guard = PPC_BEQ((u32)((p - guard) * 4));
-#endif
 }
 
 // -------------------------------------- operand2 = Rm shifted by a register

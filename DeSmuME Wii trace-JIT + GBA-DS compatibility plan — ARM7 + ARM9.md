@@ -225,20 +225,20 @@ Both validated 0-DIFF (ARM7 + ARM9), 0 CANARY / OVERRUN.
 would keep guest R0–R14 resident across a chain. That needs either cross-block
 register allocation (out of scope) or a fixed guest→host mapping. Measured ARM7
 chain length on SM64DS is ~2 blocks / ~5 guest instructions — short, in part
-because predicated ARM branches bail to the interpreter by default and force a
-trampoline round-trip (`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` +
-`BLcc` — ARM9-validated, ARM7 pending the armwrestler gate; §16). A fixed mapping's
-unconditional 15-register trampoline load/store
-would lose against the current lazy allocator at that chain length. Not
-justified by current evidence.
+because predicated ARM branches used to bail to the interpreter and force a
+trampoline round-trip. That is fixed: predicated `Bcc` + `BLcc` now compile
+unconditionally (§16), so this measurement should be re-taken — longer chains
+change the calculus. A fixed mapping's unconditional 15-register trampoline
+load/store would lose against the current lazy allocator at the *old*
+~2-block chain length; re-measure before deciding.
 
 **Measured picture:** on SM64DS (ARM9-bound, ARM9 interpreted) the ARM7 JIT is
 still a ~4.4% whole-frame regression. The dominant remaining cost is the sheer
 number of trampoline round-trips (short chains) plus the trampoline's own
-`stmw`/`lmw`. ARM7-JIT frame value is likely capped until (a) predicated ARM
-branches compile by default for ARM7 (the `Bcc` + `BLcc` codegen exists behind
-`-DJIT_ARM_PRED_BRANCH`, ARM9-validated; ARM7 default-on rides the armwrestler
-gate; §16) and/or (b) the ARM9 JIT is viable in `jitfull` (also §16).
+`stmw`/`lmw`. Predicated ARM `Bcc` + `BLcc` now compile unconditionally (§16,
+gate removed) — the "capped until predicated branches compile" condition is
+cleared, so the ARM7 chain-length / frame picture needs re-measuring. The other
+lever is (b) the ARM9 JIT being viable in `jitfull` (also §16).
 
 ---
 
@@ -367,12 +367,12 @@ shared `jit_arm.cpp` front-end (`arm7_canEnterArm` / a real `arm7_cyclesForArm`
 (BLX imm/reg, CLZ, QADD/QSUB/QD*, the SM* DSP multiplies, LDRD/STRD, the whole
 cond==NV space) and the ARMv4-vs-ARMv5 `LDR pc` / `LDM {..,pc}` interworking
 difference (ARM7 `LDTBit == 0`: `R15 = word & ~3`, no mode switch) on
-`cpu.isaLevel`. Predicated ARM branches bail to the interpreter by default;
-`-DJIT_ARM_PRED_BRANCH` compiles predicated `Bcc` and `BLcc` (ARM9-validated at
-~1.3 B instructions — §16). Both its CPU-correctness gates are now clear
-(armwrestler + arm7wrestler, roadmap #17/#18, §8.2/§8.3 — 0 new failures on
-either); still opt-in pending the broader §25 default-on bar, not because of
-an open correctness gate on this flag specifically.
+`cpu.isaLevel`. Predicated ARM `Bcc` and `BLcc` **compile unconditionally**
+(ARM9-validated at ~1.3 B instructions — §16). This was behind
+`-DJIT_ARM_PRED_BRANCH` while it was proven out; the flag was removed once both
+CPU-correctness gates cleared (armwrestler + arm7wrestler, roadmap #17/#18,
+§8.2/§8.3 — 0 new failures on either). The broader §25 default-on bar is about
+`jitArm9Enabled` as a whole, not this codegen path.
 
 **Validated (SM64DS, headless Dolphin):**
 - 210s differential soak: ARM7 `diff` 400K blocks / 1.67M insns, **0 mismatches**,
@@ -594,8 +594,10 @@ the JIT-gate purpose of this section. The one THUMB fail is the same
 pre-existing `ADD Rd,PC,#imm` pipeline-offset quirk §8.2 already documents
 for the ARM9 armwrestler (unrelated to any of the above).
 
-**JIT build** (`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH`, ARM9 JIT off --
-this ROM's ARM9 side is upstream's own trivial idle/vram-copy stub):
+**JIT build** (`-DDESMUME_JIT_ARM7`, then still with the isolation flag
+`-DJIT_ARM_PRED_BRANCH` that this gate cleared and that has since been
+removed; ARM9 JIT off -- this ROM's ARM9 side is upstream's own trivial
+idle/vram-copy stub):
 **byte-identical output to the interpreter baseline** -- same ARM 11/67,
 THUMB 1/20, same 12 fail entries in the same order. **Zero new failures
 from compiling predicated `Bcc`/`BLcc` on ARM7.** This is the ARM7 gate §16
@@ -614,8 +616,9 @@ workload available", not the primary evidence.
 Run it: `tools/arm7wrestler/build.sh`, stage `out/arm7wrestler.nds` as
 `sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ARM7WRESTLER_PROBE
 -DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` build (add
-`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH` to JITDEFS for the JIT path;
-omit all JIT flags for the interpreter baseline), pull `sd:/arm7wrestler.log`.
+`-DDESMUME_JIT_ARM7` to JITDEFS for the JIT path -- predicated `Bcc`/`BLcc`
+compile unconditionally now, no separate flag; omit all JIT flags for the
+interpreter baseline), pull `sd:/arm7wrestler.log`.
 
 ---
 
@@ -746,8 +749,9 @@ characterized starting baseline for whoever picks up those 10 findings.
 Run it: `tools/rockwrestler/build.sh`, stage `out/rockwrestler.nds` as
 `sd:/DS/ROMS/test.nds`, boot a `-DDESMUME_ROCKWRESTLER_PROBE
 -DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` build (add
-`-DDESMUME_JIT_ARM7 -DJIT_ARM_PRED_BRANCH` to JITDEFS for the JIT path;
-omit for the interpreter baseline), pull `sd:/rockwrestler.log`.
+`-DDESMUME_JIT_ARM7` to JITDEFS for the JIT path -- predicated branches
+compile unconditionally now; omit for the interpreter baseline), pull
+`sd:/rockwrestler.log`.
 
 ---
 
@@ -888,7 +892,7 @@ finding is also independently worth reporting upstream.
 
 Maintain a machine-readable results table:
 
-| Test                     | melonDS                             | DeSmuME interpreter | DeSmuME JIT (`-DJIT_ARM_PRED_BRANCH`) | Hardware/reference | Classification |
+| Test                     | melonDS                             | DeSmuME interpreter | DeSmuME JIT (predicated branches compiled) | Hardware/reference | Classification |
 | ------------------------ | ------------------------------------ | -------------------- | -------------------------------------- | ------------------- | -------------- |
 | armwrestler (ARM9)       | blocked -- see §8.5                  | ARM 0/67, THUMB 1/10 fail | byte-identical to interpreter          |                     | THUMB fail is a documented pipeline-offset quirk (§8.2) |
 | arm7wrestler (ARM7)      | blocked -- see §8.5                  | ARM 11/67, THUMB 1/20 fail | byte-identical to interpreter          |                     | 11 ARM fails match documented ARMv4T-vs-ARMv5 differences (§8.3); THUMB fail same quirk as above |
@@ -1711,11 +1715,15 @@ Maintain host-side protections:
 - ASan/host instrumentation where available
 - repeated stress runs
 
-### Predicated branch compilation — status (§16 re-open)
+### Predicated branch compilation — status (§16 re-open) — LANDED, gate removed
 
-Predicated `Bcc` **and `BLcc`** (cond ≠ AL) now **compile**, gated behind
-`-DJIT_ARM_PRED_BRANCH` (`jit_arm.cpp` `emitBranch`). Default build unchanged —
-the flag is the isolation the bailout used to be, not a permanent hide.
+Predicated `Bcc` **and `BLcc`** (cond ≠ AL) **compile unconditionally**
+(`jit_arm.cpp` `emitBranch`). This was gated behind `-DJIT_ARM_PRED_BRANCH`
+while it was being proven out; both CPU-correctness gates then cleared with zero
+new failures (armwrestler ARM9, arm7wrestler ARM7) on top of ~1.3 B-instruction
+ARM9 differential/soak coverage, so the flag was **deleted** — the codegen is
+now permanent, no build knob. The old bailout (`ctx.endBlock = true` at any
+predicated branch) is gone.
 
 `BLcc`'s taken path additionally writes guest R14 = return address. It does so
 with a **direct store to the gpr backing slot**, emitted *after*
@@ -1781,10 +1789,12 @@ Status:
   root-caused and fixed (§8.2), `armwrestler` back to the clean interpreter
   baseline (ARM 0/67, THUMB 1/10) under a full predicated-branch build.
 
-Both CPU-correctness gates for `-DJIT_ARM_PRED_BRANCH` are now clear. Making
-it default-on is a separate decision from clearing its gates -- see §25 for
-the full default-on bar (RockWrestler, retail soaks, host-memory hardening,
-etc. are still open) rather than treating this flag in isolation.
+Both CPU-correctness gates were clear, so `-DJIT_ARM_PRED_BRANCH` was removed
+and predicated-branch codegen is now permanent (`f140278`+). This is
+independent of the §25 `jitArm9Enabled` default-on bar (RockWrestler, retail
+soaks, host-memory hardening, etc. still open) — those gate turning the ARM9
+JIT on by default, not this one codegen path, which is exercised whenever the
+JIT runs at all.
 
 The `JIT_HEAP_WATCH` instrumentation (`jit_trace.cpp` / `jit_exec.cpp`) is
 `#ifdef`-gated, zero-cost when undefined, and stays in as standing §16 tooling.

@@ -31,8 +31,9 @@ u64 g_jitInsnsRun  = 0;
 u64 g_jitAttempts  = 0;   // getBlock/compile attempts that reached ExecuteJITTrace
 u64 g_jitBail0     = 0;   // attempts that bailed with 0 instructions
 // §16: predicated ARM B/BL taken-exit paths emitted (compile-time), split by
-// core. Non-zero only in a -DJIT_ARM_PRED_BRANCH build; proves coverage of the
-// predicated-branch path in a differential / soak run.
+// core. Predicated Bcc/BLcc always compile now (the -DJIT_ARM_PRED_BRANCH gate
+// was removed once both CPU-correctness gates cleared); this proves coverage of
+// the predicated-branch path in a differential / soak run.
 u64 g_jitPredBcc7  = 0;
 u64 g_jitPredBcc9  = 0;
 extern u64 g_jitSmcKills; // jit_cache.cpp -- real (non-empty-bucket) SMC invalidations
