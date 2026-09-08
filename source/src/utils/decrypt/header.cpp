@@ -19,6 +19,7 @@
 */
 
 #include "header.h"
+#include <string.h>	// memcmp (GBA_LOGO check, DetectRomType)
 
 //#include "ndstool.h"
 //#include "banner.h"
@@ -60,6 +61,33 @@
 //	return CalcCrc16((unsigned char *)&header + 0xC0, 156);
 //}
 //
+// roadmap #20 (GBA compat), post-step-6 regression fix: the real GBA header's
+// fixed Nintendo-logo bitmap (GBATEK, header offset 0x04..0x9F, 156 bytes --
+// checked byte-for-byte, not just CRC'd, against a real unmodified commercial
+// dump: The Legend of Zelda: The Minish Cap (USA).gba). Every genuine GBA
+// cartridge carries this exact blob (the real GBA BIOS itself refuses to
+// boot anything that doesn't), so matching all 156 bytes is a far more
+// decisive signal than the single fixed byte at 0xB2 used to gate this alone
+// (see DetectRomType()'s history) -- that single-byte check turned out to
+// have a real false-positive: tools/rockwrestler's own hand-built (non-
+// ndstool) DS header happens to carry 0x96 at that exact offset too,
+// misdetecting it as ROMTYPE_GBA and outright refusing to load it. Confirmed
+// via the DS regression suite (RockWrestler timing out with a virgin/
+// never-written slot-2 result buffer -- the ROM was rejected before ever
+// executing) and root-caused by inspecting the raw header bytes directly.
+static const unsigned char GBA_LOGO[156] = {
+	0x24,0xFF,0xAE,0x51,0x69,0x9A,0xA2,0x21,0x3D,0x84,0x82,0x0A,0x84,0xE4,0x09,0xAD,
+	0x11,0x24,0x8B,0x98,0xC0,0x81,0x7F,0x21,0xA3,0x52,0xBE,0x19,0x93,0x09,0xCE,0x20,
+	0x10,0x46,0x4A,0x4A,0xF8,0x27,0x31,0xEC,0x58,0xC7,0xE8,0x33,0x82,0xE3,0xCE,0xBF,
+	0x85,0xF4,0xDF,0x94,0xCE,0x4B,0x09,0xC1,0x94,0x56,0x8A,0xC0,0x13,0x72,0xA7,0xFC,
+	0x9F,0x84,0x4D,0x73,0xA3,0xCA,0x9A,0x61,0x58,0x97,0xA3,0x27,0xFC,0x03,0x98,0x76,
+	0x23,0x1D,0xC7,0x61,0x03,0x04,0xAE,0x56,0xBF,0x38,0x84,0x00,0x40,0xA7,0x0E,0xFD,
+	0xFF,0x52,0xFE,0x03,0x6F,0x95,0x30,0xF1,0x97,0xFB,0xC0,0x85,0x60,0xD6,0x80,0x25,
+	0xA9,0x63,0xBE,0x03,0x01,0x4E,0x38,0xE2,0xF9,0xA2,0x34,0xFF,0xBB,0x3E,0x03,0x44,
+	0x78,0x00,0x90,0xCB,0x88,0x11,0x3A,0x94,0x65,0xC0,0x7C,0x63,0x87,0xF0,0x3C,0xAF,
+	0xD6,0x25,0xE4,0x8B,0x38,0x0A,0xAC,0x72,0x21,0xD4,0xF8,0x07,
+};
+
 /*
  * DetectRomType
  */
@@ -67,15 +95,16 @@ int DetectRomType(const Header& header, char* romdata)
 {
 	unsigned int * data = (unsigned int*)(romdata + 0x4000);
 
-	// A real GBA cartridge header always carries this fixed magic byte
-	// (GBATEK: header offset 0xB2, "Fixed value" 0x96) -- it lands inside
-	// the DS header's reserved region (offset_0xB0..0xB3, well before the
-	// Nintendo-logo bitmap at 0xC0), which real DS dumps have no reason to
-	// match, so this reliably tells a genuine GBA ROM apart from a DS one
-	// without false-positiving on real DS dumps. Reject it here, before
-	// anything below (all of which assumes a DS-shaped header/secure-area
-	// layout) gets a chance to touch it -- see roadmap #20/plan doc §12.
-	if ((unsigned char)romdata[0xB2] == 0x96) return ROMTYPE_GBA;
+	// A real GBA cartridge header carries this fixed magic byte (GBATEK:
+	// header offset 0xB2, "Fixed value" 0x96) -- it lands inside the DS
+	// header's reserved region (offset_0xB0..0xB3, well before the DS
+	// Nintendo-logo bitmap at 0xC0). On its own this byte isn't decisive
+	// enough (see GBA_LOGO's comment above for the real collision this
+	// caused), so require the full 156-byte GBA logo match too before
+	// committing to ROMTYPE_GBA -- see roadmap #20/plan doc §12.
+	if ((unsigned char)romdata[0xB2] == 0x96 &&
+	    memcmp(romdata + 0x04, GBA_LOGO, sizeof(GBA_LOGO)) == 0)
+		return ROMTYPE_GBA;
 
 	// reject anything whose unit code isn't one of the real NDS/DSi values.
 	// header.unitcode is unsigned char, so the original `< 0` half of this

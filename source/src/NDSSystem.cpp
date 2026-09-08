@@ -376,6 +376,40 @@ void GameInfo::populate()
 	}
 }
 
+// roadmap #20 (GBA compat), post-step-6 regression fix: NDS_LoadROM()'s own
+// GBA-routing peek below used to gate on the single GBATEK offset-0xB2 fixed
+// byte (0x96) alone. Real DS regression testing (tools/rockwrestler) found
+// that this single byte isn't decisive enough: RockWrestler's own hand-built
+// (non-ndstool) DS header happens to carry 0x96 at that exact offset too,
+// so the old check misrouted it into the GBA load path and it never booted
+// as DS content at all (confirmed by tracing a suddenly-permanent
+// -DDESMUME_ROCKWRESTLER_PROBE timeout with an untouched slot-2 result
+// buffer back to this exact branch). A real GBA cartridge's header also
+// always carries this fixed 156-byte Nintendo-logo bitmap at offset
+// 0x04..0x9F (GBATEK; the real GBA BIOS itself refuses to boot anything
+// that doesn't match it) -- checked byte-for-byte here against a real,
+// unmodified commercial dump (The Legend of Zelda: The Minish Cap (USA)),
+// not just CRC'd. Requiring the full logo match alongside the 0xB2 byte
+// (see the peek[] check below) is decisive enough that a legitimate DS
+// header colliding on both is not a realistic risk. Duplicated (documented,
+// not shared) from utils/decrypt/header.cpp's own DetectRomType(), which
+// carries the identical table and the same reasoning but isn't presently
+// compiled into this port's build (source/src/utils/decrypt/ isn't one of
+// the Makefile's SOURCES directories) -- kept in sync by comment, not by
+// linkage.
+static const u8 GBA_LOGO[156] = {
+	0x24,0xFF,0xAE,0x51,0x69,0x9A,0xA2,0x21,0x3D,0x84,0x82,0x0A,0x84,0xE4,0x09,0xAD,
+	0x11,0x24,0x8B,0x98,0xC0,0x81,0x7F,0x21,0xA3,0x52,0xBE,0x19,0x93,0x09,0xCE,0x20,
+	0x10,0x46,0x4A,0x4A,0xF8,0x27,0x31,0xEC,0x58,0xC7,0xE8,0x33,0x82,0xE3,0xCE,0xBF,
+	0x85,0xF4,0xDF,0x94,0xCE,0x4B,0x09,0xC1,0x94,0x56,0x8A,0xC0,0x13,0x72,0xA7,0xFC,
+	0x9F,0x84,0x4D,0x73,0xA3,0xCA,0x9A,0x61,0x58,0x97,0xA3,0x27,0xFC,0x03,0x98,0x76,
+	0x23,0x1D,0xC7,0x61,0x03,0x04,0xAE,0x56,0xBF,0x38,0x84,0x00,0x40,0xA7,0x0E,0xFD,
+	0xFF,0x52,0xFE,0x03,0x6F,0x95,0x30,0xF1,0x97,0xFB,0xC0,0x85,0x60,0xD6,0x80,0x25,
+	0xA9,0x63,0xBE,0x03,0x01,0x4E,0x38,0xE2,0xF9,0xA2,0x34,0xFF,0xBB,0x3E,0x03,0x44,
+	0x78,0x00,0x90,0xCB,0x88,0x11,0x3A,0x94,0x65,0xC0,0x7C,0x63,0x87,0xF0,0x3C,0xAF,
+	0xD6,0x25,0xE4,0x8B,0x38,0x0A,0xAC,0x72,0x21,0xD4,0xF8,0x07,
+};
+
 int NDS_LoadROM(const char *filename, const char *logicalFilename)
 {
 	if (filename == NULL)
@@ -430,9 +464,9 @@ int NDS_LoadROM(const char *filename, const char *logicalFilename)
 		return -1;
 	}
 
-	// roadmap #20 (GBA compat), §12.3 step 6: peek the GBATEK offset-0xB2
-	// magic byte -- the same byte/constant DetectRomType (header.cpp)
-	// checks, kept in sync with ROMTYPE_GBA -- to route a real .gba
+	// roadmap #20 (GBA compat), §12.3 step 6 (+ post-landing regression fix,
+	// see GBA_LOGO's comment above): peek the GBATEK offset-0xB2 magic byte
+	// *and* the full 156-byte Nintendo-logo bitmap to route a real .gba
 	// cartridge to its own load path *before* any of the DS-shaped
 	// decrypt/copy logic below runs (that logic assumes an NDS_header,
 	// which a GBA cart doesn't have; DecryptSecureArea's own ROMTYPE_GBA
@@ -446,7 +480,7 @@ int NDS_LoadROM(const char *filename, const char *logicalFilename)
 		// rewind to where the DS path below expects the stream to be.
 		reader->Seek(file, (type == ROM_DSGBA) ? DSGBA_LOADER_SIZE : 0, SEEK_SET);
 
-		if (peek[0xB2] == 0x96)
+		if (peek[0xB2] == 0x96 && memcmp(peek + 0x04, GBA_LOGO, sizeof(GBA_LOGO)) == 0)
 		{
 			reader->DeInit(file);
 			free(noext);
