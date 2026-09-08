@@ -285,6 +285,28 @@ than the interpreter round-trip it replaces — so the non-branch ops are the
 better target regardless. Predicated `BX` can be revisited with the dirty-fix
 once the memory ops land.
 
+**Predicated non-branch memory ops landed (`b81fa91`).**
+`emitSingleDataTransfer` / `emitExtraDataTransfer` / `emitBlockDataTransfer`
+take `cond`; the general Rn/Rd form (ARM9 only) compiles as an
+**unconditional** `flushDirtyRegisters()` + `flushDirtyFlags()` *before* an
+`emitEvalCond` + BEQ guard over the access, then the existing slow tail forced
+(new `predicated` param on `emitLoadStoreTail` skips the inline-RAM fast path;
+the slow tail already writes Rd/Rn to their gpr slots and invalidates the reg
+cache). Because the flush is unconditional its STWs always execute, so the
+cond-false fall-through finds coherent guest memory — this is why it does *not*
+hit the BXcc dirty-bookkeeping bug, and no `emitDynamicExit` is involved. The
+block continues with no exit. Excluded (still end the trace): pc-relative
+literal (`Rn == 15`), `Rd == 15` / `LDMcc{pc}`, `LDRT`/`STRT`, `LDRD`/`STRD`.
+
+Result (SM64DS, `DESMUME_JIT_TRACE_FIRST`): trampoline round-trips
+**`edge` 64 % → 40 %** of dispatches, **`ins/entry` ~17 → 24**, `blk0/entry`
+1.8 → 2.0, `compiles` grows steadily (no free-run hang — the BXcc failure
+mode). Differential soak 576 M ARM9 insns / 0 mismatches; benchmark ARM9 JIT
+14.42 → 14.53, full JIT 36.17 → 36.94 (interpreter 13.16 unchanged). The gain
+is modest because `exec%` is already ~98 %. The **remaining** `dontJIT` edges
+(still ~99 % of the 40 %) are the excluded sub-forms above plus the hard tail
+(`MCR p15`, `MSR cpsr`) — next candidates, with diminishing returns.
+
 At a ~1.9-block chain a fixed-mapping trampoline's unconditional 15-register
 load/store still loses to the lazy allocator — **GPR residency stays deferred
 until chains lengthen.**
@@ -2099,14 +2121,18 @@ Optimize:
 5. trampoline overhead
 6. memory fast paths
 
-**Current position (`8f014e3`): item 1.** ARM9 telemetry (§5) shows the ~1.9-
-block chain ceiling is the emitter refusing predicated (`cond != AL`) memory
-ops — `LDRcc`/`STRcc`/`STRHcc`, `LDMcc`/`STMcc` (`POPcc`/`PUSHcc`) — so blocks
-terminate and the next instruction is interpreted one at a time. Extending the
-existing predicated-data-proc codegen (`emitEvalCond` + conditional skip) to
-those forms is a block-length win and comes before any dispatch-table work
-(item 3). Predicated `BXcc` was tried first and reverted (§5) — a conditional
-return's taken path is a dynamic exit, not a block continuation.
+**Current position (`b81fa91`): item 1, largely done.** ARM9 telemetry (§5)
+showed the ~1.9-block chain ceiling was the emitter refusing predicated
+(`cond != AL`) memory ops. Predicated `LDRcc`/`STRcc`/`LDRBcc`/`STRBcc`/
+`LDRHcc`/`STRHcc` and `LDMcc`/`STMcc` (`POPcc`/`PUSHcc`) now compile
+(`emitEvalCond` + BEQ guard over the access, unconditional pre-guard flush,
+block continues) — `b81fa91`, §5. Trampoline round-trips `edge` 64 % → 40 %,
+`ins/entry` ~17 → 24; benchmark +0.7 % ARM9 JIT / +2 % full JIT. Predicated
+`BXcc` was tried first and reverted (§5) — a conditional return's taken path is
+a dynamic exit, not a block continuation. What remains at item 1 is the hard
+tail (`MCR p15`, `MSR cpsr`) and the excluded sub-forms (pc-relative literal,
+`LDMcc{pc}`), with diminishing returns — so **measure again before deciding
+whether to push further here or move to dispatch-table / trampoline work.**
 
 ### Then
 
