@@ -221,11 +221,39 @@ memory only by the trampoline (which every exit path funnels through):
 
 Both validated 0-DIFF (ARM7 + ARM9), 0 CANARY / OVERRUN.
 
-**GPR residency across chained blocks — deferred (§23).** The third piece of §5
-would keep guest R0–R14 resident across a chain. That needs either cross-block
-register allocation (out of scope) or a fixed guest→host mapping. A fixed
-mapping's unconditional 15-register trampoline load/store only pays off once
-chains are long enough to amortise it.
+**GPR residency across chained blocks — landed (`264bf8e` + `de9f4ca`
+cleanup).** The third piece of §5: guest R0–R15 pinned 1:1 to host r14..r29
+(`R_i → r(14+i)`, R15/PC keeps r29) for the whole trace. r14 stops being the
+gpr-base pointer (moves to `80(r1)`, reloaded only on cold paths). The
+trampoline is the sole sync point — one `lmw 14,0(gpr)` on entry (CPSR is
+contiguous with `R[]` in `armcpu_t`, so r30 loads for free), one
+`stmw 14,0(gpr)` on the shared return pad (SPSR at `gpr[17]` saved/restored
+around it). The lazy allocator (`allocHostReg` / `regCache[]` / age /
+eviction) is deleted; `readReg`/`writeReg` return the pinned register;
+`flushDirtyRegisters` / `invalidateRegCache` are no-ops (kept as shims, like
+`ensureFlagsLoaded()` after P12). ~40 emitters that bypassed the allocator
+with raw `PPC_STW/LWZ(x,14,i*4)` now read/write the pinned register directly.
+Net −430 lines in the functional commit; `de9f4ca` then removes the
+now-dead predicated-op flush/invalidate scaffolding (the c375880 hazard
+class dissolves — every GPR is always live, nothing to spill or lose).
+
+Chained blocks execute with zero inter-block register traffic (the linker
+stubs are scratch-only, so the file passes straight through a chain).
+
+- **Validated:** armwrestler ARM9 `ARM 0/67, THUMB 1/10` (exact baseline),
+  arm7wrestler `ARM 11/67, THUMB 1/20` (baseline), 495 M-insn differential
+  soak 0 mismatches / 0 CHAIN-DIFF / 0 CANARY / 0 OVERRUN, selftest +
+  journal selftest PASS. Cleanup commit re-validated armwrestler + soak
+  (codegen-identical, every removed call was a no-op).
+- **Measured:** SM64DS, vs pre-residency (`d4334b5`): ARM9 JIT
+  14.86 → 14.88, full JIT (GXMerge) 39.29 → 39.37, interpreter 13.16
+  unchanged — **frame-neutral, inside cv noise.** `exec%` on this workload
+  is ~98 %, so the JIT is already almost entirely in block bodies and a
+  dispatch/bookkeeping-side change has no room to show; the one-time `lmw`/
+  `stmw` roughly offsets the per-boundary flush/reload it removes. Landed
+  as a structural simplification (−430 lines, dissolves the predicated-op
+  hazard class, no register cache to reason about for future work) that is
+  correctness-clean and not a regression — the same basis P14/P15 landed on.
 
 **Re-measured after predicated branches locked on (`94df464`, SM64DS
 castle-courtyard, `DESMUME_JIT_TRACE_FIRST` a9 tally + ARM7 `alive:` lines):**
@@ -324,17 +352,17 @@ The **remaining** `dontJIT` edges are the excluded sub-forms (pc-relative
 literal, `LDMcc{pc}`, `BXcc rN`) plus the hard tail (`MCR p15`, `MSR cpsr`) —
 next candidates, with diminishing returns.
 
-At a ~2-block chain a fixed-mapping trampoline's unconditional 15-register
-load/store still loses to the lazy allocator — **GPR residency stays deferred
-until chains lengthen.** Note that residency would also *dissolve the entire
-predicated-op hazard class*: with every guest GPR permanently pinned there is
-no register cache, no eviction, no dirty bit and no per-block
-`flushDirtyRegisters()`, so a predicated op is just "eval cond, BEQ over the
-exit, continue" with nothing to get wrong — the `emitEvalCond` guard stays but
-the unconditional-flush / `invalidateRegCache()` scaffolding these commits add
-becomes dead code and is removed. The predicated-op work is not throwaway: it
-is the correct behaviour for the lazy allocator *and* it lengthens chains
-toward the point where residency pays off.
+**GPR residency landed (`264bf8e`) — see the §5 Progress block.** With
+chains now ~7 blocks (edge ~14 %) the fixed-mapping trampoline's one `lmw` /
+`stmw` roughly breaks even against the per-boundary flush/reload it removes:
+frame-neutral on SM64DS (ARM9 JIT 14.86 → 14.88, `exec%` ~98 % so a
+dispatch-side change cannot register here). It landed anyway as a
+correctness-clean structural simplification that *dissolved the entire
+predicated-op hazard class* — with every GPR permanently pinned there is no
+register cache, no eviction, no dirty bit, so a predicated op is just "eval
+cond, BEQ over the exit, continue" and the unconditional-flush /
+`invalidateRegCache()` scaffolding the predicated-op commits added is now
+dead (removed in `de9f4ca`).
 
 **Measured picture:** on SM64DS the ARM9 JIT is now a **+9.6 % whole-frame win**
 (§16); the ARM7-only JIT A/B still needs re-measuring (was a ~4.4 % regression
@@ -2208,7 +2236,7 @@ Optimize:
 5. trampoline overhead
 6. memory fast paths
 
-**Current position (`d4334b5`): items 1 + 6 both advanced.** ARM9 telemetry
+**Current position (`de9f4ca`): items 1, 4 and 6 advanced.** ARM9 telemetry
 (§5) showed the ~1.9-block chain ceiling was the emitter refusing predicated
 (`cond != AL`) memory ops and `BXcc lr`. Now compiled (`emitEvalCond` + BEQ
 guard over the exit, unconditional pre-guard flush, block continues):
@@ -2227,12 +2255,20 @@ differential-journal hook and the multi-page SMC guard the plan flagged as
 blockers): cumulative +2.1 % ARM9 JIT / +5.6 % full JIT (37.19 → **39.29**),
 armwrestler-clean, 705 M/492 M-insn soaks clean.
 
+Then **item 4** (§5 slice 3): GPR residency — guest R0–R15 pinned to host
+r14..r29 for the whole trace, `264bf8e` + the `de9f4ca` scaffolding cleanup.
+Correctness-clean (armwrestler + arm7wrestler baselines, 495 M-insn soak);
+**frame-neutral** on SM64DS (`exec%` ~98 %, so no dispatch-side change shows
+here). Landed as a −430-line structural simplification that dissolves the
+predicated-op hazard class.
+
 What remains at item 1 is the hard tail (`MCR p15`, `MSR cpsr`) and the
 excluded sub-forms (pc-relative literal, `LDMcc{pc}`, `BXcc rN`); at item 6,
 only the rare excluded store forms (`SWP`, `STRT`, `STRD`, predicated,
 pc-relative literal `STR`) and the deferred ARM7 WRAM tier. All with
-diminishing returns — so the memory path is **done** for now; next lever is
-GPR residency (item 4) / dispatch-table work.
+diminishing returns on the one available retail workload — the dispatch
+table / trampoline `stmw`/`lmw` work is the remaining lever, but SM64DS
+boot's ~98 % `exec%` caps what any of it can show there.
 
 ### Then
 
@@ -2268,7 +2304,7 @@ The default architecture remains direct emission plus chaining.
 | 9  | ARM32 front-end on ARM9                                          | done            |
 | 10 | Static/dynamic block chaining + scheduler quota                  | done            |
 | 11 | ARM front-end on ARM7                                            | done (SM64DS soak; armwrestler + arm7wrestler both clear, §8.2/§8.3) |
-| 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; GPR residency deferred (§5/§23) |
+| 12 | Persistent JIT state + trampoline amortization                   | done: r31 icount + r30 CPSR resident; **GPR residency landed** -- guest R0..R15 pinned to r14..r29 for the whole trace (§5/§23, 264bf8e + de9f4ca), correctness-clean, frame-neutral, -430 lines |
 | 13 | Inline memory fast paths                                         | ARM7 Tier-1 literal loads + P14/P15 descriptor loads; ARM9 P16 two-region loads **and stores** (main RAM + DTCM inline, +5.6% full JIT cumulative); ARM7 general/WRAM tier + rare excluded store forms (SWP/STRT/STRD/predicated) deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads, all cores) + ARM9 STM/PUSH/STMIA (stores, P16); LDM{pc} / ARM7 STM deferred (§6/§16); correctness-validated |
