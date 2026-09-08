@@ -257,10 +257,17 @@ u32 jitRunArm9()
 #ifdef DESMUME_JIT_TRACE_FIRST
 	{
 		static u64 s_disp = 0, s_comp = 0, s_bail0 = 0, s_arm = 0, s_armbail0 = 0, s_lastRep = 0;
+		static u64 s_insns = 0, s_entries = 0, s_blk0 = 0;
 		s_disp++;
 		if (wasMiss) s_comp++;
 		if (r.instructions == 0) s_bail0++;
 		if (!thumb) { s_arm++; if (r.instructions == 0) s_armbail0++; }
+		// chain-length picture: r.instructions is the whole chained-dispatch's
+		// guest-instruction count (the trampoline accumulates it in r31 across
+		// every statically-chained block); b->insnCount() is just the entry
+		// block. s_insns/s_entries == guest instructions per trampoline
+		// round-trip; s_insns/s_blk0 == blocks per round-trip (approx chain len).
+		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += b->insnCount(); }
 		static int s_dump = 0;
 		if (!thumb && s_dump < 40) {
 			s_dump++;
@@ -273,9 +280,15 @@ u32 jitRunArm9()
 		if (s_disp - s_lastRep >= 500000) {
 			s_lastRep = s_disp;
 			FILE* f = fopen("sd:/jit.log", "a");
-			if (f) { fprintf(f, "[jit] a9 tally: disp=%llu compiles=%llu bail0=%llu | arm disp=%llu arm bail0=%llu\n",
+			if (f) { fprintf(f, "[jit] a9 tally: disp=%llu compiles=%llu bail0=%llu | arm disp=%llu arm bail0=%llu"
+			                 " | ins/entry=%llu.%02llu blk0/entry=%llu.%02llu (entries=%llu)\n",
 			                 (unsigned long long)s_disp, (unsigned long long)s_comp, (unsigned long long)s_bail0,
-			                 (unsigned long long)s_arm, (unsigned long long)s_armbail0); fclose(f); }
+			                 (unsigned long long)s_arm, (unsigned long long)s_armbail0,
+			                 (unsigned long long)(s_entries ? s_insns / s_entries : 0),
+			                 (unsigned long long)(s_entries ? (s_insns * 100 / s_entries) % 100 : 0),
+			                 (unsigned long long)(s_entries ? s_insns / (s_blk0 ? s_blk0 : 1) : 0),
+			                 (unsigned long long)(s_entries ? (s_insns * 100 / (s_blk0 ? s_blk0 : 1)) % 100 : 0),
+			                 (unsigned long long)s_entries); fclose(f); }
 		}
 	}
 #endif

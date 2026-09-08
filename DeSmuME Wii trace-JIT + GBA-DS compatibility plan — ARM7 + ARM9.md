@@ -223,22 +223,38 @@ Both validated 0-DIFF (ARM7 + ARM9), 0 CANARY / OVERRUN.
 
 **GPR residency across chained blocks — deferred (§23).** The third piece of §5
 would keep guest R0–R14 resident across a chain. That needs either cross-block
-register allocation (out of scope) or a fixed guest→host mapping. Measured ARM7
-chain length on SM64DS is ~2 blocks / ~5 guest instructions — short, in part
-because predicated ARM branches used to bail to the interpreter and force a
-trampoline round-trip. That is fixed: predicated `Bcc` + `BLcc` now compile
-unconditionally (§16), so this measurement should be re-taken — longer chains
-change the calculus. A fixed mapping's unconditional 15-register trampoline
-load/store would lose against the current lazy allocator at the *old*
-~2-block chain length; re-measure before deciding.
+register allocation (out of scope) or a fixed guest→host mapping. A fixed
+mapping's unconditional 15-register trampoline load/store only pays off once
+chains are long enough to amortise it.
 
-**Measured picture:** on SM64DS (ARM9-bound, ARM9 interpreted) the ARM7 JIT is
-still a ~4.4% whole-frame regression. The dominant remaining cost is the sheer
-number of trampoline round-trips (short chains) plus the trampoline's own
-`stmw`/`lmw`. Predicated ARM `Bcc` + `BLcc` now compile unconditionally (§16,
-gate removed) — the "capped until predicated branches compile" condition is
-cleared, so the ARM7 chain-length / frame picture needs re-measuring. The other
-lever is (b) the ARM9 JIT being viable in `jitfull` (also §16).
+**Re-measured after predicated branches locked on (`94df464`, SM64DS
+castle-courtyard, `DESMUME_JIT_TRACE_FIRST` a9 tally + ARM7 `alive:` lines):**
+
+| core | guest-instrs / trampoline round-trip | blocks / round-trip | bail0 rate | compile churn |
+| ---- | ----------------------------------- | ------------------- | ---------- | ------------- |
+| ARM9 | ~15                                 | ~1.9                | ~0 %       | 0.35 %        |
+| ARM7 | ~12 (per *successful* entry)        | —                   | ~19 %      | — |
+
+Chains are **still ~1.9 blocks** even with predicated `Bcc`/`BLcc` compiling and
+near-zero compile/bail churn. The limiter is **not** the cycle quota
+(`JIT_YIELD_NUMBER`): raising it 64 → 128 was byte-identical on the benchmark
+(ARM9 JIT 14.43, jitfull 36.17 both unchanged). The ceiling is the **guarded
+dynamic-dispatch hash table** (`emitDynamicLinkerStub`, `jit_cache.cpp`) — a
+direct-mapped slot, so the BL→BX call/return pair and any two hot dynamic-edge
+targets that collide evict each other and fall back to the C trampoline every
+visit. That, not GPR residency and not the quota, is the next lever: a
+set-associative dynamic-dispatch table, or a return-address stack for the
+call/return pattern.
+
+At a ~1.9-block chain a fixed-mapping trampoline's unconditional 15-register
+load/store still loses to the lazy allocator — **GPR residency stays deferred
+until the dynamic-edge ceiling is lifted.**
+
+**Measured picture:** on SM64DS the ARM9 JIT is now a **+9.6 % whole-frame win**
+(§16); the ARM7-only JIT A/B still needs re-measuring (was a ~4.4 % regression
+pre-predicated-branch). The dominant remaining cost is the number of trampoline
+round-trips (short chains → the dynamic-edge ceiling above) plus the
+trampoline's own `stmw`/`lmw`.
 
 ---
 
