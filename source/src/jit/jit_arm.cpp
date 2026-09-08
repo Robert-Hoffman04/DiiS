@@ -159,10 +159,8 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND / OP_BL taken cost
 	ctx.emitDirtyFlagFlush();                            // no-op (P12), kept for shape
 	ctx.emitDirtyRegisterFlush();                        // non-clearing: fall-through re-flushes
-	if (isBL) {                                          // guest R14 = return address
-		emitLoadImm32(p, PPC_R11, retLR);
-		*p++ = PPC_STW(PPC_R11, 14, 14 * 4);            // direct: bypass + override the cache
-	}
+	if (isBL)                                            // guest R14 = return address
+		emitLoadImm32(p, ctx.hostRegFor(14), retLR);    // pinned reg; only the taken path runs this
 	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
 	const u32 pipe = target + 8;
 	*p++ = PPC_LIS(PPC_R29, pipe   >> 16);
@@ -664,17 +662,15 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
 		}
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
-		*p++ = PPC_STW(PPC_R10, 14, rd * 4);        // result last: wins if rd == rn
+		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);   // base writeback (pinned)
+		*p++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);         // result last: wins if rd == rn
 	} else {
 		ctx.emitSmcCheckAndBail(PPC_R12);
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		*p++ = PPC_LWZ(PPC_R10, 1, 100);
 		ctx.emitSlowStore(PPC_R12, PPC_R10, size);
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 	}
 }
 
@@ -747,8 +743,7 @@ void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
 	*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
 	ctx.emitMemEpilogue();
-	ctx.invalidateRegCache();
-	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);   // base writeback (pinned)
 
 	emitLdrPcExit(ctx, PPC_R10, op);
 }
@@ -831,18 +826,15 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 				*p++ = PPC_RLWINM(PPC_R10, PPC_R10, rl, 0, 31);
 			}
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 			if (rd == 15) { emitLdrPcExit(ctx, PPC_R10, op); return; }   // LDR pc,[pc,#imm]
-			*p++ = PPC_STW(PPC_R10, 14, rd * 4);
+			*p++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		} else {
 			emitLoadImm32(p, PPC_R12, ea);
 			*p++ = PPC_STW(PPC_R12, 1, 96);
 			ctx.emitSmcCheckAndBail(PPC_R12);
 			*p++ = PPC_LWZ(PPC_R12, 1, 96);
-			*p++ = PPC_LWZ(PPC_R10, 14, rd * 4);
-			ctx.emitSlowStore(PPC_R12, PPC_R10, size);
+			ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(rd), size);
 			ctx.emitMemEpilogue();
-			ctx.invalidateRegCache();
 		}
 		return;
 	}
@@ -1089,30 +1081,21 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	ctx.emitMemPrologue();
 	if (!L) { *p++ = PPC_LWZ(PPC_R12, 1, 96); ctx.emitSmcCheckAndBail(PPC_R12); }
 
-	// r0..r14 in ascending order at lowAddr + 4*slot
+	// r0..r14 in ascending order at lowAddr + 4*slot -- pinned regs directly
 	u32 slot = 0;
 	for (int i = 0; i < 15; i++) {
 		if (!(list & (1u << i))) continue;
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		if (slot) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
-		if (L) {
-			ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
-			*p++ = PPC_STW(PPC_R10, 14, i * 4);
-		} else {
-			*p++ = PPC_LWZ(PPC_R10, 14, i * 4);
-			ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
-		}
+		if (L) ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false);
+		else   ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(i), 4);
 		slot++;
 	}
 
 	if (!pcInList) {
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
-		if (guard) {
-			*guard = PPC_BEQ((u32)((p - guard) * 4));
-			ctx.invalidateRegCache();
-		}
+		if (W) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);   // base writeback (pinned)
+		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 		return;                                 // not a terminator: block continues
 	}
 
@@ -1122,8 +1105,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 	*p++ = PPC_STW(PPC_R10, 1, 100);                                // stash raw popped pc
 	ctx.emitMemEpilogue();
-	ctx.invalidateRegCache();
-	if (W) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	if (W) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 
 	const u32 term = ctx.cpu.cyclesForArm(op);
 
@@ -1395,9 +1377,7 @@ void emitSwap(JitTraceCtx& ctx, u32 op)
 	ctx.emitSlowStore(PPC_R12, PPC_R10, size);
 
 	ctx.emitMemEpilogue();
-	ctx.invalidateRegCache();
-	*p++ = PPC_LWZ(PPC_R11, 1, 104);
-	*p++ = PPC_STW(PPC_R11, 14, rd * 4);                     // Rd = loaded value (last)
+	*p++ = PPC_LWZ(ctx.hostRegFor(rd), 1, 104);              // Rd = loaded value (pinned)
 }
 
 // ------------------------------------------------------------- MRS / MSR (B6)
@@ -1561,15 +1541,12 @@ void emitDoubleDataTransfer(JitTraceCtx& ctx, u32 op)
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		ctx.emitSmcCheckAndBail(PPC_R12);
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
-		*p++ = PPC_LWZ(PPC_R10, 14, rd * 4);
-		ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+		ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(rd), 4);
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		*p++ = PPC_ADDI(PPC_R12, PPC_R12, 4);
-		*p++ = PPC_LWZ(PPC_R10, 14, (rd + 1) * 4);
-		ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+		ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(rd + 1), 4);
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 	} else {
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
@@ -1578,11 +1555,9 @@ void emitDoubleDataTransfer(JitTraceCtx& ctx, u32 op)
 		*p++ = PPC_ADDI(PPC_R12, PPC_R12, 4);
 		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);        // word 1 -> R10
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		*p++ = PPC_STW(PPC_R10, 14, (rd + 1) * 4);           // Rd+1
-		*p++ = PPC_LWZ(PPC_R11, 1, 100);
-		*p++ = PPC_STW(PPC_R11, 14, rd * 4);                 // Rd
-		if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+		*p++ = PPC_OR(ctx.hostRegFor(rd + 1), PPC_R10, PPC_R10);   // Rd+1
+		*p++ = PPC_LWZ(ctx.hostRegFor(rd), 1, 100);                // Rd
+		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 	}
 }
 

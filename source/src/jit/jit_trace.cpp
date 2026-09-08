@@ -302,125 +302,34 @@ void JitTraceCtx::emitCVfromXER(u32 scratchReg)
 	emitFlagBit(JITF_V, scratchReg, 2);
 }
 
-// ---- lazy host-register allocator: guest R0..R14 -> host r15..r28 --------
-u8 JitTraceCtx::allocHostReg(u8 gbaReg, bool loadFromMem, u32& lockedMask)
-{
-	if (gbaReg == 15) return PPC_R29;   // guest PC is hardwired to r29
-
-	if (regCache[gbaReg].allocated) {
-		regCache[gbaReg].age = ++currentAge;
-		lockedMask |= (1u << regCache[gbaReg].hostReg);
-		return regCache[gbaReg].hostReg;
-	}
-
-	u32 inUseMask = allocatedHostRegsMask | lockedMask;
-	u32 freeMask  = (~inUseMask) & 0x1FFF8000u;   // host r15..r28
-	u8  freeReg   = 0;
-
-	if (freeMask != 0) {
-		freeReg = (u8)(31 - __builtin_clz(freeMask));
-	} else {
-		u32 oldestAge = 0xFFFFFFFFu;
-		int spillTarget = -1;
-		for (int i = 0; i < 15; i++) {
-			if (regCache[i].allocated &&
-			    ((lockedMask & (1u << regCache[i].hostReg)) == 0) &&
-			    regCache[i].age < oldestAge) {
-				oldestAge = regCache[i].age;
-				spillTarget = i;
-			}
-		}
-		// GO-FIX-PH hardening: every real ARM/THUMB instruction locks only a
-		// handful of operands (<=4) against 14 pool registers, so this should
-		// be unreachable -- but the old code indexed regCache[-1] unconditionally
-		// if it ever *was* unreachable-in-theory-but-not-in-practice, emitting
-		// a PPC_STW through a garbage host register at gpr_base-4, one word
-		// before the guest register array: a host memory write outside the
-		// guest state the differential harness compares, so a bug here can
-		// corrupt unrelated heap memory without ever showing up as a DIFF.
-		// If genuinely no eviction candidate exists, fall back to the oldest
-		// *any* allocated slot (ignoring the lock) rather than a negative index.
-		if (spillTarget < 0) {
-			for (int i = 0; i < 15; i++) {
-				if (regCache[i].allocated && regCache[i].age < oldestAge) {
-					oldestAge = regCache[i].age;
-					spillTarget = i;
-				}
-			}
-		}
-		if (spillTarget < 0) {
-			// regCache has zero allocated entries yet freeMask == 0 -- would mean
-			// lockedMask alone claims all 14 pool registers, i.e. >=14 locked
-			// operands on one instruction. Not reachable by any real emitter;
-			// bail the block rather than touch the array with a bad index.
-			endBlock = true;
-			return PPC_R10;
-		}
-		if (regCache[spillTarget].dirty)
-			*emitPtr++ = PPC_STW(regCache[spillTarget].hostReg, 14, spillTarget * 4);
-		regCache[spillTarget].allocated = false;
-		regCache[spillTarget].dirty = false;
-		allocatedHostRegsMask &= ~(1u << regCache[spillTarget].hostReg);
-		freeReg = regCache[spillTarget].hostReg;
-	}
-
-	regCache[gbaReg].allocated = true;
-	regCache[gbaReg].dirty = false;
-	regCache[gbaReg].hostReg = freeReg;
-	regCache[gbaReg].age = ++currentAge;
-
-	allocatedHostRegsMask |= (1u << freeReg);
-	lockedMask            |= (1u << freeReg);
-
-	if (loadFromMem) *emitPtr++ = PPC_LWZ(freeReg, 14, gbaReg * 4);
-	return freeReg;
-}
-
-u8 JitTraceCtx::writeReg(u8 gbaReg, bool fullOverwrite, u32& lockedMask)
-{
-	u8 h = allocHostReg(gbaReg, !fullOverwrite, lockedMask);
-	if (gbaReg < 15) regCache[gbaReg].dirty = true;
-	return h;
-}
-
-void JitTraceCtx::flushDirtyRegisters()
-{
-	for (int i = 0; i < 15; i++) {
-		if (regCache[i].allocated && regCache[i].dirty) {
-			*emitPtr++ = PPC_STW(regCache[i].hostReg, 14, i * 4);
-			regCache[i].dirty = false;
-		}
-	}
-}
-
-void JitTraceCtx::emitDirtyRegisterFlush()
-{
-	for (int i = 0; i < 15; i++)
-		if (regCache[i].allocated && regCache[i].dirty)
-			*emitPtr++ = PPC_STW(regCache[i].hostReg, 14, i * 4);
-}
+// ---- fixed guest-register file --------------------------------------------
+// Guest R0..R15 are pinned to host r14..r29 for the whole (possibly chained)
+// trace; the trampoline (jit_trampoline.S) loads them from cpu.R[] on entry and
+// stores them back on the one landing pad every exit funnels through. There is
+// no cache, no eviction and no dirty bit -- readReg/writeReg (jit_trace.h) just
+// return the pinned host register, and flushDirtyRegisters / invalidateRegCache
+// are no-ops. The few emitters that still need guest state in *memory* mid-block
+// (a C call that peeks cpu.R[], the interpreter bail) reload the gpr base from
+// stack slot 80(r1).
 
 void JitTraceCtx::emitEagerFlush()
 {
 	flushDirtyFlags();
-	flushDirtyRegisters();
-}
-
-void JitTraceCtx::invalidateRegCache()
-{
-	for (int i = 0; i < 15; i++) { regCache[i].allocated = false; regCache[i].dirty = false; }
-	allocatedHostRegsMask = 0;
+	flushDirtyRegisters();   // no-op under residency; kept for call-site parity
 }
 
 // ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite --------
 // r3 holds the cross-block cycle accumulator and is PPC-EABI volatile, so it's
-// spilled/reloaded around the call. Guest regs (r14..r31) -- including the P12
-// resident r30 packed flags and r31 instruction count -- are non-volatile and
-// survive the call untouched, so the flags no longer need a spill here.
+// spilled/reloaded around the call. Every guest register (R0..R15 -> r14..r29,
+// flags r30, icount r31) is non-volatile and survives the call untouched -- the
+// whole point of GPR residency -- so nothing else needs saving here. The guest
+// PC is still mirrored to gpr[15] defensively in case a C memory path peeks it;
+// r14 is no longer the gpr base, so reload it from the stack slot the trampoline
+// stashed.
 void JitTraceCtx::emitMemPrologue()
 {
-	flushDirtyRegisters();
-	*emitPtr++ = PPC_STW(PPC_R29, 14, 15 * 4);   // guest PC -> gpr[15] (in case the C path peeks)
+	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 80);        // gpr base
+	*emitPtr++ = PPC_STW(PPC_R29, PPC_R10, 15 * 4);   // guest PC -> gpr[15]
 	*emitPtr++ = PPC_STW(PPC_R3, 1, 92);         // save cycle accumulator
 }
 
@@ -508,16 +417,14 @@ void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
 	*p++ = PPC_LWZ(PPC_R3, 1, 92);
 }
 
-// emitInterpreterBail whose emitted (runtime-only) state flush must not disturb
-// the compile-time dirty bookkeeping the fall-through fast path still relies on.
+// Under GPR + flag residency there is no compile-time dirty bookkeeping to
+// protect: emitInterpreterBail emits no state flush of its own (the trampoline's
+// single landing pad owns that), so a runtime bail on a guarded fast path leaves
+// the fall-through's compile-time model untouched. Kept as a named wrapper so
+// the call sites still read intentionally.
 static void bailPreservingDirty(JitTraceCtx& ctx, u32 metaCount)
 {
-	const bool fd = ctx.flagsDirty;
-	bool sv[15];
-	for (int i = 0; i < 15; i++) sv[i] = ctx.regCache[i].dirty;
 	ctx.emitInterpreterBail(metaCount);
-	ctx.flagsDirty = fd;
-	for (int i = 0; i < 15; i++) ctx.regCache[i].dirty = sv[i];
 }
 
 // P14/P15 shared: guard EA (PPC_R12) against the cached-descriptor page window,
@@ -690,11 +597,10 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 		if (signExt) *p++ = PPC_EXTSB(PPC_R10, PPC_R10);
 	}
 
-	// ---- converge ----
+	// ---- converge ---- (guest regs are pinned: commit straight into them)
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
-	invalidateRegCache();
-	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
-	*p++ = PPC_STW(PPC_R10, 14, rd * 4);
+	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
+	*p++ = PPC_OR(hostRegFor(rd), PPC_R10, PPC_R10);
 }
 
 // P14: inline RAM load. See jit_trace.h. eaReg == PPC_R12 by contract.
@@ -747,29 +653,26 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 	u32* fast[2];
 	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast);
 
-	// ---- slow: per-word slowRead C loop ----
+	// ---- slow: per-word slowRead C loop, straight into the pinned regs ----
 	emitMemPrologue();
 	for (u32 k = 0; k < n; k++) {
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
-		emitSlowLoad(PPC_R10, PPC_R12, 4, false);
-		*p++ = PPC_STW(PPC_R10, 14, regs[k] * 4);
+		emitSlowLoad(hostRegFor(regs[k]), PPC_R12, 4, false);
 	}
 	emitMemEpilogue();
 	u32* toEnd = p++;                                              // B over the fast block
 
-	// ---- fast: n sequential inline lwbrx ----
+	// ---- fast: n sequential inline lwbrx into the pinned regs ----
 	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
 	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // r10 = host addr of the low word
 	for (u32 k = 0; k < n; k++) {
-		*p++ = PPC_LWBRX(PPC_R11, 0, PPC_R10);
-		*p++ = PPC_STW(PPC_R11, 14, regs[k] * 4);
+		*p++ = PPC_LWBRX(hostRegFor(regs[k]), 0, PPC_R10);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
 	}
 
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	*p++ = PPC_LWZ(PPC_R12, 1, 96);               // restore low EA (THUMB LDMIA reads it back)
-	invalidateRegCache();
 }
 
 // P15: inline sequential block load (LDM / POP / LDMIA). See jit_trace.h.
@@ -854,15 +757,14 @@ void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn)
 	*p++ = PPC_LWZ(PPC_R11, 1, 100);                               // value
 	emitArm9Stw(p, size);
 
-	// ---- converge ----
+	// ---- converge ---- (writeback straight into the pinned base register)
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
-	invalidateRegCache();
-	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
 }
 
 // P16: ARM9 inline block store (STM / PUSH / STMIA, non-pc). See jit_trace.h.
-// Low EA in PPC_R12; each source register is read from its gpr slot (the
-// unconditional flush below makes them coherent).
+// Low EA in PPC_R12; each source register is read straight from its pinned host
+// register (r14..r29).
 void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 {
 	u32*& p = emitPtr;
@@ -884,8 +786,7 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 	for (u32 k = 0; k < n; k++) {
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
 		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
-		*p++ = PPC_LWZ(PPC_R10, 14, regs[k] * 4);
-		emitSlowStore(PPC_R12, PPC_R10, 4);
+		emitSlowStore(PPC_R12, hostRegFor(regs[k]), 4);
 	}
 	emitMemEpilogue();
 	u32* toEnd = p++;                                              // B over the fast block(s)
@@ -913,15 +814,13 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 	emitJournalNote(PPC_R12, 4 * n);
 	*p++ = PPC_LWZ(PPC_R10, 1, 108);
 	for (u32 k = 0; k < n; k++) {
-		*p++ = PPC_LWZ(PPC_R11, 14, regs[k] * 4);
-		*p++ = PPC_STWBRX(PPC_R11, 0, PPC_R10);
+		*p++ = PPC_STWBRX(hostRegFor(regs[k]), 0, PPC_R10);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
 	}
 
 	// ---- converge ----
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	*p++ = PPC_LWZ(PPC_R12, 1, 96);                                // restore low EA for the caller
-	invalidateRegCache();
 }
 
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)

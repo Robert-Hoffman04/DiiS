@@ -122,13 +122,6 @@ struct JitDeferredBailout {
 	u32 instructions;
 };
 
-struct JitRegSlot {
-	bool allocated;
-	bool dirty;
-	u8   hostReg;
-	u32  age;
-};
-
 // Per-compile state, threaded through the scanner and the emitter table.
 struct JitTraceCtx {
 	const JitCpuProfile& cpu;
@@ -153,10 +146,6 @@ struct JitTraceCtx {
 	bool flagsLoaded;
 	bool flagsDirty;
 
-	JitRegSlot regCache[15];
-	u32        allocatedHostRegsMask;
-	u32        currentAge;
-
 	JitDeferredBailout bailouts[JIT_MAX_BAILOUTS];
 	u32                bailoutCount;
 
@@ -173,14 +162,21 @@ struct JitTraceCtx {
 	void emitNZ(u32 srcReg);
 	void emitCVfromXER(u32 scratchReg);
 
-	// ---- lazy host-register allocator (guest R0..R14 -> host r15..r28) ----
-	u8   allocHostReg(u8 gbaReg, bool loadFromMem, u32& lockedMask);
-	u8   readReg(u8 gbaReg, u32& lockedMask)  { return allocHostReg(gbaReg, true,  lockedMask); }
-	u8   writeReg(u8 gbaReg, bool fullOverwrite, u32& lockedMask);
-	void flushDirtyRegisters();                   // stores + clears dirty
-	void emitDirtyRegisterFlush();                // stores, leaves dirty set
+	// ---- fixed guest-register file: guest R0..R15 pinned to host r14..r29 ----
+	// Every guest GPR is resident in a callee-saved host register for the whole
+	// (possibly chained) trace; the trampoline (jit_trampoline.S) is the only
+	// place they touch cpu.R[]. readReg/writeReg just return the pinned host
+	// register (no load, no dirty tracking); the flush/invalidate helpers are
+	// retained as no-ops so their ~30 call sites need no edit (same pattern as
+	// ensureFlagsLoaded() after P12). lockedMask is vestigial -- no eviction.
+	static u8 hostRegFor(u8 gbaReg) { return (u8)(14 + gbaReg); }   // R15 -> r29
+	u8   readReg(u8 gbaReg, u32& lockedMask)  { (void)lockedMask; return hostRegFor(gbaReg); }
+	u8   writeReg(u8 gbaReg, bool fullOverwrite, u32& lockedMask)
+	     { (void)fullOverwrite; (void)lockedMask; return hostRegFor(gbaReg); }
+	void flushDirtyRegisters()   {}              // resident: nothing to flush
+	void emitDirtyRegisterFlush() {}
 	void emitEagerFlush();
-	void invalidateRegCache();                    // drop all host-reg allocations
+	void invalidateRegCache()    {}              // resident: no cache to drop
 
 	// ---- guest memory via a C call to JitCpuProfile::slowRead/slowWrite ----
 	// eaReg / valReg are host scratch (r10..r12). r3 (cross-block cycle accum)

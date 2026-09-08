@@ -74,22 +74,20 @@
 // R12 : Scratch: Target Address / Operand / General Math.
 //
 // NON-VOLATILE REGISTERS (Host ABI - Preserved across C++ calls)
-// R14 : PPC_REG_GBA_REGS_PTR (Base pointer to the C++ gbaRegs array).
-// R15 : Lazily allocated host pool for GBA R0-R14.
-// R16 : Lazily allocated host pool for GBA R0-R14.
-// R17 : Lazily allocated host pool for GBA R0-R14.
-// R18 : Lazily allocated host pool for GBA R0-R14.
-// R19 : Lazily allocated host pool for GBA R0-R14.
-// R20 : Lazily allocated host pool for GBA R0-R14.
-// R21 : Lazily allocated host pool for GBA R0-R14.
-// R22 : Lazily allocated host pool for GBA R0-R14.
-// R23 : Lazily allocated host pool for GBA R0-R14.
-// R24 : Lazily allocated host pool for GBA R0-R14.
-// R25 : Lazily allocated host pool for GBA R0-R14.
-// R26 : Lazily allocated host pool for GBA R0-R14.
-// R27 : Lazily allocated host pool for GBA R0-R14.
-// R28 : Lazily allocated host pool for GBA R0-R14.
-// R29 : PPC_REG_PC (GBA R15 / Pipeline PC).
+// R14..R29 : GPR residency -- guest R0..R15 pinned 1:1 (R_i -> r(14+i)) for the
+//            whole (possibly chained) trace. R29 == guest R15 / pipeline PC.
+//            The trampoline (jit_trampoline.S) is the only place they sync to
+//            cpu.R[]: one lmw on entry, one stmw on the shared return pad. There
+//            is no allocator, no eviction, no dirty bit; readReg/writeReg just
+//            return the pinned register. The old gpr-base pointer (was r14) now
+//            lives at 80(r1); the few cold paths that still need guest state in
+//            memory (a C mem path that peeks cpu.R[], the interpreter bail via
+//            the trampoline) reload it from there.
+// R15 : guest R1.   R16 : guest R2.   R17 : guest R3.   R18 : guest R4.
+// R19 : guest R5.   R20 : guest R6.   R21 : guest R7.   R22 : guest R8.
+// R23 : guest R9.   R24 : guest R10.  R25 : guest R11.  R26 : guest R12.
+// R27 : guest R13 (SP).   R28 : guest R14 (LR).
+// R29 : PPC_REG_PC (guest R15 / Pipeline PC) -- the i=15 slot of the file above.
 // R30 : PPC_REG_FLAGS (P12) -- packed N/Z/C/V, resident for the whole trace.
 //       Bits 0-3 in IBM/rlwinm numbering (top nibble, conventional bits 31-28)
 //       hold N,Z,C,V; the low 28 bits mirror the rest of the guest CPSR word so

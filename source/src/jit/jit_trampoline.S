@@ -58,16 +58,19 @@ ExecuteJITTrace:
     stwu 1, -128(1)             # new frame
     stmw 14, 8(1)               # save host non-volatiles r14..r31
 
-    lwz 14, 0(5)                # r14 = st->gpr
-    lwz 10, 4(5)                # r10 = st->cpsr    (st->readTable at 8(5) is unread until P6)
-    lwz 30, 0(10)              # P12: r30 = *cpsr -- PPC_REG_FLAGS, resident for the whole trace
+    # GPR residency: guest R0..R15 live in r14..r29 for the whole (chained)
+    # trace, CPSR in r30 (== &R[0] + 16, contiguous in armcpu_t), synced to
+    # memory only here. One lmw covers all of it -- r31 briefly holds SPSR
+    # (&R[0] + 17), immediately zeroed as the P12 instruction-count accumulator.
+    # r3 = execute, r4 = JITResult* out, r5 = st -- keep all three until used.
+    lwz 10, 0(5)              # r10 = st->gpr  (== &cpu.R[0])
+    lwz 11, 4(5)              # r11 = st->cpsr
 
-    stw 14, 80(1)              # [80] guest gpr base
-    stw 10, 84(1)              # [84] guest cpsr pointer
-    stw 4, 88(1)               # [88] JITResult* out
+    stw 10, 80(1)            # [80] guest gpr base -- reloaded by the few cold paths
+    stw 11, 84(1)            # [84] guest cpsr pointer (parity; return uses [80])
+    stw 4, 88(1)             # [88] JITResult* out
 
-    lwz 29, 60(14)             # r29 = guest R15 (pipeline PC), loaded eagerly
-
+    lmw 14, 0(10)            # r14..r29 = R0..R15 ; r30 = CPSR ; r31 = SPSR (discarded)
     li 31, 0                    # P12: resident guest-instruction-count accumulator
 
     mtctr 3                     # enter the compiled block via CTR (never a call:
@@ -86,15 +89,13 @@ ExecuteJITTrace_Return:
     stw 4, 4(10)              # out->nextPC       (r4)
     stw 31, 8(10)            # out->instructions (r31, P12 resident accumulator)
 
+    # GPR residency: flush guest R0..R15 (r14..r29) + CPSR (r30) back to memory.
+    # One stmw covers gpr[0..17]; gpr[16] = CPSR <- r30 is exactly right, but
+    # gpr[17] = SPSR would be clobbered by r31 (icount), so save/restore it.
     lwz 10, 80(1)             # r10 = guest gpr base
-    stw 29, 60(10)            # flush guest R15 (PC)
-
-    lwz 9, 84(1)             # P12: *cpsr = r30 (PPC_REG_FLAGS, resident whole trace).
-    stw 30, 0(9)            #   every exit path lands here, so no block flushes flags itself.
-
-    # By contract, guest R0..R14 were already flushed by the trace before it
-    # reached this landing pad; the trampoline owns the PC it eagerly loaded,
-    # the r31 instruction-count accumulator and the r30 packed-flags word.
+    lwz 0, 68(10)            # save SPSR  (gpr[17])
+    stmw 14, 0(10)           # R0..R15 <- r14..r29 ; CPSR <- r30 ; SPSR <- r31 (bogus)
+    stw 0, 68(10)            # restore SPSR
 
     lmw 14, 8(1)              # restore host non-volatiles
     lwz 0, 132(1)            # saved host LR (128 + 4)

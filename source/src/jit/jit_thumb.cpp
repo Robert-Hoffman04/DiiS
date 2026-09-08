@@ -308,7 +308,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 		ctx.emitMemEpilogue();
 		ctx.invalidateRegCache();
-		*emitPtr++ = PPC_STW(PPC_R10, 14, rd * 4);
+		*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		break;
 	}
 
@@ -398,7 +398,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			}
 			ctx.emitMemEpilogue();
 			ctx.invalidateRegCache();
-			*emitPtr++ = PPC_STW(PPC_R10, 14, rd * 4);
+			*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		}
 		break;
 	}
@@ -430,7 +430,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 			ctx.emitMemEpilogue();
 			ctx.invalidateRegCache();
-			*emitPtr++ = PPC_STW(PPC_R10, 14, rd * 4);
+			*emitPtr++ = PPC_OR(ctx.hostRegFor(rd), PPC_R10, PPC_R10);
 		} else {
 			ctx.emitSmcCheckAndBail(PPC_R12);
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
@@ -536,14 +536,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitMemPrologue();
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
 			ctx.emitSmcCheckAndBail(PPC_R12);
-			// guard passed -- commit the real decrement and flush it now (the
-			// per-register loop below reuses stack slot 96 for addressing,
-			// and invalidateRegCache() after the loop discards the register
-			// cache without flushing, so this must land in guest memory
-			// before the loop, not just before the block ends).
-			hSp = ctx.writeReg(13, false, lockedMask);
+			// guard passed -- commit the real decrement into the pinned SP now
+			// (a bail before this point re-runs the whole PUSH against the
+			// undecremented SP, avoiding the double-decrement stack corruption).
 			*emitPtr++ = PPC_ADDI(hSp, hSp, -4 * nregs);
-			*emitPtr++ = PPC_STW(hSp, 14, 13 * 4);
 		} else {
 			hSp = ctx.writeReg(13, false, lockedMask);
 			*emitPtr++ = PPC_RLWINM(PPC_R12, hSp, 0, 0, 29);       // word-align base
@@ -559,25 +555,20 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
 			if (slot) *emitPtr++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
 			if (isPop) {
-				ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
-				if (isLR) { *emitPtr++ = PPC_STW(PPC_R10, 1, 100); popPC = true; }
-				else      { *emitPtr++ = PPC_STW(PPC_R10, 14, i * 4); }
+				if (isLR) { ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
+				            *emitPtr++ = PPC_STW(PPC_R10, 1, 100); popPC = true; }
+				else      { ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false); }
 			} else {
-				*emitPtr++ = PPC_LWZ(PPC_R10, 14, (isLR ? 14 : i) * 4);
-				ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
+				ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(isLR ? 14 : i), 4);
 			}
 			slot++;
 		}
 
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
 
-		// SP writeback (PUSH: decremented value already in gpr[13]; POP: += size)
-		{
-			const u8 hSp2 = ctx.writeReg(13, true, lockedMask);
-			*emitPtr++ = PPC_LWZ(hSp2, 14, 13 * 4);
-			if (isPop) *emitPtr++ = PPC_ADDI(hSp2, hSp2, 4 * nregs);
-		}
+		// SP writeback: PUSH already holds the decremented SP in the pinned reg;
+		// POP adds the popped size to it.
+		if (isPop) *emitPtr++ = PPC_ADDI(ctx.hostRegFor(13), ctx.hostRegFor(13), 4 * nregs);
 
 		if (popPC) {
 			// The popped value's bit0 is the real ARMv4T mode switch (same
@@ -660,21 +651,15 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			if (!(list & (1 << i))) continue;
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
 			if (slot) *emitPtr++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
-			if (isLoad) {
-				ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
-				*emitPtr++ = PPC_STW(PPC_R10, 14, i * 4);
-			} else {
-				*emitPtr++ = PPC_LWZ(PPC_R10, 14, i * 4);
-				ctx.emitSlowStore(PPC_R12, PPC_R10, 4);
-			}
+			if (isLoad) ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false);
+			else        ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(i), 4);
 			slot++;
 		}
 
 		ctx.emitMemEpilogue();
-		ctx.invalidateRegCache();
-		// writeback: Rb += 4 * count
+		// writeback: Rb = base + 4 * count  (raw base still stashed at 96(r1))
 		{
-			const u8 hRb2 = ctx.writeReg(rb, true, lockedMask);
+			const u8 hRb2 = ctx.hostRegFor(rb);
 			*emitPtr++ = PPC_LWZ(hRb2, 1, 96);
 			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(slot * 4));
 		}

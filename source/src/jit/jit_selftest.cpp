@@ -63,11 +63,14 @@ bool jitSelfTest()
 	DCStoreRange(code, bytes);
 	ICInvalidateRange(code, bytes);
 
-	u32 gpr[16];
+	// GPR residency: the trampoline lmw/stmw spans gpr[0..17] (R0..R15, then CPSR
+	// at [16] and SPSR at [17], contiguous in armcpu_t). Mirror that layout here
+	// so the bulk load/store stays in bounds.
+	u32 gpr[18];
 	memset(gpr, 0, sizeof(gpr));
 	gpr[15] = 0x02000000;
-	u32 cpsr = 0x0000001F;   // SYS mode, flags clear
-	jit_cpu_state st = { gpr, &cpsr, nullptr };
+	gpr[16] = 0x0000001F;    // CPSR: SYS mode, flags clear
+	jit_cpu_state st = { gpr, &gpr[16], nullptr };
 
 	JITResult r;
 	memset(&r, 0, sizeof(r));
