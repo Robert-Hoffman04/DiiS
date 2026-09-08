@@ -1023,6 +1023,16 @@ void MMU_Reset()
 	memset(MMU.ARM7_WIRAM,	  0, sizeof(MMU.ARM7_WIRAM));
 	memset(MMU.SWIRAM,	  0, sizeof(MMU.SWIRAM));
 
+	// roadmap #20 (GBA compat), §12.3 step 3: keep the GBA backing buffers
+	// reset-safe (no stale bytes across a soft reset) even though nothing
+	// reads/writes them yet -- see MMU.h.
+	memset(MMU.GBA_BIOS,      0, sizeof(MMU.GBA_BIOS));
+	memset(MMU.GBA_EWRAM,     0, sizeof(MMU.GBA_EWRAM));
+	memset(MMU.GBA_IWRAM,     0, sizeof(MMU.GBA_IWRAM));
+	memset(MMU.GBA_PALETTE,   0, sizeof(MMU.GBA_PALETTE));
+	memset(MMU.GBA_VRAM,      0, sizeof(MMU.GBA_VRAM));
+	memset(MMU.GBA_OAM,       0, sizeof(MMU.GBA_OAM));
+
 	IPC_FIFOinit(ARMCPU_ARM9);
 	IPC_FIFOinit(ARMCPU_ARM7);
 	GFX_PIPEclear();

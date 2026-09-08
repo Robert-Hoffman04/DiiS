@@ -297,6 +297,21 @@ struct MMU_struct
 	u8 ARM7_REG[0x10000];
 	u8 ARM7_WIRAM[0x10000];
 
+	// roadmap #20 (GBA compat), §12.3 step 3: flat GBA memory-map backing
+	// buffers. GBA_-prefixed so these are never confusable with, or
+	// accidentally reused as, the DS MAIN_MEM/SWIRAM/ARM7_ERAM buffers above
+	// despite overlapping address *values* -- only ARM7 will ever address
+	// these, and only when gameInfo.isGBA is set. Inert until §12.3 step 4
+	// wires _MMU_ARM7GBA_read/write* address decoding to them; nothing reads
+	// or writes them yet. Cartridge ROM/SRAM are not here -- those are
+	// §12.3 step 7 (peripherals/cartridge bus), not this memory-map slice.
+	u8 GBA_BIOS[0x4000];      // 16 KB,  0x00000000
+	u8 GBA_EWRAM[0x40000];    // 256 KB, 0x02000000
+	u8 GBA_IWRAM[0x8000];     // 32 KB,  0x03000000
+	u8 GBA_PALETTE[0x400];    // 1 KB,   0x05000000
+	u8 GBA_VRAM[0x18000];     // 96 KB,  0x06000000
+	u8 GBA_OAM[0x400];        // 1 KB,   0x07000000
+
 	// VRAM mapping
 	u8 VRAM_MAP[4][32];
 	u32 LCD_VRAM_ADDR[10];
