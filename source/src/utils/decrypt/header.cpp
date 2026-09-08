@@ -67,8 +67,22 @@ int DetectRomType(const Header& header, char* romdata)
 {
 	unsigned int * data = (unsigned int*)(romdata + 0x4000);
 
-	//this is attempting to check for an utterly invalid nds header
-	if(header.unitcode < 0 && header.unitcode > 3) return ROMTYPE_INVALID;
+	// A real GBA cartridge header always carries this fixed magic byte
+	// (GBATEK: header offset 0xB2, "Fixed value" 0x96) -- it lands inside
+	// the DS header's reserved region (offset_0xB0..0xB3, well before the
+	// Nintendo-logo bitmap at 0xC0), which real DS dumps have no reason to
+	// match, so this reliably tells a genuine GBA ROM apart from a DS one
+	// without false-positiving on real DS dumps. Reject it here, before
+	// anything below (all of which assumes a DS-shaped header/secure-area
+	// layout) gets a chance to touch it -- see roadmap #20/plan doc §12.
+	if ((unsigned char)romdata[0xB2] == 0x96) return ROMTYPE_GBA;
+
+	// reject anything whose unit code isn't one of the real NDS/DSi values.
+	// header.unitcode is unsigned char, so the original `< 0` half of this
+	// check could never be true (dead code) -- every malformed/non-DS
+	// header fell through to the unchecked paths below instead of actually
+	// being rejected here.
+	if (header.unitcode > 3) return ROMTYPE_INVALID;
 
 	if (header.arm9_rom_offset < 0x4000) return ROMTYPE_HOMEBREW;
 	if (data[0] == 0x00000000 && data[1] == 0x00000000) return ROMTYPE_MULTIBOOT;

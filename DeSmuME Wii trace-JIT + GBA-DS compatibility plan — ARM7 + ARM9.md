@@ -997,41 +997,165 @@ The goal is to explain discrepancies, not blindly copy whichever emulator produc
 
 # 12. GBA compatibility architecture
 
-Investigate and implement, as required:
+## 12.1 Starting-point audit (roadmap #20)
 
-- GBA cartridge detection
-- DS compatibility-mode entry
-- ARM7 configuration/state
-- GBA memory map
-- internal WRAM
-- external WRAM
-- cartridge ROM address space
-- save-memory devices
-- BIOS behavior
-- IRQs
-- timers
-- DMA
-- display/video registers
-- sound registers
-- keypad/input
-- wait states
-- reset behavior
-- cartridge bus behavior
-- relevant timing behavior
+Before any design work, a full source audit (three parallel passes over
+`source/src`, not the prose below) established the actual starting point,
+since none of this had been verified against the real codebase before:
 
-Separate:
+- **Zero native-GBA-execution scaffolding exists anywhere.**
+  `source/src/addons/gbagame.cpp` is *slot-2 SRAM/Flash backup-memory*
+  emulation for DS games that use a GBA cart for save transfer (Pokémon-style
+  connectivity) -- not GBA CPU/PPU/APU execution. No GBA memory map, no GBA
+  BIOS, no "halt ARM9, run ARM7 alone" mechanism, no GBA header check, no
+  `GBA_MODE` flag of any kind exists.
+- **Loading a real `.gba` file was actively unsafe, not just unsupported --
+  now fixed.** `NDS_LoadROM`'s only type check was `path.isdsgba()`
+  (`source/src/path.h:367`), which just checks the filename ends in
+  `"ds.gba"` -- a flashcart *multiboot-wrapped-NDS-ROM* convention, not a
+  real GBA header check. A genuine GBA ROM fell through and got parsed as a
+  DS header. `DetectRomType`'s "invalid header" guard
+  (`source/src/utils/decrypt/header.cpp`) was dead code (`header.unitcode`
+  is `unsigned char`, so `< 0` could never be true), so nothing rejected it,
+  and the header offset that decides ARM9/ARM7 copy sizes/addresses landed
+  inside the GBA logo bitmap -- garbage in, garbage out. Two real bugs, both
+  fixed this pass (§12.2).
+- **The JIT already has the right seam.** `JitCpuProfile`
+  (`source/src/jit/jit_cpu_profile.h`) is function-pointer-based, published
+  into a runtime-indexed `jitProfile[2]` array, and the shared emitters
+  (`jit_arm.cpp`/`jit_thumb.cpp`) never hardcode DS address ranges -- they
+  only call through `ctx.cpu.slowRead/slowWrite/mainMemBase/...`. A new
+  `jit_arm7gba_profile.cpp` returning a GBA-backed profile would plug into
+  `jitBuildArm7Profile()`'s call site with no emitter changes.
+- **The interpreter's memory path is not actually behind a live abstraction
+  in this build.** `armcpu_memory_iface`/`mem_if` exists in `armcpu.h` but
+  only under `#ifdef GDB_STUB`, which is never defined -- dead code.
+  `READ32`/`WRITE32` (`MMU.h`) compile straight to `_MMU_read/write32<PROCNUM>`,
+  and `PROCNUM` is a compile-time 0/1 template parameter baked in pervasively
+  as `PROCNUM ? ARM7 : ARM9` (`MMU.h`, and throughout `MMU.cpp`/`armcpu.cpp`).
+  Reusing the interpreter for GBA mode needs a real seam added -- cheapest is
+  a runtime mode-flag branch inside the existing `_MMU_ARM7_read*/write*`
+  functions (`MMU.cpp`), mirroring the early-out pattern those functions
+  already use for the slot-2 `addon.read/write` vtable.
+- **Slot-1 cartridge state is one hardcoded global, not addon-shaped.**
+  `GameInfo gameInfo` / `NDS_header` (`NDSSystem.h`) is a fixed
+  DS-header-shaped struct consumed by name throughout
+  `NDSSystem.cpp`/`MMU.cpp`/`cheatSystem.cpp`/`movie.cpp`. Unlike slot-2
+  (`ADDONINTERFACE`, a genuinely reusable vtable), there is no interface to
+  extend here -- a GBA cart needs a parallel loading/reset path, gated by a
+  new mode flag at the small number of slot-1 entry points, not a vtable
+  swap.
 
-```text
-known hardware requirements
-```
+A *complete* native GBA-compatibility mode (full memory map, PPU, APU,
+timers, DMA, BIOS, save types, JIT + interpreter parity) is a multi-week
+subsystem, not something to half-build speculatively. §12.2 covers what
+landed this pass; §12.3 is the concrete, sequenced remainder.
 
-from:
+## 12.2 Landed this pass: safe detection, not a crash
 
-```text
-emulator-specific approximations
-```
+`NDS_LoadROM` -> `DecryptSecureArea` -> `decrypt_arm9` had a real,
+independent-of-GBA-work memory-safety bug: `DecryptSecureArea`
+(`utils/decrypt/decrypt.cpp`) copies a `0x4000`-byte window starting at file
+offset `0x4000` out of the ROM-header scratch buffer, but that buffer
+(`SMALL_READ`, `NDSSystem.h`) was only `1024*20 = 0x5000` bytes -- so the
+copy's source range ran to offset `0x8000`, a 12 KB heap over-read past the
+end of the allocation. This wasn't GBA-specific: it fires on essentially
+every ROM classified `ROMTYPE_ENCRSECURE`/`ROMTYPE_MASKROM`, i.e. most
+normal encrypted-secure-area loads, not just malformed input. Confirmed with
+an isolated ASan host build exercising the real `decrypt.cpp`/`header.cpp`
+unmodified: `heap-buffer-overflow ... READ of size 16384 ... 0 bytes after
+20480-byte region`, pinned to the exact `memcpy` line. Fixed by sizing
+`SMALL_READ` to `0x8000` (32 KB) -- the buffer now actually covers what the
+existing code already assumed it covered; re-run of the same ASan harness
+after the fix shows no report.
 
-so that later hardware discoveries do not require redesigning the entire compatibility layer.
+On top of that: `DetectRomType` now does a real GBA-vs-DS discrimination.
+GBA cartridge headers carry a fixed magic byte (GBATEK: offset `0xB2` = 
+`0x96`) that lands inside the DS header's *reserved* region (before the
+Nintendo-logo bitmap at `0xC0`), so it reliably tells a genuine GBA ROM
+apart from a real DS dump with no false positives. A new `ROMTYPE_GBA`
+classification is checked first in `DetectRomType`
+(`utils/decrypt/header.cpp`) and handled in `DecryptSecureArea`
+(`utils/decrypt/decrypt.cpp`) exactly like the (now-actually-reachable)
+`ROMTYPE_INVALID` case: a clean, logged rejection (`NDS_LoadROM` already had
+an `if(!okRom) { ...; return -1; }` bail-out other callers check -- this is
+a real, non-silent failure path, not new plumbing) instead of proceeding
+into DS-shaped decrypt/copy logic with a GBA-shaped header. The previously
+dead `unitcode`-range guard was fixed at the same time (was `< 0 && > 3` on
+an `unsigned char`, i.e. never true; now correctly `> 3`).
+
+Verified: a standalone ASan/UBSan host build linking the actual
+`header.cpp`/`decrypt.cpp`/`crc.cpp` unmodified (no reimplementation)
+against (a) a real DS ROM's actual header bytes (`armwrestler.nds`) --
+classification and decrypt path unaffected, (b) a synthetic GBA-header blob
+-- classified `ROMTYPE_GBA`, rejected cleanly, (c) a synthetic invalid
+blob -- classified `ROMTYPE_INVALID`, rejected cleanly, (d) a
+`MASKROM`-shaped blob at the fixed `SMALL_READ` size -- classification
+unchanged, decrypt path runs with no ASan report. The Wii `.dol` build
+(`make`, devkitPPC) also compiles clean with these changes. No GBA
+execution, memory map, BIOS, or ARM9-halt mechanism was implemented this
+pass -- see §12.3.
+
+## 12.3 Remaining sequenced work
+
+In dependency order (each is its own scoped pass, reference-first per §11
+against melonDS's GBA mode and mGBA where hardware behavior is in
+question):
+
+1. **Boot-mode gate.** A runtime flag (set once `ROMTYPE_GBA` is detected)
+   threaded through `NDS_LoadROM`/`NDS_Reset` that this pass's classifier
+   already produces but does not yet act on beyond rejecting the load.
+2. **ARM9-halt mechanism.** Nothing in the current reset path can leave one
+   CPU non-running -- `NDS_Reset` unconditionally `armcpu_init()`s both
+   cores every boot, and `POWCNT`/`EXMEMCNT`/`waitIRQ` gate power/bus/WFI,
+   not CPU dispatch. Needs new state (e.g. a checked `arm9Halted` gate in
+   `armInnerLoop`/`NDS_exec`), matching real hardware/melonDS's GBA mode
+   (ARM9 held in reset, ARM7 alone runs the GBA memory map from its own
+   BIOS reset vector).
+3. **GBA memory-map allocation.** Flat backing buffers for BIOS (16 KB, read
+   protected against non-BIOS-fetch reads per real hardware), EWRAM (256 KB),
+   IWRAM (32 KB), palette/VRAM/OAM, distinct from and not reusing the DS
+   `MMU.MAIN_MEM`/`SWIRAM`/`ARM7_ERAM` buffers despite overlapping address
+   *values* -- §7.1's note on `_MMU_ARM7_read/write*` being wholly separate,
+   hand-written functions from the ARM9 side is the precedent to follow: a
+   parallel `_MMU_ARM7GBA_read/write*` set (or an equivalent mode-flag
+   branch), not a third `PROCNUM` value threaded through the pervasive
+   `PROCNUM ? ARM7 : ARM9` idiom.
+4. **Interpreter memory-backend seam.** The mode-flag branch described in
+   §12.1 -- needed because the JIT can always bail to the interpreter for a
+   block it can't compile, so GBA mode isn't real until the interpreter has
+   a working GBA memory path too, not just the JIT.
+5. **JIT `jit_arm7gba_profile.cpp`.** A third `JitCpuProfile` instantiation
+   alongside `jit_arm7_profile.cpp`/`jit_arm9_profile.cpp`, `isaLevel=4`
+   (GBA's ARM7TDMI is the same core family the existing ARM7 profile already
+   targets -- zero changes needed in `jit_arm.cpp`/`jit_thumb.cpp`), wired
+   into `jitBuildArm7Profile()`'s call site behind the boot-mode flag. Per
+   §11, this comes only after the interpreter path is validated correct.
+6. **BIOS strategy -- open question, needs an explicit decision before #2-5
+   can produce a booting GBA ROM.** Real GBA BIOS is copyrighted and can't
+   be vendored in this repo. Options: (a) an HLE BIOS (SWI table +
+   reset/IRQ vectors implemented in C++, the approach several open-source
+   GBA/DS emulators use for redistribution), or (b) requiring the user
+   supply their own dumped BIOS file at runtime (closer to real-hardware
+   fidelity for the handful of SWI calls HLE commonly gets subtly wrong).
+   Not decided; needs the user's input when this slice is picked up.
+7. **Peripherals**, each its own reference-first slice per §11/§13: PPU
+   (display/video registers), APU (sound registers), timers, DMA, keypad/
+   input, wait states, cartridge bus/save-memory devices, relevant timing
+   behavior -- the original unordered checklist below, now sequenced after
+   the CPU/memory-map foundation instead of alongside it.
+
+Original subsystem checklist (still the reference for what "done" covers,
+just no longer the plan for *how* to get there): GBA cartridge detection
+(done, §12.2) -- DS compatibility-mode entry -- ARM7 configuration/state --
+GBA memory map -- internal/external WRAM -- cartridge ROM address space --
+save-memory devices -- BIOS behavior -- IRQs -- timers -- DMA --
+display/video registers -- sound registers -- keypad/input -- wait states --
+reset behavior -- cartridge bus behavior -- relevant timing behavior.
+
+Throughout, separate `known hardware requirements` from
+`emulator-specific approximations` so that later hardware discoveries do not
+require redesigning the entire compatibility layer.
 
 ---
 
@@ -1555,7 +1679,7 @@ The default architecture remains direct emission plus chaining.
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
 | 19 | RockWrestler automated DS conformance gate                       | done: headless via slot-2 I/O (§8.4), no crt0 workaround needed (upstream is `-nostartfiles`) -- interpreter baseline 10/23 fail (SMLALxy, LDM/STM base-in-list, IPCSYNC/IPCFIFO/IPCFIFO IRQ, DIV 32/32 + 64/32 sign-extension, TCM/CP15 readback -- all pre-existing interpreter gaps, characterized in §8.4); `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures |
-| 20 | GBA compatibility architecture                                   | next            |
+| 20 | GBA compatibility architecture                                   | in progress: full source audit done (§12.1, no native-GBA-execution scaffolding existed anywhere); found + fixed a real, GBA-independent 12 KB heap over-read in `DecryptSecureArea` (`SMALL_READ` undersized, hit on most normal encrypted-ROM loads, confirmed via isolated ASan repro against the unmodified real source and fixed); added real GBA-header detection (`ROMTYPE_GBA`, GBATEK offset-0xB2 magic) so `NDS_LoadROM` cleanly rejects a `.gba` file instead of misparsing it as a DS header -- both changes ASan- and build-verified (§12.2), zero behavior change for real DS ROMs. No GBA execution yet -- concrete sequenced next steps (boot-mode gate, ARM9-halt, GBA memory map, interpreter + JIT backends, BIOS strategy decision, peripherals) in §12.3 |
 | 21 | GBA reference baseline: DS-side melonDS + GBA reference emulator | next            |
 | 22 | GBA memory/cartridge/BIOS/peripheral implementation              | next            |
 | 23 | GBA conformance harness                                          | next            |

@@ -235,7 +235,14 @@ void NDS_DeInit(void);
 BOOL NDS_SetROM(u8 * rom, u32 mask);
 NDS_header * NDS_getROMHeader(void);
 extern u8* MMU_CART_ROM(u32 position);
-#define SMALL_READ	(1024*20) // read and save a small amount of the rom for decrypt and header
+// read and save a small amount of the rom for decrypt and header. Must be
+// at least 0x8000: DecryptSecureArea()'s decrypt_arm9() path (decrypt.cpp)
+// reads a 0x4000-byte window starting at offset 0x4000 out of a buffer
+// this size -- anything smaller (the previous 1024*20 = 0x5000) let that
+// read run 0x3000 bytes past the end of the allocation on every ROM
+// classified ROMTYPE_ENCRSECURE/ROMTYPE_MASKROM, i.e. essentially every
+// normal encrypted-secure-area ROM load, not just malformed input.
+#define SMALL_READ	(1024*32)
 struct GameInfo
 {
 	GameInfo()

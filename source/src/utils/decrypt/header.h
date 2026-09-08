@@ -127,5 +127,6 @@ unsigned short CalcSecureAreaCRC(bool encrypt);
 #define ROMTYPE_ENCRSECURE	3
 #define ROMTYPE_MASKROM		4	// unknown layout
 #define ROMTYPE_INVALID		5	// rejected; can't be a supported rom
+#define ROMTYPE_GBA			6	// real GBA cartridge header; not a supported DS rom (yet -- roadmap #20)
 
 #endif

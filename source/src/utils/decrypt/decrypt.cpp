@@ -468,6 +468,13 @@ bool DecryptSecureArea(u8 *romdata, long romlen)
 	if(romType == ROMTYPE_INVALID)
 		return false;
 
+	if(romType == ROMTYPE_GBA)
+	{
+		printf("This is a GBA ROM, not a Nintendo DS ROM -- native GBA "
+			"compatibility mode is not implemented yet (roadmap #20).\n");
+		return false;
+	}
+
 	// check if ROM is already encrypted
 	if (romType == ROMTYPE_NDSDUMPED)
 	{
