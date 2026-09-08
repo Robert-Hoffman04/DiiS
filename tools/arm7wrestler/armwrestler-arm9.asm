@@ -20,6 +20,18 @@
 
 main:
 
+@ §20 fix: grant ARM7 the GBA Slot-2 bus (EXMEMCNT.7). Only the ARM9 can
+@ set this; real hardware -- and accurate emulators (melonDS) -- gate slot-2
+@ access on it, defaulting to ARM9 ownership at boot. Without this, every
+@ arm7wrestler-arm7 write to the 0x09000000+ result region (this ROM's own
+@ slot-2/ExpMemory protocol, see PROVENANCE.md) is silently dropped -- this
+@ went unnoticed under desmumewii because its ExpMemory addon doesn't
+@ enforce EXMEMCNT arbitration, only surfacing once tested against melonDS.
+ldr	r0,=0x4000204
+ldrh	r1,[r0]
+orr	r1,r1,#0x80
+strh	r1,[r0]
+
 mov	r0, #0x04000000			@ IME = 0;
 add	r0, r0, #0x208
 strh	r0, [r0]

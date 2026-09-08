@@ -21,6 +21,18 @@
 
 main:
 
+@ §20 fix: claim the GBA Slot-2 bus for ARM9 (EXMEMCNT.7=0). Real hardware
+@ -- and accurate emulators (melonDS) -- default this bit to 1 (ARM7 owns
+@ slot-2) post-boot; without clearing it, every write this ROM's §17 patch
+@ makes to the 0x09000000+ result region (slot-2/ExpMemory, see
+@ PROVENANCE.md) is silently dropped for the deselected CPU. Went unnoticed
+@ under desmumewii, whose ExpMemory addon doesn't enforce this arbitration,
+@ only surfacing once tested against melonDS.
+ldr	r0,=0x4000204
+ldrh	r1,[r0]
+bic	r1,r1,#0x80
+strh	r1,[r0]
+
 ldr 	r0,=0x11340
 mov 	r1,#0x4000000
 str 	r0,[r1]

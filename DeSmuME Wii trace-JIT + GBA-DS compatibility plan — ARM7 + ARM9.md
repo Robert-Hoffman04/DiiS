@@ -751,20 +751,135 @@ omit for the interpreter baseline), pull `sd:/rockwrestler.log`.
 
 ---
 
+## 8.5 melonDS reference matrix (roadmap #16)
+
+§8.2's own note ("the same 'write results where the emulator can just read
+them' trick a custom melonDS build could use identically") turns out to be
+literally true, with one caveat below. Status: **the automation path works;
+the actual pass/fail numbers don't yet, for a reason specific to melonDS's
+more hardware-accurate Slot-2 bus model** -- documented here rather than
+worked around, since it's a real finding, not a harness bug.
+
+### What works
+
+* melonDS already ships the real hardware this project's `ExpMemory` addon
+  is a simplified stand-in for -- `GBACart::CartRAMExpansion` (the actual DS
+  Browser "Memory Expansion Pak"), selectable via
+  `GBAAddon_RAMExpansion` -- so **no new pak needed**, just a way to select
+  it headlessly (upstream only exposes it through
+  `MainWindow::onInsertGBAAddon`'s menu). Added a `-G/--gba-addon` CLI flag
+  to a local melonDS checkout (`~/Desktop/DS/melonDS`, its own separate git
+  repo -- not committed there, that tree already carries unrelated
+  in-progress local work of its own) -- three small, self-contained diffs to
+  `CLI.h`/`CLI.cpp`/`main.cpp`, using `EmuInstance::getEmuThread()`'s
+  existing `insertGBAAddon()` (the same call the menu action makes) right
+  after `preloadROMs()` boots Slot-1.
+* melonDS's Qt frontend runs fully headless under
+  `QT_QPA_PLATFORM=offscreen` -- no Dolphin-style `-b` flag needed, no
+  virtual framebuffer.
+* melonDS already ships a GDB remote-serial stub (`GDBSTUB_ENABLED`,
+  `Instance0.Gdb.*` in `melonDS.toml`), one TCP port per core (ARM7/ARM9).
+  Since the stub's `ReadMem` goes through the exact same `BusRead32` path
+  the CPU itself uses, polling it for the slot-2 sentinel (a plain `m`
+  packet) is a drop-in replacement for Dolphin+the SD-card log file: no
+  melonDS frontend/threading changes needed at all. A portable config
+  directory (`<melonDS>/build/portable/melonDS.toml`) keeps all of this
+  off the user's real `~/.config/melonDS`.
+* One sharp edge worth recording: **reconnect once and stay connected.**
+  The stub only accepts a new client after the previous `ConnFd` cleanly
+  disconnects, but a client that opens a fresh TCP connection while an
+  older one is still pending in the listen backlog gets serviced *behind*
+  it -- so a naive "one connection per read" script intermittently reads a
+  stale, never-completed handshake and desyncs the whole stream (`[GDB]
+  Received unknown character`). Fix: one persistent connection per melonDS
+  process for the whole session, not a reconnect per read.
+* Found and fixed a real, hardware-accurate bug in **our own** ROMs while
+  bringing this up: neither `armwrestler-arm9.asm` nor `arm7wrestler`'s ARM9
+  stub ever touched `EXMEMCNT` bit 7 (which CPU owns the Slot-2 bus).
+  desmumewii's `ExpMemory` addon never enforced that arbitration, so it went
+  unnoticed; melonDS does enforce it (`NDS::ARM9Read/Write*` and
+  `ARM7Read/Write*` both gate on it), and its post-`DirectBoot` default
+  leaves the bit granting ARM7, not ARM9, ownership. Fixed by having each
+  ROM's ARM9-side driver explicitly claim (`armwrestler-arm9.asm`) or
+  confirm (`arm7wrestler`'s ARM9 stub) the bit it needs at the very start of
+  `main`. Before this fix, ARM9-driven ROMs (armwrestler, and by extension
+  RockWrestler) never got past a permanently-zero slot-2 region under
+  melonDS at all.
+
+### What's blocked
+
+With EXMEMCNT fixed, armwrestler boots, runs to completion, and reaches its
+terminal spin-loop in well under a second (confirmed via the GDB stub's `g`
+register-read command: PC parked on a two-instruction self-loop, same
+registers across repeated samples seconds apart) -- but roughly every other
+32-bit word of the slot-2 result block still reads back as the pristine
+"never written" fill (`CartRAMExpansion::Reset()`'s `memset(RAM, 0xFF,
+...)`) instead of what the ROM's own driver wrote, **reproducibly, byte-for-
+byte identical across independent runs** (ruled out as a race).
+
+The pattern is internally consistent with *isolated* stores (one `ldr rX,=ADDR
+/ str` per call, seconds apart -- `AW_RecordResult`'s counters) landing
+correctly, while the initial 512-byte *clear loop*'s tight, back-to-back
+`str r2,[r0],#4` sequence mostly doesn't: e.g. the ARM-fail counter
+(`+0x08`) never leaves its pristine fill at all (consistent with the clear
+loop failing to zero it, and this ROM having zero real ARM failures so
+`AW_RecordResult`'s own conditional write to that address never fires
+either) as tracked bit-for-bit precisely across two rebuilds where the only
+change was inserting `nop`s into the clear loop (which shifted a *stray
+pointer-shaped value* landing one word early -- see below -- by exactly the
+same few bytes the `nop`s shifted the ROM's code, confirming that value
+really is a live code/rodata address, not noise). Adding `nop`s between the
+clear loop's stores did **not** fix the underlying drop, ruling out a pure
+back-to-back-issue-rate theory as the whole story.
+
+The leading hypothesis, not yet confirmed: our from-scratch `ds_arm9_crt0.S`
+(written for §17 to route around a devkitPro/libnds crt0 mismatch, see
+`tools/armwrestler/PROVENANCE.md`) sets the CP15 control register to
+`0x00042078` -- global D-cache and I-cache both off -- but never touches the
+separate CP15 write-buffer/cacheability-by-region registers (c2/c3), which
+`DirectBoot` appears to pre-seed with firmware-realistic defaults for all
+eight MPU regions (visible in melonDS's own boot log: `PU: region N = ...`).
+On ARM946E-S, write buffering is independent of the cache-enable bits;
+if `DirectBoot` leaves the Slot-2 region (`PU: region 3 = 08000035`, base
+`0x08000000`) marked bufferable, a real ARM9 core's write buffer could
+legitimately merge or reorder-relative-to-bus a tight run of stores to nearby
+addresses the way we're seeing -- something desmumewii's `ExpMemory` addon,
+which has no write-buffer model at all, simply cannot reproduce. Not
+confirmed by directly reading back c2/c3 yet; the fix, if this is right, is
+either configuring the region as non-bufferable in the crt0 or issuing an
+explicit drain between the clear loop and the first read-back.
+
+**Until this is resolved, the melonDS column below is not filled in with
+numbers** -- reporting counts from a demonstrably-inconsistent readback
+would be worse than leaving it blank. The automation path (CLI flag, GDB
+polling, EXMEMCNT fix) is solid and reusable for all three ROMs the moment
+the write-consistency issue is understood.
+
+---
+
 # 9. DS reference matrix
 
 Maintain a machine-readable results table:
 
-| Test                    | melonDS | DeSmuME interpreter | DeSmuME JIT | Hardware/reference | Classification |
-| ----------------------- | ------- | ------------------- | ----------- | ------------------ | -------------- |
-| armwrestler             |         |                     |             |                    |                |
-| arm7wrestler            |         |                     |             |                    |                |
-| RockWrestler ARMv4      |         |                     |             |                    |                |
-| RockWrestler ARMv5      |         |                     |             |                    |                |
-| RockWrestler IPC        |         |                     |             |                    |                |
-| RockWrestler memory     |         |                     |             |                    |                |
-| RockWrestler TCM        |         |                     |             |                    |                |
-| GBA compatibility tests |         |                     |             |                    |                |
+| Test                     | melonDS                             | DeSmuME interpreter | DeSmuME JIT (`-DJIT_ARM_PRED_BRANCH`) | Hardware/reference | Classification |
+| ------------------------ | ------------------------------------ | -------------------- | -------------------------------------- | ------------------- | -------------- |
+| armwrestler (ARM9)       | blocked -- see §8.5                  | ARM 0/67, THUMB 1/10 fail | byte-identical to interpreter          |                     | THUMB fail is a documented pipeline-offset quirk (§8.2) |
+| arm7wrestler (ARM7)      | blocked -- see §8.5                  | ARM 11/67, THUMB 1/20 fail | byte-identical to interpreter          |                     | 11 ARM fails match documented ARMv4T-vs-ARMv5 differences (§8.3); THUMB fail same quirk as above |
+| RockWrestler ARMv4       | not yet attempted                    | 0/1 fail             | byte-identical                         |                     | |
+| RockWrestler ARMv5       | not yet attempted                    | 2/11 fail (SMLALxy, LDM/STM base-in-list) | byte-identical            |                     | interpreter multiply/LDM gaps (§8.4) |
+| RockWrestler IPC         | not yet attempted                    | 3/3 fail (IPCSYNC, IPCFIFO, IPCFIFO IRQ) | byte-identical             |                     | interpreter gap, not yet root-caused (§8.4) |
+| RockWrestler DS MATH     | not yet attempted                    | 2/5 fail (DIV 32/32, DIV 64/32) | byte-identical                  |                     | DIVCNT div-by-zero sign-extension asymmetry (§8.4) -- row added, absent from the original table |
+| RockWrestler memory      | not yet attempted                    | 2/2 fail (WRAMCNT, VRAMCNT) | byte-identical                        |                     | plausibly downstream of the IPC gap above, not confirmed (§8.4) |
+| RockWrestler TCM         | not yet attempted                    | 1/1 fail             | byte-identical                         |                     | CP15 DTCMcontrol readback gap (§8.4) |
+| GBA compatibility tests  |                                       |                      |                                         |                     | not started (§20+) |
+
+DeSmuME JIT is byte-identical to the interpreter on every row above -- this
+table's own JIT correctness gate (§25's "ARM9 ARM/THUMB differential tests
+pass" / RockWrestler line) reads as "no regressions found", not "clean" --
+every interpreter fail listed is a **pre-existing** interpreter-level gap
+(§8.2/§8.3/§8.4 have the per-fail detail), reproduced identically with no
+JIT flags at all. "Hardware/reference" stays blank throughout: no real DS
+hardware or melonDS numbers are available yet (§8.5).
 
 The important invariant is:
 
@@ -1409,7 +1524,7 @@ The default architecture remains direct emission plus chaining.
 | 13 | Inline memory fast paths                                         | Tier-1 literal loads landed; general/WRAM tier deferred (§6/§23) |
 | 14 | Cached page descriptors                                          | done: ARM7 RAM-window descriptor table + inline single loads; correctness-validated, frame-neutral on SM64DS (§6) |
 | 15 | LDM/STM and sequential memory optimization                       | done: inline LDM/LDMIA/POP (loads); STM/PUSH + LDM{pc} deferred (§6/§16); correctness-validated, frame-neutral |
-| 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | next            |
+| 16 | DS CPU reference matrix: melonDS + DeSmuME interpreter           | in progress: §9 table filled in for DeSmuME interpreter/JIT (all 3 ROMs, byte-identical JIT results); melonDS column blocked on a write-consistency issue under melonDS's Slot-2 bus model, see §8.5 -- CLI hook + GDB-stub polling harness proven working once that's resolved |
 | 17 | `armwrestler` automated regression gate                          | done: headless via slot-2 I/O (§8.2); found + fixed an 8MB-addon/JIT-arena OOM hang; found + fixed pre-existing ARM9 JIT bugs (SMLAL missing carry, THUMB LDR missing unaligned rotate) -- back to clean baseline (ARM 0/67, THUMB 1/10) |
 | 18 | `arm7wrestler` automated regression gate                         | done: headless via slot-2 I/O (§8.3), same technique as #17 -- interpreter baseline ARM 11/67 fail (matches documented ARMv4T-vs-ARMv5 differences) / THUMB 1/20 fail; `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures -- ARM7 predicated-branch gate cleared |
 | 19 | RockWrestler automated DS conformance gate                       | done: headless via slot-2 I/O (§8.4), no crt0 workaround needed (upstream is `-nostartfiles`) -- interpreter baseline 10/23 fail (SMLALxy, LDM/STM base-in-list, IPCSYNC/IPCFIFO/IPCFIFO IRQ, DIV 32/32 + 64/32 sign-extension, TCM/CP15 readback -- all pre-existing interpreter gaps, characterized in §8.4); `-DJIT_ARM_PRED_BRANCH` build byte-identical, 0 new failures |
