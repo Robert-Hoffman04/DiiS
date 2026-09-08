@@ -299,6 +299,17 @@ JitCpuProfile* jitBuildArm9Profile()
 	// wasted empty-bucket walk.
 	s_arm9Profile.smcBankMask = (1u << 0) | (1u << 2) | (1u << 3);
 
+	// P16: two-region inline load guard (main RAM + DTCM inline; every other
+	// region via the slowRead C call). MMU.MAIN_MEM / MMU.ARM9_DTCM are allocated
+	// by MMU_Init (before jitInit) and never reallocated. MMU.DTCMRegion is read
+	// live at emit time (baked per-block); every path that moves it flushes
+	// jitCacheArm9. pageDescBase stays 0 -- this path does not use the descriptor
+	// table.
+	s_arm9Profile.mainMemBase       = (u32)(uintptr_t)MMU.MAIN_MEM;
+	s_arm9Profile.arm9MainMask      = _MMU_MAIN_MEM_MASK;
+	s_arm9Profile.arm9DtcmBase      = (u32)(uintptr_t)MMU.ARM9_DTCM;
+	s_arm9Profile.arm9DtcmRegionPtr = (u32)(uintptr_t)&MMU.DTCMRegion;
+
 	return &s_arm9Profile;
 }
 

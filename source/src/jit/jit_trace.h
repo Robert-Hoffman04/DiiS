@@ -199,6 +199,26 @@ struct JitTraceCtx {
 	// r10, r11; EA stays in r12.
 	void emitPageResolve(u32 spanBytes, u8 alignMe);
 
+	// ---- P16 ARM9 two-region inline guard --------------------------------
+	// EA must be in PPC_R12 (any alignment). Emits a runtime guard for the two
+	// inline-able ARM9 data regions -- main RAM (0x02xxxxxx) and the CP15 DTCM
+	// window (base baked from *arm9DtcmRegionPtr at emit time). On a hit the
+	// emitted code sets PPC_R10 = host base, PPC_R11 = (EA & regionMask) cleared
+	// to `alignMe`, and branches forward; the caller patches those branch slots
+	// (returned in fastSlots[0..count-1]) to its inline-load block. A miss (or,
+	// for spanBytes > 0, a run that straddles a region edge / 1 MB page) falls
+	// through -- the caller emits the slowRead C path there. Clobbers r10, r11;
+	// EA stays in r12. Returns the number of fast-branch slots written (2).
+	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots);
+
+	// Full ARM9 single load: EA in PPC_R12. Unconditional dirty flush, then the
+	// region guard -> inline lwbrx (main RAM / DTCM) or the slowRead C call
+	// (every other region, no interpreter round-trip); result -> gpr[rd] and the
+	// register cache is invalidated. When `writeback`, the caller has stashed the
+	// new base value at 104(r1) and it is committed to gpr[rn] afterwards. Does
+	// not end the block. Clobbers r10, r11, r12.
+	void emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn);
+
 	// ---- P14 inline RAM load via cached page descriptors ------------------
 	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a
 	// page-window guard (out of window -> interpreter bail at currentPC), then

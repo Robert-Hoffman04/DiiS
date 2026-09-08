@@ -296,7 +296,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.ensureArena();
 		const u8 rd = (opcode >> 8) & 0x07;
 		const u32 ea = ((currentPC + 4) & ~3u) + ((opcode & 0xFF) << 2);
-		if (ctx.cpu.pageDescBase) {                       // P14 inline RAM load
+		if (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) {   // P14/P16 inline RAM load
 			*emitPtr++ = PPC_LIS(PPC_R12, ea >> 16);
 			*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, ea & 0xFFFF);
 			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
@@ -362,7 +362,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// THUMB LDR test, which deliberately misaligns the EA, caught it).
 		const bool wordRotate = isLoad && size == 4;
 
-		if (isLoad && ctx.cpu.pageDescBase) {            // P14 inline RAM load
+		if (isLoad && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase)) {   // P14/P16 inline RAM load
 			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
 			break;
 		}
@@ -407,7 +407,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		u8 hVal = 0;
 		if (!isLoad) hVal = ctx.readReg(rd, lockedMask);
 		*emitPtr++ = PPC_ADDI(PPC_R12, hSp, (s32)immOff);
-		if (isLoad && ctx.cpu.pageDescBase) {            // P14 inline RAM load
+		if (isLoad && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase)) {   // P14/P16 inline RAM load
 			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
 			break;
 		}

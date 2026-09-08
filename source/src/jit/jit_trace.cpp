@@ -546,11 +546,144 @@ void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
 	if (alignMe < 31) *p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, alignMe);
 }
 
+// P16: ARM9 two-region inline guard. See jit_trace.h. EA in PPC_R12.
+int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots)
+{
+	(void)size;
+	u32*& p = emitPtr;
+	int nFast = 0;
+	u32* slow[6]; int nSlow = 0; bool slowIsBeq[6] = { false };
+
+	// DTCM window base, read live at emit time and baked (see the profile note).
+	// _MMU_*<ARM9> compares (addr & ~0x3FFF) == MMU.DTCMRegion against the *full*
+	// value, so a window base with any of bits 0..13 set can never match -- DTCM
+	// is then unreachable and the whole branch is skipped at compile time. When
+	// it can match it is 16 KB aligned, so the shifted-tag compare is exact.
+	const u32 dtcmRegion   = *(const volatile u32*)(uintptr_t)cpu.arm9DtcmRegionPtr;
+	const bool dtcmReach   = (dtcmRegion & 0x3FFFu) == 0;
+	const s32 dtcmTag      = (s32)(dtcmRegion >> 14);
+	const bool dtcmInMain  = dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u;
+	const u32 mainMb       = (u32)__builtin_clz(cpu.arm9MainMask); // top set bit of the mirror mask
+	const u32 dtcmBase     = cpu.arm9DtcmBase;
+	const u32 mainBase     = cpu.mainMemBase;
+
+	// ---- DTCM: (EA >> 14) == (dtcmRegion >> 14) ----
+	u32* notDtcm = nullptr;
+	if (dtcmReach) {
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 14);
+		*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
+		notDtcm = p++;                                             // BNE -> main check
+		if (spanBytes) {                                           // whole run in the 16 KB window
+			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
+			*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
+			*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
+			slow[nSlow++] = p++;                                   // BNE -> slow (straddles window)
+		}
+		*p++ = PPC_LIS(PPC_R10, dtcmBase >> 16);
+		if (dtcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, dtcmBase & 0xFFFF);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, alignMe);       // EA & 0x3FFF, cleared to align
+		fastSlots[nFast++] = p++;                                  // B -> caller inline block
+
+		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
+	}
+
+	// ---- main RAM: (EA >> 24) & 0xF == 2 ----
+	*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);
+	*p++ = PPC_CMPWI(0, PPC_R10, 2);
+	slow[nSlow++] = p++;                                           // BNE -> slow
+	if (spanBytes) {
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
+		*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
+		*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
+		*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+		slow[nSlow++] = p++;                                       // BNE -> slow (crosses a 1 MB page)
+		if (dtcmInMain) {                                          // ...and not into the DTCM window
+			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
+			*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
+			*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
+			slowIsBeq[nSlow] = true;
+			slow[nSlow++] = p++;                                   // BEQ -> slow
+		}
+	}
+	*p++ = PPC_LIS(PPC_R10, mainBase >> 16);
+	if (mainBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, mainBase & 0xFFFF);
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);       // EA & mirrorMask, cleared to align
+	fastSlots[nFast++] = p++;                                      // B -> caller inline block
+
+	// slow fall-through starts here; retarget every miss branch to it
+	for (int i = 0; i < nSlow; i++) {
+		const u32 off = (u32)((p - slow[i]) * 4);
+		*slow[i] = slowIsBeq[i] ? PPC_BEQ(off) : PPC_BNE(off);
+	}
+	return nFast;
+}
+
+// P16: full ARM9 single load. See jit_trace.h. EA in PPC_R12.
+void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn)
+{
+	u32*& p = emitPtr;
+
+	// Coherent guest memory on both runtime paths, empty compile-time cache
+	// afterwards (same shape as the predicated memory ops).
+	flushDirtyRegisters();
+	flushDirtyFlags();
+	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA for the slow path
+
+	u32* fast[2];
+	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
+	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast);
+
+	// ---- slow: slowRead C call ----
+	emitMemPrologue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);
+	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
+	if (wordRotate) {                                              // ROR(R10, 8 * (EA & 3))
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
+		*p++ = PPC_LI(PPC_R11, 4);
+		*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
+		*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+	}
+	emitMemEpilogue();
+	u32* toEnd = p++;                                              // B over the fast block
+
+	// ---- fast: inline lwbrx (r10 = host base, r11 = aligned in-region offset) ----
+	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
+	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
+	if (size == 4) {
+		*p++ = PPC_LWBRX(PPC_R10, 0, PPC_R10);
+		if (wordRotate) {
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31);        // x = EA & 3
+			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);                // 4 - x
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28);        // ((4 - x) & 3) << 3
+			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R11, 0, 31);
+		}
+	} else if (size == 2) {
+		*p++ = PPC_LHBRX(PPC_R10, 0, PPC_R10);
+		if (signExt) *p++ = PPC_EXTSH(PPC_R10, PPC_R10);
+	} else {
+		*p++ = PPC_LBZX(PPC_R10, 0, PPC_R10);
+		if (signExt) *p++ = PPC_EXTSB(PPC_R10, PPC_R10);
+	}
+
+	// ---- converge ----
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	invalidateRegCache();
+	if (writeback) { *p++ = PPC_LWZ(PPC_R11, 1, 104); *p++ = PPC_STW(PPC_R11, 14, rn * 4); }
+	*p++ = PPC_STW(PPC_R10, 14, rd * 4);
+}
+
 // P14: inline RAM load. See jit_trace.h. eaReg == PPC_R12 by contract.
 bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool wordRotate, u32& lockedMask)
 {
-	if (!cpu.pageDescBase) return false;
 	(void)eaReg;                                  // contract: EA is in PPC_R12
+	if (cpu.arm9DtcmBase) {                        // P16 ARM9 two-region path
+		(void)lockedMask;
+		emitArm9Load(rd, size, signExt, wordRotate, /*writeback=*/false, /*rn=*/0);
+		return true;
+	}
+	if (!cpu.pageDescBase) return false;
 	u32*& p = emitPtr;
 
 	emitPageResolve(/*spanBytes=*/0, size == 4 ? 29 : size == 2 ? 30 : 31);

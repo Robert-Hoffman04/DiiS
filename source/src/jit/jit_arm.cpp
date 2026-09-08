@@ -625,6 +625,16 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 		return;
 	}
 
+	// P16 (ARM9): inline main RAM / DTCM, slowRead C call for every other region
+	// (no interpreter round-trip). emitArm9Load does its own pre-guard dirty
+	// flush + post-op cache invalidation and commits the writeback itself.
+	if (!predicated && isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
+		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
+		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
+		ctx.emitArm9Load(rd, size, signExt, wordRotate, writeback, rn);
+		return;
+	}
+
 	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value

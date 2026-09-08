@@ -72,9 +72,9 @@ struct JitCpuProfile {
 	// backing store (MMU.MAIN_MEM), captured at jitInit (it never moves for the
 	// life of an NDS_Init). Non-zero enables the emitter's inline direct access
 	// for the (addr & 0x0F000000) == 0x02000000 region -- a runtime region guard
-	// plus lwbrx/stwbrx instead of the slowRead/slowWrite C call. Left 0 for the
-	// ARM9 (its TCM windows overlay this range and are CP15-relocatable), so the
-	// ARM9 keeps the slow path until a later tier handles the TCM check.
+	// plus lwbrx/stwbrx instead of the slowRead/slowWrite C call. The ARM9 also
+	// sets this (P16) as the main-RAM host base for its two-region inline guard;
+	// see arm9DtcmBase below.
 	u32  mainMemBase;
 
 	// P14 cached page descriptors: a flat {hostBase, mask} table, one entry per
@@ -90,6 +90,22 @@ struct JitCpuProfile {
 	u32  pageDescBase;   // host address of JitPageDesc[pageDescHi - pageDescLo + 1]
 	u32  pageDescLo;     // inclusive low page index (addr >> 20)
 	u32  pageDescHi;     // inclusive high page index
+
+	// P16 (ARM9) inline load path. The ARM9 has one pure-RAM data region (main
+	// RAM 0x02xxxxxx, mirrored) plus the CP15-relocatable 16 KB DTCM window that
+	// _MMU_*<ARM9> patches on top of it. Non-zero arm9DtcmBase selects a
+	// two-region inline guard (main RAM and DTCM both loaded inline; every other
+	// region -- I/O, VRAM, palette, OAM, shared WRAM, BIOS -- falls back to the
+	// slowRead C call, NOT an interpreter round-trip). arm9DtcmRegionPtr is the
+	// address of the live u32 MMU.DTCMRegion; the emitter dereferences it at
+	// *emit* time and bakes the current window base as an immediate -- every JIT
+	// path that can move it (CP15 DTCM write, savestate load, reset) already
+	// flushes jitCacheArm9, so a stale bake can never execute. arm9MainMask
+	// mirrors _MMU_MAIN_MEM_MASK; mainMemBase (above) doubles as the main-RAM
+	// host base for the ARM9 too. All 0 on the ARM7.
+	u32  arm9DtcmBase;
+	u32  arm9DtcmRegionPtr;
+	u32  arm9MainMask;
 };
 
 // One cached page descriptor (see JitCpuProfile::pageDescBase). LAYOUT IS ABI:
