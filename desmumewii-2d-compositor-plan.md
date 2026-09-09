@@ -495,8 +495,37 @@ consumed). `4cd6858` adds a *bake-worth-it* gate — `GX2DBG_NoteWouldRecord`
 from the recorder, checked in `GX2DBG_FrameUpdate` / `GX2DBG_ObjFrameUpdate` —
 that skips both bakes entirely in any scene the recorder can't take (1-in-128
 re-probe frame recovers if state changes). Boot-screen win unchanged; gameplay
-overhead removed. **Net: GX2DBG is a pure-2D-screen optimisation; do not
-expect it to help 3D gameplay without the blend + affine-BG chunks.**
+overhead removed.
+
+**Blend relaxation landed (`32b261d`).** A non-zero `setFinalColorBck_funcNum`
+now falls back only when the effect touches a *recorded* pixel: the per-pixel
+templates (`_master_setFinalBGColor`) are a passthrough for any BG whose
+1st-target bit is clear, a Blend on the backdrop is a no-op, and the 3D
+layer's own blend is already the KIND_3D sandwich entry's job. Increase/
+Decrease on the backdrop is folded into the recorded flat backdrop colour.
+`GX2DBG_ObjFrameUpdate` likewise only bails when OBJ itself is a blend target
+or a semi-transparent sprite is present. **Result:** in `sm64` gameplay the
+MAIN blend is entirely 3D-directed, so MAIN recorder coverage went **0 →
+192/192 scanlines**; compositor 17.76 → 17.55 ms — the armed-idle regression
+is gone, small net win. The MAIN gain is capped because the legacy 3D
+sandwich already offloaded that screen.
+
+**`5649fc4`:** ext-palette 256-colour sprites now bake (were a hard reject).
+
+**SUB touch screen is still blocked** and is where the remaining `sm64`
+compositor time lives (~half of 17.5 ms). Its blockers are all *genuine*, not
+stale gates: a BG layer is a real blend 1st-target (`s_bld` ≈ 50 lines/frame),
+a non-text/affine minimap BG (`s_lay` ≈ 130k lines total), and problematic
+sprites (`s_obj`). Moving it onto GX needs **per-BG-entry blend TEV in the
+band replay** (alpha = KONST-modulate + `GX_BM_BLEND`, brighten/darken = a
+KONST lerp stage — recipes already proven in the 3D sandwich's draw 3 / draw
+4) **plus** affine-BG-as-texture, and even then live per-frame blending means
+partial coverage. Substantial, and unverifiable without a Dolphin/hardware
+visual A/B (FBDUMP can't see GX output).
+
+**Net: GX2DBG is a validated pure-2D-screen optimisation; the MAIN 3D-gameplay
+path is unblocked but low-yield, and the SUB 3D-gameplay screen is a
+multi-piece build away.**
 
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
@@ -554,4 +583,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 done** (`55d0436`..`4cd6858`, 17 commits). MAIN+SUB text BGs + 3D-fold + non-affine/affine sprites on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Validated −74 % compositor / +15 % fps on pure-2D screens** (`sm64boot`); **zero regression** elsewhere (bake-worth-it gate in `4cd6858` removes the idle overhead). **Paused here.** Real-gameplay diagnosis (`sm64` savestate scene): GX2DBG takes **0 scanlines** in 3D gameplay — pervasive per-frame `BLDCNT` blend on both engines + affine minimap BG on SUB; it is a **pure-2D-screen** optimisation. The two heavy scenes need bigger pieces: `sm64` gameplay (49 %) needs blend-mode band replay (deferred 5.1a) **+** affine-BG texture (5.4) and still partially falls back; `vsd` (54 %) is dead composite work in dispMode 2 (guarded skip, declined). Then 5.3 (windows) / 5.4, and 5.1b if a prototype proves out. Visual A/B on Dolphin/hardware still pending. |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 done** (`55d0436`..`5649fc4`, 20 commits). MAIN+SUB text BGs + 3D-fold + non-affine/affine/ext-pal-256 sprites on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Validated −74 % compositor / +15 % fps on pure-2D screens** (`sm64boot`); **zero regression** elsewhere. Real-gameplay (`sm64` savestate): the blend relaxation (`32b261d`) unblocks the **MAIN** screen (0 → 192/192 scanlines) but the gain is small — the legacy 3D sandwich already had it. The **SUB** touch screen — where ~half the remaining 17.5 ms lives — is still blocked by *genuine* per-BG-layer blending + an affine minimap BG; that needs per-entry blend TEV in the band replay + affine-BG-as-texture, a multi-piece build, and is unverifiable without a Dolphin/hardware visual A/B. `vsd` (54 %): the prior "dispMode-2 dead work" premise was **wrong** — `GPU_RenderLine_layer` runs on displayed lines, no skippable work. Then 5.3 (windows) / 5.4, 5.1b if a prototype proves out. Visual A/B still pending. |
