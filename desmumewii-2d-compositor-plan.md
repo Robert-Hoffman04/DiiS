@@ -450,6 +450,19 @@ does the wrap and the composite.
   full-vs-incremental assert harness is still TODO. Visual A/B on
   Dolphin/hardware still pending (FBDUMP can't see GX-composited output).
 
+**5.2-1 landed (`56d5a97`) — non-affine tiled sprites.**
+`GPU_ResolveObjSprite` decodes an OAM entry (endian-corrected) and resolves a
+non-affine, tiled, standard-palette OBJ (16/256-colour, 1D/2D map, Mode 0/1)
+to RGB5A3. Per-engine 128-slot pool with a content-keyed texture cache
+(rebake on OAM/palette/VRAM epoch or key/size change), latched for the draw
+thread, drawn back-to-front over the BG bands on both screens (flip via UVs).
+Frame-gated all-or-nothing: any affine / bitmap / OBJ-window / ext-pal-256 /
+mosaic / non-priority-0 enabled sprite → CPU sprite path for that engine.
+**No regression** (`sm64boot` still −74 %); **does not clear `sm64` gameplay**
+— its HUD has affine sprites (rotating Mario head, power meter). Next: the
+affine path — one `GX_LoadPosMtx` + quad per OBJ from the OAM 2×2 matrix,
+which is what unblocks the 63 % scene.
+
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
 GPU.cpp:1636–1639) that `_spriteRender` currently applies via a per-pixel
@@ -506,4 +519,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 done** (`55d0436`, dark, perf-neutral). **5.1a done** (`917eef7`..`34109fd`): MAIN text BGs baked to GX planes, per-scanline recorder, GX2DBGBand replay incl. the 3D-fold. **Validated −37 % of the compositor zone / +7 % fps on pure-2D MAIN screens** (`sm64boot`). vsd/sm64-gameplay unmoved — vsd is `GXMerge_FrameMergeable`-disarmed, sm64 gameplay is sprite-gated → needs **5.2 (sprites)**. Then 5.3/5.4, and 5.1b (GX indirect lookup) if a prototype proves out |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 done** (`55d0436`, dark, perf-neutral). **5.1a done** (`917eef7`..`f5196fc`): MAIN+SUB text BGs on GX planes, per-scanline recorder, N-entry band replay incl. the 3D-fold. **Validated −74 % of the compositor zone / +15 % fps on pure-2D screens** (`sm64boot`, both engines). **5.2-1 done** (`56d5a97`): non-affine tiled sprites as GX quads, no regression, but sm64's affine HUD keeps it CPU-side → needs the **affine sprite path** next. vsd's 54 % is dead composite work in dispMode 2 (skip declined). Then 5.3/5.4, and 5.1b if a prototype proves out |
