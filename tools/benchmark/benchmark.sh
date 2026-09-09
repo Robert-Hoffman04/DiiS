@@ -230,6 +230,11 @@ run_one() {
 		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.perfzones.log") perfzone rows"
 		mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 	fi
+	# Step 5.1a 2D-BG-on-GX coverage probe (only a profile2dbg build writes it)
+	if mcopy -i "$DOLPHIN_SD" ::/gx2dbg.log "$RUNDIR/raw/${scene}_${mode}.gx2dbg.log" 2>/dev/null; then
+		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.gx2dbg.log") gx2dbg rows"
+		mdel -i "$DOLPHIN_SD" ::/gx2dbg.log 2>/dev/null || true
+	fi
 }
 
 #--- matrix --------------------------------------------------------------
