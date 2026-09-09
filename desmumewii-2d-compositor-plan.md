@@ -472,6 +472,32 @@ uses colour effects the fixed-function band replay can't express (fail reason
 the 63 % scene now needs **blend-mode handling** (the deferred 5.1a
 "blend/brighten" item), a separate chunk.
 
+**Real-gameplay diagnosis (`4cd6858`, new `sm64` savestate scene = actual
+gameplay, not the attract-demo window).** Per-scanline bail histogram in
+`sd:/gx2dbg.log` (`DESMUME_BENCH`): in steady gameplay the 2D-BG recorder
+takes **0 of 384 scanlines/frame** on *both* engines. Cause is uniform —
+`setFinalColorBck_funcNum` in {1,2,3} (a live `BLDCNT` blend/brighten effect,
+**no window**, no non-text BG on MAIN); the SUB touch screen adds a non-text
+(affine minimap) BG on top of that. `((BLDCNT>>6)&3)!=0` at line 0 is true on
+essentially every frame for both engines, so this is genuine per-frame
+blending, not a stale gate. The legacy `GXMerge` 3D sandwich already offloads
+the MAIN top-screen 3D composite in the baseline; the remaining 17.8 ms / 49 %
+`sm64` compositor is **(a)** the MAIN behind/front 2D-bucket CPU fill on
+3D-active lines and **(b)** the entire SUB screen. To move either onto GX2DBG
+needs: blend-mode band replay (deferred 5.1a) **and** affine-BG-as-texture
+(part of 5.4) **and** — because blending is live every frame — many SUB lines
+would *still* fall back. Not a clean lever; a multi-piece build with partial
+payoff.
+
+With the path armed but idle, GX2DBG was costing ~0.4–0.6 ms on the `sm64`
+compositor zone (per-frame BG-plane + 128-sprite bakes the recorder never
+consumed). `4cd6858` adds a *bake-worth-it* gate — `GX2DBG_NoteWouldRecord`
+from the recorder, checked in `GX2DBG_FrameUpdate` / `GX2DBG_ObjFrameUpdate` —
+that skips both bakes entirely in any scene the recorder can't take (1-in-128
+re-probe frame recovers if state changes). Boot-screen win unchanged; gameplay
+overhead removed. **Net: GX2DBG is a pure-2D-screen optimisation; do not
+expect it to help 3D gameplay without the blend + affine-BG chunks.**
+
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
 GPU.cpp:1636–1639) that `_spriteRender` currently applies via a per-pixel
@@ -528,4 +554,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 done** (`55d0436`..`0acfb1e`, 15 commits). MAIN+SUB text BGs + 3D-fold + non-affine/affine sprites on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Validated −74 % compositor / +15 % fps on pure-2D screens** (`sm64boot`); **zero regression** on the heavy scenes. **Paused here.** The two profiled heavy scenes each need one more piece: `sm64` gameplay (63 %) is blend-mode-gated (deferred 5.1a "blend/brighten"); `vsd` (54 %) is dead composite work in dispMode 2 (guarded skip, declined). Then 5.3 (windows) / 5.4, and 5.1b if a prototype proves out. Visual A/B on Dolphin/hardware still pending. |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 done** (`55d0436`..`4cd6858`, 17 commits). MAIN+SUB text BGs + 3D-fold + non-affine/affine sprites on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Validated −74 % compositor / +15 % fps on pure-2D screens** (`sm64boot`); **zero regression** elsewhere (bake-worth-it gate in `4cd6858` removes the idle overhead). **Paused here.** Real-gameplay diagnosis (`sm64` savestate scene): GX2DBG takes **0 scanlines** in 3D gameplay — pervasive per-frame `BLDCNT` blend on both engines + affine minimap BG on SUB; it is a **pure-2D-screen** optimisation. The two heavy scenes need bigger pieces: `sm64` gameplay (49 %) needs blend-mode band replay (deferred 5.1a) **+** affine-BG texture (5.4) and still partially falls back; `vsd` (54 %) is dead composite work in dispMode 2 (guarded skip, declined). Then 5.3 (windows) / 5.4, and 5.1b if a prototype proves out. Visual A/B on Dolphin/hardware still pending. |
