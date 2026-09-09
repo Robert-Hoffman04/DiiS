@@ -394,6 +394,21 @@ treat it as its own milestone with its own correctness pass (stale-texture
 bugs are visually obvious but easy to introduce subtly, e.g. a write path
 that bypasses the barrier).
 
+**Landed (`55d0436`) — `GXDirty.{h,cpp}`.** `u8 lcdPageDirty[64]` (one flag
+per 16 KB LCDC physical page) + `palGen` / `oamGen` / `fullGen` counters, all
+gated behind `g_gxDirtyArmed` (default off → each hook is a single
+predicted-not-taken branch; `GXDIRTY_DISABLED` removes them). Hooks:
+`_MMU_ARM9_write08/16/32` tails (interpreter + ARM9 JIT — its inline-store
+fast path already excludes VRAM/pal/OAM — + DMA), `_MMU_ARM7_write08/16/32`
+tails (VRAM C/D, region-gated), and `GPU_RenderLine_DispCapture` (marks the
+128 KB write block — capture bypasses `_MMU_write*`). `GXDirty_FullInvalidate`
+on bank remap (`MMU_VRAMmapControl`), reset, and savestate load. The consumer
+(5.1's bake) clears the pages it reads → clear-on-consume *is* the epoch.
+Benchmark with `armed=false`: byte-identical to the Step-4 baseline on every
+renderer and every perf_zones zone — the dark path costs nothing measurable.
+Also landed the shared `GPU_ResolveTextTile8x8()` tile-resolve helper (mirrors
+`renderline_textBG`; 64 RGB5A3 texels per 8×8 cell), inert until 5.1 wires it.
+
 ### 5.1 BG layers as GX-sampled textures
 Text/affine/extended BG layers are tileset + tilemap in VRAM — a texture
 atlas + UV lookup. Build (and, via 5.0, incrementally update) an atlas per BG
@@ -459,4 +474,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | 5.0 first, then 5.1 (BG-as-texture, the main lever), then 5.2–5.4 each gated on the prior |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 done (`55d0436`, dark, perf-neutral).** Next: 5.1a (per-BG resolved-plane texture, incrementally baked from 5.0 epochs, GX owns scroll/composite/blend) + generalize the band list to N layers; 5.1b (GX indirect tile lookup) gated on a standalone prototype; then 5.2–5.4 |
