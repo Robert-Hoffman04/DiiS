@@ -1241,11 +1241,15 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 #endif
 		return -1;
 	}
-	if (oe.Depth && dispCnt->ExOBJPalette_Enable) {
+	// ext-pal 256-colour sprite: bake against MMU.ObjExtPal (one 256-entry bank
+	// selected by PaletteIndex), mirroring _spriteRender.  If the bank isn't
+	// mapped, fall back.
+	const bool extPal256 = (oe.Depth && dispCnt->ExOBJPalette_Enable);
+	if (extPal256 && !MMU.ObjExtPal[gpu->core][0]) {
 #ifdef DESMUME_BENCH
 		rj[3]++;
 #endif
-		return -1;   // ext-pal 256
+		return -1;
 	}
 
 	const bool affine = (oe.RotScale & 1) != 0;
@@ -1286,7 +1290,7 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 	*texW = PW; *texH = PH;
 	*okey = ((u32)oe.TileIndex) | ((u32)oe.PaletteIndex << 10) | ((u32)oe.Depth << 14)
 	      | ((u32)oe.Size << 15) | ((u32)oe.Shape << 17) | ((u32)oe.Mode << 19)
-	      | ((u32)(oe.RotScale & 1) << 21);
+	      | ((u32)(oe.RotScale & 1) << 21) | ((u32)extPal256 << 22);
 
 	// --- UVs -----------------------------------------------------------------
 	const float m = (float)GX2OBJ_MARGIN;
@@ -1333,6 +1337,9 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 	                   : (base + ((u32)oe.TileIndex << block));
 	u8 *palBase = MMU.ARM9_VMEM + 0x200 + gpu->core * ADDRESS_STEP_1KB;
 	u8 *pal16   = palBase + (oe.PaletteIndex << 5);
+	// d256 palette base: standard 256 bank, or the selected ObjExtPal bank.
+	u8 *pal256  = extPal256 ? (MMU.ObjExtPal[gpu->core][0] + (u32)oe.PaletteIndex * 0x200)
+	                        : palBase;
 
 	for (int py = 0; py < H; py++) {
 		const int ty = py >> 3, yin = py & 7;
@@ -1344,7 +1351,7 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 64 + (u32)yin * 8 + xin
 				                : (u32)ty * (u32)Wt * 64 + (u32)tx * 64 + (u32)yin * 8 + xin;
 				idx = *(u8 *)MMU_gpu_map(tbase + ofs);
-				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(palBase, idx << 1)) : 0;
+				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(pal256, idx << 1)) : 0;
 			} else {
 				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1)
 				                : (u32)ty * (u32)Wt * 32 + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1);
