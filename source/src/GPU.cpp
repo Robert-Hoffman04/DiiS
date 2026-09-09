@@ -103,6 +103,7 @@ void GPU_DispCapDumpRing()
 #include "readwrite.h"
 #include "guDesmume.h"
 #include "GXMerge.h"
+#include "GXDirty.h"
 
 // Per-scanline mergeability check (defined below, near GXMerge_FrameMergeable);
 // forward-declared so GPU_RenderLine_layer's 3D split point can call it.
@@ -1115,6 +1116,81 @@ template<bool MOSAIC, int FUNCNUM> INLINE void renderline_textBG(GPU * gpu, u16 
 			++x; ++xoff;
 
 			line += line_dir;
+		}
+	}
+}
+
+//------------------------------------------------------------------------------
+// GX 2D-BG compositor (Step 5.1a) - resolve one 8x8 tile cell of a MAIN text BG
+// plane into 64 GX RGB5A3 texels (row-major, out[0] = top-left of the cell).
+// out == 0x0000 means transparent (BG colour index 0); every opaque texel gets
+// the RGB5A3 opaque bit via RGB15_REVERSE.  tx/ty are tile coords in the BG
+// plane; the caller need not pre-mask them.  This mirrors renderline_textBG()
+// exactly (screenblock wrap, H/V flip, 16- vs 256-colour, standard vs extended
+// palette); GX2DBG_VERIFY builds cross-check the two against each other.
+//------------------------------------------------------------------------------
+#ifndef RGB15_REVERSE
+#define RGB15_REVERSE(col) ( 0x8000 | (((col) & 0x001F) << 10) | ((col) & 0x03E0) | (((col) & 0x7C00) >> 10) )
+#endif
+
+void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
+{
+	const struct _BGxCNT  *bgCnt   = &(gpu->dispx_st)->dispx_BGxCNT[num].bits;
+	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
+
+	const u32 lg  = gpu->BGSize[num][0];       // plane width  in px (pow2)
+	const u32 ht  = gpu->BGSize[num][1];       // plane height in px (pow2)
+	const u32 lgt = lg >> 3;                   // plane width  in tiles
+	const u32 htt = ht >> 3;                   // plane height in tiles
+
+	const u32 mrow = ty & (htt - 1);           // == (YBG & (ht-1)) >> 3
+	const u32 mcol = tx & (lgt - 1);
+
+	u32 rowbase = gpu->BG_map_ram[num] + (mrow & 31) * 64;
+	if (mrow > 31) rowbase += ADDRESS_STEP_512B << bgCnt->ScreenSize;
+
+	u32 mapinfo = rowbase + ((mcol & 31) << 1);
+	if (mcol > 31) mapinfo += 32 * 32 * 2;
+
+	TILEENTRY te;
+	te.val = T1ReadWord(MMU_gpu_map(mapinfo), 0);
+
+	const u32 tileBase = gpu->BG_tile_ram[num];
+
+	if (!bgCnt->Palette_256)
+	{
+		// 16-colour: 32 bytes/tile, low nibble = even pixel
+		u8 *pal = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
+		const u16 palOfs = (te.bits.Palette << 4);
+		for (u32 r = 0; r < 8; r++) {
+			const u32 sr = te.bits.VFlip ? (7 - r) : r;
+			const u8 *line = (const u8 *)MMU_gpu_map(tileBase + te.bits.TileNum * 0x20 + sr * 4);
+			for (u32 c = 0; c < 8; c++) {
+				const u32 sc = te.bits.HFlip ? (7 - c) : c;
+				u8 b = line[sc >> 1];
+				u8 idx = (sc & 1) ? (b >> 4) : (b & 0xF);
+				out[r * 8 + c] = idx ? RGB15_REVERSE(T1ReadWord(pal, (idx + palOfs) << 1)) : 0;
+			}
+		}
+		return;
+	}
+
+	// 256-colour: 64 bytes/tile, one byte per pixel
+	u8 *pal;
+	if (dispCnt->ExBGxPalette_Enable) {
+		pal = MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[num]];
+		if (!pal) { for (int i = 0; i < 64; i++) out[i] = 0; return; }
+		pal += (te.bits.Palette << 9);
+	} else {
+		pal = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
+	}
+	for (u32 r = 0; r < 8; r++) {
+		const u32 sr = te.bits.VFlip ? (7 - r) : r;
+		const u8 *line = (const u8 *)MMU_gpu_map(tileBase + te.bits.TileNum * 0x40 + sr * 8);
+		for (u32 c = 0; c < 8; c++) {
+			const u32 sc = te.bits.HFlip ? (7 - c) : c;
+			u8 idx = line[sc];
+			out[r * 8 + c] = idx ? RGB15_REVERSE(T1ReadWord(pal, idx << 1)) : 0;
 		}
 	}
 }
@@ -2367,6 +2443,9 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 		{
 			gpu->dispCapCnt.enabled = TRUE;
 			T1WriteLong(MMU.ARM9_REG, 0x64, gpu->dispCapCnt.val);
+			// capture writes go straight into MMU.ARM9_LCD, bypassing the GX
+			// dirty hooks in _MMU_write* - mark the destination 128 KB block.
+			GXDirty_MarkCaptureBlock(gpu->dispCapCnt.writeBlock);
 		}
 	}
 

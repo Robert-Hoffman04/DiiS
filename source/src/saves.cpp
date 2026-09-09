@@ -45,6 +45,7 @@
 #include "readwrite.h"
 #include "GPU.h"
 #include "gfx3d.h"
+#include "GXDirty.h"
 #include "GXMerge.h"
 #include "movie.h"
 #include "mic.h"
@@ -1061,6 +1062,10 @@ static void loadstate()
 	// perf), so just drop the whole cache -- both cores'.
 	jitFlushAllCaches();
 #endif
+
+	// A state load also overwrites VRAM / palette / OAM in bulk (ReadStateChunk
+	// SF_MEM), bypassing the GX dirty hooks -- drop the whole compositor cache.
+	GXDirty_FullInvalidate();
 
 	execute = 1;//!driver->EMU_IsEmulationPaused();
 }
