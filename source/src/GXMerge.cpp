@@ -88,15 +88,19 @@ static bool s_presentBehindContent = false;
 // --- Step 5.1a: 2D-BG-on-GX per-scanline record -----------------------------
 static u8   s2_used[DS_H];
 static u8   s2_nLay[DS_H];
+static u8   s2_kind[DS_H][GX2DBG_MAX_LAYERS];
 static u8   s2_lay [DS_H][GX2DBG_MAX_LAYERS];
 static u16  s2_hofs[DS_H][GX2DBG_MAX_LAYERS];
 static u16  s2_vofs[DS_H][GX2DBG_MAX_LAYERS];
 static u16  s2_bd  [DS_H];
 static u8   s2_bmode[DS_H];
 static u8   s2_bfac [DS_H];
+static u8   s2_ao  [DS_H];
+static u8   s2_bc  [DS_H];
 static GX2DBGFrame s2_working;
 static GX2DBGFrame s2_present;
 static bool        s2_havePresent = false;
+static int         s2_slot        = -1;   // resident 3D texture slot for KIND_3D entries
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -313,7 +317,8 @@ bool GXMerge_LineWasMerged(int l)
 }
 
 void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
-                            int nLayers, const u8 *layers,
+                            u8 alphaOver, u8 behindContent, int nLayers,
+                            const u8 *kind, const u8 *layer,
                             const u16 *hofs, const u16 *vofs)
 {
 	if (l < 0 || l >= DS_H) return;
@@ -321,6 +326,8 @@ void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
 	s2_used[l]  = 1;
 	s2_nLay[l]  = (u8)nLayers;
 	s2_bd[l]    = backdrop;
+	s2_ao[l]    = alphaOver ? 1 : 0;
+	s2_bc[l]    = behindContent ? 1 : 0;
 	if ((brightMode == 1 || brightMode == 2) && brightFactor) {
 		s2_bmode[l] = brightMode;
 		s2_bfac[l]  = brightFactor > 16 ? 16 : brightFactor;
@@ -329,7 +336,8 @@ void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
 		s2_bfac[l]  = 0;
 	}
 	for (int i = 0; i < nLayers; i++) {
-		s2_lay[l][i]  = layers[i];
+		s2_kind[l][i] = kind[i];
+		s2_lay[l][i]  = layer[i];
 		s2_hofs[l][i] = hofs[i] & 0x1FF;
 		s2_vofs[l][i] = vofs[i] & 0x1FF;
 	}
@@ -349,6 +357,8 @@ static void GXMerge_End2DBG(void)
 		#define S2_SAME(a) ( \
 			s2_used[a] && s2_nLay[a] == s2_nLay[start] && s2_bd[a] == s2_bd[start] && \
 			s2_bmode[a] == s2_bmode[start] && s2_bfac[a] == s2_bfac[start] && \
+			s2_ao[a] == s2_ao[start] && s2_bc[a] == s2_bc[start] && \
+			!memcmp(s2_kind[a], s2_kind[start], s2_nLay[start]) && \
 			!memcmp(s2_lay[a],  s2_lay[start],  s2_nLay[start]) && \
 			!memcmp(s2_hofs[a], s2_hofs[start], s2_nLay[start] * sizeof(u16)) && \
 			!memcmp(s2_vofs[a], s2_vofs[start], s2_nLay[start] * sizeof(u16)) )
@@ -363,7 +373,10 @@ static void GXMerge_End2DBG(void)
 		b->backdrop = s2_bd[start];
 		b->brightMode = s2_bmode[start];
 		b->brightFactor = s2_bfac[start];
+		b->alphaOver = s2_ao[start];
+		b->behindContent = s2_bc[start];
 		for (int i = 0; i < b->nLayers; i++) {
+			b->kind[i]  = s2_kind[start][i];
 			b->layer[i] = s2_lay[start][i];
 			b->hofs[i]  = s2_hofs[start][i];
 			b->vofs[i]  = s2_vofs[start][i];
@@ -508,7 +521,9 @@ void GXMerge_Present(void)
 	// textures, no dependency on the 3D slot) - present them whenever the frame
 	// was armed, even if the 3D sandwich itself fell back this frame.
 	s2_present = s2_working;
-	s2_havePresent = s_frameArmed && s2_working.valid && s2_working.nBands > 0;
+	s2_slot    = slot;   // resident 3D texture slot for this frame's KIND_3D entries
+	s2_havePresent = s_frameArmed && s2_working.valid && s2_working.nBands > 0
+	                 && slot >= 0;
 
 	if (!s_working.valid || slot < 0) {
 		s_havePresent = false;
@@ -606,7 +621,8 @@ static void GXMerge_Draw2DBGBands(f32 x0, f32 y0, f32 w, f32 h)
 			GX_End();
 		}
 
-		// BG layers, painter's order (index 0 = bottom)
+		// layers, painter's order (entry 0 = bottom): BG plane quads and, at
+		// BG0's priority slot, the resident 3D texture band.
 		GX_ClearVtxDesc();
 		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
 		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
@@ -614,19 +630,46 @@ static void GXMerge_Draw2DBGBands(f32 x0, f32 y0, f32 w, f32 h)
 		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
-		GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
-		GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);   // discard index-0
+
+		const f32 tv0 = (f32)b->yStart      / (f32)DS_H;
+		const f32 tv1 = (f32)(b->yEnd + 1)  / (f32)DS_H;
 
 		for (int li = 0; li < b->nLayers; li++) {
+			if (b->kind[li] == GX2DBG_KIND_3D) {
+				if (s2_slot < 0) continue;
+				int sx0, cnt, tx0;
+				if (!GXMerge_HofsSegment(b->hofs[li], &sx0, &cnt, &tx0))
+					continue;
+				if (b->alphaOver) {
+					GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+					GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+				} else {
+					GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+					if (b->behindContent)
+						GX_SetAlphaCompare(GX_GEQUAL, 128, GX_AOP_OR, GX_NEVER, 0);
+					else
+						GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+				}
+				GX_LoadTexObj(&s_resident[s2_slot], GX_TEXMAP0);
+				const f32 qx0 = x0 + w * (sx0        / (f32)DS_W);
+				const f32 qx1 = x0 + w * ((sx0 + cnt) / (f32)DS_W);
+				const f32 u0  = tx0        / (f32)DS_W;
+				const f32 u1  = (tx0 + cnt) / (f32)DS_W;
+				quad(qx0, qy0, qx1, qy1, u0, tv0, u1, tv1);
+				continue;
+			}
+			// BG plane
 			u16 pw = 0, ph = 0;
 			GXTexObj *obj = GX2DBG_LayerTex(b->layer[li], &pw, &ph);
 			if (!obj || !pw || !ph) continue;
+			GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+			GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);   // discard index-0
 			GX_LoadTexObj(obj, GX_TEXMAP0);
-			const f32 u0 = b->hofs[li]                    / (f32)pw;
-			const f32 u1 = (f32)(DS_W + b->hofs[li])      / (f32)pw;
-			const f32 tv0 = (f32)(b->yStart   + b->vofs[li]) / (f32)ph;
-			const f32 tv1 = (f32)(b->yEnd + 1 + b->vofs[li]) / (f32)ph;
-			quad(x0, qy0, x0 + w, qy1, u0, tv0, u1, tv1);
+			const f32 u0  = b->hofs[li]               / (f32)pw;
+			const f32 u1  = (f32)(DS_W + b->hofs[li]) / (f32)pw;
+			const f32 bv0 = (f32)(b->yStart   + b->vofs[li]) / (f32)ph;
+			const f32 bv1 = (f32)(b->yEnd + 1 + b->vofs[li]) / (f32)ph;
+			quad(x0, qy0, x0 + w, qy1, u0, bv0, u1, bv1);
 		}
 	}
 }

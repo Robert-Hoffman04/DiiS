@@ -2164,40 +2164,67 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 	u16 backdrop_color = LE_TO_LOCAL_16(T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF);
 
-	// Step 5.1a: if this whole scanline's 2D composite is GX-expressible
-	// (MAIN, all enabled BGs are baked text layers, no sprites/window/mosaic/
-	// BLDCNT effect/3D), record it for the GX band replay and skip the CPU walk.
+	// Step 5.1a: if this whole scanline's 2D composite is GX-expressible - MAIN,
+	// every enabled BG a baked text layer, no sprites / window / mosaic / BLDCNT
+	// effect - record it for the GX band replay and skip the CPU walk.  A
+	// BG0-as-3D line is handled too when the existing GXMerge_LineMergeable
+	// accepts the 3D part (opaque, no front translucent BG): the resident 3D
+	// texture is drawn as a KIND_3D entry at BG0's priority slot.
 	if (gpu->core == GPU_MAIN && GXMerge_2DBGEnabled() && GXMerge_FrameArmed()
-	    && !dispCnt->BG0_3D && !gpu->LayersEnable[4]
+	    && !gpu->LayersEnable[4]
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
 	    && gpu->setFinalColorBck_funcNum == 0
 	    && ((gpu->BLDCNT >> 6) & 3) == 0)
 	{
-		u8  gxlay[4]; u16 gxhofs[4], gxvofs[4]; int gxn = 0;
+		const bool has3d = dispCnt->BG0_3D && gpu->LayersEnable[0];
+		bool ao = false, fao = false; u8 feva = 0, bmode = 0, bfac = 0;
 		bool ok = true;
+
+		if (has3d) {
+			if (!GXMerge_LineMergeable(gpu, &ao, &fao, &feva, &bmode, &bfac) || fao)
+				ok = false;   // front translucent BG / other 3D disqualifier -> CPU path
+		} else if ((gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2)
+		           && gpu->MasterBrightFactor) {
+			bmode = gpu->MasterBrightMode;
+			bfac  = gpu->MasterBrightFactor > 16 ? 16 : gpu->MasterBrightFactor;
+		}
+
+		u8  gxkind[GX2DBG_MAX_LAYERS], gxlay[GX2DBG_MAX_LAYERS];
+		u16 gxhofs[GX2DBG_MAX_LAYERS], gxvofs[GX2DBG_MAX_LAYERS];
+		int gxn = 0;
+		int threeDAt = -1;
 		for (int prio = NB_PRIORITIES - 1; prio >= 0 && ok; prio--) {
 			itemsForPriority_t *it = &gpu->itemsForPriority[prio];
 			for (int i = 0; i < it->nbBGs; i++) {
 				const int bg = it->BGs[i];
 				if (!gpu->LayersEnable[bg]) continue;
+				if (gxn >= GX2DBG_MAX_LAYERS) { ok = false; break; }
+				if (bg == 0 && has3d) {
+					gxkind[gxn] = GX2DBG_KIND_3D;
+					gxlay[gxn]  = 0;
+					gxhofs[gxn] = (u16)gpu->getHOFS(0);
+					gxvofs[gxn] = 0;
+					threeDAt = gxn;
+					gxn++;
+					continue;
+				}
 				if (gpu->BGTypes[bg] != BGType_Text ||
 				    gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
 				    !GX2DBG_LayerReady(bg)) { ok = false; break; }
+				gxkind[gxn] = GX2DBG_KIND_BG;
 				gxlay[gxn]  = (u8)bg;
 				gxhofs[gxn] = (u16)gpu->getHOFS(bg);
 				gxvofs[gxn] = (u16)gpu->getVOFS(bg);
 				gxn++;
 			}
 		}
+		if (has3d && threeDAt < 0) ok = false;   // 3D expected but BG0 not in the walk
+
 		if (ok) {
-			u8 bmode = 0, bfac = 0;
-			if ((gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2) &&
-			    gpu->MasterBrightFactor) {
-				bmode = gpu->MasterBrightMode;
-				bfac  = gpu->MasterBrightFactor > 16 ? 16 : gpu->MasterBrightFactor;
-			}
+			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
 			GXMerge_Record2DBGLine(l, (u16)(backdrop_color | 0x8000), bmode, bfac,
-			                       gxn, gxlay, gxhofs, gxvofs);
+			                       ao ? 1 : 0, behindContent,
+			                       gxn, gxkind, gxlay, gxhofs, gxvofs);
 			return;
 		}
 	}

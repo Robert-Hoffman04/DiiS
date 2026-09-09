@@ -155,8 +155,10 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 	const bool extPal = gpu->dispCnt().ExBGxPalette_Enable;
 
 	for (int n = 0; n < 4; n++) {
-		// text-type, enabled, MAIN only (caller passes the MAIN gpu)
-		if (!gpu->LayersEnable[n] || gpu->BGTypes[n] != BGType_Text) { freeLayer(n); continue; }
+		// text-type, enabled, MAIN only (caller passes the MAIN gpu); BG0-as-3D
+		// is drawn from the resident 3D texture, not a baked plane.
+		if (!gpu->LayersEnable[n] || gpu->BGTypes[n] != BGType_Text ||
+		    (n == 0 && gpu->dispCnt().BG0_3D)) { freeLayer(n); continue; }
 
 		const u16 w = gpu->BGSize[n][0];
 		const u16 h = gpu->BGSize[n][1];

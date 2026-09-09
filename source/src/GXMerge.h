@@ -88,15 +88,19 @@ typedef struct {
 //   3D on the line.  A band breaks on any change of layer set / scroll /
 //   backdrop / brightness.
 #define GX2DBG_MAX_BANDS   64
-#define GX2DBG_MAX_LAYERS  4
+#define GX2DBG_MAX_LAYERS  5            // 4 BG + the 3D layer
+enum { GX2DBG_KIND_BG = 0, GX2DBG_KIND_3D = 1 };
 typedef struct {
 	u8  yStart, yEnd;
 	u8  nLayers;
-	u8  layer[GX2DBG_MAX_LAYERS];   // BG index 0..3, painter's order (index 0 = bottom)
-	u16 hofs[GX2DBG_MAX_LAYERS];
-	u16 vofs[GX2DBG_MAX_LAYERS];
+	u8  kind [GX2DBG_MAX_LAYERS];   // GX2DBG_KIND_BG / _3D
+	u8  layer[GX2DBG_MAX_LAYERS];   // BG index 0..3 (KIND_BG); unused for _3D
+	u16 hofs [GX2DBG_MAX_LAYERS];   // BG scroll (KIND_BG) or BG0 hofs (KIND_3D)
+	u16 vofs [GX2DBG_MAX_LAYERS];
 	u16 backdrop;                   // RGB555 | 0x8000
 	u8  brightMode, brightFactor;
+	u8  alphaOver;                  // KIND_3D: real per-pixel alpha blend vs opaque-key
+	u8  behindContent;             // KIND_3D: real 2D sits behind the 3D layer
 } GX2DBGBand;
 
 typedef struct {
@@ -106,10 +110,13 @@ typedef struct {
 } GX2DBGFrame;
 
 // Recorder: called from GPU_RenderLine_layer for each scanline whose entire 2D
-// composite is GX-expressible (see above).  layers/hofs/vofs are nLayers long,
-// painter's order.  The line's CPU BG/sprite walk is then skipped.
+// composite is GX-expressible (see above).  kind/layer/hofs/vofs are nLayers
+// long, painter's order (entry 0 = bottom).  A KIND_3D entry draws the resident
+// 3D texture band (alphaOver / behindContent as GXMerge_LineMergeable decided);
+// its hofs is BG0's X-scroll.  The line's CPU BG/sprite/3D walk is then skipped.
 void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
-                            int nLayers, const u8 *layers,
+                            u8 alphaOver, u8 behindContent, int nLayers,
+                            const u8 *kind, const u8 *layer,
                             const u16 *hofs, const u16 *vofs);
 
 //--- toggle -------------------------------------------------------------------
