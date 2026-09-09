@@ -282,22 +282,82 @@ guesses about how much of the 58–65% is dispatch/clear/endian overhead versus
 irreducible per-pixel work. This step turns the guess into a number before
 committing to Step 5, which is the expensive one.
 
-**Action:**
-1. Run the full `tools/benchmark` matrix (both scenes, all three renderers)
-   with Steps 1–3 applied cumulatively, same format as
-   desmumewii-perf-results.md's table.
-2. If a CPU-load breakdown tool (the one that produced the numbers driving
-   this doc) is available, re-run it and directly compare the "2D software
-   compositor" line against the original 65%/58%.
-3. Decide, from that number, how much of Step 5 is justified. If the
-   compositor share drops substantially, the highest-value remaining GX work
-   may narrow to just sprite-affine-as-quad (Step 5.2) rather than the full
-   BG-layer-as-texture project (Step 5.1) — re-prioritize the sub-steps of
-   Step 5 based on what's actually left, not on the plan as originally
-   written.
-
 **No code changes in this step** — it's a checkpoint, and it's here
 specifically so Step 5 doesn't start from a stale profile.
+
+### Cumulative result, Steps 1–3 (measured)
+
+Baseline `20260908T233009Z` (pre-Step-1) → `20260909T015711Z` (Steps 1–3),
+FullJIT + perf_zones, Dolphin 2606a / i5-1145G7:
+
+| scene | 2D compositor before | after | Δ | frame total | eff. fps |
+|---|--:|--:|--:|--:|--:|
+| vsd  | 14.212 ms (58.3%) | **11.809 ms (53.7%)** | **−2.40 ms / −16.9%** | 24.38 → 21.98 ms | 41.0 → 45.5 (+11%) |
+| sm64 | 17.393 ms (65.5%) | **15.828 ms (63.3%)** | **−1.57 ms / −9.0%** | 26.57 → 25.01 ms | 37.6 → 40.0 (+6%) |
+
+All three non-profile renderers moved flat-to-slightly-up (no regression):
+vsd sw 15.6 / GX 26.5→26.7 / merge 26.4→26.6; sm64 sw 13.4 / GX 30.8→31.0 /
+merge 30.3→30.5 fps.
+
+Full post-Steps-1–3 zone breakdown:
+
+| zone | vsd ms | vsd % | sm64 ms | sm64 % |
+|---|--:|--:|--:|--:|
+| **GPU 2D compositor** | **11.809** | **53.7** | **15.828** | **63.3** |
+| GPU geometry engine | 3.053 | 13.9 | 0.337 | 1.3 |
+| ARM9 JIT execute | 4.179 | 19.0 | 2.289 | 9.2 |
+| ARM7 JIT execute | 0.036 | 0.2 | 1.966 | 7.9 |
+| GX present/Draw | 1.352 | 6.2 | 1.819 | 7.3 |
+| GPU 3D render | 0.205 | 0.9 | 0.119 | 0.5 |
+| other / glue | 1.215 | 5.5 | 1.870 | 7.5 |
+| SPU | 0.104 | 0.5 | 0.169 | 0.7 |
+| **TOTAL** | **21.978** | | **25.011** | |
+
+### Assessment
+
+**The premise of Step 5 still holds.** The compositor share fell only ~4–5 pp
+(58→54, 65→63); it is still by a wide margin the single dominant cost and the
+only zone large enough to close the gap to the 16.72 ms frame budget. vsd
+needs another ~5.3 ms off *somewhere* to hit full speed and sm64 another
+~8.3 ms — in both cases larger than every non-compositor zone combined. Full
+speed is not reachable without a major compositor reduction.
+
+**Steps 1–3 captured most of the cheap, non-GX headroom.** They removed the
+per-pixel blend dispatch (§2), the per-pixel window-check call for the
+no-window cases (subsumed into §2's `FUNCNUM` 0–3 vs 4–7 split), and the
+redundant per-line clears (§3.1). What remains in the compositor is genuine
+per-pixel work: tile/tilemap fetch, palette lookup, priority compare against
+`bgPixels[x]`, the blend arithmetic, and the store — repeated for up to 4 BG
+layers plus the sprite line, 256×192 times. Back-of-envelope on vsd:
+11.8 ms / (49 152 px × ~2.5 effective layers) ≈ 95 ns ≈ ~70 Broadway cycles
+per pixel-layer. There is *some* left in tighter inner loops / paired-single
+stores / run-batching same-window spans, but it's incremental (§3-sized, low
+single digits each) and it does not change the order of magnitude.
+
+**The GX path is the only lever with the right ceiling.** GX present is at
+6–7 % — the Wii GPU is nearly idle while Broadway spends 54–63 % of the frame
+being a software rasterizer for a chip that is structurally a tile/sprite GPU.
+Moving BG-layer compositing onto GX (Step 5.1) is the piece that can plausibly
+take the compositor from ~12–16 ms to low single digits, because it removes
+the per-pixel loop entirely rather than shaving cycles off it.
+
+### Decision — proceed to Step 5, in this order
+
+1. **5.0 — dirty tracking first.** Non-negotiable prerequisite; everything
+   else in Step 5 is a stale-texture bug without it. Milestone-scale, own
+   correctness pass. Start here.
+2. **5.1 — BG layers as GX textures, before 5.2.** BG compositing dominates
+   *both* test scenes (vsd is nearly sprite-free; sm64's cost is the castle's
+   text/affine BGs, not the HUD sprites). The original plan hedged that §4
+   "might" narrow the work to 5.2-only — it does not. 5.1 is the main event.
+3. **5.2 / 5.3 / 5.4** after 5.1 lands and is measured — sprites-as-quads,
+   windows-as-scissors, N-layer sandwich, in that order, each gated on the
+   previous one's measured result.
+
+**Secondary finding, out of scope for this doc:** on vsd the geometry engine
+(CPU 3D vertex transform) is 13.9 % / 3.05 ms — the #2 cost after the
+compositor and untouched by any step here. Worth its own investigation once
+the compositor is on GX; noted so it isn't lost.
 
 ---
 
@@ -398,5 +458,5 @@ be a multi-milestone project, not a single patch.
 | 1. ~~Scope `-fno-strict-aliasing` off `GPU.cpp`~~ | 1 file, Makefile | **Done — 0%, reverted** | Low | — |
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
-| 4. Re-benchmark checkpoint | No code | Hours | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | Step 4's findings; 5.0 gates 5.1–5.4 |
+| 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | 5.0 first, then 5.1 (BG-as-texture, the main lever), then 5.2–5.4 each gated on the prior |
