@@ -1336,6 +1336,36 @@ void DSExec(){
 #endif
 	pzFrameTick();
 
+#ifdef DESMUME_FBDUMP
+	// Renderer correctness A/B (-DDESMUME_FBDUMP): on a deterministic direct-boot
+	// ROM, snapshot the composited framebuffer at a fixed frame and write it to
+	// sd:/fb.dump. Two builds that render identically produce a byte-identical
+	// dump. Pair with -DDESMUME_BENCH so the run has a frame budget; pull
+	// sd:/fb.dump after killing the emulator.
+	//   make TESTDEFS="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_FBDUMP [-DDESMUME_FBDUMP_FRAME=N] -DDESMUME_FORCE_CORE=1"
+#ifndef DESMUME_FBDUMP_FRAME
+#define DESMUME_FBDUMP_FRAME 600
+#endif
+	{
+		// Snapshot GPU_screen at a fixed frame (the ROM's frame counter is
+		// deterministic, so an A/B pair captures the identical emulated frame),
+		// then keep re-writing that frozen snapshot every 60 frames so Dolphin's
+		// periodic SD sync has flushed a complete copy before the harness kills it.
+		static u32 _fbframe = 0;
+		static u8  _fbsnap[sizeof(GPU_screen)];
+		static bool _fbhave = false;
+		++_fbframe;
+		if (_fbframe == DESMUME_FBDUMP_FRAME) {
+			memcpy(_fbsnap, GPU_screen, sizeof(_fbsnap));
+			_fbhave = true;
+		}
+		if (_fbhave && (_fbframe % 60) == 0) {
+			FILE *f = fopen("sd:/fb.dump", "w");
+			if (f) { fwrite(_fbsnap, 1, sizeof(_fbsnap), f); fflush(f); fclose(f); }
+		}
+	}
+#endif
+
 #ifdef DESMUME_ARMWRESTLER_PROBE
 	armwrestler_probe_tick();
 #endif

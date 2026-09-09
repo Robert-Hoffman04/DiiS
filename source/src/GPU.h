@@ -760,9 +760,13 @@ struct GPU{
 
 	void setFinalColor3d(int dstX, int srcX);
 
+	// FUNCNUM >= 0 => blend mode resolved by the caller (compile-time dispatch);
+	// FUNCNUM < 0  => per-pixel switch on setFinalColorBck_funcNum (legacy path).
+	// The BG leaf renderers thread a hoisted FUNCNUM down from modeRender()
+	// (desmumewii-2d-compositor-plan.md Step 2); backdrop always passes 0..7.
 	template<bool BACKDROP, int FUNCNUM> void setFinalColorBG(u16 color, const u32 x);
-	template<bool MOSAIC, bool BACKDROP> FORCEINLINE void __setFinalColorBck(u16 color, const u32 x, const int opaque);
-	template<bool MOSAIC, bool BACKDROP, int FUNCNUM> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x, const int opaque);
+	template<bool MOSAIC, bool BACKDROP, int FUNCNUM = -1> FORCEINLINE void __setFinalColorBck(u16 color, const u32 x, const int opaque);
+	template<bool MOSAIC, bool BACKDROP, int FUNCNUM = -1> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x, const int opaque);
 
 	void setAffineStart(int layer, int xy, u32 val);
 	void setAffineStartWord(int layer, int xy, u16 val, int word);

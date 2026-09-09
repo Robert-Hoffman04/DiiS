@@ -812,7 +812,9 @@ FORCEINLINE void GPU::setFinalColorBG(u16 color, const u32 x)
 
 	bool draw = false;
 
-	const int test = BACKDROP ? FUNCNUM : setFinalColorBck_funcNum;
+	// FUNCNUM >= 0 folds to a compile-time constant here, so the switch below
+	// collapses to a single case. FUNCNUM < 0 keeps the per-pixel dispatch.
+	const int test = (FUNCNUM >= 0) ? FUNCNUM : setFinalColorBck_funcNum;
 	switch(test)
 	{
 		case 0x0: draw = _master_setFinalBGColor<BACKDROP,None,false>(color,x); break;
@@ -848,25 +850,16 @@ FORCEINLINE void GPU::setFinalColor3d(int dstX, int srcX)
 	};
 }
 
-FORCEINLINE void setFinalColorSpr(GPU* gpu, u8 *dst, u16 color, u8 alpha, u8 type, u16 x)
-{
-	switch(gpu->setFinalColorSpr_funcNum)
-	{
-		case 0x0: _master_setFinalOBJColor<None,false>(gpu, dst, color, alpha, type, x); break;
-		case 0x1: _master_setFinalOBJColor<Blend,false>(gpu, dst, color, alpha, type, x); break;
-		case 0x2: _master_setFinalOBJColor<Increase,false>(gpu, dst, color, alpha, type, x); break;
-		case 0x3: _master_setFinalOBJColor<Decrease,false>(gpu, dst, color, alpha, type, x); break;
-		case 0x4: _master_setFinalOBJColor<None,true>(gpu, dst, color, alpha, type, x); break;
-		case 0x5: _master_setFinalOBJColor<Blend,true>(gpu, dst, color, alpha, type, x); break;
-		case 0x6: _master_setFinalOBJColor<Increase,true>(gpu, dst, color, alpha, type, x); break;
-		case 0x7: _master_setFinalOBJColor<Decrease,true>(gpu, dst, color, alpha, type, x); break;
-	};
-}
+// setFinalColorSpr() used to live here: a per-sprite-pixel switch on
+// setFinalColorSpr_funcNum selecting one of 8 _master_setFinalOBJColor<>
+// instantiations. The sole caller (the sprite-composite loop in
+// GPU_RenderLine_layer) now hoists that switch out of the loop itself
+// (desmumewii-2d-compositor-plan.md Step 2), so this wrapper is gone.
 
-template<bool MOSAIC, bool BACKDROP>
+template<bool MOSAIC, bool BACKDROP, int FUNCNUM>
 FORCEINLINE void GPU::__setFinalColorBck(u16 color, const u32 x, const int opaque)
 {
-	return ___setFinalColorBck<MOSAIC, BACKDROP, 0>(color,x,opaque);
+	return ___setFinalColorBck<MOSAIC, BACKDROP, FUNCNUM>(color,x,opaque);
 }
 
 //this was forced inline because most of the time it just falls through to setFinalColorBck() and the function call
@@ -977,7 +970,7 @@ template<bool MOSAIC> void lineLarge8bpp(GPU * gpu)
 		XBG &= wmask;
 		u8 pixel = map[XBG];
 		u16 color = T1ReadWord(pal, pixel<<1);
-		gpu->__setFinalColorBck<MOSAIC,false>(color,x,color);
+		gpu->__setFinalColorBck<MOSAIC,false>(color,x,color); // dead code path (no caller); left on the legacy per-pixel dispatch
 	}
 	
 }
@@ -986,7 +979,7 @@ template<bool MOSAIC> void lineLarge8bpp(GPU * gpu)
 //			BACKGROUND RENDERING -TEXT-
 /*****************************************************************************/
 // render a text background to the combined pixelbuffer
-template<bool MOSAIC> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG, u16 LG)
+template<bool MOSAIC, int FUNCNUM> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG, u16 LG)
 {
 	u8 num = gpu->currBgNum;
 	struct _BGxCNT *bgCnt = &(gpu->dispx_st)->dispx_BGxCNT[num].bits;
@@ -1047,14 +1040,14 @@ template<bool MOSAIC> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG,
 					if(!(xoff&1))
 					{
 						color = T1ReadWord(pal, ((currLine>>4) + tilePalette) << 1);
-						gpu->__setFinalColorBck<MOSAIC,false>(color,x,currLine>>4);
+						gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,x,currLine>>4);
 						++x; ++xoff;
 					}
 					
 					if(x<xfin)
 					{
 						color = T1ReadWord(pal, ((currLine&0xF) + tilePalette) << 1);
-						gpu->__setFinalColorBck<MOSAIC,false>(color,x,currLine&0xF);
+						gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,x,currLine&0xF);
 						++x; ++xoff;
 					}
 				}
@@ -1068,14 +1061,14 @@ template<bool MOSAIC> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG,
 					if(!(xoff&1))
 					{
 						color = T1ReadWord(pal, ((currLine&0xF) + tilePalette) << 1);
-						gpu->__setFinalColorBck<MOSAIC,false>(color,x,currLine&0xF);
+						gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,x,currLine&0xF);
 						++x; ++xoff;
 					}
 
 					if(x<xfin)
 					{
 						color = T1ReadWord(pal, ((currLine>>4) + tilePalette) << 1);
-						gpu->__setFinalColorBck<MOSAIC,false>(color,x,currLine>>4);
+						gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,x,currLine>>4);
 						++x; ++xoff;
 					}
 				}
@@ -1117,7 +1110,7 @@ template<bool MOSAIC> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG,
 		for(; x < xfin; )
 		{
 			color = T1ReadWord(tilePal, (*line) << 1);
-			gpu->__setFinalColorBck<MOSAIC,false>(color,x,*line);
+			gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,x,*line);
 			
 			++x; ++xoff;
 
@@ -1130,7 +1123,7 @@ template<bool MOSAIC> INLINE void renderline_textBG(GPU * gpu, u16 XBG, u16 YBG,
 //			BACKGROUND RENDERING -ROTOSCALE-
 /*****************************************************************************/
 
-template<bool MOSAIC> FORCEINLINE void rot_tiled_8bit_entry(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
+template<bool MOSAIC, int FUNCNUM> FORCEINLINE void rot_tiled_8bit_entry(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
 	u16 tileindex = *(u8*)MMU_gpu_map(map + ((auxX>>3) + (auxY>>3) * (lg>>3)));
 
 	u16 x = (auxX&7); 
@@ -1139,10 +1132,10 @@ template<bool MOSAIC> FORCEINLINE void rot_tiled_8bit_entry(GPU * gpu, s32 auxX,
 	u8 palette_entry = *(u8*)MMU_gpu_map(tile + ((tileindex<<6)+(y<<3)+x));
 	u16 color = T1ReadWord(pal, palette_entry << 1);
 	//Log_fprintf("%s %d %d\n", __FUNCTION__, color, palette_entry);
-	gpu->__setFinalColorBck<MOSAIC,false>(color,i,palette_entry);
+	gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color,i,palette_entry);
 }
 
-template<bool MOSAIC, bool extPal> FORCEINLINE void rot_tiled_16bit_entry(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
+template<bool MOSAIC, bool extPal, int FUNCNUM> FORCEINLINE void rot_tiled_16bit_entry(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
 	void* const map_addr = MMU_gpu_map(map + (((auxX>>3) + (auxY>>3) * (lg>>3))<<1));
 	
 	TILEENTRY tileentry;
@@ -1153,23 +1146,23 @@ template<bool MOSAIC, bool extPal> FORCEINLINE void rot_tiled_16bit_entry(GPU * 
 
 	const u8 palette_entry = *(u8*)MMU_gpu_map(tile + ((tileentry.bits.TileNum<<6)+(y<<3)+x));
 	const u16 color = T1ReadWord(pal, (palette_entry + (extPal ? (tileentry.bits.Palette<<8) : 0)) << 1);
-	gpu->__setFinalColorBck<MOSAIC,false>(color, i, palette_entry);
+	gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color, i, palette_entry);
 }
 
-template<bool MOSAIC> FORCEINLINE void rot_256_map(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
+template<bool MOSAIC, int FUNCNUM> FORCEINLINE void rot_256_map(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
 	u8* adr = (u8*)MMU_gpu_map((map) + ((auxX + auxY * lg)));
 
 	u8 palette_entry = *adr;
 	u16 color = T1ReadWord(pal, palette_entry << 1);
 	//Log_fprintf("%s %d %d\n", __FUNCTION__, color, palette_entry);
-	gpu->__setFinalColorBck<MOSAIC,false>(color, i, palette_entry);
+	gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color, i, palette_entry);
 }
 
-template<bool MOSAIC> FORCEINLINE void rot_BMP_map(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
+template<bool MOSAIC, int FUNCNUM> FORCEINLINE void rot_BMP_map(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i) {
 	void* adr = MMU_gpu_map((map) + ((auxX + auxY * lg) << 1));
 	u16 color = T1ReadWord(adr, 0);
 	//Log_fprintf("%s %d\n", __FUNCTION__, color);
-	gpu->__setFinalColorBck<MOSAIC,false>(color, i, color&0x8000);
+	gpu->__setFinalColorBck<MOSAIC,false,FUNCNUM>(color, i, color&0x8000);
 }
 
 typedef void (*rot_fun)(GPU * gpu, s32 auxX, s32 auxY, int lg, u32 map, u32 tile, u8 * pal, int i);
@@ -1240,15 +1233,15 @@ FORCEINLINE void apply_rot_fun(GPU * gpu, s32 X, s32 Y, s16 PA, s16 PB, s16 PC, 
 }
 
 
-template<bool MOSAIC> FORCEINLINE void rotBG2(GPU * gpu, s32 X, s32 Y, s16 PA, s16 PB, s16 PC, s16 PD, u16 LG)
+template<bool MOSAIC, int FUNCNUM> FORCEINLINE void rotBG2(GPU * gpu, s32 X, s32 Y, s16 PA, s16 PB, s16 PC, s16 PD, u16 LG)
 {
 	u8 num = gpu->currBgNum;
 	u8 * pal = MMU.ARM9_VMEM + gpu->core * 0x400;
 //	printf("rot mode\n");
-	apply_rot_fun<rot_tiled_8bit_entry<MOSAIC> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
+	apply_rot_fun<rot_tiled_8bit_entry<MOSAIC,FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
 }
 
-template<bool MOSAIC> FORCEINLINE void extRotBG2(GPU * gpu, s32 X, s32 Y, s16 PA, s16 PB, s16 PC, s16 PD, s16 LG)
+template<bool MOSAIC, int FUNCNUM> FORCEINLINE void extRotBG2(GPU * gpu, s32 X, s32 Y, s16 PA, s16 PB, s16 PC, s16 PD, s16 LG)
 {
 	u8 num = gpu->currBgNum;
 	struct _DISPCNT * dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
@@ -1265,22 +1258,22 @@ template<bool MOSAIC> FORCEINLINE void extRotBG2(GPU * gpu, s32 X, s32 Y, s16 PA
 		if (!pal) return;
 		// 16  bit bgmap entries
 		if(dispCnt->ExBGxPalette_Enable)
-			apply_rot_fun<rot_tiled_16bit_entry<MOSAIC, true> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
-		else apply_rot_fun<rot_tiled_16bit_entry<MOSAIC, false> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
+			apply_rot_fun<rot_tiled_16bit_entry<MOSAIC, true, FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
+		else apply_rot_fun<rot_tiled_16bit_entry<MOSAIC, false, FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_map_ram[num], gpu->BG_tile_ram[num], pal);
 		return;
 	case BGType_AffineExt_256x1:
-		// 256 colors 
+		// 256 colors
 		pal = MMU.ARM9_VMEM + gpu->core * 0x400;
-		apply_rot_fun<rot_256_map<MOSAIC> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_ram[num], 0, pal);
+		apply_rot_fun<rot_256_map<MOSAIC,FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_ram[num], 0, pal);
 		return;
 	case BGType_AffineExt_Direct:
 		// direct colors / BMP
-		apply_rot_fun<rot_BMP_map<MOSAIC> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_ram[num], 0, NULL);
+		apply_rot_fun<rot_BMP_map<MOSAIC,FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_ram[num], 0, NULL);
 		return;
 	case BGType_Large8bpp:
 		// large screen 256 colors
 		pal = MMU.ARM9_VMEM + gpu->core * 0x400;
-		apply_rot_fun<rot_256_map<MOSAIC> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_large_ram[num], 0, pal);
+		apply_rot_fun<rot_256_map<MOSAIC,FUNCNUM> >(gpu,X,Y,PA,PB,PC,PD,LG, gpu->BG_bmp_large_ram[num], 0, pal);
 		return;
 	default: break;
 	}
@@ -1296,7 +1289,7 @@ static void lineNull(GPU * gpu)
 }
 #endif
 
-template<bool MOSAIC> void lineText(GPU * gpu)
+template<bool MOSAIC, int FUNCNUM> void lineText(GPU * gpu)
 {
 //	if(gpu->debug)
 //	{
@@ -1307,12 +1300,12 @@ template<bool MOSAIC> void lineText(GPU * gpu)
 //	{
 		const u16 vofs = gpu->getVOFS(gpu->currBgNum);
 		const u16 hofs = gpu->getHOFS(gpu->currBgNum);
-		renderline_textBG<MOSAIC>(gpu, hofs, gpu->currLine + vofs, 256);
+		renderline_textBG<MOSAIC,FUNCNUM>(gpu, hofs, gpu->currLine + vofs, 256);
 //	}
 }
 
-template<bool MOSAIC> void lineRot(GPU * gpu)
-{	
+template<bool MOSAIC, int FUNCNUM> void lineRot(GPU * gpu)
+{
 	BGxPARMS * parms;
 	if (gpu->currBgNum==2) {
 		parms = &(gpu->dispx_st)->dispx_BG2PARMS;
@@ -1328,7 +1321,7 @@ template<bool MOSAIC> void lineRot(GPU * gpu)
 //	else
 //	{
 
-		 rotBG2<MOSAIC>(gpu, 
+		 rotBG2<MOSAIC,FUNCNUM>(gpu,
 			parms->BGxX,
 			parms->BGxY,
 			LE_TO_LOCAL_16(parms->BGxPA),
@@ -1342,7 +1335,7 @@ template<bool MOSAIC> void lineRot(GPU * gpu)
 //	}
 }
 
-template<bool MOSAIC> void lineExtRot(GPU * gpu)
+template<bool MOSAIC, int FUNCNUM> void lineExtRot(GPU * gpu)
 {
 	BGxPARMS * parms;
 	if (gpu->currBgNum==2) {
@@ -1358,7 +1351,7 @@ template<bool MOSAIC> void lineExtRot(GPU * gpu)
 //	}
 //	else
 //	{
-		extRotBG2<MOSAIC>(gpu,
+		extRotBG2<MOSAIC,FUNCNUM>(gpu,
 			parms->BGxX,
 			parms->BGxY,
 			LE_TO_LOCAL_16(parms->BGxPA),
@@ -2291,12 +2284,32 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 		{
 			gpu->currBgNum = 4;
 			gpu->blend1 = (gpu->BLDCNT & (1 << gpu->currBgNum))!=0;
-			
-			for (int i=0; i < item->nbPixelsX; i++)
+
+			// setFinalColorSpr_funcNum is loop-invariant across this bucket (set
+			// once per BLDCNT/DISPCNT write in SetupFinalPixelBlitter), but the
+			// switch inside setFinalColorSpr() would otherwise be an indirect
+			// jump-table dispatch on every sprite pixel. Hoist it: pick the
+			// blend-mode template once, run a straight-line loop.
+			// desmumewii-2d-compositor-plan.md Step 2.
+			const int nbPixelsX = item->nbPixelsX;
+			#define DESMUME_SPR_COMPOSITE(FUNC, WIN) \
+				for (int i=0; i < nbPixelsX; i++) { \
+					const u16 px = item->PixelsX[i]; \
+					_master_setFinalOBJColor<FUNC, WIN>(gpu, gpu->currDst, \
+						HostReadWord(spr, (px<<1)), sprAlpha[px], sprType[px], px); \
+				}
+			switch(gpu->setFinalColorSpr_funcNum)
 			{
-				i16=item->PixelsX[i];
-				setFinalColorSpr(gpu, gpu->currDst, HostReadWord(spr, (i16<<1)), sprAlpha[i16], sprType[i16], i16);
+				case 0x0: DESMUME_SPR_COMPOSITE(None,     false); break;
+				case 0x1: DESMUME_SPR_COMPOSITE(Blend,    false); break;
+				case 0x2: DESMUME_SPR_COMPOSITE(Increase, false); break;
+				case 0x3: DESMUME_SPR_COMPOSITE(Decrease, false); break;
+				case 0x4: DESMUME_SPR_COMPOSITE(None,     true);  break;
+				case 0x5: DESMUME_SPR_COMPOSITE(Blend,    true);  break;
+				case 0x6: DESMUME_SPR_COMPOSITE(Increase, true);  break;
+				case 0x7: DESMUME_SPR_COMPOSITE(Decrease, true);  break;
 			}
+			#undef DESMUME_SPR_COMPOSITE
 		}
 	}
 }
@@ -3166,19 +3179,41 @@ void GPU::refreshAffineStartRegs(const int num, const int xy)
 		parms->BGxY = affineInfo[num-2].y;
 }
 
-template<bool MOSAIC> void GPU::modeRender(int layer)
+template<bool MOSAIC, int FUNCNUM> static FORCEINLINE void modeRenderT(GPU * gpu, int layer)
 {
-	switch(GPU_mode2type[dispCnt().BG_Mode][layer])
+	switch(GPU_mode2type[gpu->dispCnt().BG_Mode][layer])
 	{
-		case BGType_Text: lineText<MOSAIC>(this); break;
-		case BGType_Affine: lineRot<MOSAIC>(this); break;
-		case BGType_AffineExt: lineExtRot<MOSAIC>(this); break;
-		case BGType_Large8bpp: lineExtRot<MOSAIC>(this); break;
-		case BGType_Invalid: 
+		case BGType_Text: lineText<MOSAIC,FUNCNUM>(gpu); break;
+		case BGType_Affine: lineRot<MOSAIC,FUNCNUM>(gpu); break;
+		case BGType_AffineExt: lineExtRot<MOSAIC,FUNCNUM>(gpu); break;
+		case BGType_Large8bpp: lineExtRot<MOSAIC,FUNCNUM>(gpu); break;
+		case BGType_Invalid:
 			PROGINFO("Attempting to render an invalid BG type\n");
 			break;
 		default:
 			break;
+	}
+}
+
+template<bool MOSAIC> void GPU::modeRender(int layer)
+{
+	// setFinalColorBck_funcNum (blend mode + window-in-use, set once per
+	// BLDCNT/DISPCNT write) is loop-invariant for the whole scanline. Resolve
+	// it once here and thread it into the BG renderers as a template constant,
+	// so the per-pixel switch in setFinalColorBG() collapses to one blend path
+	// instead of an indirect jump-table dispatch per pixel.
+	// desmumewii-2d-compositor-plan.md Step 2.
+	switch(setFinalColorBck_funcNum)
+	{
+		case 0x0: modeRenderT<MOSAIC,0x0>(this, layer); break;
+		case 0x1: modeRenderT<MOSAIC,0x1>(this, layer); break;
+		case 0x2: modeRenderT<MOSAIC,0x2>(this, layer); break;
+		case 0x3: modeRenderT<MOSAIC,0x3>(this, layer); break;
+		case 0x4: modeRenderT<MOSAIC,0x4>(this, layer); break;
+		case 0x5: modeRenderT<MOSAIC,0x5>(this, layer); break;
+		case 0x6: modeRenderT<MOSAIC,0x6>(this, layer); break;
+		case 0x7: modeRenderT<MOSAIC,0x7>(this, layer); break;
+		default:  modeRenderT<MOSAIC, -1>(this, layer); break; // out of range: legacy per-pixel dispatch
 	}
 }
 
