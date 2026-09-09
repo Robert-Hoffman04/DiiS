@@ -418,6 +418,38 @@ GX's native wrap mode instead of the CPU's per-pixel `(x+hofs)&mask` walk
 alpha-blend reuse the same TEV constant-color stages GXRender.cpp already
 sets up for the 3D path (GXRender.cpp:~366) — no new blend math.
 
+**Landed — 5.1a (`917eef7` GX2DBG bake · `ed65ccb` pipeline · `a281165`
+coverage probe + validation · `34109fd` 3D-fold).** Chosen approach: not GX
+indirect tile lookup (5.1b — Broadway indirect stages can't address a 10-bit
+TileNum exactly) but a per-BG **resolved-plane texture** — the tilemap
+resolved against tileset+palette in BG-native space (`GX_TF_RGB5A3`,
+4×4-swizzled, ≤512 KB/layer, 1.5 MB budget), baked by `GX2DBG_FrameUpdate`
+(core thread, l==0) only for the 8×8 cells whose 5.0 epochs changed, then
+drawn every frame as a `GX_REPEAT` quad with `(HOFS,VOFS)` in the UVs — GX
+does the wrap and the composite.
+- **Recorder** (`GPU_RenderLine_layer` top): a scanline whose whole 2D
+  composite is GX-expressible — MAIN, every enabled BG a baked `BGType_Text`
+  layer, no sprites/window/mosaic/BLDCNT-effect — is gathered in CPU painter
+  order into a `GX2DBGBand` and the CPU BG walk for that line is skipped.
+  BG0-as-3D lines are handled too when `GXMerge_LineMergeable` accepts the 3D
+  part (opaque, no front-translucent BG): a `KIND_3D` entry at BG0's slot
+  draws the resident 3D texture between the GX BG quads (the "3D-fold").
+- **Coalesce / replay**: `GXMerge_End2DBG` → `GX2DBGBand[64]` (overflow →
+  whole-frame CPU fallback); `GXMerge_Draw2DBGBands` on `draw_thread` draws
+  backdrop quad → BG/3D entries painter-order → the existing draw-4
+  MASTER_BRIGHT pass. Legacy `GXMerge` 3D sandwich path untouched.
+- **Measured** (`profile` vs `profile2dbg`): **pure-2D MAIN screen
+  (`sm64boot`) — compositor 4.30 → 2.72 ms (−37 %), frame 23.25 → 21.71 ms,
+  43.1 → 46.1 fps (+7 %)**, GX-present cost +0.05 ms. No regression on any
+  path. vsd unmoved (frame `GXMerge_FrameMergeable`-disarmed upstream — the
+  legacy sandwich doesn't run there either); sm64 gameplay unmoved (sprites
+  on every frame → **5.2**).
+- **Deferred**: affine BGs, windows (5.3), mosaic, non-mode-0 BLDCNT,
+  front-translucent BG over 3D, `frontAlphaOver` — all documented per-line
+  fallbacks. Incremental (dirty-only) cell re-bake landed; a
+  full-vs-incremental assert harness is still TODO. Visual A/B on
+  Dolphin/hardware still pending (FBDUMP can't see GX-composited output).
+
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
 GPU.cpp:1636–1639) that `_spriteRender` currently applies via a per-pixel
@@ -474,4 +506,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 done (`55d0436`, dark, perf-neutral).** Next: 5.1a (per-BG resolved-plane texture, incrementally baked from 5.0 epochs, GX owns scroll/composite/blend) + generalize the band list to N layers; 5.1b (GX indirect tile lookup) gated on a standalone prototype; then 5.2–5.4 |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 done** (`55d0436`, dark, perf-neutral). **5.1a done** (`917eef7`..`34109fd`): MAIN text BGs baked to GX planes, per-scanline recorder, GX2DBGBand replay incl. the 3D-fold. **Validated −37 % of the compositor zone / +7 % fps on pure-2D MAIN screens** (`sm64boot`). vsd/sm64-gameplay unmoved — vsd is `GXMerge_FrameMergeable`-disarmed, sm64 gameplay is sprite-gated → needs **5.2 (sprites)**. Then 5.3/5.4, and 5.1b (GX indirect lookup) if a prototype proves out |
