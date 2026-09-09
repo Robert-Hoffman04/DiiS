@@ -37,6 +37,7 @@ struct Layer {
 	u32      builtPalGen;
 	u32      builtFullGen;
 	bool     ready;        // baked and valid for this frame
+	bool     affine;       // BGType_Affine (else text)
 };
 
 static Layer s_layer[2][4];
@@ -107,10 +108,16 @@ static void bakeLayer(GPU *gpu, int e, int n)
 	const u16 W = L->w, H = L->h;
 	u16 *plane = L->plane;
 
+	const bool affine = L->affine;
 	u16 cell[64];
 	for (u32 cy = 0; cy < (u32)(H >> 3); cy++) {
 		for (u32 cx = 0; cx < (u32)(W >> 3); cx++) {
-			GPU_ResolveTextTile8x8(gpu, (u8)n, cx, cy, cell);
+			if (affine) {
+				if (!GPU_ResolveAffineTile8x8(gpu, (u8)n, cx, cy, cell))
+					memset(cell, 0, sizeof cell);
+			} else {
+				GPU_ResolveTextTile8x8(gpu, (u8)n, cx, cy, cell);
+			}
 			const u32 px0 = cx << 3, py0 = cy << 3;
 			for (u32 r = 0; r < 8; r++)
 				for (u32 c = 0; c < 8; c++)
@@ -184,7 +191,12 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 	const bool bg0is3d = (e == 0) && gpu->dispCnt().BG0_3D;   // SUB has no 3D
 
 	for (int n = 0; n < 4; n++) {
-		if (!gpu->LayersEnable[n] || gpu->BGTypes[n] != BGType_Text ||
+		const BGType bt = (BGType)gpu->BGTypes[n];
+		const bool isText   = bt == BGType_Text;
+		const bool isAffine = bt == BGType_Affine || bt == BGType_AffineExt_256x16 ||
+		                      bt == BGType_AffineExt_256x1 || bt == BGType_AffineExt_Direct ||
+		                      bt == BGType_Large8bpp;
+		if (!gpu->LayersEnable[n] || (!isText && !isAffine) ||
 		    (n == 0 && bg0is3d)) { freeLayer(e, n); continue; }
 
 		const u16 w = gpu->BGSize[n][0];
@@ -192,20 +204,31 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 		if (!ensureLayer(e, n, w, h))          // over budget -> CPU path
 			continue;
 
-		if (extPal && gpu->bgcnt(n).Palette_256 &&
+		if (isText && extPal && gpu->bgcnt(n).Palette_256 &&
 		    !MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[n]]) {
 			freeLayer(e, n);
 			continue;
 		}
 
 		Layer *L = &s_layer[e][n];
+		L->affine = isAffine;
+		const bool bitmap = bt == BGType_AffineExt_256x1 || bt == BGType_Large8bpp ||
+		                    bt == BGType_AffineExt_Direct;
 		// On a re-probe frame the per-page dirty flags may have been cleared by
 		// GX2DBG_EndFrame during the skip window, so force a full rebake.
-		const bool dirty = probe ||
-		                   (L->builtFullGen != g_gxDirty.fullGen) ||
-		                   (L->builtPalGen  != g_gxDirty.palGen)  ||
-		                   rangeDirty(gpu->BG_map_ram[n], 0x2000) ||
-		                   rangeDirty(gpu->BG_tile_ram[n], 0x10000);
+		bool dirty = probe ||
+		             (L->builtFullGen != g_gxDirty.fullGen) ||
+		             (L->builtPalGen  != g_gxDirty.palGen);
+		if (!dirty) {
+			if (bitmap) {
+				const u32 src = (bt == BGType_Large8bpp) ? gpu->BG_bmp_large_ram[n]
+				                                         : gpu->BG_bmp_ram[n];
+				dirty = rangeDirty(src, (u32)w * h * (bt == BGType_AffineExt_Direct ? 2 : 1));
+			} else {
+				dirty = rangeDirty(gpu->BG_map_ram[n], isAffine ? 0x4000 : 0x2000) ||
+				        rangeDirty(gpu->BG_tile_ram[n], 0x10000);
+			}
+		}
 		if (dirty)
 			bakeLayer(gpu, e, n);
 		L->ready = true;
@@ -254,10 +277,12 @@ static int   s_objN[2]       = { 0, 0 };
 static bool  s_objGXable[2]  = { false, false };
 static u32   s_objBuiltEp[2] = { 0, 0 };
 static u32   s_objBytes      = 0;
+static u8    s_objEva[2]     = { 16, 16 };   // BLDALPHA EVA for semi-transparent sprites
 // latched for the draw thread (Present copies s_obj -> here)
 static ObjS  s_objP[2][128];
 static int   s_objPN[2]      = { 0, 0 };
 static bool  s_objPGXable[2] = { false, false };
+static u8    s_objEvaP[2]    = { 16, 16 };
 
 static void swizzle16(const u16 *src, u16 *dst, int w, int h)
 {
@@ -309,6 +334,8 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 		return;
 	}
 
+	s_objEva[e] = gpu->BLDALPHA_EVA > 16 ? 16 : gpu->BLDALPHA_EVA;
+
 	const u32 ep = g_gxDirty.oamGen ^ (g_gxDirty.palGen << 1) ^ (g_gxDirty.fullGen << 2);
 	const bool rebakeAll = (ep != s_objBuiltEp[e]);
 
@@ -319,11 +346,9 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 		                                   &fx, &fy, &ox, &oy, &op, &os, &key, uv, &tw, &th);
 		if (r == 0) continue;
 		if (r < 0)  { s_objGXable[e] = false; return; }        // -> CPU sprite path
-		// Semi-transparent sprite (OBJ mode 1): blends per-pixel against whatever
-		// is beneath it.  The replay draws sprite quads opaque, so fall the whole
-		// engine's sprite path back to the CPU for this frame.  (§5.1a-blend
-		// follow-up: draw these in a constant-EVA blend sub-pass instead.)
-		if (os) { s_objGXable[e] = false; return; }
+		// Semi-transparent sprite (OBJ mode 1): drawn in a constant-EVA/16 blend
+		// against the EFB by the replay (approximates the per-pixel blend2[under]
+		// gate as "always blend" - fine for HUD sprites over 2nd-target content).
 		// NOTE: 5.2 draws sprites last (over all BG bands).  This is only correct
 		// when no opaque BG sits in front of a sprite; a per-priority interleave
 		// is 5.2-2.  Both bench scenes' sprites are HUD (front), so allow all.
@@ -374,10 +399,12 @@ void GX2DBG_ObjLatch(void)
 		memcpy(s_objP[e], s_obj[e], sizeof(s_objP[e]));
 		s_objPN[e]      = s_objN[e];
 		s_objPGXable[e] = s_objGXable[e];
+		s_objEvaP[e]    = s_objEva[e];
 	}
 }
 
 int  GX2DBG_ObjCount(int eng)   { return (unsigned)eng < 2 ? s_objPN[eng] : 0; }
+u8   GX2DBG_ObjEva(int eng)     { return (unsigned)eng < 2 ? s_objEvaP[eng] : 16; }
 
 GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *fx, u16 *fy,
                         u8 *prio, u8 *semi, const float **uv)

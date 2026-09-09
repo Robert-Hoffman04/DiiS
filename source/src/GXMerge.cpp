@@ -88,14 +88,9 @@ static bool s_presentBehindContent = false;
 // --- Step 5.1a: 2D-BG-on-GX per-scanline record -----------------------------
 // per engine: 0 = MAIN (may carry a KIND_3D entry), 1 = SUB (pure 2D)
 struct S2Rec {
-	u8   used [DS_H];
-	u8   nLay [DS_H];
-	u8   kind [DS_H][GX2DBG_MAX_LAYERS];
-	u8   lay  [DS_H][GX2DBG_MAX_LAYERS];
-	u16  hofs [DS_H][GX2DBG_MAX_LAYERS];
-	u16  vofs [DS_H][GX2DBG_MAX_LAYERS];
-	u8   fx   [DS_H][GX2DBG_MAX_LAYERS];
-	u8   fxa  [DS_H][GX2DBG_MAX_LAYERS];
+	u8          used [DS_H];
+	u8          nLay [DS_H];
+	GX2DBGEntry e    [DS_H][GX2DBG_MAX_LAYERS];
 	u16  bd   [DS_H];
 	u8   bmode[DS_H];
 	u8   bfac [DS_H];
@@ -341,9 +336,7 @@ void GXMerge_Begin2DBGSub(int subDispMode)
 
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brightFactor,
                             u8 alphaOver, u8 behindContent, int nLayers,
-                            const u8 *kind, const u8 *layer,
-                            const u16 *hofs, const u16 *vofs,
-                            const u8 *fx, const u8 *fxa)
+                            const GX2DBGEntry *entries)
 {
 	if ((unsigned)eng >= 2 || l < 0 || l >= DS_H) return;
 	if (nLayers > GX2DBG_MAX_LAYERS) nLayers = GX2DBG_MAX_LAYERS;
@@ -361,16 +354,31 @@ void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brig
 		S->bfac[l]  = 0;
 	}
 	for (int i = 0; i < nLayers; i++) {
-		S->kind[l][i] = kind[i];
-		S->lay[l][i]  = layer[i];
-		S->hofs[l][i] = hofs[i] & 0x1FF;
-		S->vofs[l][i] = vofs[i] & 0x1FF;
-		S->fx[l][i]   = fx  ? fx[i]  : 0;
-		S->fxa[l][i]  = fxa ? fxa[i] : 0;
+		S->e[l][i] = entries[i];
+		if (S->e[l][i].kind == GX2DBG_KIND_BG || S->e[l][i].kind == GX2DBG_KIND_3D) {
+			S->e[l][i].hofs &= 0x1FF;
+			S->e[l][i].vofs &= 0x1FF;
+		}
 	}
 }
 
-// Coalesce one engine's recorded 2D-BG scanlines into bands.
+// True if scanline a's recorded layer set is band-compatible with the run that
+// started at `start` (affX/affY excluded - they advance per line for affine).
+static bool s2_lineSame(const S2Rec *S, int a, int start)
+{
+	if (!S->used[a] || S->nLay[a] != S->nLay[start]) return false;
+	if (S->bd[a] != S->bd[start] || S->bmode[a] != S->bmode[start] ||
+	    S->bfac[a] != S->bfac[start] || S->ao[a] != S->ao[start] ||
+	    S->bc[a] != S->bc[start]) return false;
+	for (int i = 0; i < S->nLay[start]; i++)
+		if (memcmp(&S->e[a][i], &S->e[start][i], GX2DBG_ENTRY_KEYLEN)) return false;
+	return true;
+}
+
+// Coalesce one engine's recorded 2D-BG scanlines into bands.  An affine entry's
+// affX/affY legitimately advance line-to-line (recorder adds affPB/affPD), so
+// they are excluded from the run-equality test and the band takes them from its
+// first line.
 static void GXMerge_End2DBGEng(int eng)
 {
 	S2Rec *S = &s2[eng];
@@ -382,19 +390,8 @@ static void GXMerge_End2DBGEng(int eng)
 	while (y < DS_H) {
 		if (!S->used[y]) { y++; continue; }
 		const int start = y;
-		#define S2_SAME(a) ( \
-			S->used[a] && S->nLay[a] == S->nLay[start] && S->bd[a] == S->bd[start] && \
-			S->bmode[a] == S->bmode[start] && S->bfac[a] == S->bfac[start] && \
-			S->ao[a] == S->ao[start] && S->bc[a] == S->bc[start] && \
-			!memcmp(S->kind[a], S->kind[start], S->nLay[start]) && \
-			!memcmp(S->lay[a],  S->lay[start],  S->nLay[start]) && \
-			!memcmp(S->hofs[a], S->hofs[start], S->nLay[start] * sizeof(u16)) && \
-			!memcmp(S->vofs[a], S->vofs[start], S->nLay[start] * sizeof(u16)) && \
-			!memcmp(S->fx[a],   S->fx[start],   S->nLay[start]) && \
-			!memcmp(S->fxa[a],  S->fxa[start],  S->nLay[start]) )
 		y++;
-		while (y < DS_H && S2_SAME(y)) y++;
-		#undef S2_SAME
+		while (y < DS_H && s2_lineSame(S, y, start)) y++;
 		if (S->working.nBands >= GX2DBG_MAX_BANDS) { S->working.valid = false; return; }
 		GX2DBGBand *b = &S->working.bands[S->working.nBands++];
 		b->yStart = (u8)start;
@@ -405,14 +402,8 @@ static void GXMerge_End2DBGEng(int eng)
 		b->brightFactor = S->bfac[start];
 		b->alphaOver = S->ao[start];
 		b->behindContent = S->bc[start];
-		for (int i = 0; i < b->nLayers; i++) {
-			b->kind[i]  = S->kind[start][i];
-			b->layer[i] = S->lay[start][i];
-			b->hofs[i]  = S->hofs[start][i];
-			b->vofs[i]  = S->vofs[start][i];
-			b->fx[i]    = S->fx[start][i];
-			b->fxa[i]   = S->fxa[start][i];
-		}
+		for (int i = 0; i < b->nLayers; i++)
+			b->e[i] = S->e[start][i];
 	}
 }
 
@@ -598,7 +589,7 @@ void GXMerge_Present(void)
 		bool needSlot = false;
 		for (int bi = 0; bi < s2[e].working.nBands && !needSlot; bi++)
 			for (int li = 0; li < s2[e].working.bands[bi].nLayers; li++)
-				if (s2[e].working.bands[bi].kind[li] == GX2DBG_KIND_3D) { needSlot = true; break; }
+				if (s2[e].working.bands[bi].e[li].kind == GX2DBG_KIND_3D) { needSlot = true; break; }
 		s2[e].havePresent = s2[e].working.valid && s2[e].working.nBands > 0
 		                    && (!needSlot || slot >= 0);
 	}
@@ -717,10 +708,11 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 		const f32 tv1 = (f32)(b->yEnd + 1)  / (f32)DS_H;
 
 		for (int li = 0; li < b->nLayers; li++) {
-			if (b->kind[li] == GX2DBG_KIND_3D) {
+			const GX2DBGEntry *E = &b->e[li];
+			if (E->kind == GX2DBG_KIND_3D) {
 				if (s2_slot < 0) continue;
 				int sx0, cnt, tx0;
-				if (!GXMerge_HofsSegment(b->hofs[li], &sx0, &cnt, &tx0))
+				if (!GXMerge_HofsSegment(E->hofs, &sx0, &cnt, &tx0))
 					continue;
 				if (b->alphaOver) {
 					GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
@@ -742,13 +734,41 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 			}
 			// BG plane
 			u16 pw = 0, ph = 0;
-			GXTexObj *obj = GX2DBG_LayerTex(eng, b->layer[li], &pw, &ph);
+			GXTexObj *obj = GX2DBG_LayerTex(eng, E->layer, &pw, &ph);
 			if (!obj || !pw || !ph) continue;
 			GX_LoadTexObj(obj, GX_TEXMAP0);
 
+			// affine BG: one affine-mapped quad over the band.  Screen (i, sy) ->
+			// texel: (affX + i*affPA + (sy-yStart)*affPB, affY + i*affPC +
+			// (sy-yStart)*affPD) / 256, in a plane of pw x ph texels.
+			if (E->kind == GX2DBG_KIND_AFFINE) {
+				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+				GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+				// transparent-outside (affWrap 0): a GX_CLAMP border reads through;
+				// the bake leaves out-of-plane areas... actually the plane has no
+				// border, so rely on index-0 discard + CLAMP.  wrap: GX_REPEAT.
+				GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+				const int dh = (b->yEnd + 1) - b->yStart;
+				const f32 fx0 = (f32)E->affX, fy0 = (f32)E->affY;
+				const f32 pa = (f32)E->affPA, pb = (f32)E->affPB;
+				const f32 pc = (f32)E->affPC, pd = (f32)E->affPD;
+				#define AFF_U(I,S) ((fx0 + (I) * pa + (S) * pb) / 256.0f / pw)
+				#define AFF_V(I,S) ((fy0 + (I) * pc + (S) * pd) / 256.0f / ph)
+				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+					GX_Position2f32(x0,     qy0); GX_TexCoord2f32(AFF_U(0,0),      AFF_V(0,0));
+					GX_Position2f32(x0,     qy1); GX_TexCoord2f32(AFF_U(0,dh),     AFF_V(0,dh));
+					GX_Position2f32(x0 + w, qy1); GX_TexCoord2f32(AFF_U(DS_W,dh),  AFF_V(DS_W,dh));
+					GX_Position2f32(x0 + w, qy0); GX_TexCoord2f32(AFF_U(DS_W,0),   AFF_V(DS_W,0));
+				GX_End();
+				#undef AFF_U
+				#undef AFF_V
+				continue;
+			}
+
 			// §5.1a-blend: per-entry BLDCNT colour effect for a blend 1st-target BG.
-			const u8 fx  = b->fx[li];
-			const u8 fxa = b->fxa[li] > 16 ? 16 : b->fxa[li];
+			const u8 fx  = E->fx;
+			const u8 fxa = E->fxa > 16 ? 16 : E->fxa;
 			if (fx == 0) {
 				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
@@ -784,10 +804,10 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 				GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
 			}
 
-			const f32 u0  = b->hofs[li]               / (f32)pw;
-			const f32 u1  = (f32)(DS_W + b->hofs[li]) / (f32)pw;
-			const f32 bv0 = (f32)(b->yStart   + b->vofs[li]) / (f32)ph;
-			const f32 bv1 = (f32)(b->yEnd + 1 + b->vofs[li]) / (f32)ph;
+			const f32 u0  = E->hofs               / (f32)pw;
+			const f32 u1  = (f32)(DS_W + E->hofs) / (f32)pw;
+			const f32 bv0 = (f32)(b->yStart   + E->vofs) / (f32)ph;
+			const f32 bv1 = (f32)(b->yEnd + 1 + E->vofs) / (f32)ph;
 			quad(x0, qy0, x0 + w, qy1, u0, bv0, u1, bv1);
 
 			if (fx != 0) {   // restore the plain textured-quad TEV for the next entry
@@ -841,11 +861,34 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 		GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
 		GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+		const u8 objEva = GX2DBG_ObjEva(eng);
+		int curMode = 0;   // 0 = opaque, 1 = semi-transparent EVA blend
 		for (int pr = 3; pr >= 0; pr--) {
 			for (int i = nObj - 1; i >= 0; i--) {
 				s16 sx, sy; u16 fxw, fyh; u8 sp, ss; const f32 *uv = NULL;
 				GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &fxw, &fyh, &sp, &ss, &uv);
 				if (!ot || sp != pr || !uv) continue;
+				const int want = ss ? 1 : 0;
+				if (want != curMode) {
+					if (want == 1) {   // semi-transparent: out.a = TEXA * EVA/16
+						const u8 eva8 = (u8)(((objEva > 16 ? 16 : objEva) * 255 + 8) / 16);
+						GXColor k = { 0, 0, 0, eva8 };
+						GX_SetTevKColor(GX_KCOLOR0, k);
+						GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
+						GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+						GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_KONST, GX_CA_ZERO);
+						GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+						GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+						GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+						GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+					} else {
+						GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+						GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+						GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+						GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+					}
+					curMode = want;
+				}
 				GX_LoadTexObj(ot, GX_TEXMAP0);
 				const f32 gx0 = x0 + w * (sx          / (f32)DS_W);
 				const f32 gx1 = x0 + w * ((sx + fxw)  / (f32)DS_W);

@@ -1196,6 +1196,68 @@ void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
 	}
 }
 
+// §5.4 affine: resolve one 8x8 cell of a rotscale background to RGB5A3, in the
+// BG's native plane space.  Mirrors extRotBG2 / rotBG2 for the tiled and
+// bitmap affine BG types.  Returns false for a type this path doesn't bake.
+bool GPU_ResolveAffineTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
+{
+	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
+	const u32 W = (u32)gpu->BGSize[num][0];
+	const u32 px0 = tx << 3, py0 = ty << 3;
+	u8 *palStd = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
+
+	switch (gpu->BGTypes[num]) {
+	case BGType_Affine: {
+		const u32 mapEnt = gpu->BG_map_ram[num] + ty * (W >> 3) + tx;
+		const u8  tile   = *(u8 *)MMU_gpu_map(mapEnt);
+		const u32 tbase  = gpu->BG_tile_ram[num] + ((u32)tile << 6);
+		for (u32 r = 0; r < 8; r++) {
+			const u8 *line = (const u8 *)MMU_gpu_map(tbase + r * 8);
+			for (u32 c = 0; c < 8; c++) {
+				u8 i = line[c];
+				out[r * 8 + c] = i ? RGB15_REVERSE(T1ReadWord(palStd, i << 1)) : 0;
+			}
+		}
+		return true;
+	}
+	case BGType_AffineExt_256x16: {
+		const bool ext = dispCnt->ExBGxPalette_Enable;
+		u8 *pal = ext ? MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[num]] : palStd;
+		if (!pal) return false;
+		const u32 stride = W >> 3;
+		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
+			const u32 mx = (px0 + c) >> 3, my = (py0 + r) >> 3;
+			TILEENTRY te; te.val = T1ReadWord(MMU_gpu_map(gpu->BG_map_ram[num] + ((my * stride + mx) << 1)), 0);
+			const u32 fx = te.bits.HFlip ? 7 - c : c;
+			const u32 fy = te.bits.VFlip ? 7 - r : r;
+			u8 i = *(u8 *)MMU_gpu_map(gpu->BG_tile_ram[num] + (te.bits.TileNum << 6) + (fy << 3) + fx);
+			u16 col = T1ReadWord(pal, (i + (ext ? (te.bits.Palette << 8) : 0)) << 1);
+			out[r * 8 + c] = i ? RGB15_REVERSE(col) : 0;
+		}
+		return true;
+	}
+	case BGType_AffineExt_256x1:
+	case BGType_Large8bpp: {
+		const u32 base = (gpu->BGTypes[num] == BGType_Large8bpp)
+		                 ? gpu->BG_bmp_large_ram[num] : gpu->BG_bmp_ram[num];
+		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
+			u8 i = *(u8 *)MMU_gpu_map(base + (px0 + c) + (py0 + r) * W);
+			out[r * 8 + c] = i ? RGB15_REVERSE(T1ReadWord(palStd, i << 1)) : 0;
+		}
+		return true;
+	}
+	case BGType_AffineExt_Direct: {
+		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
+			u16 col = T1ReadWord(MMU_gpu_map(gpu->BG_bmp_ram[num] + (((px0 + c) + (py0 + r) * W) << 1)), 0);
+			out[r * 8 + c] = (col & 0x8000) ? RGB15_REVERSE(col) : 0;
+		}
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
 //------------------------------------------------------------------------------
 // GX sprite compositor (Step 5.2) - resolve one tiled, standard-palette OBJ
 // (non-affine OR affine) into a padded RGB5A3 texture (transparent GX2OBJ_MARGIN
@@ -2399,9 +2461,9 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 			bfac  = gpu->MasterBrightFactor > 16 ? 16 : gpu->MasterBrightFactor;
 		}
 
-		u8  gxkind[GX2DBG_MAX_LAYERS], gxlay[GX2DBG_MAX_LAYERS];
-		u16 gxhofs[GX2DBG_MAX_LAYERS], gxvofs[GX2DBG_MAX_LAYERS];
-		u8  gxfx[GX2DBG_MAX_LAYERS], gxfxa[GX2DBG_MAX_LAYERS];
+		GX2DBGEntry ent[GX2DBG_MAX_LAYERS];
+		BGxPARMS   *entAff[GX2DBG_MAX_LAYERS] = { 0 };   // affine param blk to advance
+		memset(ent, 0, sizeof ent);
 		int gxn = 0;
 		int threeDAt = -1;
 		bool anyFx = false;
@@ -2411,46 +2473,72 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 				const int bg = it->BGs[i];
 				if (!gpu->LayersEnable[bg]) continue;
 				if (gxn >= GX2DBG_MAX_LAYERS) { ok = false; break; }
+				GX2DBGEntry *E = &ent[gxn];
 				if (bg == 0 && has3d) {
-					gxkind[gxn] = GX2DBG_KIND_3D;
-					gxlay[gxn]  = 0;
-					gxhofs[gxn] = (u16)gpu->getHOFS(0);
-					gxvofs[gxn] = 0;
-					gxfx[gxn] = 0; gxfxa[gxn] = 0;
+					E->kind = GX2DBG_KIND_3D;
+					E->layer = 0;
+					E->hofs = (u16)gpu->getHOFS(0);
 					threeDAt = gxn;
 					gxn++;
 					continue;
 				}
-				if (gpu->BGTypes[bg] != BGType_Text ||
-				    gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
+				if (gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
 				    !GX2DBG_LayerReady(gxeng, bg)) { ok = false; break; }
-				gxkind[gxn] = GX2DBG_KIND_BG;
-				gxlay[gxn]  = (u8)bg;
-				gxhofs[gxn] = (u16)gpu->getHOFS(bg);
-				gxvofs[gxn] = (u16)gpu->getVOFS(bg);
-				gxfx[gxn] = 0; gxfxa[gxn] = 0;
+
+				const bool is1st = s5_bm != 0 && (s5_t1st & (1 << bg));
+
+				const u8 bgt = gpu->BGTypes[bg];
+				const bool bgAffine = bgt == BGType_Affine || bgt == BGType_AffineExt_256x16 ||
+				                      bgt == BGType_AffineExt_256x1 || bgt == BGType_AffineExt_Direct ||
+				                      bgt == BGType_Large8bpp;
+				if (bgAffine) {
+					// affine/rotscale BG as a GX affine-mapped quad.  Blended
+					// affine BG -> CPU for now.
+					if (is1st) { ok = false; break; }
+					BGxPARMS *p = (bg == 2) ? &gpu->dispx_st->dispx_BG2PARMS
+					                        : &gpu->dispx_st->dispx_BG3PARMS;
+					E->kind  = GX2DBG_KIND_AFFINE;
+					E->layer = (u8)bg;
+					E->affX  = p->BGxX;
+					E->affY  = p->BGxY;
+					E->affPA = (s16)LE_TO_LOCAL_16(p->BGxPA);
+					E->affPB = (s16)LE_TO_LOCAL_16(p->BGxPB);
+					E->affPC = (s16)LE_TO_LOCAL_16(p->BGxPC);
+					E->affPD = (s16)LE_TO_LOCAL_16(p->BGxPD);
+					E->affWrap = gpu->dispx_st->dispx_BGxCNT[bg].bits.PaletteSet_Wrap;
+					entAff[gxn] = p;
+					gxn++;
+					continue;
+				}
+				if (gpu->BGTypes[bg] != BGType_Text) { ok = false; break; }
+
+				E->kind  = GX2DBG_KIND_BG;
+				E->layer = (u8)bg;
+				E->hofs  = (u16)gpu->getHOFS(bg);
+				E->vofs  = (u16)gpu->getVOFS(bg);
 
 				// per-entry BLDCNT colour effect (§5.1a-blend): only when this BG
 				// is a live 1st target.
-				if (s5_bm != 0 && (s5_t1st & (1 << bg))) {
+				if (is1st) {
 					if (s5_bm >= 2) {                       // Increase / Decrease
-						gxfx[gxn]  = s5_bm;                 // 2 / 3
-						gxfxa[gxn] = gpu->BLDY_EVY > 16 ? 16 : gpu->BLDY_EVY;
+						E->fx  = s5_bm;                     // 2 / 3
+						E->fxa = gpu->BLDY_EVY > 16 ? 16 : gpu->BLDY_EVY;
 					} else {                               // Blend (alpha)
 						// Only whole-quad-correct if everything this layer sits on
 						// (backdrop + every lower BG entry) is uniformly 2nd-target
 						// eligible, and nothing 3D is below it.
 						bool uniform = (s5_t2nd & 0x20) != 0;
 						for (int j = 0; j < gxn && uniform; j++) {
-							if (gxkind[j] == GX2DBG_KIND_3D) { uniform = false; break; }
-							if (!(s5_t2nd & (1 << gxlay[j]))) uniform = false;
+							if (ent[j].kind == GX2DBG_KIND_3D) { uniform = false; break; }
+							if (ent[j].kind == GX2DBG_KIND_BG && !(s5_t2nd & (1 << ent[j].layer)))
+								uniform = false;
 						}
 						if (!uniform) { ok = false; break; }
-						gxfx[gxn]  = 1;
-						gxfxa[gxn] = gpu->BLDALPHA_EVA > 16 ? 16 : gpu->BLDALPHA_EVA;
+						E->fx  = 1;
+						E->fxa = gpu->BLDALPHA_EVA > 16 ? 16 : gpu->BLDALPHA_EVA;
 					}
-					if (gxfxa[gxn]) anyFx = true;
-					else            gxfx[gxn] = 0;         // zero factor -> no effect
+					if (E->fxa) anyFx = true;
+					else        E->fx = 0;                 // zero factor -> no effect
 				}
 				gxn++;
 			}
@@ -2461,8 +2549,14 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 		if (ok) {
 			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
 			GXMerge_Record2DBGLine(gxeng, l, (u16)(s5_backdrop | 0x8000), bmode, bfac,
-			                       ao ? 1 : 0, behindContent,
-			                       gxn, gxkind, gxlay, gxhofs, gxvofs, gxfx, gxfxa);
+			                       ao ? 1 : 0, behindContent, gxn, ent);
+			// advance each affine BG's param block by one scanline, exactly as
+			// lineRot would have if the CPU path had run this line.
+			for (int j = 0; j < gxn; j++)
+				if (entAff[j]) {
+					entAff[j]->BGxX += (s16)LE_TO_LOCAL_16(entAff[j]->BGxPB);
+					entAff[j]->BGxY += (s16)LE_TO_LOCAL_16(entAff[j]->BGxPD);
+				}
 #ifdef DESMUME_BENCH
 			g_gx2dbgBail[gxeng & 1][0]++;
 #endif

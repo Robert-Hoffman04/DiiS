@@ -89,19 +89,29 @@ typedef struct {
 //   backdrop / brightness.
 #define GX2DBG_MAX_BANDS   64
 #define GX2DBG_MAX_LAYERS  5            // 4 BG + the 3D layer
-enum { GX2DBG_KIND_BG = 0, GX2DBG_KIND_3D = 1 };
+enum { GX2DBG_KIND_BG = 0, GX2DBG_KIND_3D = 1, GX2DBG_KIND_AFFINE = 2 };
+
+// One painter's-order layer in a band.  Fields up to (not including) affX/affY
+// are the band-coalesce equality key; affX/affY vary per scanline for an affine
+// layer (the recorder advances them by affPB/affPD) and are taken from the
+// band's first line.
+typedef struct {
+	u8  kind;                       // GX2DBG_KIND_BG / _3D / _AFFINE
+	u8  layer;                      // BG index 0..3 (KIND_BG / _AFFINE)
+	u16 hofs, vofs;                 // KIND_BG scroll / KIND_3D BG0 hofs
+	// Per-entry BLDCNT colour effect for a blend 1st-target BG: 0 none,
+	// 1 alpha (fxa = EVA 0..16), 2 brighten, 3 darken (fxa = EVY 0..16).
+	u8  fx, fxa;
+	u8  affWrap;                    // KIND_AFFINE: 1 wrap, 0 transparent outside
+	u8  _pad;
+	s16 affPA, affPB, affPC, affPD; // KIND_AFFINE: 2x2 matrix, 8.8 fixed
+	s32 affX, affY;                 // KIND_AFFINE: ref pos at band yStart, 20.8
+} GX2DBGEntry;
+
 typedef struct {
 	u8  yStart, yEnd;
 	u8  nLayers;
-	u8  kind [GX2DBG_MAX_LAYERS];   // GX2DBG_KIND_BG / _3D
-	u8  layer[GX2DBG_MAX_LAYERS];   // BG index 0..3 (KIND_BG); unused for _3D
-	u16 hofs [GX2DBG_MAX_LAYERS];   // BG scroll (KIND_BG) or BG0 hofs (KIND_3D)
-	u16 vofs [GX2DBG_MAX_LAYERS];
-	// Per-entry BLDCNT colour effect for a KIND_BG entry that is a blend 1st
-	// target: 0 none, 1 alpha (fxa = EVA 0..16), 2 brighten, 3 darken
-	// (fxa = EVY 0..16).  §5.1a-blend.
-	u8  fx   [GX2DBG_MAX_LAYERS];
-	u8  fxa  [GX2DBG_MAX_LAYERS];
+	GX2DBGEntry e[GX2DBG_MAX_LAYERS];
 	u16 backdrop;                   // RGB555 | 0x8000
 	u8  brightMode, brightFactor;
 	u8  alphaOver;                  // KIND_3D: real per-pixel alpha blend vs opaque-key
@@ -114,17 +124,19 @@ typedef struct {
 	bool       valid;
 } GX2DBGFrame;
 
+// Bytes of GX2DBGEntry that participate in band-coalesce equality (everything
+// before affX/affY).
+#include <stddef.h>
+#define GX2DBG_ENTRY_KEYLEN  offsetof(GX2DBGEntry, affX)
+
 // Recorder: called from GPU_RenderLine_layer for each scanline whose entire 2D
-// composite is GX-expressible (see above).  eng: 0 MAIN, 1 SUB.
-// kind/layer/hofs/vofs are nLayers long, painter's order (entry 0 = bottom).  A
-// KIND_3D entry (MAIN only) draws the resident 3D texture band (alphaOver /
-// behindContent as GXMerge_LineMergeable decided); its hofs is BG0's X-scroll.
-// The line's CPU BG/sprite/3D walk is then skipped.
+// composite is GX-expressible (see above).  eng: 0 MAIN, 1 SUB.  entries[] is
+// nLayers long, painter's order (entry 0 = bottom).  A KIND_3D entry (MAIN
+// only) draws the resident 3D texture band.  The line's CPU walk is then
+// skipped.
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode,
                             u8 brightFactor, u8 alphaOver, u8 behindContent,
-                            int nLayers, const u8 *kind, const u8 *layer,
-                            const u16 *hofs, const u16 *vofs,
-                            const u8 *fx, const u8 *fxa);
+                            int nLayers, const GX2DBGEntry *entries);
 
 // Is engine eng's 2D-BG record armed this frame? (recorder gate)
 bool GXMerge_2DBGLineArmed(int eng);

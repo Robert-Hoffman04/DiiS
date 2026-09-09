@@ -832,6 +832,7 @@ void GPU_setBGProp(GPU *, u16 num, u16 p);
 // GX 2D-BG compositor (Step 5.1a): resolve one 8x8 tile cell of a MAIN text BG
 // plane to 64 GX RGB5A3 texels (0x0000 == transparent). See GPU.cpp.
 void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64]);
+bool GPU_ResolveAffineTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64]);
 
 // GX sprite compositor (Step 5.2): resolve a tiled OBJ (affine or not) into a
 // padded RGB5A3 texture + its on-screen field rect + 4 quad-corner UVs

@@ -82,6 +82,7 @@ bool GX2DBG_ObjGXable(int eng);
 // Core thread, GXMerge_Present: latch the sprite list for the draw thread.
 void GX2DBG_ObjLatch(void);
 int  GX2DBG_ObjCount(int eng);
+u8   GX2DBG_ObjEva(int eng);   // BLDALPHA EVA (0..16) for semi-transparent sprites
 // Draw thread: latched sprite i (OAM order) - texture, field rect (x,y,fx,fy),
 // priority, semi-transparent flag, and the 4 quad-corner UVs (TL,BL,BR,TR).
 GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *fx, u16 *fy,
