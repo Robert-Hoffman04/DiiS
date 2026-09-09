@@ -97,6 +97,11 @@ typedef struct {
 	u8  layer[GX2DBG_MAX_LAYERS];   // BG index 0..3 (KIND_BG); unused for _3D
 	u16 hofs [GX2DBG_MAX_LAYERS];   // BG scroll (KIND_BG) or BG0 hofs (KIND_3D)
 	u16 vofs [GX2DBG_MAX_LAYERS];
+	// Per-entry BLDCNT colour effect for a KIND_BG entry that is a blend 1st
+	// target: 0 none, 1 alpha (fxa = EVA 0..16), 2 brighten, 3 darken
+	// (fxa = EVY 0..16).  §5.1a-blend.
+	u8  fx   [GX2DBG_MAX_LAYERS];
+	u8  fxa  [GX2DBG_MAX_LAYERS];
 	u16 backdrop;                   // RGB555 | 0x8000
 	u8  brightMode, brightFactor;
 	u8  alphaOver;                  // KIND_3D: real per-pixel alpha blend vs opaque-key
@@ -118,7 +123,8 @@ typedef struct {
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode,
                             u8 brightFactor, u8 alphaOver, u8 behindContent,
                             int nLayers, const u8 *kind, const u8 *layer,
-                            const u16 *hofs, const u16 *vofs);
+                            const u16 *hofs, const u16 *vofs,
+                            const u8 *fx, const u8 *fxa);
 
 // Is engine eng's 2D-BG record armed this frame? (recorder gate)
 bool GXMerge_2DBGLineArmed(int eng);

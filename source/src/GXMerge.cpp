@@ -94,6 +94,8 @@ struct S2Rec {
 	u8   lay  [DS_H][GX2DBG_MAX_LAYERS];
 	u16  hofs [DS_H][GX2DBG_MAX_LAYERS];
 	u16  vofs [DS_H][GX2DBG_MAX_LAYERS];
+	u8   fx   [DS_H][GX2DBG_MAX_LAYERS];
+	u8   fxa  [DS_H][GX2DBG_MAX_LAYERS];
 	u16  bd   [DS_H];
 	u8   bmode[DS_H];
 	u8   bfac [DS_H];
@@ -340,7 +342,8 @@ void GXMerge_Begin2DBGSub(int subDispMode)
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brightFactor,
                             u8 alphaOver, u8 behindContent, int nLayers,
                             const u8 *kind, const u8 *layer,
-                            const u16 *hofs, const u16 *vofs)
+                            const u16 *hofs, const u16 *vofs,
+                            const u8 *fx, const u8 *fxa)
 {
 	if ((unsigned)eng >= 2 || l < 0 || l >= DS_H) return;
 	if (nLayers > GX2DBG_MAX_LAYERS) nLayers = GX2DBG_MAX_LAYERS;
@@ -362,6 +365,8 @@ void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brig
 		S->lay[l][i]  = layer[i];
 		S->hofs[l][i] = hofs[i] & 0x1FF;
 		S->vofs[l][i] = vofs[i] & 0x1FF;
+		S->fx[l][i]   = fx  ? fx[i]  : 0;
+		S->fxa[l][i]  = fxa ? fxa[i] : 0;
 	}
 }
 
@@ -384,7 +389,9 @@ static void GXMerge_End2DBGEng(int eng)
 			!memcmp(S->kind[a], S->kind[start], S->nLay[start]) && \
 			!memcmp(S->lay[a],  S->lay[start],  S->nLay[start]) && \
 			!memcmp(S->hofs[a], S->hofs[start], S->nLay[start] * sizeof(u16)) && \
-			!memcmp(S->vofs[a], S->vofs[start], S->nLay[start] * sizeof(u16)) )
+			!memcmp(S->vofs[a], S->vofs[start], S->nLay[start] * sizeof(u16)) && \
+			!memcmp(S->fx[a],   S->fx[start],   S->nLay[start]) && \
+			!memcmp(S->fxa[a],  S->fxa[start],  S->nLay[start]) )
 		y++;
 		while (y < DS_H && S2_SAME(y)) y++;
 		#undef S2_SAME
@@ -403,6 +410,8 @@ static void GXMerge_End2DBGEng(int eng)
 			b->layer[i] = S->lay[start][i];
 			b->hofs[i]  = S->hofs[start][i];
 			b->vofs[i]  = S->vofs[start][i];
+			b->fx[i]    = S->fx[start][i];
+			b->fxa[i]   = S->fxa[start][i];
 		}
 	}
 }
@@ -735,14 +744,56 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 			u16 pw = 0, ph = 0;
 			GXTexObj *obj = GX2DBG_LayerTex(eng, b->layer[li], &pw, &ph);
 			if (!obj || !pw || !ph) continue;
-			GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
-			GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);   // discard index-0
 			GX_LoadTexObj(obj, GX_TEXMAP0);
+
+			// §5.1a-blend: per-entry BLDCNT colour effect for a blend 1st-target BG.
+			const u8 fx  = b->fx[li];
+			const u8 fxa = b->fxa[li] > 16 ? 16 : b->fxa[li];
+			if (fx == 0) {
+				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+				GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+				GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);   // discard index-0
+			} else if (fx == 1) {
+				// alpha blend against the EFB with a constant fraction EVA/16
+				// (EVB forced to 16-EVA, same as the sandwich front-blend path).
+				const u8 eva8 = (u8)((fxa * 255 + 8) / 16);
+				GXColor k = { 0, 0, 0, eva8 };
+				GX_SetTevKColor(GX_KCOLOR0, k);
+				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+				GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
+				GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+				GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_KONST, GX_CA_ZERO);
+				GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+				GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+				GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+				GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+			} else {
+				// brighten (2) / darken (3): out.rgb = lerp(TEXC, white|black, EVY/16)
+				const u8 k8 = (u8)((fxa * 255 + 8) / 16);
+				GXColor kc = { k8, k8, k8, 255 };
+				GX_SetTevKColor(GX_KCOLOR0, kc);
+				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+				GX_SetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
+				GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_TEXC,
+				                 (fx == 2) ? GX_CC_ONE : GX_CC_ZERO, GX_CC_KONST, GX_CC_ZERO);
+				GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
+				GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+				GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+				GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+				GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+			}
+
 			const f32 u0  = b->hofs[li]               / (f32)pw;
 			const f32 u1  = (f32)(DS_W + b->hofs[li]) / (f32)pw;
 			const f32 bv0 = (f32)(b->yStart   + b->vofs[li]) / (f32)ph;
 			const f32 bv1 = (f32)(b->yEnd + 1 + b->vofs[li]) / (f32)ph;
 			quad(x0, qy0, x0 + w, qy1, u0, bv0, u1, bv1);
+
+			if (fx != 0) {   // restore the plain textured-quad TEV for the next entry
+				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+			}
 		}
 
 		// MASTER_BRIGHT: one full-width fade-to-white/black quad over the band

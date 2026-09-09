@@ -2353,21 +2353,17 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// (a window in the DISPCNT config) still falls back.
 	const u8  s5_bm   = (gpu->BLDCNT >> 6) & 3;
 	const u16 s5_t1st = gpu->BLDCNT & 0x3F;              // BG0..3, OBJ(4), BD(5)
-	bool s5_blendOK = (s5_bm == 0);
-	if (!s5_blendOK) {
-		s5_blendOK = true;
-		for (int bg = 0; bg < 4; bg++)
-			if (gpu->LayersEnable[bg] && (s5_t1st & (1 << bg))) s5_blendOK = false;
-		if ((s5_t1st & 0x10) && gpu->LayersEnable[4]) s5_blendOK = false;   // OBJ 1st tgt
-		if (s5_bm == 1 && (s5_t1st & 0x20)) { /* Blend on backdrop: no-op */ }
-	}
+	const u16 s5_t2nd = (gpu->BLDCNT >> 8) & 0x3F;       // 2nd-target mask
+	// OBJ as a blend 1st target while sprites are on: the sprite quad pass draws
+	// opaque, so a per-pixel blend against what's beneath is unreachable -> CPU.
+	const bool s5_objBlend = s5_bm != 0 && (s5_t1st & 0x10) && gpu->LayersEnable[4];
 #ifdef DESMUME_BENCH
 	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails.
 	extern u32 g_gx2dbgBail[2][8];
 	if (!GXMerge_2DBGLineArmed(gxeng))                                  g_gx2dbgBail[gxeng & 1][1]++;
 	else if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) g_gx2dbgBail[gxeng & 1][3]++;
 	else if (gpu->setFinalColorBck_funcNum >= 4)                       g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
-	else if (!s5_blendOK)                                              g_gx2dbgBail[gxeng & 1][5]++;  // BG/OBJ blend 1st-target
+	else if (s5_objBlend)                                              g_gx2dbgBail[gxeng & 1][5]++;  // OBJ blend target
 	else if (gpu->LayersEnable[4] && !GX2DBG_ObjGXable(gxeng))          g_gx2dbgBail[gxeng & 1][2]++;
 	/* else: entered the gate - reason 0/6/7 tallied inside */
 #endif
@@ -2376,7 +2372,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
 	    && gpu->setFinalColorBck_funcNum < 4
-	    && s5_blendOK)
+	    && !s5_objBlend)
 	{
 		// Fold a backdrop brighten/darken (Increase/Decrease with BD as 1st
 		// target) into the recorded backdrop colour - GX draws the backdrop as a
@@ -2405,8 +2401,10 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 		u8  gxkind[GX2DBG_MAX_LAYERS], gxlay[GX2DBG_MAX_LAYERS];
 		u16 gxhofs[GX2DBG_MAX_LAYERS], gxvofs[GX2DBG_MAX_LAYERS];
+		u8  gxfx[GX2DBG_MAX_LAYERS], gxfxa[GX2DBG_MAX_LAYERS];
 		int gxn = 0;
 		int threeDAt = -1;
+		bool anyFx = false;
 		for (int prio = NB_PRIORITIES - 1; prio >= 0 && ok; prio--) {
 			itemsForPriority_t *it = &gpu->itemsForPriority[prio];
 			for (int i = 0; i < it->nbBGs; i++) {
@@ -2418,6 +2416,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 					gxlay[gxn]  = 0;
 					gxhofs[gxn] = (u16)gpu->getHOFS(0);
 					gxvofs[gxn] = 0;
+					gxfx[gxn] = 0; gxfxa[gxn] = 0;
 					threeDAt = gxn;
 					gxn++;
 					continue;
@@ -2429,16 +2428,41 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 				gxlay[gxn]  = (u8)bg;
 				gxhofs[gxn] = (u16)gpu->getHOFS(bg);
 				gxvofs[gxn] = (u16)gpu->getVOFS(bg);
+				gxfx[gxn] = 0; gxfxa[gxn] = 0;
+
+				// per-entry BLDCNT colour effect (§5.1a-blend): only when this BG
+				// is a live 1st target.
+				if (s5_bm != 0 && (s5_t1st & (1 << bg))) {
+					if (s5_bm >= 2) {                       // Increase / Decrease
+						gxfx[gxn]  = s5_bm;                 // 2 / 3
+						gxfxa[gxn] = gpu->BLDY_EVY > 16 ? 16 : gpu->BLDY_EVY;
+					} else {                               // Blend (alpha)
+						// Only whole-quad-correct if everything this layer sits on
+						// (backdrop + every lower BG entry) is uniformly 2nd-target
+						// eligible, and nothing 3D is below it.
+						bool uniform = (s5_t2nd & 0x20) != 0;
+						for (int j = 0; j < gxn && uniform; j++) {
+							if (gxkind[j] == GX2DBG_KIND_3D) { uniform = false; break; }
+							if (!(s5_t2nd & (1 << gxlay[j]))) uniform = false;
+						}
+						if (!uniform) { ok = false; break; }
+						gxfx[gxn]  = 1;
+						gxfxa[gxn] = gpu->BLDALPHA_EVA > 16 ? 16 : gpu->BLDALPHA_EVA;
+					}
+					if (gxfxa[gxn]) anyFx = true;
+					else            gxfx[gxn] = 0;         // zero factor -> no effect
+				}
 				gxn++;
 			}
 		}
 		if (has3d && threeDAt < 0) ok = false;   // 3D expected but BG0 not in the walk
+		if (has3d && anyFx)        ok = false;   // blended BG + 3D sandwich: too tangled -> CPU
 
 		if (ok) {
 			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
 			GXMerge_Record2DBGLine(gxeng, l, (u16)(s5_backdrop | 0x8000), bmode, bfac,
 			                       ao ? 1 : 0, behindContent,
-			                       gxn, gxkind, gxlay, gxhofs, gxvofs);
+			                       gxn, gxkind, gxlay, gxhofs, gxvofs, gxfx, gxfxa);
 #ifdef DESMUME_BENCH
 			g_gx2dbgBail[gxeng & 1][0]++;
 #endif
