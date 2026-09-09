@@ -2122,11 +2122,19 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	memset(gpu->bgPixels,5,256);
 
 	// init background color & priorities
-	memset(sprAlpha, 0, 256);
-	memset(sprType, 0, 256);
-	memset(sprPrio, 0xFF, 256);
-	memset(sprWin, 0, 256);
-	
+	// sprAlpha/sprType/sprPrio are only ever read behind the LayersEnable[4]
+	// gate below (sprite bucketing + composite); sprWin only when the OBJ
+	// window is active. Skip ~1 KB of memsets per scanline when neither is on.
+	// (desmumewii-2d-compositor-plan.md Step 3.1)
+	if (gpu->LayersEnable[4])
+	{
+		memset(sprAlpha, 0, 256);
+		memset(sprType, 0, 256);
+		memset(sprPrio, 0xFF, 256);
+	}
+	if (gpu->LayersEnable[4] || gpu->WINOBJ_ENABLED)
+		memset(sprWin, 0, 256);
+
 	// init pixels priorities
 	assert(NB_PRIORITIES==4);
 	gpu->itemsForPriority[0].nbPixelsX = 0;

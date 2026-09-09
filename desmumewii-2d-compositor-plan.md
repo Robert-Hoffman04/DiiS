@@ -234,6 +234,45 @@ now-unclear buffers when sprites are off (should be none, given the
 write path identified and the shadow copy kept in sync on every write width
 (byte/half/word) OAM currently accepts.
 
+### Result (measured) — landed on `arm9-jit-infra`
+
+**3.1 — clear sprite buffers only when they'll be read.** `GPU_RenderLine_layer`
+now gates the `sprAlpha`/`sprType`/`sprPrio` memsets behind `LayersEnable[4]`
+and the `sprWin` memset behind `LayersEnable[4] || WINOBJ_ENABLED`. Verified
+the read sides: `sprAlpha`/`sprType` only in the sprite composite + `mosaicSpriteLine`
+(both behind the gate), `sprPrio` only in the priority-bucketing loop (behind
+the gate), `sprWin` only at `GPU.cpp:634` behind `WINOBJ_ENABLED`. When a
+scene runs with sprites off this drops ~768 B/line (147 KB/frame) of memset.
+
+**3.2 — deferred.** The per-scanline OAM bit-rotate in `_spriteRender` is real
+waste but small (4 `u16` rotates × nbShow × 192 lines, ~0.1 ms range) and the
+clean fix — a native-endian OAM shadow updated on write — has no safe single
+choke point on the Wii: the ARM9 JIT stores to guest memory (OAM included)
+directly, bypassing the `_MMU_write*` handlers a shadow hook would live in.
+Not worth an MMU/JIT audit for a sub-1 % gain. Revisit only if Step 4 says
+the sprite path specifically is still hot.
+
+**3.3 — confirmed collapsed.** Backdrop windowed cases 4–7 already call
+`___setFinalColorBck<false,true,4>` … `<…,7>` with a compile-time constant, so
+Step 2's `FUNCNUM` dispatch is dead-code-eliminated per case. No action.
+
+**Benchmarks** (FullJIT — `profile` = jitfull + perf_zones, both scenes; Dolphin
+2606a, i5-1145G7). Step 2 baseline = `20260909T011152Z`, Step 3 = `20260909T015711Z`.
+
+| scene | 2D compositor Step 2 | Step 3 | Δ | frame total | eff. fps |
+|---|--:|--:|--:|--:|--:|
+| vsd  | 12.080 ms (54.3%) | **11.809 ms (53.7%)** | **−0.27 ms / −2.2%** | 22.25 → 21.98 ms | 44.95 → 45.50 |
+| sm64 | 16.026 ms (63.6%) | **15.828 ms (63.3%)** | **−0.20 ms / −1.2%** | 25.22 → 25.01 ms | 39.67 → 39.99 |
+
+Standard bench, no regression on any renderer (Step 2 → Step 3):
+vsd sw 15.6→15.6 / GX 26.5→26.7 / merge 26.4→26.6 / jitfull —→46.6;
+sm64 sw 13.4→13.4 / GX 30.8→31.0 / merge 30.3→30.5 / jitfull —→41.8 fps.
+
+Small as expected — vsd/sm64 aren't sprite-off scenes, so 3.1's memset skip
+only partly applies. The saving lands entirely in the compositor zone.
+Correctness: 3.1 is a pure "don't clear a buffer nobody reads" change, gates
+audited against every read site; no framebuffer A/B needed.
+
 ---
 
 ## Step 4 — Re-benchmark and re-scope before touching GX
@@ -358,6 +397,6 @@ be a multi-milestone project, not a single patch.
 |---|---|---|---|---|
 | 1. ~~Scope `-fno-strict-aliasing` off `GPU.cpp`~~ | 1 file, Makefile | **Done — 0%, reverted** | Low | — |
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
-| 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | Days | Low | — |
+| 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | Hours | — | Steps 1–3 |
 | 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | Step 4's findings; 5.0 gates 5.1–5.4 |
