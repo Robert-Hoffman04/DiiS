@@ -152,6 +152,17 @@ void GX2DBG_Reset(void)
 	s_enabled = false;
 }
 
+// Set by the recorder (GPU_RenderLine_layer) whenever a scanline passes every
+// frame-invariant gate (armed, no window, no live blend/brighten, sprites GX-able)
+// - i.e. the only thing that could still stop it recording is an unbaked layer.
+// GX2DBG_FrameUpdate consults last frame's value to decide whether baking the BG
+// planes is worth it: in real 3D gameplay (pervasive live blend) it never trips,
+// so the per-frame dirty-cell bake - pure overhead there - is skipped entirely.
+static bool s_wouldRec[2]     = { false, false };
+static u32  s_probeCtr[2]     = { 0, 0 };
+static bool s_bakeGo[2]       = { false, false };   // FrameUpdate's decision, for ObjFrameUpdate
+void GX2DBG_NoteWouldRecord(int eng) { if ((unsigned)eng < 2) s_wouldRec[eng] = true; }
+
 // Called at each engine's line 0 (core thread).  eng = gpu->core.
 void GX2DBG_FrameUpdate(GPU *gpu)
 {
@@ -159,6 +170,15 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 	const int e = (gpu->core == 0) ? 0 : 1;
 	for (int n = 0; n < 4; n++) s_layer[e][n].ready = false;
 	if (!s_enabled) return;
+
+	// Skip the bake unless the recorder wanted a layer last frame (or a periodic
+	// re-probe frame - the recorder's would-record test doesn't depend on baked
+	// state, so a stale "no" self-corrects within one frame once conditions change).
+	const bool probe = (s_probeCtr[e]++ & 127u) == 0;
+	const bool go = s_wouldRec[e] || probe;
+	s_wouldRec[e] = false;
+	s_bakeGo[e] = go;
+	if (!go) return;
 
 	const bool extPal = gpu->dispCnt().ExBGxPalette_Enable;
 	const bool bg0is3d = (e == 0) && gpu->dispCnt().BG0_3D;   // SUB has no 3D
@@ -179,7 +199,10 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 		}
 
 		Layer *L = &s_layer[e][n];
-		const bool dirty = (L->builtFullGen != g_gxDirty.fullGen) ||
+		// On a re-probe frame the per-page dirty flags may have been cleared by
+		// GX2DBG_EndFrame during the skip window, so force a full rebake.
+		const bool dirty = probe ||
+		                   (L->builtFullGen != g_gxDirty.fullGen) ||
 		                   (L->builtPalGen  != g_gxDirty.palGen)  ||
 		                   rangeDirty(gpu->BG_map_ram[n], 0x2000) ||
 		                   rangeDirty(gpu->BG_tile_ram[n], 0x10000);
@@ -261,12 +284,23 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 	if (!s_enabled) return;
 	if (!gpu->LayersEnable[4]) return;   // no OBJ layer -> trivially GX-able
 
+	// Same bake-worth-it gate as GX2DBG_FrameUpdate: if the recorder took nothing
+	// last frame, skip the 128-entry OAM scan + sprite bake (pure overhead in a
+	// scene the recorder can't use).  s_objGXable stays false so the recorder
+	// bails, exactly as it would once it reached the OBJ check.
+	if (!s_bakeGo[e]) { s_objGXable[e] = false; return; }
+
 	// Cheap frame-level early-out: if the recorder can't fire this frame anyway
 	// (any BLDCNT colour effect, or a window active), don't spend time baking
 	// sprites nobody will draw.  Mirrors the recorder's frame-invariant gates.
 	if (((gpu->BLDCNT >> 6) & 3) != 0 ||
 	    gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) {
 		s_objGXable[e] = false;
+#ifdef DESMUME_BENCH
+		{ extern u32 g_gx2objDis[2][4];
+		  g_gx2objDis[e][((gpu->BLDCNT>>6)&3)?0:1]++;
+		  if (gpu->WINOBJ_ENABLED) g_gx2objDis[e][2]++; }
+#endif
 		return;
 	}
 
@@ -296,10 +330,18 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 				if (S->tex) { free(S->tex); s_objBytes -= S->bytes; }
 				if (s_totalBytes + s_objBytes + need > GX2DBG_BUDGET) {
 					S->tex = NULL; S->bytes = 0;
-					s_objGXable[e] = false; return;
+					s_objGXable[e] = false;
+#ifdef DESMUME_BENCH
+					{ extern u32 g_gx2objDis[2][4]; g_gx2objDis[e][3]++; }
+#endif
+					return;
 				}
 				S->tex = (u16 *)memalign(32, need);
-				if (!S->tex) { S->bytes = 0; s_objGXable[e] = false; return; }
+				if (!S->tex) { S->bytes = 0; s_objGXable[e] = false;
+#ifdef DESMUME_BENCH
+					{ extern u32 g_gx2objDis[2][4]; g_gx2objDis[e][3]++; }
+#endif
+					return; }
 				S->bytes = need; s_objBytes += need;
 			}
 			swizzle16(tmp, S->tex, tw, th);

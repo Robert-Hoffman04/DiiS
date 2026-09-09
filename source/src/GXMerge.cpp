@@ -507,7 +507,10 @@ static void gx2dbg_covlog(void)
 	if (!init) {
 		init = true;
 		FILE *f = fopen("sd:/gx2dbg.log", "w");
-		if (f) { fprintf(f, "frame,avg_cov_main,avg_cov_sub,avg_bands,frames_active,frames_fallback,frames_armed,fail0,fail1_dispmode,fail2_capture,fail3_5\n"); fclose(f); }
+		if (f) { fprintf(f, "frame,avg_cov_main,avg_cov_sub,avg_bands,frames_active,frames_fallback,frames_armed,fail0,fail1_dispmode,fail2_capture,fail3_5,"
+		                    "m_ok,m_notarm,m_obj,m_win,m_func,m_bld,m_3d,m_lay,s_ok,s_notarm,s_obj,s_win,s_func,s_bld,s_3d,s_lay,"
+		                    "mo_objwin,mo_bmp,mo_mos,mo_ext256,mo_size,mo_cap,so_objwin,so_bmp,so_mos,so_ext256,so_size,so_cap,"
+		                    "mdis_bld,mdis_win,mdis_winobj,mdis_bud,sdis_bld,sdis_win,sdis_winobj,sdis_bud\n"); fclose(f); }
 	}
 	fr++;
 	int cov = 0, covSub = 0;
@@ -526,7 +529,8 @@ static void gx2dbg_covlog(void)
 	if (fr % 60 == 0) {
 		FILE *f = fopen("sd:/gx2dbg.log", "a");
 		if (f) {
-			fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", fr,
+			extern u32 g_gx2dbgBail[2][8];
+			fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu", fr,
 			        (unsigned long long)(accCov / 60), (unsigned long long)(accCovSub / 60),
 			        (unsigned long long)(accBands / 60),
 			        (unsigned long long)framesActive, (unsigned long long)framesFallback,
@@ -534,6 +538,20 @@ static void gx2dbg_covlog(void)
 			        (unsigned long long)failHist[0], (unsigned long long)failHist[1],
 			        (unsigned long long)failHist[2],
 			        (unsigned long long)(failHist[3] + failHist[4] + failHist[5]));
+			for (int e = 0; e < 2; e++)
+				for (int r = 0; r < 8; r++)
+					fprintf(f, ",%lu", (unsigned long)g_gx2dbgBail[e][r]);
+			{
+				extern u32 g_gx2objRej[2][6];
+				extern u32 g_gx2objDis[2][4];
+				for (int e = 0; e < 2; e++)
+					for (int r = 0; r < 6; r++)
+						fprintf(f, ",%lu", (unsigned long)g_gx2objRej[e][r]);
+				for (int e = 0; e < 2; e++)
+					for (int r = 0; r < 4; r++)
+						fprintf(f, ",%lu", (unsigned long)g_gx2objDis[e][r]);
+			}
+			fprintf(f, "\n");
 			fclose(f);
 		}
 		accCov = accCovSub = accBands = 0;

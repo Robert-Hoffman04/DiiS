@@ -59,6 +59,11 @@ bool GX2DBG_Enabled(void);
 // dirty.
 void GX2DBG_FrameUpdate(struct GPU *gpu);
 
+// Recorder hint (GPU_RenderLine_layer): a scanline passed every frame-invariant
+// gate and would record if the BG planes were baked.  Gates the bake in
+// GX2DBG_FrameUpdate so it costs nothing in scenes the recorder can never take.
+void GX2DBG_NoteWouldRecord(int eng);
+
 // Core thread, once per frame after both engines' FrameUpdate: clears the 5.0
 // per-page dirty flags (clear-on-consume epoch).
 void GX2DBG_EndFrame(void);

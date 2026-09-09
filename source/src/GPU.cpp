@@ -1225,18 +1225,47 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 	}
 
 	if (oe.RotScale == 2)     return 0;    // disabled
-	if (oe.Mode == 2 || oe.Mode == 3) return -1;   // OBJ window / bitmap
-	if (oe.Mosaic)            return -1;
-	if (oe.Depth && dispCnt->ExOBJPalette_Enable) return -1;   // ext-pal 256
+#ifdef DESMUME_BENCH
+	extern u32 g_gx2objRej[2][6];  // [eng][0 objwin 1 bitmap 2 mosaic 3 extpal256 4 size 5 cap]
+	u32 *rj = g_gx2objRej[gpu->core ? 1 : 0];
+#endif
+	if (oe.Mode == 2 || oe.Mode == 3) {
+#ifdef DESMUME_BENCH
+		rj[oe.Mode == 2 ? 0 : 1]++;
+#endif
+		return -1;   // OBJ window / bitmap
+	}
+	if (oe.Mosaic) {
+#ifdef DESMUME_BENCH
+		rj[2]++;
+#endif
+		return -1;
+	}
+	if (oe.Depth && dispCnt->ExOBJPalette_Enable) {
+#ifdef DESMUME_BENCH
+		rj[3]++;
+#endif
+		return -1;   // ext-pal 256
+	}
 
 	const bool affine = (oe.RotScale & 1) != 0;
 	const size sz = sprSizeTab[oe.Size][oe.Shape];
 	const int W = sz.x, H = sz.y;
-	if (W <= 0 || H <= 0) return -1;
+	if (W <= 0 || H <= 0) {
+#ifdef DESMUME_BENCH
+		rj[4]++;
+#endif
+		return -1;
+	}
 
 	const int PW = W + 2 * GX2OBJ_MARGIN;
 	const int PH = H + 2 * GX2OBJ_MARGIN;
-	if (PW * PH > outCap) return -1;
+	if (PW * PH > outCap) {
+#ifdef DESMUME_BENCH
+		rj[5]++;
+#endif
+		return -1;
+	}
 
 	// field (on-screen footprint): sprite size, doubled in double-size mode
 	int FX = W, FY = H;
@@ -2304,12 +2333,27 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// texture is drawn as a KIND_3D entry at BG0's priority slot.
 	{
 	const int gxeng = (gpu->core == GPU_MAIN) ? 0 : 1;
+#ifdef DESMUME_BENCH
+	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails, so
+	// the coverage log can say what to build next (window vs blend vs layer).
+	extern u32 g_gx2dbgBail[2][8];
+	if (!GXMerge_2DBGLineArmed(gxeng))                                  g_gx2dbgBail[gxeng & 1][1]++;
+	else if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) g_gx2dbgBail[gxeng & 1][3]++;
+	else if (gpu->setFinalColorBck_funcNum >= 4)                       g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
+	else if (gpu->setFinalColorBck_funcNum != 0)                       g_gx2dbgBail[gxeng & 1][5]++;  // blend-only, no window
+	else if (gpu->LayersEnable[4] && !GX2DBG_ObjGXable(gxeng))          g_gx2dbgBail[gxeng & 1][2]++;
+	/* else: entered the gate - reason 0/6/7 tallied inside */
+#endif
 	if (GXMerge_2DBGLineArmed(gxeng)
 	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
 	    && gpu->setFinalColorBck_funcNum == 0
 	    && ((gpu->BLDCNT >> 6) & 3) == 0)
 	{
+		// This line cleared every frame-invariant gate; tell GX2DBG the BG-plane
+		// bake is worth doing (even if this particular line still bails below on
+		// an unbaked layer or a 3D-shape check).
+		GX2DBG_NoteWouldRecord(gxeng);
 		const bool has3d = (gxeng == 0) && dispCnt->BG0_3D && gpu->LayersEnable[0];
 		bool ao = false, fao = false; u8 feva = 0, bmode = 0, bfac = 0;
 		bool ok = true;
@@ -2359,8 +2403,14 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 			GXMerge_Record2DBGLine(gxeng, l, (u16)(backdrop_color | 0x8000), bmode, bfac,
 			                       ao ? 1 : 0, behindContent,
 			                       gxn, gxkind, gxlay, gxhofs, gxvofs);
+#ifdef DESMUME_BENCH
+			g_gx2dbgBail[gxeng & 1][0]++;
+#endif
 			return;
 		}
+#ifdef DESMUME_BENCH
+		g_gx2dbgBail[gxeng & 1][(has3d && (threeDAt < 0 || !ok)) ? 6 : 7]++;
+#endif
 	}
 	}
 
@@ -3009,6 +3059,15 @@ void GPU::update_winh(int WIN_NUM)
 // 7 unused (was masterbright - now handled per-band via GXMerge draw 4, see
 //   GXMergeBand::brightMode)
 int g_gxmergeFailReason = 0;
+
+#ifdef DESMUME_BENCH
+// Step 5 diagnostic: [engine][reason] scanline tally for the 2D-BG recorder.
+// reason: 0 recorded, 1 not-armed, 2 obj, 3 window, 4 funcNum, 5 blendmode,
+//         6 3D-line-not-mergeable, 7 layer-not-bakeable.
+u32 g_gx2dbgBail[2][8] = {{0}};
+u32 g_gx2objRej[2][6] = {{0}};
+u32 g_gx2objDis[2][4] = {{0}};   // ObjFrameUpdate disable cause: [0]bld [1]win [2]winobj [3]budget
+#endif
 
 static bool GXMerge_FrameMergeable(GPU * gpu)
 {
