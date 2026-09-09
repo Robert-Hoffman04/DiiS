@@ -86,21 +86,25 @@ static bool s_frameBehindContent = false;  // behind bucket has real 2D, not jus
 static bool s_presentBehindContent = false;
 
 // --- Step 5.1a: 2D-BG-on-GX per-scanline record -----------------------------
-static u8   s2_used[DS_H];
-static u8   s2_nLay[DS_H];
-static u8   s2_kind[DS_H][GX2DBG_MAX_LAYERS];
-static u8   s2_lay [DS_H][GX2DBG_MAX_LAYERS];
-static u16  s2_hofs[DS_H][GX2DBG_MAX_LAYERS];
-static u16  s2_vofs[DS_H][GX2DBG_MAX_LAYERS];
-static u16  s2_bd  [DS_H];
-static u8   s2_bmode[DS_H];
-static u8   s2_bfac [DS_H];
-static u8   s2_ao  [DS_H];
-static u8   s2_bc  [DS_H];
-static GX2DBGFrame s2_working;
-static GX2DBGFrame s2_present;
-static bool        s2_havePresent = false;
-static int         s2_slot        = -1;   // resident 3D texture slot for KIND_3D entries
+// per engine: 0 = MAIN (may carry a KIND_3D entry), 1 = SUB (pure 2D)
+struct S2Rec {
+	u8   used [DS_H];
+	u8   nLay [DS_H];
+	u8   kind [DS_H][GX2DBG_MAX_LAYERS];
+	u8   lay  [DS_H][GX2DBG_MAX_LAYERS];
+	u16  hofs [DS_H][GX2DBG_MAX_LAYERS];
+	u16  vofs [DS_H][GX2DBG_MAX_LAYERS];
+	u16  bd   [DS_H];
+	u8   bmode[DS_H];
+	u8   bfac [DS_H];
+	u8   ao   [DS_H];
+	u8   bc   [DS_H];
+	bool armed;                 // this engine's 2D-BG path armed this frame
+	GX2DBGFrame working, present;
+	bool        havePresent;
+};
+static S2Rec s2[2];
+static int   s2_slot = -1;      // MAIN resident 3D texture slot for KIND_3D entries
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -268,9 +272,12 @@ void GXMerge_BeginFrame(bool mainIsTop)
 	memset(s_lineBrightMode, 0, sizeof(s_lineBrightMode));
 	memset(s_lineBrightFactor, 0, sizeof(s_lineBrightFactor));
 	memset(&s_working, 0, sizeof(s_working));
-	memset(s2_used, 0, sizeof(s2_used));
-	memset(&s2_working, 0, sizeof(s2_working));
+	// Step 5.1a: reset both engines' 2D-BG record.  MAIN is armed here (rides on
+	// the same s_frameArmed as the 3D sandwich); SUB is armed separately from
+	// its own line 0 (GXMerge_Begin2DBGSub) since it has no 3D dependency.
+	for (int e = 0; e < 2; e++) { memset(s2[e].used, 0, sizeof s2[e].used); s2[e].armed = false; }
 	s_frameArmed = s_active && s_haveAnyCopy;
+	s2[0].armed  = s_active && s_flag2DBG && s_haveAnyCopy;
 	s_frameMainIsTop = mainIsTop;
 	s_gxRanThisFrame = false;
 	s_convertedValid = false;   // re-de-swizzle on demand for this frame
@@ -313,80 +320,103 @@ void GXMerge_RecordLine(int l, bool behindContent, u16 hofs, bool alphaOver,
 
 bool GXMerge_LineWasMerged(int l)
 {
-	return l >= 0 && l < DS_H && (s_line3d[l] != 0 || s2_used[l] != 0);
+	return l >= 0 && l < DS_H &&
+	       (s_line3d[l] != 0 || s2[0].used[l] != 0);   // SUB is the other screen
 }
 
-void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
+bool GXMerge_2DBGLineArmed(int eng)
+{
+	return (unsigned)eng < 2 && s2[eng].armed;
+}
+
+// SUB engine (no 3D): arm the 2D-BG record for this frame if it is showing its
+// 2D compositor output.  Called from the SUB engine's line 0.
+void GXMerge_Begin2DBGSub(int subDispMode)
+{
+	memset(s2[1].used, 0, sizeof s2[1].used);
+	s2[1].armed = s_active && s_flag2DBG && (subDispMode == 1);
+}
+
+void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brightFactor,
                             u8 alphaOver, u8 behindContent, int nLayers,
                             const u8 *kind, const u8 *layer,
                             const u16 *hofs, const u16 *vofs)
 {
-	if (l < 0 || l >= DS_H) return;
+	if ((unsigned)eng >= 2 || l < 0 || l >= DS_H) return;
 	if (nLayers > GX2DBG_MAX_LAYERS) nLayers = GX2DBG_MAX_LAYERS;
-	s2_used[l]  = 1;
-	s2_nLay[l]  = (u8)nLayers;
-	s2_bd[l]    = backdrop;
-	s2_ao[l]    = alphaOver ? 1 : 0;
-	s2_bc[l]    = behindContent ? 1 : 0;
+	S2Rec *S = &s2[eng];
+	S->used[l]  = 1;
+	S->nLay[l]  = (u8)nLayers;
+	S->bd[l]    = backdrop;
+	S->ao[l]    = alphaOver ? 1 : 0;
+	S->bc[l]    = behindContent ? 1 : 0;
 	if ((brightMode == 1 || brightMode == 2) && brightFactor) {
-		s2_bmode[l] = brightMode;
-		s2_bfac[l]  = brightFactor > 16 ? 16 : brightFactor;
+		S->bmode[l] = brightMode;
+		S->bfac[l]  = brightFactor > 16 ? 16 : brightFactor;
 	} else {
-		s2_bmode[l] = 0;
-		s2_bfac[l]  = 0;
+		S->bmode[l] = 0;
+		S->bfac[l]  = 0;
 	}
 	for (int i = 0; i < nLayers; i++) {
-		s2_kind[l][i] = kind[i];
-		s2_lay[l][i]  = layer[i];
-		s2_hofs[l][i] = hofs[i] & 0x1FF;
-		s2_vofs[l][i] = vofs[i] & 0x1FF;
+		S->kind[l][i] = kind[i];
+		S->lay[l][i]  = layer[i];
+		S->hofs[l][i] = hofs[i] & 0x1FF;
+		S->vofs[l][i] = vofs[i] & 0x1FF;
 	}
 }
 
-// Coalesce recorded 2D-BG scanlines into bands (called from GXMerge_EndFrame).
-static void GXMerge_End2DBG(void)
+// Coalesce one engine's recorded 2D-BG scanlines into bands.
+static void GXMerge_End2DBGEng(int eng)
 {
-	s2_working.nBands = 0;
-	s2_working.valid  = s_frameArmed;
-	if (!s_frameArmed) return;
+	S2Rec *S = &s2[eng];
+	S->working.nBands = 0;
+	S->working.valid  = S->armed;
+	if (!S->armed) return;
 
 	int y = 0;
 	while (y < DS_H) {
-		if (!s2_used[y]) { y++; continue; }
+		if (!S->used[y]) { y++; continue; }
 		const int start = y;
 		#define S2_SAME(a) ( \
-			s2_used[a] && s2_nLay[a] == s2_nLay[start] && s2_bd[a] == s2_bd[start] && \
-			s2_bmode[a] == s2_bmode[start] && s2_bfac[a] == s2_bfac[start] && \
-			s2_ao[a] == s2_ao[start] && s2_bc[a] == s2_bc[start] && \
-			!memcmp(s2_kind[a], s2_kind[start], s2_nLay[start]) && \
-			!memcmp(s2_lay[a],  s2_lay[start],  s2_nLay[start]) && \
-			!memcmp(s2_hofs[a], s2_hofs[start], s2_nLay[start] * sizeof(u16)) && \
-			!memcmp(s2_vofs[a], s2_vofs[start], s2_nLay[start] * sizeof(u16)) )
+			S->used[a] && S->nLay[a] == S->nLay[start] && S->bd[a] == S->bd[start] && \
+			S->bmode[a] == S->bmode[start] && S->bfac[a] == S->bfac[start] && \
+			S->ao[a] == S->ao[start] && S->bc[a] == S->bc[start] && \
+			!memcmp(S->kind[a], S->kind[start], S->nLay[start]) && \
+			!memcmp(S->lay[a],  S->lay[start],  S->nLay[start]) && \
+			!memcmp(S->hofs[a], S->hofs[start], S->nLay[start] * sizeof(u16)) && \
+			!memcmp(S->vofs[a], S->vofs[start], S->nLay[start] * sizeof(u16)) )
 		y++;
 		while (y < DS_H && S2_SAME(y)) y++;
 		#undef S2_SAME
-		if (s2_working.nBands >= GX2DBG_MAX_BANDS) { s2_working.valid = false; return; }
-		GX2DBGBand *b = &s2_working.bands[s2_working.nBands++];
+		if (S->working.nBands >= GX2DBG_MAX_BANDS) { S->working.valid = false; return; }
+		GX2DBGBand *b = &S->working.bands[S->working.nBands++];
 		b->yStart = (u8)start;
 		b->yEnd   = (u8)(y - 1);
-		b->nLayers = s2_nLay[start];
-		b->backdrop = s2_bd[start];
-		b->brightMode = s2_bmode[start];
-		b->brightFactor = s2_bfac[start];
-		b->alphaOver = s2_ao[start];
-		b->behindContent = s2_bc[start];
+		b->nLayers = S->nLay[start];
+		b->backdrop = S->bd[start];
+		b->brightMode = S->bmode[start];
+		b->brightFactor = S->bfac[start];
+		b->alphaOver = S->ao[start];
+		b->behindContent = S->bc[start];
 		for (int i = 0; i < b->nLayers; i++) {
-			b->kind[i]  = s2_kind[start][i];
-			b->layer[i] = s2_lay[start][i];
-			b->hofs[i]  = s2_hofs[start][i];
-			b->vofs[i]  = s2_vofs[start][i];
+			b->kind[i]  = S->kind[start][i];
+			b->layer[i] = S->lay[start][i];
+			b->hofs[i]  = S->hofs[start][i];
+			b->vofs[i]  = S->vofs[start][i];
 		}
 	}
+}
+
+static void GXMerge_End2DBG(void)
+{
+	GXMerge_End2DBGEng(0);
+	GXMerge_End2DBGEng(1);
 }
 
 void GXMerge_Disarm(void)
 {
 	s_frameArmed = false;
+	s2[0].armed  = false;   // MAIN 2D-BG can carry a KIND_3D entry -> needs the sandwich
 }
 
 bool GXMerge_FrameArmed(void)
@@ -477,23 +507,28 @@ static void gx2dbg_covlog(void)
 	if (!init) {
 		init = true;
 		FILE *f = fopen("sd:/gx2dbg.log", "w");
-		if (f) { fprintf(f, "frame,avg_cov_lines,avg_bands,frames_active,frames_fallback,frames_armed,fail0,fail1_dispmode,fail2_capture,fail3_5\n"); fclose(f); }
+		if (f) { fprintf(f, "frame,avg_cov_main,avg_cov_sub,avg_bands,frames_active,frames_fallback,frames_armed,fail0,fail1_dispmode,fail2_capture,fail3_5\n"); fclose(f); }
 	}
 	fr++;
-	int cov = 0;
-	for (int i = 0; i < s2_working.nBands; i++)
-		cov += s2_working.bands[i].yEnd - s2_working.bands[i].yStart + 1;
+	int cov = 0, covSub = 0;
+	for (int i = 0; i < s2[0].working.nBands; i++)
+		cov += s2[0].working.bands[i].yEnd - s2[0].working.bands[i].yStart + 1;
+	for (int i = 0; i < s2[1].working.nBands; i++)
+		covSub += s2[1].working.bands[i].yEnd - s2[1].working.bands[i].yStart + 1;
+	static u64 accCovSub = 0;
+	accCovSub += covSub;
 	accCov += cov;
-	accBands += s2_working.nBands;
-	if (cov > 0) framesActive++;
-	if (!s2_working.valid) framesFallback++;
+	accBands += s2[0].working.nBands + s2[1].working.nBands;
+	if (cov > 0 || covSub > 0) framesActive++;
+	if (!s2[0].working.valid || !s2[1].working.valid) framesFallback++;
 	if (s_frameArmed) framesArmed++;
 	{ int r = g_gxmergeFailReason; if (r >= 0 && r < 8) failHist[r]++; }
 	if (fr % 60 == 0) {
 		FILE *f = fopen("sd:/gx2dbg.log", "a");
 		if (f) {
-			fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", fr,
-			        (unsigned long long)(accCov / 60), (unsigned long long)(accBands / 60),
+			fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", fr,
+			        (unsigned long long)(accCov / 60), (unsigned long long)(accCovSub / 60),
+			        (unsigned long long)(accBands / 60),
 			        (unsigned long long)framesActive, (unsigned long long)framesFallback,
 			        (unsigned long long)framesArmed,
 			        (unsigned long long)failHist[0], (unsigned long long)failHist[1],
@@ -501,7 +536,7 @@ static void gx2dbg_covlog(void)
 			        (unsigned long long)(failHist[3] + failHist[4] + failHist[5]));
 			fclose(f);
 		}
-		accCov = accBands = 0;
+		accCov = accCovSub = accBands = 0;
 	}
 }
 #endif
@@ -527,12 +562,20 @@ void GXMerge_Present(void)
 #endif
 
 	// Step 5.1a: the 2D-BG bands are self-contained (their own baked plane
-	// textures, no dependency on the 3D slot) - present them whenever the frame
-	// was armed, even if the 3D sandwich itself fell back this frame.
-	s2_present = s2_working;
-	s2_slot    = slot;   // resident 3D texture slot for this frame's KIND_3D entries
-	s2_havePresent = s_frameArmed && s2_working.valid && s2_working.nBands > 0
-	                 && slot >= 0;
+	// textures) - present each engine whenever it was armed, independent of the
+	// 3D sandwich.  MAIN bands may carry a KIND_3D entry -> need a valid slot;
+	// SUB never does.
+	s2_slot = slot;
+	for (int e = 0; e < 2; e++) {
+		s2[e].present = s2[e].working;
+		bool needSlot = false;
+		for (int bi = 0; bi < s2[e].working.nBands && !needSlot; bi++)
+			for (int li = 0; li < s2[e].working.bands[bi].nLayers; li++)
+				if (s2[e].working.bands[bi].kind[li] == GX2DBG_KIND_3D) { needSlot = true; break; }
+		s2[e].havePresent = s2[e].working.valid && s2[e].working.nBands > 0
+		                    && (!needSlot || slot >= 0);
+	}
+	GX2DBG_EndFrame();   // clear-on-consume for the 5.0 dirty flags
 
 	if (!s_working.valid || slot < 0) {
 		s_havePresent = false;
@@ -550,7 +593,7 @@ void GXMerge_Present(void)
 
 bool GXMerge_HasPresentFrame(void)
 {
-	return s_havePresent || s2_havePresent;
+	return s_havePresent || s2[0].havePresent || s2[1].havePresent;
 }
 
 //------------------------------------------------------------------------------
@@ -598,12 +641,14 @@ static void quad(f32 x0, f32 y0, f32 x1, f32 y1,
 	GX_End();
 }
 
-// Step 5.1a: draw the recorded 2D-BG bands (backdrop + text BG layers +
-// MASTER_BRIGHT).  Painter's order, self-contained; runs on lines with no 3D.
-static void GXMerge_Draw2DBGBands(f32 x0, f32 y0, f32 w, f32 h)
+// Step 5.1a: draw one engine's recorded 2D-BG bands (backdrop + text BG layers
+// + optional KIND_3D resident-texture entry + MASTER_BRIGHT).  Painter's order,
+// self-contained.  eng: 0 MAIN, 1 SUB.
+static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 {
-	for (int bi = 0; bi < s2_present.nBands; bi++) {
-		const GX2DBGBand *b = &s2_present.bands[bi];
+	const GX2DBGFrame *pf = &s2[eng].present;
+	for (int bi = 0; bi < pf->nBands; bi++) {
+		const GX2DBGBand *b = &pf->bands[bi];
 		const f32 qy0 = y0 + h * (b->yStart        / (f32)DS_H);
 		const f32 qy1 = y0 + h * ((b->yEnd + 1)    / (f32)DS_H);
 
@@ -669,7 +714,7 @@ static void GXMerge_Draw2DBGBands(f32 x0, f32 y0, f32 w, f32 h)
 			}
 			// BG plane
 			u16 pw = 0, ph = 0;
-			GXTexObj *obj = GX2DBG_LayerTex(b->layer[li], &pw, &ph);
+			GXTexObj *obj = GX2DBG_LayerTex(eng, b->layer[li], &pw, &ph);
 			if (!obj || !pw || !ph) continue;
 			GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
 			GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);   // discard index-0
@@ -680,12 +725,63 @@ static void GXMerge_Draw2DBGBands(f32 x0, f32 y0, f32 w, f32 h)
 			const f32 bv1 = (f32)(b->yEnd + 1 + b->vofs[li]) / (f32)ph;
 			quad(x0, qy0, x0 + w, qy1, u0, bv0, u1, bv1);
 		}
+
+		// MASTER_BRIGHT: one full-width fade-to-white/black quad over the band
+		// (same recipe as the 3D sandwich's draw 4).
+		if (b->brightMode) {
+			const u8 f = b->brightFactor > 16 ? 16 : b->brightFactor;
+			const u8 a = (u8)((f * 255 + 8) / 16);
+			const u8 c = (b->brightMode == 1) ? 255 : 0;
+			GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+			GX_ClearVtxDesc();
+			GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+			GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+			GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+			GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+			GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+			GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+				GX_Position2f32(x0,     qy0); GX_Color4u8(c, c, c, a);
+				GX_Position2f32(x0,     qy1); GX_Color4u8(c, c, c, a);
+				GX_Position2f32(x0 + w, qy1); GX_Color4u8(c, c, c, a);
+				GX_Position2f32(x0 + w, qy0); GX_Color4u8(c, c, c, a);
+			GX_End();
+			// leave a clean textured-quad state for the next band / caller
+			GX_ClearVtxDesc();
+			GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+			GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+			GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+			GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+			GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+		}
 	}
+}
+
+void GXMerge_DrawSubScreen(f32 x0, f32 y0, f32 w, f32 h)
+{
+	if (!s2[1].havePresent)
+		return;
+	GX_InvalidateTexAll();
+	GX_SetZMode(GX_ENABLE, GX_ALWAYS, GX_FALSE);
+	GXMerge_Draw2DBGBandsEng(1, x0, y0, w, h);
+	// restore what draw_thread expects after a screen quad
+	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 }
 
 void GXMerge_DrawMainScreen(f32 x0, f32 y0, f32 w, f32 h)
 {
-	if (!s_havePresent && !s2_havePresent)
+	if (!s_havePresent && !s2[0].havePresent)
 		return;
 
 	GX_InvalidateTexAll();
@@ -693,8 +789,8 @@ void GXMerge_DrawMainScreen(f32 x0, f32 y0, f32 w, f32 h)
 	// painter's order; no depth interaction between the three sandwich layers
 	GX_SetZMode(GX_ENABLE, GX_ALWAYS, GX_FALSE);
 
-	if (s2_havePresent)
-		GXMerge_Draw2DBGBands(x0, y0, w, h);
+	if (s2[0].havePresent)
+		GXMerge_Draw2DBGBandsEng(0, x0, y0, w, h);
 
 	if (!s_havePresent) {
 		// restore state the rest of draw_thread expects, then done

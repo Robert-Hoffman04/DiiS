@@ -54,15 +54,20 @@ struct GPU;
 void GX2DBG_SetEnabled(bool on);
 bool GX2DBG_Enabled(void);
 
-// Core thread, start of GXMerge_Present: re-bake any armed MAIN text BG layer
-// whose source bytes changed since its last bake.  Cheap when nothing is dirty.
-void GX2DBG_FrameUpdate(struct GPU *mainGpu);
+// Core thread, at each engine's line 0: re-bake any armed text BG layer of that
+// engine (eng = gpu->core) whose source bytes changed.  Cheap when nothing is
+// dirty.
+void GX2DBG_FrameUpdate(struct GPU *gpu);
 
-// Is layer `num` (0..3) currently a valid baked plane this frame?
-bool GX2DBG_LayerReady(int num);
+// Core thread, once per frame after both engines' FrameUpdate: clears the 5.0
+// per-page dirty flags (clear-on-consume epoch).
+void GX2DBG_EndFrame(void);
+
+// Is engine `eng` (0 MAIN / 1 SUB) layer `num` (0..3) a valid baked plane now?
+bool GX2DBG_LayerReady(int eng, int num);
 
 // Latched texture object for a ready layer (draw thread).  w/h out = plane size.
-GXTexObj *GX2DBG_LayerTex(int num, u16 *w, u16 *h);
+GXTexObj *GX2DBG_LayerTex(int eng, int num, u16 *w, u16 *h);
 
 // Machine reset / video teardown.
 void GX2DBG_Reset(void);

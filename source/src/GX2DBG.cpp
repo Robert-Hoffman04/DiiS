@@ -27,7 +27,7 @@
 #include <string.h>
 
 //------------------------------------------------------------------------------
-// Per-layer state (MAIN engine, layers 0..3)
+// Per-engine (0 = MAIN, 1 = SUB), per-layer (0..3) baked "resolved plane".
 //------------------------------------------------------------------------------
 struct Layer {
 	u16     *plane;        // swizzled RGB5A3, w*h*2 bytes, 32-aligned
@@ -39,9 +39,9 @@ struct Layer {
 	bool     ready;        // baked and valid for this frame
 };
 
-static Layer s_layer[4];
+static Layer s_layer[2][4];
 static bool  s_enabled = false;
-static u32   s_totalBytes = 0;
+static u32   s_totalBytes = 0;   // across both engines
 
 //------------------------------------------------------------------------------
 // Helpers
@@ -53,38 +53,37 @@ static inline u32 tex16_ofs(u32 x, u32 y, u32 W)
 	return ((y >> 2) * (W >> 2) + (x >> 2)) * 16 + ((y & 3) << 2) + (x & 3);
 }
 
-static void freeLayer(int n)
+static void freeLayer(int e, int n)
 {
-	if (s_layer[n].plane) {
-		free(s_layer[n].plane);
-		s_totalBytes -= s_layer[n].bytes;
+	if (s_layer[e][n].plane) {
+		free(s_layer[e][n].plane);
+		s_totalBytes -= s_layer[e][n].bytes;
 	}
-	memset(&s_layer[n], 0, sizeof(Layer));
+	memset(&s_layer[e][n], 0, sizeof(Layer));
 }
 
-// (re)allocate layer n's plane buffer for a w*h texture; returns false if that
-// would blow the MEM1 budget (the layer then stays on the CPU path).
-static bool ensureLayer(int n, u16 w, u16 h)
+// (re)allocate layer's plane buffer for a w*h texture; false if that would blow
+// the MEM1 budget (the layer then stays on the CPU path).
+static bool ensureLayer(int e, int n, u16 w, u16 h)
 {
+	Layer *L = &s_layer[e][n];
 	u32 need = (u32)w * h * 2;
-	if (s_layer[n].plane && s_layer[n].bytes == need)
+	if (L->plane && L->bytes == need)
 		return true;
 
-	u32 projected = s_totalBytes - s_layer[n].bytes + need;
-	if (projected > GX2DBG_BUDGET)
+	if (s_totalBytes - L->bytes + need > GX2DBG_BUDGET)
 		return false;
 
-	if (s_layer[n].plane) { free(s_layer[n].plane); s_totalBytes -= s_layer[n].bytes; }
+	if (L->plane) { free(L->plane); s_totalBytes -= L->bytes; }
 
-	s_layer[n].plane = (u16 *)memalign(32, need);
-	if (!s_layer[n].plane) { s_layer[n].bytes = 0; return false; }
-	s_layer[n].bytes = need;
+	L->plane = (u16 *)memalign(32, need);
+	if (!L->plane) { L->bytes = 0; return false; }
+	L->bytes = need;
 	s_totalBytes += need;
-	s_layer[n].w = w;
-	s_layer[n].h = h;
-	// force a bake
-	s_layer[n].builtFullGen = g_gxDirty.fullGen - 1;
-	s_layer[n].builtPalGen  = g_gxDirty.palGen - 1;
+	L->w = w;
+	L->h = h;
+	L->builtFullGen = g_gxDirty.fullGen - 1;   // force a bake
+	L->builtPalGen  = g_gxDirty.palGen - 1;
 	return true;
 }
 
@@ -101,12 +100,12 @@ static bool rangeDirty(u32 base, u32 len)
 	return false;
 }
 
-// Full re-bake of layer n's plane from current VRAM/palette.
-static void bakeLayer(GPU *gpu, int n)
+// Full re-bake of one layer's plane from current VRAM/palette.
+static void bakeLayer(GPU *gpu, int e, int n)
 {
-	const u16 W = s_layer[n].w;
-	const u16 H = s_layer[n].h;
-	u16 *plane = s_layer[n].plane;
+	Layer *L = &s_layer[e][n];
+	const u16 W = L->w, H = L->h;
+	u16 *plane = L->plane;
 
 	u16 cell[64];
 	for (u32 cy = 0; cy < (u32)(H >> 3); cy++) {
@@ -119,12 +118,10 @@ static void bakeLayer(GPU *gpu, int n)
 		}
 	}
 
-	DCFlushRange(plane, s_layer[n].bytes);
-	GX_InitTexObj(&s_layer[n].obj, plane, W, H, GX_TF_RGB5A3,
-	              GX_REPEAT, GX_REPEAT, GX_FALSE);
-
-	s_layer[n].builtPalGen  = g_gxDirty.palGen;
-	s_layer[n].builtFullGen = g_gxDirty.fullGen;
+	DCFlushRange(plane, L->bytes);
+	GX_InitTexObj(&L->obj, plane, W, H, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+	L->builtPalGen  = g_gxDirty.palGen;
+	L->builtFullGen = g_gxDirty.fullGen;
 }
 
 //------------------------------------------------------------------------------
@@ -136,67 +133,73 @@ void GX2DBG_SetEnabled(bool on)
 	if (on == s_enabled) return;
 	s_enabled = on;
 	if (!on)
-		for (int n = 0; n < 4; n++) freeLayer(n);
+		for (int e = 0; e < 2; e++)
+			for (int n = 0; n < 4; n++) freeLayer(e, n);
 }
 
 bool GX2DBG_Enabled(void) { return s_enabled; }
 
 void GX2DBG_Reset(void)
 {
-	for (int n = 0; n < 4; n++) freeLayer(n);
+	for (int e = 0; e < 2; e++)
+		for (int n = 0; n < 4; n++) freeLayer(e, n);
 	s_enabled = false;
 }
 
+// Called at each engine's line 0 (core thread).  eng = gpu->core.
 void GX2DBG_FrameUpdate(GPU *gpu)
 {
-	for (int n = 0; n < 4; n++) s_layer[n].ready = false;
-	if (!s_enabled || !gpu) return;
+	if (!gpu) return;
+	const int e = (gpu->core == 0) ? 0 : 1;
+	for (int n = 0; n < 4; n++) s_layer[e][n].ready = false;
+	if (!s_enabled) return;
 
 	const bool extPal = gpu->dispCnt().ExBGxPalette_Enable;
+	const bool bg0is3d = (e == 0) && gpu->dispCnt().BG0_3D;   // SUB has no 3D
 
 	for (int n = 0; n < 4; n++) {
-		// text-type, enabled, MAIN only (caller passes the MAIN gpu); BG0-as-3D
-		// is drawn from the resident 3D texture, not a baked plane.
 		if (!gpu->LayersEnable[n] || gpu->BGTypes[n] != BGType_Text ||
-		    (n == 0 && gpu->dispCnt().BG0_3D)) { freeLayer(n); continue; }
+		    (n == 0 && bg0is3d)) { freeLayer(e, n); continue; }
 
 		const u16 w = gpu->BGSize[n][0];
 		const u16 h = gpu->BGSize[n][1];
-		if (!ensureLayer(n, w, h))          // over budget -> CPU path
+		if (!ensureLayer(e, n, w, h))          // over budget -> CPU path
 			continue;
 
-		// ext-pal enabled but the slot is unmapped -> renderline_textBG bails
-		// that line; keep the whole layer on CPU for now.
 		if (extPal && gpu->bgcnt(n).Palette_256 &&
 		    !MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[n]]) {
-			freeLayer(n);
+			freeLayer(e, n);
 			continue;
 		}
 
-		bool dirty = (s_layer[n].builtFullGen != g_gxDirty.fullGen) ||
-		             (s_layer[n].builtPalGen  != g_gxDirty.palGen)  ||
-		             rangeDirty(gpu->BG_map_ram[n], 0x2000) ||
-		             rangeDirty(gpu->BG_tile_ram[n], 0x10000);
-
+		Layer *L = &s_layer[e][n];
+		const bool dirty = (L->builtFullGen != g_gxDirty.fullGen) ||
+		                   (L->builtPalGen  != g_gxDirty.palGen)  ||
+		                   rangeDirty(gpu->BG_map_ram[n], 0x2000) ||
+		                   rangeDirty(gpu->BG_tile_ram[n], 0x10000);
 		if (dirty)
-			bakeLayer(gpu, n);
-
-		s_layer[n].ready = true;
+			bakeLayer(gpu, e, n);
+		L->ready = true;
 	}
+}
 
-	// clear-on-consume: FrameUpdate is the only consumer of the page flags.
+// Clear the per-page dirty flags once both engines have consumed them
+// (GXMerge_Present, core thread).
+void GX2DBG_EndFrame(void)
+{
 	memset(g_gxDirty.lcdPageDirty, 0, sizeof(g_gxDirty.lcdPageDirty));
 }
 
-bool GX2DBG_LayerReady(int num)
+bool GX2DBG_LayerReady(int eng, int num)
 {
-	return (unsigned)num < 4 && s_layer[num].ready;
+	return (unsigned)eng < 2 && (unsigned)num < 4 && s_layer[eng][num].ready;
 }
 
-GXTexObj *GX2DBG_LayerTex(int num, u16 *w, u16 *h)
+GXTexObj *GX2DBG_LayerTex(int eng, int num, u16 *w, u16 *h)
 {
-	if ((unsigned)num >= 4 || !s_layer[num].ready) return NULL;
-	if (w) *w = s_layer[num].w;
-	if (h) *h = s_layer[num].h;
-	return &s_layer[num].obj;
+	if ((unsigned)eng >= 2 || (unsigned)num >= 4 || !s_layer[eng][num].ready)
+		return NULL;
+	if (w) *w = s_layer[eng][num].w;
+	if (h) *h = s_layer[eng][num].h;
+	return &s_layer[eng][num].obj;
 }

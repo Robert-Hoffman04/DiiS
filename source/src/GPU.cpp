@@ -2170,13 +2170,15 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// BG0-as-3D line is handled too when the existing GXMerge_LineMergeable
 	// accepts the 3D part (opaque, no front translucent BG): the resident 3D
 	// texture is drawn as a KIND_3D entry at BG0's priority slot.
-	if (gpu->core == GPU_MAIN && GXMerge_2DBGEnabled() && GXMerge_FrameArmed()
+	{
+	const int gxeng = (gpu->core == GPU_MAIN) ? 0 : 1;
+	if (GXMerge_2DBGLineArmed(gxeng)
 	    && !gpu->LayersEnable[4]
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
 	    && gpu->setFinalColorBck_funcNum == 0
 	    && ((gpu->BLDCNT >> 6) & 3) == 0)
 	{
-		const bool has3d = dispCnt->BG0_3D && gpu->LayersEnable[0];
+		const bool has3d = (gxeng == 0) && dispCnt->BG0_3D && gpu->LayersEnable[0];
 		bool ao = false, fao = false; u8 feva = 0, bmode = 0, bfac = 0;
 		bool ok = true;
 
@@ -2210,7 +2212,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 				}
 				if (gpu->BGTypes[bg] != BGType_Text ||
 				    gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
-				    !GX2DBG_LayerReady(bg)) { ok = false; break; }
+				    !GX2DBG_LayerReady(gxeng, bg)) { ok = false; break; }
 				gxkind[gxn] = GX2DBG_KIND_BG;
 				gxlay[gxn]  = (u8)bg;
 				gxhofs[gxn] = (u16)gpu->getHOFS(bg);
@@ -2222,11 +2224,12 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 		if (ok) {
 			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
-			GXMerge_Record2DBGLine(l, (u16)(backdrop_color | 0x8000), bmode, bfac,
+			GXMerge_Record2DBGLine(gxeng, l, (u16)(backdrop_color | 0x8000), bmode, bfac,
 			                       ao ? 1 : 0, behindContent,
 			                       gxn, gxkind, gxlay, gxhofs, gxvofs);
 			return;
 		}
+	}
 	}
 
 	//we need to write backdrop colors in the same way as we do BG pixels in order to do correct window processing
@@ -3039,6 +3042,11 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 			// thread. GX_InitTexObj/DCFlushRange are thread-safe (no FIFO cmds).
 			if (GXMerge_2DBGEnabled())
 				GX2DBG_FrameUpdate(gpu);
+		}
+		// Step 5.1a: SUB engine (no 3D) - arm + bake its own 2D-BG record.
+		if (gpu->core == GPU_SUB && GXMerge_2DBGEnabled()) {
+			GXMerge_Begin2DBGSub(gpu->dispMode);
+			GX2DBG_FrameUpdate(gpu);
 		}
 		//this is speculative. the idea is as follows:
 		//whenever the user updates the affine start position regs, it goes into the active regs immediately

@@ -684,6 +684,9 @@ static void *draw_thread(void*){
 					GXMerge_DrawMainScreen(topX, topY, width, height);
 				GXMerge_DrawStatusMarker(topX, topY, width, height);
 			}
+			// Step 5.1a: SUB engine on top (main on bottom) -> 2D-BG bands here
+			if (GXMerge_Enabled() && MainScreen.offset != 0)
+				GXMerge_DrawSubScreen(topX, topY, width, height);
 		}
 		// BOTTOM SCREEN
 		if (screen_layout != SCREEN_MAIN_NORMAL && (screen_layout != SCREEN_MAIN_STRETCH)){
@@ -706,6 +709,9 @@ static void *draw_thread(void*){
 					GXMerge_DrawMainScreen(bottomX, bottomY, width, height);
 				GXMerge_DrawStatusMarker(bottomX, bottomY, width, height);
 			}
+			// Step 5.1a: SUB engine on bottom (main on top) -> 2D-BG bands here
+			if (GXMerge_Enabled() && MainScreen.offset == 0)
+				GXMerge_DrawSubScreen(bottomX, bottomY, width, height);
 
 			// CURSOR
 			if (drawcursor){

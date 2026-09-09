@@ -110,14 +110,24 @@ typedef struct {
 } GX2DBGFrame;
 
 // Recorder: called from GPU_RenderLine_layer for each scanline whose entire 2D
-// composite is GX-expressible (see above).  kind/layer/hofs/vofs are nLayers
-// long, painter's order (entry 0 = bottom).  A KIND_3D entry draws the resident
-// 3D texture band (alphaOver / behindContent as GXMerge_LineMergeable decided);
-// its hofs is BG0's X-scroll.  The line's CPU BG/sprite/3D walk is then skipped.
-void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
-                            u8 alphaOver, u8 behindContent, int nLayers,
-                            const u8 *kind, const u8 *layer,
+// composite is GX-expressible (see above).  eng: 0 MAIN, 1 SUB.
+// kind/layer/hofs/vofs are nLayers long, painter's order (entry 0 = bottom).  A
+// KIND_3D entry (MAIN only) draws the resident 3D texture band (alphaOver /
+// behindContent as GXMerge_LineMergeable decided); its hofs is BG0's X-scroll.
+// The line's CPU BG/sprite/3D walk is then skipped.
+void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode,
+                            u8 brightFactor, u8 alphaOver, u8 behindContent,
+                            int nLayers, const u8 *kind, const u8 *layer,
                             const u16 *hofs, const u16 *vofs);
+
+// Is engine eng's 2D-BG record armed this frame? (recorder gate)
+bool GXMerge_2DBGLineArmed(int eng);
+
+// SUB engine has no 3D: arm its 2D-BG record from its own line 0.
+void GXMerge_Begin2DBGSub(int subDispMode);
+
+// draw_thread: replay the SUB engine's 2D-BG bands over the SUB screen quad.
+void GXMerge_DrawSubScreen(f32 x0, f32 y0, f32 w, f32 h);
 
 //--- toggle -------------------------------------------------------------------
 void GXMerge_SetEnabled(bool en);
