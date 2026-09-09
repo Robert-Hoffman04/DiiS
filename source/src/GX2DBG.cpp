@@ -290,15 +290,20 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 	// bails, exactly as it would once it reached the OBJ check.
 	if (!s_bakeGo[e]) { s_objGXable[e] = false; return; }
 
-	// Cheap frame-level early-out: if the recorder can't fire this frame anyway
-	// (any BLDCNT colour effect, or a window active), don't spend time baking
-	// sprites nobody will draw.  Mirrors the recorder's frame-invariant gates.
-	if (((gpu->BLDCNT >> 6) & 3) != 0 ||
+	// Frame-level early-out.  A BLDCNT colour effect no longer disqualifies the
+	// whole engine (§5.1a blend): the sprite pass draws opaque quads, which is
+	// still correct as long as OBJ itself isn't a blend target - if OBJ is a 1st
+	// or 2nd target the per-pixel blend against the layer beneath is genuinely
+	// per-pixel, so fall back.  Windows still disqualify.  Semi-transparent
+	// sprites are caught per-entry in the scan loop below.
+	const u16 bld = gpu->BLDCNT;
+	const bool objInBlend = ((bld >> 6) & 3) != 0 && (bld & 0x1010) != 0;
+	if (objInBlend ||
 	    gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) {
 		s_objGXable[e] = false;
 #ifdef DESMUME_BENCH
 		{ extern u32 g_gx2objDis[2][4];
-		  g_gx2objDis[e][((gpu->BLDCNT>>6)&3)?0:1]++;
+		  g_gx2objDis[e][objInBlend ? 0 : 1]++;
 		  if (gpu->WINOBJ_ENABLED) g_gx2objDis[e][2]++; }
 #endif
 		return;
@@ -314,6 +319,11 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 		                                   &fx, &fy, &ox, &oy, &op, &os, &key, uv, &tw, &th);
 		if (r == 0) continue;
 		if (r < 0)  { s_objGXable[e] = false; return; }        // -> CPU sprite path
+		// Semi-transparent sprite (OBJ mode 1): blends per-pixel against whatever
+		// is beneath it.  The replay draws sprite quads opaque, so fall the whole
+		// engine's sprite path back to the CPU for this frame.  (§5.1a-blend
+		// follow-up: draw these in a constant-EVA blend sub-pass instead.)
+		if (os) { s_objGXable[e] = false; return; }
 		// NOTE: 5.2 draws sprites last (over all BG bands).  This is only correct
 		// when no opaque BG sits in front of a sprite; a per-priority interleave
 		// is 5.2-2.  Both bench scenes' sprites are HUD (front), so allow all.

@@ -2333,23 +2333,52 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// texture is drawn as a KIND_3D entry at BG0's priority slot.
 	{
 	const int gxeng = (gpu->core == GPU_MAIN) ? 0 : 1;
+	// BLDCNT colour-effect handling (§5.1a blend): a non-zero
+	// setFinalColorBck_funcNum only forces the CPU path when the effect actually
+	// changes a *recorded* pixel.  The per-pixel templates
+	// (GPU::_master_setFinalBGColor) are a straight passthrough for any BG whose
+	// 1st-target bit is clear, and a Blend on the backdrop is a no-op; the 3D
+	// layer's own blend is expressed by the KIND_3D sandwich path
+	// (GXMerge_LineMergeable) exactly as before.  So the recorder now accepts a
+	// blended line as long as no enabled BG is a blend 1st target, OBJ isn't in
+	// the blend while sprites are on, and (for Increase/Decrease) the backdrop
+	// tint is folded into the recorded backdrop colour here.  funcNum >= 4
+	// (a window in the DISPCNT config) still falls back.
+	const u8  s5_bm   = (gpu->BLDCNT >> 6) & 3;
+	const u16 s5_t1st = gpu->BLDCNT & 0x3F;              // BG0..3, OBJ(4), BD(5)
+	bool s5_blendOK = (s5_bm == 0);
+	if (!s5_blendOK) {
+		s5_blendOK = true;
+		for (int bg = 0; bg < 4; bg++)
+			if (gpu->LayersEnable[bg] && (s5_t1st & (1 << bg))) s5_blendOK = false;
+		if ((s5_t1st & 0x10) && gpu->LayersEnable[4]) s5_blendOK = false;   // OBJ 1st tgt
+		if (s5_bm == 1 && (s5_t1st & 0x20)) { /* Blend on backdrop: no-op */ }
+	}
 #ifdef DESMUME_BENCH
-	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails, so
-	// the coverage log can say what to build next (window vs blend vs layer).
+	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails.
 	extern u32 g_gx2dbgBail[2][8];
 	if (!GXMerge_2DBGLineArmed(gxeng))                                  g_gx2dbgBail[gxeng & 1][1]++;
 	else if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) g_gx2dbgBail[gxeng & 1][3]++;
 	else if (gpu->setFinalColorBck_funcNum >= 4)                       g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
-	else if (gpu->setFinalColorBck_funcNum != 0)                       g_gx2dbgBail[gxeng & 1][5]++;  // blend-only, no window
+	else if (!s5_blendOK)                                              g_gx2dbgBail[gxeng & 1][5]++;  // BG/OBJ blend 1st-target
 	else if (gpu->LayersEnable[4] && !GX2DBG_ObjGXable(gxeng))          g_gx2dbgBail[gxeng & 1][2]++;
 	/* else: entered the gate - reason 0/6/7 tallied inside */
 #endif
+
 	if (GXMerge_2DBGLineArmed(gxeng)
 	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
-	    && gpu->setFinalColorBck_funcNum == 0
-	    && ((gpu->BLDCNT >> 6) & 3) == 0)
+	    && gpu->setFinalColorBck_funcNum < 4
+	    && s5_blendOK)
 	{
+		// Fold a backdrop brighten/darken (Increase/Decrease with BD as 1st
+		// target) into the recorded backdrop colour - GX draws the backdrop as a
+		// flat quad, so a pre-faded colour reproduces it exactly.  (Local copy:
+		// the CPU fall-through path must still see the raw backdrop.)
+		u16 s5_backdrop = backdrop_color & 0x7FFF;
+		if (s5_bm >= 2 && (s5_t1st & 0x20))
+			s5_backdrop = (s5_bm == 2) ? gpu->currentFadeInColors[s5_backdrop]
+			                           : gpu->currentFadeOutColors[s5_backdrop];
 		// This line cleared every frame-invariant gate; tell GX2DBG the BG-plane
 		// bake is worth doing (even if this particular line still bails below on
 		// an unbaked layer or a 3D-shape check).
@@ -2400,7 +2429,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 		if (ok) {
 			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
-			GXMerge_Record2DBGLine(gxeng, l, (u16)(backdrop_color | 0x8000), bmode, bfac,
+			GXMerge_Record2DBGLine(gxeng, l, (u16)(s5_backdrop | 0x8000), bmode, bfac,
 			                       ao ? 1 : 0, behindContent,
 			                       gxn, gxkind, gxlay, gxhofs, gxvofs);
 #ifdef DESMUME_BENCH
