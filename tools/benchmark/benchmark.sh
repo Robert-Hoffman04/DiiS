@@ -107,6 +107,8 @@ defs_for() {
 		# Same config as jitfull, plus the perf_zones frame-time accountant
 		# (dumps sd:/perfzones.log). "where does the full-JIT frame go" mode.
 		profile) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
+		# profile + the Step 5.1a MAIN-text-BG-on-GX path armed at boot.
+		profile2dbg) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE -DDESMUME_FORCE_GX2DBG" ;;
 		*)      die "unknown mode '$1'" ;;
 	esac
 }
@@ -120,6 +122,7 @@ jitdefs_for() {
 		jit9on)  base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		jitfull) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		profile) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_PERFZONES" ;;
+		profile2dbg) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_PERFZONES" ;;
 		*)       base="" ;;
 	esac
 	# BENCH_EXTRA_JITDEFS: append experimental JIT flags to every JIT mode without

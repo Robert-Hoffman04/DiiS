@@ -43,6 +43,7 @@
 #include "log_console.h"
 #include "GXRender.h"
 #include "GXMerge.h"
+#include "GX2DBG.h"
 #include "rasterize.h"
 #include "perf_zones.h"
 
@@ -332,6 +333,9 @@ int main(int argc, char **argv){
 	// Automated-test switch mirrors the DESMUME_FORCE_* pattern (see Makefile).
 #ifdef DESMUME_FORCE_GXCOMPOSITE
 	GXMerge_SetEnabled(current3Dcore == 1);
+#ifdef DESMUME_FORCE_GX2DBG
+	GXMerge_Set2DBG(current3Dcore == 1);
+#endif
 #endif
 
 	printf("Initialization successful!\n");
@@ -775,6 +779,7 @@ void Execute() {
 	LWP_JoinThread(vidthread, NULL);
 	vidthread = LWP_THREAD_NULL;
 
+	GX2DBG_Reset();
 	GXMerge_Deinit();
 
 	NDS_DeInit();

@@ -81,9 +81,44 @@ typedef struct {
 	bool        mainIsTop;      // MainScreen.offset == 0 when the frame was built
 } GXMergeFrame;
 
+// --- Step 5.1a: MAIN text BG layers composited on GX -------------------------
+// A run of scanlines over which the full 2D composite is exactly:
+//   opaque backdrop, then N enabled text BG layers back-to-front, then an
+//   optional MASTER_BRIGHT pass - no sprites, no window, no BLDCNT effect, no
+//   3D on the line.  A band breaks on any change of layer set / scroll /
+//   backdrop / brightness.
+#define GX2DBG_MAX_BANDS   64
+#define GX2DBG_MAX_LAYERS  4
+typedef struct {
+	u8  yStart, yEnd;
+	u8  nLayers;
+	u8  layer[GX2DBG_MAX_LAYERS];   // BG index 0..3, painter's order (index 0 = bottom)
+	u16 hofs[GX2DBG_MAX_LAYERS];
+	u16 vofs[GX2DBG_MAX_LAYERS];
+	u16 backdrop;                   // RGB555 | 0x8000
+	u8  brightMode, brightFactor;
+} GX2DBGBand;
+
+typedef struct {
+	int        nBands;
+	GX2DBGBand bands[GX2DBG_MAX_BANDS];
+	bool       valid;
+} GX2DBGFrame;
+
+// Recorder: called from GPU_RenderLine_layer for each scanline whose entire 2D
+// composite is GX-expressible (see above).  layers/hofs/vofs are nLayers long,
+// painter's order.  The line's CPU BG/sprite walk is then skipped.
+void GXMerge_Record2DBGLine(int l, u16 backdrop, u8 brightMode, u8 brightFactor,
+                            int nLayers, const u8 *layers,
+                            const u16 *hofs, const u16 *vofs);
+
 //--- toggle -------------------------------------------------------------------
 void GXMerge_SetEnabled(bool en);
 bool GXMerge_Enabled(void);
+
+// Step 5.1a: also composite MAIN-engine text BG layers on GX (implies GXMerge).
+void GXMerge_Set2DBG(bool en);
+bool GXMerge_2DBGEnabled(void);
 
 //--- lifecycle (GX must already be initialised) ------------------------------
 void GXMerge_Init(void);

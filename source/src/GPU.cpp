@@ -104,6 +104,7 @@ void GPU_DispCapDumpRing()
 #include "guDesmume.h"
 #include "GXMerge.h"
 #include "GXDirty.h"
+#include "GX2DBG.h"
 
 // Per-scanline mergeability check (defined below, near GXMerge_FrameMergeable);
 // forward-declared so GPU_RenderLine_layer's 3D split point can call it.
@@ -2163,6 +2164,44 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 	u16 backdrop_color = LE_TO_LOCAL_16(T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF);
 
+	// Step 5.1a: if this whole scanline's 2D composite is GX-expressible
+	// (MAIN, all enabled BGs are baked text layers, no sprites/window/mosaic/
+	// BLDCNT effect/3D), record it for the GX band replay and skip the CPU walk.
+	if (gpu->core == GPU_MAIN && GXMerge_2DBGEnabled() && GXMerge_FrameArmed()
+	    && !dispCnt->BG0_3D && !gpu->LayersEnable[4]
+	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
+	    && gpu->setFinalColorBck_funcNum == 0
+	    && ((gpu->BLDCNT >> 6) & 3) == 0)
+	{
+		u8  gxlay[4]; u16 gxhofs[4], gxvofs[4]; int gxn = 0;
+		bool ok = true;
+		for (int prio = NB_PRIORITIES - 1; prio >= 0 && ok; prio--) {
+			itemsForPriority_t *it = &gpu->itemsForPriority[prio];
+			for (int i = 0; i < it->nbBGs; i++) {
+				const int bg = it->BGs[i];
+				if (!gpu->LayersEnable[bg]) continue;
+				if (gpu->BGTypes[bg] != BGType_Text ||
+				    gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
+				    !GX2DBG_LayerReady(bg)) { ok = false; break; }
+				gxlay[gxn]  = (u8)bg;
+				gxhofs[gxn] = (u16)gpu->getHOFS(bg);
+				gxvofs[gxn] = (u16)gpu->getVOFS(bg);
+				gxn++;
+			}
+		}
+		if (ok) {
+			u8 bmode = 0, bfac = 0;
+			if ((gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2) &&
+			    gpu->MasterBrightFactor) {
+				bmode = gpu->MasterBrightMode;
+				bfac  = gpu->MasterBrightFactor > 16 ? 16 : gpu->MasterBrightFactor;
+			}
+			GXMerge_Record2DBGLine(l, (u16)(backdrop_color | 0x8000), bmode, bfac,
+			                       gxn, gxlay, gxhofs, gxvofs);
+			return;
+		}
+	}
+
 	//we need to write backdrop colors in the same way as we do BG pixels in order to do correct window processing
 	//this is currently eating up 2fps or so. it is a reasonable candidate for optimization. 
 	gpu->currBgNum = 5;
@@ -2968,6 +3007,11 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 			if (!GXMerge_FrameMergeable(gpu))
 				GXMerge_Disarm();
 #endif
+			// Step 5.1a: bake this frame's MAIN text BG planes now (before the
+			// per-line recorder can consult GX2DBG_LayerReady), on the core
+			// thread. GX_InitTexObj/DCFlushRange are thread-safe (no FIFO cmds).
+			if (GXMerge_2DBGEnabled())
+				GX2DBG_FrameUpdate(gpu);
 		}
 		//this is speculative. the idea is as follows:
 		//whenever the user updates the affine start position regs, it goes into the active regs immediately
