@@ -1196,6 +1196,94 @@ void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
 	}
 }
 
+//------------------------------------------------------------------------------
+// GX sprite compositor (Step 5.2) - resolve one non-affine, tiled, standard-
+// palette OBJ into w*h RGB5A3 texels (row-major, un-flipped; the caller applies
+// H/V flip via UVs).  0x0000 = transparent.  Fills *ow/*oh/*prio/*semi/*x/*y.
+// Returns: 0 = skip (disabled / fully off-screen), 1 = baked into out[], -1 =
+// on-screen but not GX-bakeable here (affine / bitmap / OBJ-window / 256-colour
+// extended palette / mosaic / edge-wrap) - the frame then composites all its
+// sprites on the CPU.
+//------------------------------------------------------------------------------
+int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
+                         int *ow, int *oh, int *ox, int *oy,
+                         u8 *oprio, u8 *osemi, u8 *ohflip, u8 *ovflip,
+                         u32 *okey)
+{
+	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
+
+	// local, endian-corrected copy of the 8-byte OAM entry (see _spriteRender)
+	OAM oe = gpu->oam[oamIndex];
+	{
+		u16 *w = (u16 *)&oe;
+#ifdef WORDS_BIGENDIAN
+		w[1] = (u16)((w[1] >> 1) | (w[1] << 15));
+		w[2] = (u16)((w[2] >> 2) | (w[2] << 14));
+#endif
+	}
+
+	if (oe.RotScale == 2)     return 0;    // disabled
+	if (oe.RotScale & 1)      return -1;   // affine -> CPU
+	if (oe.Mode == 2 || oe.Mode == 3) return -1;   // OBJ window / bitmap
+	if (oe.Mosaic)            return -1;
+	if (oe.Depth && dispCnt->ExOBJPalette_Enable) return -1;   // ext-pal 256
+
+	const size sz = sprSizeTab[oe.Size][oe.Shape];
+	const int W = sz.x, H = sz.y;
+	if (W <= 0 || H <= 0 || W * H > outCap) return -1;
+
+	s32 sx = (oe.X << 23) >> 23;                 // sign-extend 9-bit X
+	s32 sy = oe.Y;
+	if (sy >= 192) sy = (s32)((s8)oe.Y);
+	if (sx >= 256 || sx + W <= 0 || sy >= 192 || sy + H <= 0) return 0;   // off-screen
+	if (sx < 0 || sx + W > 256) return -1;   // horizontal edge -> would wrap
+	*ox = sx; *oy = sy;
+	*ow = W;  *oh = H;
+	*oprio  = oe.Priority;
+	*osemi  = (oe.Mode == 1) ? 1 : 0;
+	*ohflip = oe.HFlip ? 1 : 0;
+	*ovflip = oe.VFlip ? 1 : 0;
+	// content key: everything that affects the baked texels (not screen pos)
+	*okey = ((u32)oe.TileIndex) | ((u32)oe.PaletteIndex << 10) | ((u32)oe.Depth << 14)
+	      | ((u32)oe.Size << 15) | ((u32)oe.Shape << 17) | ((u32)oe.Mode << 19);
+
+	const u32 base   = gpu->sprMem;
+	const u8  block  = gpu->sprBoundary;
+	const bool map2d = (gpu->spriteRenderMode == GPU::SPRITE_2D);
+	const bool d256  = oe.Depth;
+	const int  Wt    = W >> 3;
+
+	// palette pointers (standard OBJ palette: ARM9_VMEM + 0x200 + core*0x400)
+	u8 *palBase = MMU.ARM9_VMEM + 0x200 + gpu->core * ADDRESS_STEP_1KB;
+	u8 *pal16   = palBase + (oe.PaletteIndex << 5);   // 16 entries * 2 bytes
+
+	for (int py = 0; py < H; py++) {
+		const int ty = py >> 3, yin = py & 7;
+		for (int px = 0; px < W; px++) {
+			const int tx = px >> 3, xin = px & 7;
+			u32 ofs;
+			u8 idx;
+			if (d256) {
+				const u32 tbase = map2d ? (base + ((u32)oe.TileIndex << 5))
+				                        : (base + ((u32)oe.TileIndex << block));
+				ofs = map2d ? ((u32)ty << 10) + (u32)tx * 64 + (u32)yin * 8 + xin
+				            : (u32)ty * (u32)Wt * 64 + (u32)tx * 64 + (u32)yin * 8 + xin;
+				idx = *(u8 *)MMU_gpu_map(tbase + ofs);
+				out[py * W + px] = idx ? RGB15_REVERSE(T1ReadWord(palBase, idx << 1)) : 0;
+			} else {
+				const u32 tbase = map2d ? (base + ((u32)oe.TileIndex << 5))
+				                        : (base + ((u32)oe.TileIndex << block));
+				ofs = map2d ? ((u32)ty << 10) + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1)
+				            : (u32)ty * (u32)Wt * 32 + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1);
+				u8 b = *(u8 *)MMU_gpu_map(tbase + ofs);
+				idx = (xin & 1) ? (b >> 4) : (b & 0xF);
+				out[py * W + px] = idx ? RGB15_REVERSE(T1ReadWord(pal16, idx << 1)) : 0;
+			}
+		}
+	}
+	return 1;
+}
+
 /*****************************************************************************/
 //			BACKGROUND RENDERING -ROTOSCALE-
 /*****************************************************************************/
@@ -2173,7 +2261,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	{
 	const int gxeng = (gpu->core == GPU_MAIN) ? 0 : 1;
 	if (GXMerge_2DBGLineArmed(gxeng)
-	    && !gpu->LayersEnable[4]
+	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
 	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
 	    && gpu->setFinalColorBck_funcNum == 0
 	    && ((gpu->BLDCNT >> 6) & 3) == 0)
@@ -3040,13 +3128,16 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 			// Step 5.1a: bake this frame's MAIN text BG planes now (before the
 			// per-line recorder can consult GX2DBG_LayerReady), on the core
 			// thread. GX_InitTexObj/DCFlushRange are thread-safe (no FIFO cmds).
-			if (GXMerge_2DBGEnabled())
+			if (GXMerge_2DBGEnabled()) {
 				GX2DBG_FrameUpdate(gpu);
+				GX2DBG_ObjFrameUpdate(gpu);
+			}
 		}
 		// Step 5.1a: SUB engine (no 3D) - arm + bake its own 2D-BG record.
 		if (gpu->core == GPU_SUB && GXMerge_2DBGEnabled()) {
 			GXMerge_Begin2DBGSub(gpu->dispMode);
 			GX2DBG_FrameUpdate(gpu);
+			GX2DBG_ObjFrameUpdate(gpu);
 		}
 		//this is speculative. the idea is as follows:
 		//whenever the user updates the affine start position regs, it goes into the active regs immediately

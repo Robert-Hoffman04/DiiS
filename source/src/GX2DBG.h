@@ -69,6 +69,18 @@ bool GX2DBG_LayerReady(int eng, int num);
 // Latched texture object for a ready layer (draw thread).  w/h out = plane size.
 GXTexObj *GX2DBG_LayerTex(int eng, int num, u16 *w, u16 *h);
 
+// Step 5.2: non-affine tiled sprites.  Core thread at line 0.
+void GX2DBG_ObjFrameUpdate(struct GPU *gpu);
+// Every enabled OBJ on this engine is a bakeable front sprite (else CPU path).
+// Recorder gate - reads this frame's freshly built list (core thread).
+bool GX2DBG_ObjGXable(int eng);
+// Core thread, GXMerge_Present: latch the sprite list for the draw thread.
+void GX2DBG_ObjLatch(void);
+int  GX2DBG_ObjCount(int eng);
+// Draw thread: latched sprite i (0..count-1, OAM order) - tex + rect + flags.
+GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *w, u16 *h,
+                        u8 *prio, u8 *semi, u8 *hflip, u8 *vflip);
+
 // Machine reset / video teardown.
 void GX2DBG_Reset(void);
 

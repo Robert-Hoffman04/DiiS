@@ -575,6 +575,7 @@ void GXMerge_Present(void)
 		s2[e].havePresent = s2[e].working.valid && s2[e].working.nBands > 0
 		                    && (!needSlot || slot >= 0);
 	}
+	GX2DBG_ObjLatch();   // latch the sprite list for the draw thread
 	GX2DBG_EndFrame();   // clear-on-consume for the 5.0 dirty flags
 
 	if (!s_working.valid || slot < 0) {
@@ -755,6 +756,36 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 			GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 			GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+		}
+	}
+
+	// Step 5.2: front sprites, drawn over the BG bands, back-to-front (priority
+	// 3->0, and within a priority OAM 127->0 so lower OAM ends up in front).
+	const int nObj = GX2DBG_ObjCount(eng);
+	if (nObj > 0) {
+		GX_ClearVtxDesc();
+		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+		GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+		GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+		for (int pr = 3; pr >= 0; pr--) {
+			for (int i = nObj - 1; i >= 0; i--) {
+				s16 sx, sy; u16 sw, sh; u8 sp, ss, hf, vf;
+				GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &sw, &sh, &sp, &ss, &hf, &vf);
+				if (!ot || sp != pr) continue;
+				GX_LoadTexObj(ot, GX_TEXMAP0);
+				const f32 qx0 = x0 + w * (sx        / (f32)DS_W);
+				const f32 qx1 = x0 + w * ((sx + sw) / (f32)DS_W);
+				const f32 qy0s = y0 + h * (sy        / (f32)DS_H);
+				const f32 qy1s = y0 + h * ((sy + sh) / (f32)DS_H);
+				const f32 u0 = hf ? 1.f : 0.f, u1 = hf ? 0.f : 1.f;
+				const f32 v0 = vf ? 1.f : 0.f, v1 = vf ? 0.f : 1.f;
+				quad(qx0, qy0s, qx1, qy1s, u0, v0, u1, v1);
+			}
 		}
 	}
 }

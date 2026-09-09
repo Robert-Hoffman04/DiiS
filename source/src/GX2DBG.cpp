@@ -128,21 +128,27 @@ static void bakeLayer(GPU *gpu, int e, int n)
 // Public
 //------------------------------------------------------------------------------
 
+static void objFreeAll(int e);   // fwd
+
 void GX2DBG_SetEnabled(bool on)
 {
 	if (on == s_enabled) return;
 	s_enabled = on;
 	if (!on)
-		for (int e = 0; e < 2; e++)
+		for (int e = 0; e < 2; e++) {
 			for (int n = 0; n < 4; n++) freeLayer(e, n);
+			objFreeAll(e);
+		}
 }
 
 bool GX2DBG_Enabled(void) { return s_enabled; }
 
 void GX2DBG_Reset(void)
 {
-	for (int e = 0; e < 2; e++)
+	for (int e = 0; e < 2; e++) {
 		for (int n = 0; n < 4; n++) freeLayer(e, n);
+		objFreeAll(e);
+	}
 	s_enabled = false;
 }
 
@@ -202,4 +208,123 @@ GXTexObj *GX2DBG_LayerTex(int eng, int num, u16 *w, u16 *h)
 	if (w) *w = s_layer[eng][num].w;
 	if (h) *h = s_layer[eng][num].h;
 	return &s_layer[eng][num].obj;
+}
+
+//------------------------------------------------------------------------------
+// Step 5.2 - non-affine tiled sprites as GX quads
+//------------------------------------------------------------------------------
+#define GX2OBJ_TEXCAP (64 * 64)
+
+struct ObjS {
+	u16     *tex;
+	u32      bytes;
+	u16      w, h;
+	GXTexObj obj;
+	s16      x, y;
+	u8       prio, semi, hflip, vflip;
+	u32      key;
+};
+static ObjS  s_obj[2][128];
+static int   s_objN[2]       = { 0, 0 };
+static bool  s_objGXable[2]  = { false, false };
+static u32   s_objBuiltEp[2] = { 0, 0 };
+static u32   s_objBytes      = 0;
+// latched for the draw thread (Present copies s_obj -> here)
+static ObjS  s_objP[2][128];
+static int   s_objPN[2]      = { 0, 0 };
+static bool  s_objPGXable[2] = { false, false };
+
+static void swizzle16(const u16 *src, u16 *dst, int w, int h)
+{
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++)
+			dst[tex16_ofs(x, y, w)] = src[y * w + x];
+}
+
+static void objFreeAll(int e)
+{
+	for (int i = 0; i < 128; i++) {
+		if (s_obj[e][i].tex) { free(s_obj[e][i].tex); s_objBytes -= s_obj[e][i].bytes; }
+		memset(&s_obj[e][i], 0, sizeof(ObjS));
+	}
+	s_objN[e] = 0;
+}
+
+void GX2DBG_ObjFrameUpdate(GPU *gpu)
+{
+	if (!gpu) return;
+	const int e = (gpu->core == 0) ? 0 : 1;
+	s_objN[e] = 0;
+	s_objGXable[e] = true;
+	if (!s_enabled) return;
+	if (!gpu->LayersEnable[4]) return;   // no OBJ layer -> trivially GX-able
+
+	const u32 ep = g_gxDirty.oamGen ^ (g_gxDirty.palGen << 1) ^ (g_gxDirty.fullGen << 2);
+	const bool rebakeAll = (ep != s_objBuiltEp[e]);
+
+	static u16 tmp[GX2OBJ_TEXCAP];
+	for (int i = 0; i < 128; i++) {
+		int ow, oh, ox, oy; u8 op, os, hf, vf; u32 key;
+		const int r = GPU_ResolveObjSprite(gpu, i, tmp, GX2OBJ_TEXCAP,
+		                                   &ow, &oh, &ox, &oy, &op, &os, &hf, &vf, &key);
+		if (r == 0) continue;
+		if (r < 0)  { s_objGXable[e] = false; return; }        // -> CPU sprite path
+		if (op != 0) { s_objGXable[e] = false; return; }       // 5.2-1: front sprites only
+
+		ObjS *S = &s_obj[e][s_objN[e]++];
+		S->x = (s16)ox; S->y = (s16)oy; S->prio = op; S->semi = os;
+		S->hflip = hf;  S->vflip = vf;
+
+		const u32 need = (u32)ow * oh * 2;
+		if (rebakeAll || S->key != key || S->w != ow || S->h != oh || !S->tex) {
+			if (!S->tex || S->bytes != need) {
+				if (S->tex) { free(S->tex); s_objBytes -= S->bytes; }
+				if (s_totalBytes + s_objBytes + need > GX2DBG_BUDGET) {
+					S->tex = NULL; S->bytes = 0;
+					s_objGXable[e] = false; return;
+				}
+				S->tex = (u16 *)memalign(32, need);
+				if (!S->tex) { S->bytes = 0; s_objGXable[e] = false; return; }
+				S->bytes = need; s_objBytes += need;
+			}
+			swizzle16(tmp, S->tex, ow, oh);
+			DCFlushRange(S->tex, need);
+			GX_InitTexObj(&S->obj, S->tex, ow, oh, GX_TF_RGB5A3,
+			              GX_CLAMP, GX_CLAMP, GX_FALSE);
+			S->key = key; S->w = (u16)ow; S->h = (u16)oh;
+		}
+	}
+	s_objBuiltEp[e] = ep;
+}
+
+// recorder gate (core thread, this frame's freshly-built list)
+bool GX2DBG_ObjGXable(int eng)  { return (unsigned)eng < 2 && s_objGXable[eng]; }
+
+// core thread, GXMerge_Present: latch the sprite list for the draw thread.
+void GX2DBG_ObjLatch(void)
+{
+	for (int e = 0; e < 2; e++) {
+		memcpy(s_objP[e], s_obj[e], sizeof(s_objP[e]));
+		s_objPN[e]      = s_objN[e];
+		s_objPGXable[e] = s_objGXable[e];
+	}
+}
+
+int  GX2DBG_ObjCount(int eng)   { return (unsigned)eng < 2 ? s_objPN[eng] : 0; }
+
+GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *w, u16 *h,
+                        u8 *prio, u8 *semi, u8 *hflip, u8 *vflip)
+{
+	if ((unsigned)eng >= 2 || (unsigned)i >= (unsigned)s_objPN[eng]) return NULL;
+	ObjS *S = &s_objP[eng][i];
+	if (!S->tex) return NULL;
+	if (x)     { *x = S->x; }
+	if (y)     { *y = S->y; }
+	if (w)     { *w = S->w; }
+	if (h)     { *h = S->h; }
+	if (prio)  { *prio = S->prio; }
+	if (semi)  { *semi = S->semi; }
+	if (hflip) { *hflip = S->hflip; }
+	if (vflip) { *vflip = S->vflip; }
+	return &S->obj;
 }
