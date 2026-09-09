@@ -450,18 +450,27 @@ does the wrap and the composite.
   full-vs-incremental assert harness is still TODO. Visual A/B on
   Dolphin/hardware still pending (FBDUMP can't see GX-composited output).
 
-**5.2-1 landed (`56d5a97`) — non-affine tiled sprites.**
-`GPU_ResolveObjSprite` decodes an OAM entry (endian-corrected) and resolves a
-non-affine, tiled, standard-palette OBJ (16/256-colour, 1D/2D map, Mode 0/1)
-to RGB5A3. Per-engine 128-slot pool with a content-keyed texture cache
-(rebake on OAM/palette/VRAM epoch or key/size change), latched for the draw
-thread, drawn back-to-front over the BG bands on both screens (flip via UVs).
-Frame-gated all-or-nothing: any affine / bitmap / OBJ-window / ext-pal-256 /
-mosaic / non-priority-0 enabled sprite → CPU sprite path for that engine.
-**No regression** (`sm64boot` still −74 %); **does not clear `sm64` gameplay**
-— its HUD has affine sprites (rotating Mario head, power meter). Next: the
-affine path — one `GX_LoadPosMtx` + quad per OBJ from the OAM 2×2 matrix,
-which is what unblocks the 63 % scene.
+**5.2 landed (`56d5a97` non-affine, `0acfb1e` affine).**
+`GPU_ResolveObjSprite` decodes an OAM entry (endian-corrected) and bakes a
+tiled, standard-palette OBJ — non-affine *or* affine (Mode 0/1, 16/256-colour,
+1D/2D map) — into a `GX2OBJ_MARGIN`-padded RGB5A3 texture (transparent border →
+`GX_CLAMP` reads through outside the sprite). Non-affine flips and the affine
+OAM 2×2 matrix (`dx/dmx/dy/dmy`, double-size field) both fold into the 4
+field-rect corner UVs; the replay emits one per-corner-UV quad per sprite,
+priority-ordered over the BG bands, both engines. Per-engine 128-slot pool
+with a content-keyed cache (rebake on OAM/palette/VRAM epoch or key/size
+change), latched for the draw thread. `GX2DBG_ObjFrameUpdate` early-outs on
+any BLDCNT colour effect / active window so it doesn't bake sprites the
+recorder can't use. Frame gate: any bitmap / OBJ-window / ext-pal-256 / mosaic
+sprite → CPU sprite path for that engine.
+
+**No regression** (`sm64boot` still −74 %). **Still does not clear `sm64`
+gameplay** — and it's no longer the sprites. The recorder's frame-invariant
+gates (`BLDCNT` blend mode 0, no window) fail on sm64 gameplay: its 3D layer
+uses colour effects the fixed-function band replay can't express (fail reason
+3/4/5 — the same wall the legacy `GXMerge` 3D sandwich hits there). Unblocking
+the 63 % scene now needs **blend-mode handling** (the deferred 5.1a
+"blend/brighten" item), a separate chunk.
 
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
