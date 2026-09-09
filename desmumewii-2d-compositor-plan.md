@@ -512,20 +512,44 @@ sandwich already offloaded that screen.
 
 **`5649fc4`:** ext-palette 256-colour sprites now bake (were a hard reject).
 
-**SUB touch screen is still blocked** and is where the remaining `sm64`
-compositor time lives (~half of 17.5 ms). Its blockers are all *genuine*, not
-stale gates: a BG layer is a real blend 1st-target (`s_bld` ≈ 50 lines/frame),
-a non-text/affine minimap BG (`s_lay` ≈ 130k lines total), and problematic
-sprites (`s_obj`). Moving it onto GX needs **per-BG-entry blend TEV in the
-band replay** (alpha = KONST-modulate + `GX_BM_BLEND`, brighten/darken = a
-KONST lerp stage — recipes already proven in the 3D sandwich's draw 3 / draw
-4) **plus** affine-BG-as-texture, and even then live per-frame blending means
-partial coverage. Substantial, and unverifiable without a Dolphin/hardware
-visual A/B (FBDUMP can't see GX output).
+**Per-BG-entry blend TEV landed (`67f0be2`).** `GX2DBGBand` carries `fx/fxa`
+per entry; a blend 1st-target BG is drawn with its own effect — Increase/
+Decrease as a KONST lerp stage (`out.rgb = lerp(tex, white|black, EVY/16)`),
+Blend as KONST-modulated fragment alpha + `GX_BM_BLEND` against the EFB (only
+when the layer sits on uniformly 2nd-target content, else the line falls
+back). Boot-screen blend effects that were forcing fallback are now
+expressed: **`sm64boot` compositor 4.31 → 0.43 ms (−90 %), 43 → 51 fps.**
 
-**Net: GX2DBG is a validated pure-2D-screen optimisation; the MAIN 3D-gameplay
-path is unblocked but low-yield, and the SUB 3D-gameplay screen is a
-multi-piece build away.**
+**SUB (touch) screen unblocked (`5fe828f`).** Two pieces:
+- **semi-transparent sprites** (OBJ mode 1) — a hard whole-engine fallback —
+  now drawn in a constant-EVA/16 blend sub-pass, interleaved with the opaque
+  sprite pass by a per-sprite mode switch.
+- **affine / rotscale BGs** — `BGType_Affine` and every `AffineExt` variant
+  (256×16 / 256×1 / direct / Large8bpp) — bake to a GX texture in native
+  plane space (`GPU_ResolveAffineTile8x8`, mirroring `extRotBG2`) and replay
+  as **one affine-mapped quad per band**: the screen→texel map is linear, so
+  4 corner UVs + GX bilinear interpolation are exact. The recorder reads the
+  `BGxPARMS` block and advances `BGxX`/`BGxY` per recorded line exactly as
+  `lineRot` would; a band splits when the 2×2 matrix changes. Overflow-wrap
+  uses `GX_REPEAT` (transparent-overflow not yet distinguished).
+
+**Measured — savestate gameplay (`profile` vs `profile2dbg`):**
+
+| scene | compositor | fps | notes |
+|---|---|---|---|
+| `sm64` gameplay | **17.81 → 6.85 ms (−61 %)** | **27.6 → 40.1 (+45 %)** | both screens fully recorded (cov 192/192) |
+| `vsd` | **12.01 → 8.37 ms (−30 %)** | **44.9 → 53.4 (+19 %)** | its SUB engine was the offloadable part — not the "dead composite" earlier chased |
+| `sm64boot` | 4.33 → 0.47 ms (−89 %) | 42.9 → 51.1 | held |
+
+**Still unverified visually** — FBDUMP can't see GX-composited output, so BG/
+sprite/blend/affine correctness rests on the CPU-path mirroring in
+`GPU_Resolve*` + the TEV recipes. All behind the `GXMerge_Set2DBG` opt-in;
+CPU path fully intact. A Dolphin/hardware A/B is the outstanding gate before
+this is trustworthy for real use.
+
+**Net: GX2DBG now offloads both screens in 3D gameplay — −61 % / +45 % fps on
+the profiled `sm64` scene, −30 % / +19 % on `vsd` — pending visual
+verification.**
 
 ### 5.2 Sprites as per-OBJ textured quads
 Affine sprites already carry a 2×2 transform (`dx/dmx/dy/dmy`,
@@ -583,4 +607,4 @@ be a multi-milestone project, not a single patch.
 | 2. Hand-hoist per-pixel dispatch | 3 call sites, mechanical | **Done — −8–15 % of compositor** | Low | ~~Step 1's result~~ (Step 1 confirmed needed) |
 | 3. Trim per-line CPU waste (clears, OAM endian) | ~3 small sites | **Done — 3.1 −1–2 % of compositor; 3.2 deferred; 3.3 already collapsed** | Low | — |
 | 4. Re-benchmark checkpoint | No code | **Done — cumulative −17 % (vsd) / −9 % (sm64) of compositor; +11 % / +6 % fps. Verdict: Step 5 justified, do 5.1 before 5.2** | — | Steps 1–3 |
-| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 done** (`55d0436`..`5649fc4`, 20 commits). MAIN+SUB text BGs + 3D-fold + non-affine/affine/ext-pal-256 sprites on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Validated −74 % compositor / +15 % fps on pure-2D screens** (`sm64boot`); **zero regression** elsewhere. Real-gameplay (`sm64` savestate): the blend relaxation (`32b261d`) unblocks the **MAIN** screen (0 → 192/192 scanlines) but the gain is small — the legacy 3D sandwich already had it. The **SUB** touch screen — where ~half the remaining 17.5 ms lives — is still blocked by *genuine* per-BG-layer blending + an affine minimap BG; that needs per-entry blend TEV in the band replay + affine-BG-as-texture, a multi-piece build, and is unverifiable without a Dolphin/hardware visual A/B. `vsd` (54 %): the prior "dispMode-2 dead work" premise was **wrong** — `GPU_RenderLine_layer` runs on displayed lines, no skippable work. Then 5.3 (windows) / 5.4, 5.1b if a prototype proves out. Visual A/B still pending. |
+| 5. GX-offload the 2D compositor | New subsystem (dirty-tracking + N-layer sandwich) | Multi-milestone | High | **5.0 / 5.1a / 5.2 / most of 5.4 done** (`55d0436`..`5fe828f`, 22 commits). Both screens: text + affine/rotscale BGs, 3D-fold, non-affine/affine/ext-pal/semi-transparent sprites, per-entry BLDCNT blend/brighten/darken — all on GX, opt-in (`GXMerge_Set2DBG`), CPU path intact. **Measured (savestate gameplay): `sm64` compositor −61 % / +45 % fps; `vsd` −30 % / +19 % fps; `sm64boot` −89 %.** Both screens fully recorded in 3D gameplay (cov 192/192). `vsd`'s offloadable work was its SUB engine, not the "dispMode-2 dead composite" earlier (mis)chased — that premise was wrong, `GPU_RenderLine_layer` runs on displayed lines. **Remaining:** 5.3 (windows as scissors), transparent-overflow wrap for affine, 5.1b (GX indirect lookup) if a prototype proves out, and — the real gate — a **Dolphin/hardware visual A/B**: none of the GX-composited output has been seen, correctness rests on CPU-path mirroring. |
