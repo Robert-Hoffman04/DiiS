@@ -1197,18 +1197,20 @@ void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
 }
 
 //------------------------------------------------------------------------------
-// GX sprite compositor (Step 5.2) - resolve one non-affine, tiled, standard-
-// palette OBJ into w*h RGB5A3 texels (row-major, un-flipped; the caller applies
-// H/V flip via UVs).  0x0000 = transparent.  Fills *ow/*oh/*prio/*semi/*x/*y.
-// Returns: 0 = skip (disabled / fully off-screen), 1 = baked into out[], -1 =
-// on-screen but not GX-bakeable here (affine / bitmap / OBJ-window / 256-colour
-// extended palette / mosaic / edge-wrap) - the frame then composites all its
-// sprites on the CPU.
+// GX sprite compositor (Step 5.2) - resolve one tiled, standard-palette OBJ
+// (non-affine OR affine) into a padded RGB5A3 texture (transparent GX2OBJ_MARGIN
+// border so GX_CLAMP outside the sprite reads as transparent) plus its on-screen
+// field rect and the 4 quad-corner UVs (TL,BL,BR,TR - into the *padded* texture,
+// 0..1).  Non-affine flips fold into the UVs; affine uses the OAM 2x2 matrix.
+// Returns 0 = skip, 1 = baked, -1 = not GX-bakeable (bitmap / OBJ-window /
+// ext-pal-256 / mosaic) - the frame then composites all its sprites on the CPU.
 //------------------------------------------------------------------------------
+#define GX2OBJ_MARGIN 2   // keeps padded dims a multiple of 4 (sprite dims are 8/16/32/64)
+
 int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
-                         int *ow, int *oh, int *ox, int *oy,
-                         u8 *oprio, u8 *osemi, u8 *ohflip, u8 *ovflip,
-                         u32 *okey)
+                         int *fx, int *fy, int *ox, int *oy,
+                         u8 *oprio, u8 *osemi, u32 *okey,
+                         float uv[8], int *texW, int *texH)
 {
 	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
 
@@ -1223,61 +1225,103 @@ int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
 	}
 
 	if (oe.RotScale == 2)     return 0;    // disabled
-	if (oe.RotScale & 1)      return -1;   // affine -> CPU
 	if (oe.Mode == 2 || oe.Mode == 3) return -1;   // OBJ window / bitmap
 	if (oe.Mosaic)            return -1;
 	if (oe.Depth && dispCnt->ExOBJPalette_Enable) return -1;   // ext-pal 256
 
+	const bool affine = (oe.RotScale & 1) != 0;
 	const size sz = sprSizeTab[oe.Size][oe.Shape];
 	const int W = sz.x, H = sz.y;
-	if (W <= 0 || H <= 0 || W * H > outCap) return -1;
+	if (W <= 0 || H <= 0) return -1;
+
+	const int PW = W + 2 * GX2OBJ_MARGIN;
+	const int PH = H + 2 * GX2OBJ_MARGIN;
+	if (PW * PH > outCap) return -1;
+
+	// field (on-screen footprint): sprite size, doubled in double-size mode
+	int FX = W, FY = H;
+	if (affine && (oe.RotScale & 2)) { FX <<= 1; FY <<= 1; }
 
 	s32 sx = (oe.X << 23) >> 23;                 // sign-extend 9-bit X
 	s32 sy = oe.Y;
 	if (sy >= 192) sy = (s32)((s8)oe.Y);
-	if (sx >= 256 || sx + W <= 0 || sy >= 192 || sy + H <= 0) return 0;   // off-screen
-	if (sx < 0 || sx + W > 256) return -1;   // horizontal edge -> would wrap
+	// wrap: DS wraps sprites at 256/512; approximate with the closer copy
+	if (sx + FX <= 0)   sx += 512;
+	if (sx >= 256)      sx -= 512;
+	if (sx + FX <= 0 || sx >= 256 || sy + FY <= 0 || sy >= 192) return 0;   // off-screen
+
 	*ox = sx; *oy = sy;
-	*ow = W;  *oh = H;
+	*fx = FX; *fy = FY;
 	*oprio  = oe.Priority;
 	*osemi  = (oe.Mode == 1) ? 1 : 0;
-	*ohflip = oe.HFlip ? 1 : 0;
-	*ovflip = oe.VFlip ? 1 : 0;
-	// content key: everything that affects the baked texels (not screen pos)
+	*texW = PW; *texH = PH;
 	*okey = ((u32)oe.TileIndex) | ((u32)oe.PaletteIndex << 10) | ((u32)oe.Depth << 14)
-	      | ((u32)oe.Size << 15) | ((u32)oe.Shape << 17) | ((u32)oe.Mode << 19);
+	      | ((u32)oe.Size << 15) | ((u32)oe.Shape << 17) | ((u32)oe.Mode << 19)
+	      | ((u32)(oe.RotScale & 1) << 21);
+
+	// --- UVs -----------------------------------------------------------------
+	const float m = (float)GX2OBJ_MARGIN;
+	if (!affine) {
+		float u0 = m / PW,       u1 = (m + W) / PW;
+		float v0 = m / PH,       v1 = (m + H) / PH;
+		if (oe.HFlip) { float t = u0; u0 = u1; u1 = t; }
+		if (oe.VFlip) { float t = v0; v0 = v1; v1 = t; }
+		uv[0] = u0; uv[1] = v0;   // TL
+		uv[2] = u0; uv[3] = v1;   // BL
+		uv[4] = u1; uv[5] = v1;   // BR
+		uv[6] = u1; uv[7] = v0;   // TR
+	} else {
+		const int bp = (oe.RotScalIndex + (oe.HFlip << 3) + (oe.VFlip << 4)) * 4;
+		const s16 dx  = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 0])[3]);
+		const s16 dmx = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 1])[3]);
+		const s16 dy  = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 2])[3]);
+		const s16 dmy = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 3])[3]);
+		const float Cx = W * 128.0f, Cy = H * 128.0f;      // sprite centre, 8.8
+		const float hx = FX * 0.5f,  hy = FY * 0.5f;
+		// texX/texY at field-local (a,b): Cx + (a-hx)*dx + (b-hy)*dmx  (8.8)
+		const int cx[4] = { 0, 0, FX, FX };
+		const int cy[4] = { 0, FY, FY, 0 };
+		for (int k = 0; k < 4; k++) {
+			float tX = (Cx + (cx[k] - hx) * dx + (cy[k] - hy) * dmx) / 256.0f;
+			float tY = (Cy + (cx[k] - hx) * dy + (cy[k] - hy) * dmy) / 256.0f;
+			uv[k * 2 + 0] = (tX + m) / PW;
+			uv[k * 2 + 1] = (tY + m) / PH;
+		}
+	}
+
+	// --- bake the W*H sprite pixels into the padded buffer ------------------
+	for (int i = 0; i < PW * PH; i++) out[i] = 0;   // transparent border
 
 	const u32 base   = gpu->sprMem;
 	const u8  block  = gpu->sprBoundary;
 	const bool map2d = (gpu->spriteRenderMode == GPU::SPRITE_2D);
 	const bool d256  = oe.Depth;
 	const int  Wt    = W >> 3;
-
-	// palette pointers (standard OBJ palette: ARM9_VMEM + 0x200 + core*0x400)
+	// tile-base shift: 2D mapping uses <<5, 1D uses <<sprBoundary - except the
+	// affine 256-colour path, which _spriteRender always addresses with <<block.
+	const u32 tbase  = (map2d && !(affine && d256))
+	                   ? (base + ((u32)oe.TileIndex << 5))
+	                   : (base + ((u32)oe.TileIndex << block));
 	u8 *palBase = MMU.ARM9_VMEM + 0x200 + gpu->core * ADDRESS_STEP_1KB;
-	u8 *pal16   = palBase + (oe.PaletteIndex << 5);   // 16 entries * 2 bytes
+	u8 *pal16   = palBase + (oe.PaletteIndex << 5);
 
 	for (int py = 0; py < H; py++) {
 		const int ty = py >> 3, yin = py & 7;
+		u16 *dstrow = out + (py + GX2OBJ_MARGIN) * PW + GX2OBJ_MARGIN;
 		for (int px = 0; px < W; px++) {
 			const int tx = px >> 3, xin = px & 7;
-			u32 ofs;
 			u8 idx;
 			if (d256) {
-				const u32 tbase = map2d ? (base + ((u32)oe.TileIndex << 5))
-				                        : (base + ((u32)oe.TileIndex << block));
-				ofs = map2d ? ((u32)ty << 10) + (u32)tx * 64 + (u32)yin * 8 + xin
-				            : (u32)ty * (u32)Wt * 64 + (u32)tx * 64 + (u32)yin * 8 + xin;
+				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 64 + (u32)yin * 8 + xin
+				                : (u32)ty * (u32)Wt * 64 + (u32)tx * 64 + (u32)yin * 8 + xin;
 				idx = *(u8 *)MMU_gpu_map(tbase + ofs);
-				out[py * W + px] = idx ? RGB15_REVERSE(T1ReadWord(palBase, idx << 1)) : 0;
+				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(palBase, idx << 1)) : 0;
 			} else {
-				const u32 tbase = map2d ? (base + ((u32)oe.TileIndex << 5))
-				                        : (base + ((u32)oe.TileIndex << block));
-				ofs = map2d ? ((u32)ty << 10) + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1)
-				            : (u32)ty * (u32)Wt * 32 + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1);
+				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1)
+				                : (u32)ty * (u32)Wt * 32 + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1);
 				u8 b = *(u8 *)MMU_gpu_map(tbase + ofs);
 				idx = (xin & 1) ? (b >> 4) : (b & 0xF);
-				out[py * W + px] = idx ? RGB15_REVERSE(T1ReadWord(pal16, idx << 1)) : 0;
+				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(pal16, idx << 1)) : 0;
 			}
 		}
 	}

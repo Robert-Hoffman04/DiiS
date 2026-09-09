@@ -774,17 +774,21 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 		GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
 		for (int pr = 3; pr >= 0; pr--) {
 			for (int i = nObj - 1; i >= 0; i--) {
-				s16 sx, sy; u16 sw, sh; u8 sp, ss, hf, vf;
-				GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &sw, &sh, &sp, &ss, &hf, &vf);
-				if (!ot || sp != pr) continue;
+				s16 sx, sy; u16 fxw, fyh; u8 sp, ss; const f32 *uv = NULL;
+				GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &fxw, &fyh, &sp, &ss, &uv);
+				if (!ot || sp != pr || !uv) continue;
 				GX_LoadTexObj(ot, GX_TEXMAP0);
-				const f32 qx0 = x0 + w * (sx        / (f32)DS_W);
-				const f32 qx1 = x0 + w * ((sx + sw) / (f32)DS_W);
-				const f32 qy0s = y0 + h * (sy        / (f32)DS_H);
-				const f32 qy1s = y0 + h * ((sy + sh) / (f32)DS_H);
-				const f32 u0 = hf ? 1.f : 0.f, u1 = hf ? 0.f : 1.f;
-				const f32 v0 = vf ? 1.f : 0.f, v1 = vf ? 0.f : 1.f;
-				quad(qx0, qy0s, qx1, qy1s, u0, v0, u1, v1);
+				const f32 gx0 = x0 + w * (sx          / (f32)DS_W);
+				const f32 gx1 = x0 + w * ((sx + fxw)  / (f32)DS_W);
+				const f32 gy0 = y0 + h * (sy          / (f32)DS_H);
+				const f32 gy1 = y0 + h * ((sy + fyh)  / (f32)DS_H);
+				// field-rect quad with per-corner UVs (affine or flipped sprite)
+				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+					GX_Position2f32(gx0, gy0); GX_TexCoord2f32(uv[0], uv[1]);  // TL
+					GX_Position2f32(gx0, gy1); GX_TexCoord2f32(uv[2], uv[3]);  // BL
+					GX_Position2f32(gx1, gy1); GX_TexCoord2f32(uv[4], uv[5]);  // BR
+					GX_Position2f32(gx1, gy0); GX_TexCoord2f32(uv[6], uv[7]);  // TR
+				GX_End();
 			}
 		}
 	}

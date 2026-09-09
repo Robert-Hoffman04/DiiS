@@ -833,12 +833,13 @@ void GPU_setBGProp(GPU *, u16 num, u16 p);
 // plane to 64 GX RGB5A3 texels (0x0000 == transparent). See GPU.cpp.
 void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64]);
 
-// GX sprite compositor (Step 5.2): resolve a non-affine tiled OBJ to w*h RGB5A3
-// texels. 0 = skip, 1 = baked, -1 = not GX-bakeable. See GPU.cpp.
+// GX sprite compositor (Step 5.2): resolve a tiled OBJ (affine or not) into a
+// padded RGB5A3 texture + its on-screen field rect + 4 quad-corner UVs
+// (TL,BL,BR,TR). 0 = skip, 1 = baked, -1 = not GX-bakeable. See GPU.cpp.
 int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
-                         int *ow, int *oh, int *ox, int *oy,
-                         u8 *oprio, u8 *osemi, u8 *ohflip, u8 *ovflip,
-                         u32 *okey);
+                         int *fx, int *fy, int *ox, int *oy,
+                         u8 *oprio, u8 *osemi, u32 *okey,
+                         float uv[8], int *texW, int *texH);
 void GPU_setBLDCNT(GPU *gpu, u16 v) ;
 void GPU_setBLDY(GPU *gpu, u16 v) ;
 void GPU_setMOSAIC(GPU *gpu, u16 v) ;

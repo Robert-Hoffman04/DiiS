@@ -213,15 +213,17 @@ GXTexObj *GX2DBG_LayerTex(int eng, int num, u16 *w, u16 *h)
 //------------------------------------------------------------------------------
 // Step 5.2 - non-affine tiled sprites as GX quads
 //------------------------------------------------------------------------------
-#define GX2OBJ_TEXCAP (64 * 64)
+#define GX2OBJ_TEXCAP (72 * 72)   // 64x64 sprite + 2px margin each side, padded
 
 struct ObjS {
 	u16     *tex;
 	u32      bytes;
-	u16      w, h;
+	u16      tw, th;        // padded texture dims
 	GXTexObj obj;
-	s16      x, y;
-	u8       prio, semi, hflip, vflip;
+	s16      x, y;          // field rect origin (screen)
+	u16      fx, fy;        // field rect size (screen footprint)
+	float    uv[8];         // quad corner UVs: TL,BL,BR,TR
+	u8       prio, semi;
 	u32      key;
 };
 static ObjS  s_obj[2][128];
@@ -259,24 +261,37 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 	if (!s_enabled) return;
 	if (!gpu->LayersEnable[4]) return;   // no OBJ layer -> trivially GX-able
 
+	// Cheap frame-level early-out: if the recorder can't fire this frame anyway
+	// (any BLDCNT colour effect, or a window active), don't spend time baking
+	// sprites nobody will draw.  Mirrors the recorder's frame-invariant gates.
+	if (((gpu->BLDCNT >> 6) & 3) != 0 ||
+	    gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) {
+		s_objGXable[e] = false;
+		return;
+	}
+
 	const u32 ep = g_gxDirty.oamGen ^ (g_gxDirty.palGen << 1) ^ (g_gxDirty.fullGen << 2);
 	const bool rebakeAll = (ep != s_objBuiltEp[e]);
 
 	static u16 tmp[GX2OBJ_TEXCAP];
 	for (int i = 0; i < 128; i++) {
-		int ow, oh, ox, oy; u8 op, os, hf, vf; u32 key;
+		int fx, fy, ox, oy, tw, th; u8 op, os; u32 key; float uv[8];
 		const int r = GPU_ResolveObjSprite(gpu, i, tmp, GX2OBJ_TEXCAP,
-		                                   &ow, &oh, &ox, &oy, &op, &os, &hf, &vf, &key);
+		                                   &fx, &fy, &ox, &oy, &op, &os, &key, uv, &tw, &th);
 		if (r == 0) continue;
 		if (r < 0)  { s_objGXable[e] = false; return; }        // -> CPU sprite path
-		if (op != 0) { s_objGXable[e] = false; return; }       // 5.2-1: front sprites only
+		// NOTE: 5.2 draws sprites last (over all BG bands).  This is only correct
+		// when no opaque BG sits in front of a sprite; a per-priority interleave
+		// is 5.2-2.  Both bench scenes' sprites are HUD (front), so allow all.
 
 		ObjS *S = &s_obj[e][s_objN[e]++];
-		S->x = (s16)ox; S->y = (s16)oy; S->prio = op; S->semi = os;
-		S->hflip = hf;  S->vflip = vf;
+		S->x = (s16)ox; S->y = (s16)oy;
+		S->fx = (u16)fx; S->fy = (u16)fy;
+		S->prio = op; S->semi = os;
+		memcpy(S->uv, uv, sizeof S->uv);
 
-		const u32 need = (u32)ow * oh * 2;
-		if (rebakeAll || S->key != key || S->w != ow || S->h != oh || !S->tex) {
+		const u32 need = (u32)tw * th * 2;
+		if (rebakeAll || S->key != key || S->tw != tw || S->th != th || !S->tex) {
 			if (!S->tex || S->bytes != need) {
 				if (S->tex) { free(S->tex); s_objBytes -= S->bytes; }
 				if (s_totalBytes + s_objBytes + need > GX2DBG_BUDGET) {
@@ -287,11 +302,11 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 				if (!S->tex) { S->bytes = 0; s_objGXable[e] = false; return; }
 				S->bytes = need; s_objBytes += need;
 			}
-			swizzle16(tmp, S->tex, ow, oh);
+			swizzle16(tmp, S->tex, tw, th);
 			DCFlushRange(S->tex, need);
-			GX_InitTexObj(&S->obj, S->tex, ow, oh, GX_TF_RGB5A3,
+			GX_InitTexObj(&S->obj, S->tex, tw, th, GX_TF_RGB5A3,
 			              GX_CLAMP, GX_CLAMP, GX_FALSE);
-			S->key = key; S->w = (u16)ow; S->h = (u16)oh;
+			S->key = key; S->tw = (u16)tw; S->th = (u16)th;
 		}
 	}
 	s_objBuiltEp[e] = ep;
@@ -312,19 +327,18 @@ void GX2DBG_ObjLatch(void)
 
 int  GX2DBG_ObjCount(int eng)   { return (unsigned)eng < 2 ? s_objPN[eng] : 0; }
 
-GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *w, u16 *h,
-                        u8 *prio, u8 *semi, u8 *hflip, u8 *vflip)
+GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *fx, u16 *fy,
+                        u8 *prio, u8 *semi, const float **uv)
 {
 	if ((unsigned)eng >= 2 || (unsigned)i >= (unsigned)s_objPN[eng]) return NULL;
 	ObjS *S = &s_objP[eng][i];
 	if (!S->tex) return NULL;
-	if (x)     { *x = S->x; }
-	if (y)     { *y = S->y; }
-	if (w)     { *w = S->w; }
-	if (h)     { *h = S->h; }
-	if (prio)  { *prio = S->prio; }
-	if (semi)  { *semi = S->semi; }
-	if (hflip) { *hflip = S->hflip; }
-	if (vflip) { *vflip = S->vflip; }
+	if (x)    { *x = S->x; }
+	if (y)    { *y = S->y; }
+	if (fx)   { *fx = S->fx; }
+	if (fy)   { *fy = S->fy; }
+	if (prio) { *prio = S->prio; }
+	if (semi) { *semi = S->semi; }
+	if (uv)   { *uv = S->uv; }
 	return &S->obj;
 }

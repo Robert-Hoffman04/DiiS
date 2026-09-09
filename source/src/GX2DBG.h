@@ -77,9 +77,10 @@ bool GX2DBG_ObjGXable(int eng);
 // Core thread, GXMerge_Present: latch the sprite list for the draw thread.
 void GX2DBG_ObjLatch(void);
 int  GX2DBG_ObjCount(int eng);
-// Draw thread: latched sprite i (0..count-1, OAM order) - tex + rect + flags.
-GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *w, u16 *h,
-                        u8 *prio, u8 *semi, u8 *hflip, u8 *vflip);
+// Draw thread: latched sprite i (OAM order) - texture, field rect (x,y,fx,fy),
+// priority, semi-transparent flag, and the 4 quad-corner UVs (TL,BL,BR,TR).
+GXTexObj *GX2DBG_ObjGet(int eng, int i, s16 *x, s16 *y, u16 *fx, u16 *fy,
+                        u8 *prio, u8 *semi, const float **uv);
 
 // Machine reset / video teardown.
 void GX2DBG_Reset(void);
