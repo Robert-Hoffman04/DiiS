@@ -463,6 +463,7 @@ static unsigned s_dbgFrame = 0;
 #endif
 
 #ifdef DESMUME_BENCH
+extern int g_gxmergeFailReason;   // GPU.cpp: 0 ok, 1 dispMode, 2 capture, 3..5 line
 // Step 5.1a coverage probe: how many MAIN scanlines the 2D-BG path actually
 // takes off the CPU compositor, written to sd:/gx2dbg.log every 60 frames.
 static void gx2dbg_covlog(void)
@@ -471,10 +472,12 @@ static void gx2dbg_covlog(void)
 	static bool init = false;
 	static u32  fr = 0;
 	static u64  accCov = 0, accBands = 0, framesActive = 0, framesFallback = 0;
+	static u64  failHist[8] = {0};
+	static u64  framesArmed = 0;
 	if (!init) {
 		init = true;
 		FILE *f = fopen("sd:/gx2dbg.log", "w");
-		if (f) { fprintf(f, "frame,avg_cov_lines,avg_bands,frames_active,frames_fallback\n"); fclose(f); }
+		if (f) { fprintf(f, "frame,avg_cov_lines,avg_bands,frames_active,frames_fallback,frames_armed,fail0,fail1_dispmode,fail2_capture,fail3_5\n"); fclose(f); }
 	}
 	fr++;
 	int cov = 0;
@@ -484,12 +487,18 @@ static void gx2dbg_covlog(void)
 	accBands += s2_working.nBands;
 	if (cov > 0) framesActive++;
 	if (!s2_working.valid) framesFallback++;
+	if (s_frameArmed) framesArmed++;
+	{ int r = g_gxmergeFailReason; if (r >= 0 && r < 8) failHist[r]++; }
 	if (fr % 60 == 0) {
 		FILE *f = fopen("sd:/gx2dbg.log", "a");
 		if (f) {
-			fprintf(f, "%u,%llu,%llu,%llu,%llu\n", fr,
+			fprintf(f, "%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", fr,
 			        (unsigned long long)(accCov / 60), (unsigned long long)(accBands / 60),
-			        (unsigned long long)framesActive, (unsigned long long)framesFallback);
+			        (unsigned long long)framesActive, (unsigned long long)framesFallback,
+			        (unsigned long long)framesArmed,
+			        (unsigned long long)failHist[0], (unsigned long long)failHist[1],
+			        (unsigned long long)failHist[2],
+			        (unsigned long long)(failHist[3] + failHist[4] + failHist[5]));
 			fclose(f);
 		}
 		accCov = accBands = 0;
