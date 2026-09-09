@@ -1,0 +1,74 @@
+/*
+    Copyright (C) 2026 DeSmuMEWii team
+
+    This file is part of DeSmuMEWii
+
+    DeSmuMEWii is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    DeSmuMEWii is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with DeSmuMEWii; if not, write to the Free Software
+    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+*/
+
+//------------------------------------------------------------------------------
+// GX2DBG - MAIN-engine text BG layers as GX-sampled textures (Step 5.1a).
+//
+// Each armed text BG layer is baked into a "resolved plane" texture in its
+// native size (BGSize, 256/512 px, always pow2): the tilemap resolved against
+// tileset + palette, one GX RGB5A3 texel per BG pixel, 0x0000 == transparent.
+// The bake happens on the core thread inside GXMerge_Present and only when the
+// GXDirty epochs say the backing VRAM/palette actually changed.  GX then draws
+// the plane every frame as a GX_REPEAT-wrapped quad with (HOFS,VOFS) folded
+// into the texcoord matrix - the hardware does the (x+hofs)&mask wrap and the
+// composite/blend that the CPU per-pixel path used to.
+//
+// THREADING: bake + descriptor update run on the core thread (GXMerge_Present,
+// under vidmutex).  The draw thread only reads the latched GXTexObj.
+//------------------------------------------------------------------------------
+
+#ifndef GX2DBG_H
+#define GX2DBG_H
+
+#include <gctypes.h>
+#include <gccore.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct GPU;
+
+// Total MEM1 the baked planes may claim (a layer that would exceed it stays on
+// the CPU path).  4 * 512*512*2 == 2 MB worst case; cap below that.
+#define GX2DBG_BUDGET (1536 * 1024)
+
+// Called from GXMerge_Set2DBG().  false teardown frees every plane.
+void GX2DBG_SetEnabled(bool on);
+bool GX2DBG_Enabled(void);
+
+// Core thread, start of GXMerge_Present: re-bake any armed MAIN text BG layer
+// whose source bytes changed since its last bake.  Cheap when nothing is dirty.
+void GX2DBG_FrameUpdate(struct GPU *mainGpu);
+
+// Is layer `num` (0..3) currently a valid baked plane this frame?
+bool GX2DBG_LayerReady(int num);
+
+// Latched texture object for a ready layer (draw thread).  w/h out = plane size.
+GXTexObj *GX2DBG_LayerTex(int num, u16 *w, u16 *h);
+
+// Machine reset / video teardown.
+void GX2DBG_Reset(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // GX2DBG_H
