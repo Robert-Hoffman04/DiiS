@@ -49,13 +49,22 @@
 #ifndef JIT_ARENA_SIZE
 #define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB (ARM7)
 #endif
-// ARM9 is the hot core. 3 MB filled within ~150 emulated frames in SM64DS and
-// was recycled ~90 times over a 3000-frame run (arenapeak 99%, ~1 ms/frame lost
-// to re-compilation); the profEmitReport heuristic flagged it. 6 MB gives real
-// headroom without crowding MEM1 (ARM7 2 MB + ARM9 6 MB = 8 MB, still under
-// VBA-GX's original single-core 8 MB).
+// ARM9 is the hot core. History: 3 MB thrashed (~90 flushes/3000 frames);
+// 6 MB still thrashed - a harness capture (SM64DS savestate) showed arenapeak
+// pinned at 99% with a full-cache flush every ~130 frames, ~15 over a
+// 1400-frame run, driving the JIT-build cost and the p99 frametime tail.
+// 12 MB (measured, same SM64DS capture to frame ~1200, vs the 6 MB numbers):
+//   p99 frame time   ~41-48 ms -> ~28-34 ms
+//   worst frame      ~49 ms    -> ~44 ms
+//   ARM9 JIT-build   0.53 ms/f -> 0.38 ms/f   (-28%)
+//   flush interval   ~1/130 fr -> ~1/175 fr
+// It does NOT fix the thrash: arena peak stays 99% and collision-misses stay
+// ~38k (bound by the 64K direct-mapped block table, independent of arena
+// size), so SM64DS's ARM9 working set still outgrows 12 MB - this buys the
+// latency tail, not saturation headroom. Which pool the arena lands in
+// (MEM1 vs MEM2) is tracked in jit/NOTES.md.
 #ifndef JIT_ARENA_SIZE_ARM9
-#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 6) // 6 MB (ARM9 is the hot core)
+#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 12) // 12 MB (ARM9 is the hot core)
 #endif
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
