@@ -95,6 +95,9 @@ JITCache::JITCache() {
 	arenaPeakEver = 0;
 	lastHeuristic = 0;
 	memset(&profStats, 0, sizeof profStats);
+#ifdef JIT_HASH_HISTO
+	bucketEvict = nullptr;
+#endif
 #endif
 }
 
@@ -116,6 +119,10 @@ void JITCache::initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr
 #if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 	if (!installFrame)
 		installFrame = (u32*)calloc(HASH_TABLE_SIZE, sizeof(u32));
+#ifdef JIT_HASH_HISTO
+	if (!bucketEvict)
+		bucketEvict = (u16*)calloc(HASH_TABLE_SIZE, sizeof(u16));
+#endif
 	installSeq = 0;
 	arenaPeak = 0;
 	arenaPeakEver = 0;
@@ -137,6 +144,10 @@ void JITCache::destroy() {
 #if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 	free(installFrame);
 	installFrame = nullptr;
+#ifdef JIT_HASH_HISTO
+	free(bucketEvict);
+	bucketEvict = nullptr;
+#endif
 #endif
 }
 
@@ -165,7 +176,7 @@ void JITCache::rewindJITMemory(size_t numBytes) {
 }
 
 BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bool thumb) {
-	u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);
+	u32 index = jitHashPC(pc);
 	length = (length & 0x7FFFFFFFu) | (thumb ? 0x80000000u : 0u);
 
 	u32 evictedPC = blockTable[index].startPC;
@@ -238,10 +249,13 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 	*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
 
-	*emitPtr++ = PPC_SRWI(PPC_R11, PPC_R4, 1);
-	*emitPtr++ = PPC_SRWI(PPC_R12, PPC_R4, 13);
-	*emitPtr++ = PPC_XOR(PPC_R11, PPC_R11, PPC_R12);
-	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 4, maskBegin, 27);
+	// jitHashPC(pc): (pc * golden) >> (32 - hashBits), pre-shifted by 4 for the
+	// 16-byte BasicBlock stride -> RLWINM(x, 32-maskBegin, maskBegin, 27), since
+	// maskBegin == 28 - hashBits (see flushCache()).
+	*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
+	*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
+	*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
+	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
 	*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
 
 	// Guard 1: PC collision (hash-slot occupant is a different address)
@@ -297,15 +311,16 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
 
-		// 2. Native Hash Calculation
-		*emitPtr++ = PPC_SRWI(PPC_R11, PPC_R4, 1);
-		*emitPtr++ = PPC_SRWI(PPC_R12, PPC_R4, 13);
-		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R11, PPC_R12);
-		// Dynamically calculate the Native Mask boundaries based on HASH_TABLE_SIZE
+		// 2. Native Hash Calculation -- jitHashPC(pc): multiplicative
+		//    (pc * JIT_HASH_GOLDEN) >> (32 - hashBits), then << 4 for the
+		//    16-byte BasicBlock stride, folded into the one RLWINM.
 		u32 hashBits = __builtin_ctz(HASH_TABLE_SIZE); // 8192 = 13, 32768 = 15, 65536 = 16
-		u32 maskBegin = 27 - hashBits + 1;
+		u32 maskBegin = 27 - hashBits + 1;            // == 28 - hashBits
 
-		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 4, maskBegin, 27);
+		*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
+		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
+		*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
+		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
 		*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
 
 		// 3. Miss Guard 1: PC Collision Check
@@ -468,12 +483,15 @@ void JITCache::profCacheEvict(u32 evictedPC, u32 newPC) {
 	profStats.registrations++;
 	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;  // §3.3b
 	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
-	u32 index = ((newPC >> 1) ^ (newPC >> 13)) & (HASH_TABLE_SIZE - 1);
+	u32 index = jitHashPC(newPC);
 	const BasicBlock& ev = blockTable[index];
 	if (evictedPC != 0 && ev.execute != nullptr && ev.length > 0) {
 		profStats.evictions++;
 		if (installFrame)
 			profStats.evictLifetimeSum += (installSeq - installFrame[index]);
+#ifdef JIT_HASH_HISTO
+		if (bucketEvict && bucketEvict[index] != 0xFFFF) bucketEvict[index]++;
+#endif
 	}
 	if (installFrame) installFrame[index] = ++installSeq;
 }
@@ -510,6 +528,41 @@ void JITCache::profEmitReport(const char* tag) {
 		(unsigned long long)lifeAvg, (unsigned long long)s.flushes,
 		(unsigned)arenaOffset, (unsigned)cap, (unsigned)fillPct,
 		(unsigned)arenaPeakEver, (unsigned)peakPct);
+
+#ifdef JIT_HASH_HISTO
+	if (bucketEvict) {
+		u32 occ = 0, mx = 0;
+		u32 b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0;   // counts of buckets per band
+		u64 ev5 = 0, sumSq = 0;                        // evicts in 16+ band; sum of c^2
+		for (u32 i = 0; i < HASH_TABLE_SIZE; i++) {
+			u32 c = bucketEvict[i];
+			if (!c) continue;
+			occ++; if (c > mx) mx = c; sumSq += (u64)c * c;
+			if      (c == 1)  b1++;
+			else if (c <= 3)  b2++;
+			else if (c <= 7)  b3++;
+			else if (c <= 15) b4++;
+			else            { b5++; ev5 += c; }
+		}
+		u64 tot   = s.evictions ? s.evictions : 1;
+		u32 meanX100 = occ ? (u32)((u64)tot * 100 / occ) : 0;   // mean evicts per touched bucket
+		// dispersion index D = Var/Mean ; ==100 (x100) for a Poisson/uniform
+		// spread, >>100 => a few buckets hogging evictions (hash weakness).
+		// D = Var/Mean = (sumSq/occ - mean^2)/mean = sumSq/tot - tot/occ
+		u32 dispX100 = 0;
+		if (occ) {
+			u64 t1 = (u64)sumSq * 100 / tot;
+			u64 t2 = (u64)tot * 100 / occ;
+			dispX100 = (t1 > t2) ? (u32)(t1 - t2) : 0;
+		}
+		harness_profile_emitf(
+			"jit hashhisto cache=%s evbuckets=%u/%u max=%u meanx100=%u dispx100=%u "
+			"b1=%u b2_3=%u b4_7=%u b8_15=%u b16+=%u ev_in_b16+=%llu/%llu",
+			tag, occ, (unsigned)HASH_TABLE_SIZE, mx, meanX100, dispX100,
+			b1, b2, b3, b4, b5,
+			(unsigned long long)ev5, (unsigned long long)s.evictions);
+	}
+#endif
 
 	// §3.3 / §3.3b heuristic, three-way and edge-triggered (emit only when the
 	// verdict changes, not every report):

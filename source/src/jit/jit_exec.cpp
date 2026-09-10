@@ -331,7 +331,7 @@ u32 jitRunArm9()
 			if (r.instructions < 4)           s_edgeShort++;
 			{
 				u32 tpc = r.nextPC & ~1u;
-				u32 idx = ((tpc >> 1) ^ (tpc >> 13)) & (HASH_TABLE_SIZE - 1);
+				u32 idx = jitHashPC(tpc);
 				const BasicBlock& sl = jitCacheArm9.debugSlot(idx);
 				if      (sl.startPC == 0)      s_slotEmpty++;
 				else if (sl.startPC != tpc)    s_slotOther++;

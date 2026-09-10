@@ -24,8 +24,9 @@
  *     fetch; the heavier registerBlock()/flushCache()/invalidateSMCTarget()
  *     logic lives in JITCache.cpp.
  *
- * JIT_ARENA_SIZE (8MB), HASH_TABLE_SIZE (65536), and SMC_MAP_SIZE are the
- * settled tuning constants
+ * JIT_ARENA_SIZE (2 MB ARM7), JIT_ARENA_SIZE_ARM9 (12 MB), HASH_TABLE_SIZE
+ * (65536, indexed by the multiplicative jitHashPC()), and SMC_MAP_SIZE are the
+ * tuning constants -- see jit/NOTES.md for the measurements behind them.
  ***************************************************************************/
 
 #ifndef JIT_CACHE_H
@@ -68,6 +69,21 @@
 #endif
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
+
+// Block-table index hash. Was ((pc>>1) ^ (pc>>13)) & (HASH_TABLE_SIZE-1): a
+// -DJIT_HASH_HISTO capture (SM64DS, jit/NOTES.md) showed that shift-xor mix
+// collapsing the hot ARM9 working set into ~55 buckets - one bucket alone took
+// 2700+ evictions in a single run, so the "collision misses" were a hash
+// weakness, not a load-factor / table-size problem. Replaced with a
+// multiplicative (Fibonacci) hash: 32-bit product with the golden-ratio
+// constant, keep the top HASH_TABLE_SIZE-log2 bits (which depend on every
+// input bit). The hand-emitted stub in jit_cache.cpp mirrors this exactly
+// (lis/ori/mullw + one rlwinm), so getBlock() and JIT-emitted lookups agree.
+#define JIT_HASH_GOLDEN					0x9E3779B1u
+#define JIT_HASH_BITS					(__builtin_ctz(HASH_TABLE_SIZE))
+static inline u32 jitHashPC(u32 pc) {
+	return (pc * JIT_HASH_GOLDEN) >> (32 - JIT_HASH_BITS);
+}
 
 // -------------------------------------------------------------------------
 // ENGINE DEFINITIONS
@@ -159,6 +175,12 @@ class JITCache {
 		};
 		CacheStats profStats;
 		u32* installFrame;         // HASH_TABLE_SIZE entries, or nullptr
+#ifdef JIT_HASH_HISTO
+		// Step 3 one-off: per-bucket real-eviction tally, to tell a structural
+		// hash weakness (a few buckets hogging evictions) from a plain
+		// load-factor problem (uniform spread). calloc'd in initialize().
+		u16* bucketEvict;          // HASH_TABLE_SIZE entries, or nullptr
+#endif
 		u32  installSeq;
 		u32  arenaPeak;            // §3.3b high-water arenaOffset since last flush
 		u32  arenaPeakEver;        // §3.3b high-water across the whole run
@@ -174,7 +196,7 @@ class JITCache {
 
 		inline BasicBlock* getBlock(u32 pc) {
 			if (!isInitialized) return nullptr;
-			u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);
+			u32 index = jitHashPC(pc);
 			BasicBlock* block = &blockTable[index];
 			if (block->startPC == pc) {
 				PROFILER_CACHE_HIT();

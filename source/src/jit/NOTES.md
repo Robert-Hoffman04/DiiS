@@ -61,4 +61,65 @@ left) is the safer shape.
 
 ## Hash-collision distribution  (Step 3)
 
-(pending - `-DJIT_HASH_HISTO` run)
+`-DJIT_HASH_HISTO` adds a per-bucket real-eviction tally to `profEmitReport`
+(`jit hashhisto cache=...` line: touched buckets, max single bucket, dispersion
+index x100 (==100 for a uniform/Poisson spread), and 1 / 2-3 / 4-7 / 8-15 / 16+
+eviction-count bands).
+
+### Old hash `((pc>>1) ^ (pc>>13)) & (HASH_TABLE_SIZE-1)` -- SM64DS, ARM9
+
+```
+evbuckets=129/65536  max=2707  dispx100=140939  (D ~ 1409, uniform = 1)
+b1=49  b2_3=10  b4_7=9  b8_15=6  b16+=55
+ev_in_b16+ = 86174 / 86367      (99.8% of all evictions in 55 buckets)
+```
+
+One bucket alone climbed by ~13 evictions per report for the whole run
+(25 -> 2707). **This is case (a): a structural hash weakness, not a load
+factor problem.** Only 129 of 65,536 buckets ever evict; the hot ARM9 working
+set is small but the shift-xor mix folds those blocks onto ~55 buckets where
+they permanently ping-pong recompile - which is also what keeps the 12 MB
+arena pinned at 99% and drives the ARM9 JIT-build cost. Growing
+`HASH_TABLE_SIZE` would not help (the colliding PCs would still collide).
+
+ARM7 is unaffected (6 buckets, max 2) but ARM7 barely uses its cache (9
+evictions total), so that says little.
+
+### Fix tried: multiplicative (Fibonacci) hash
+
+`jitHashPC(pc) = (pc * 0x9E3779B1u) >> (32 - log2(HASH_TABLE_SIZE))`, mirrored
+in the two hand-emitted PPC stubs (`lis`/`ori`/`mullw` + one `rlwinm`, same
+instruction count as the old `srwi`/`srwi`/`xor` + `rlwinm`). All C++ sites go
+through the shared `jitHashPC()` inline in `jit_cache.h`.
+
+Result (SM64DS, `-DJIT_HASH_HISTO` build, matched to ~11M ARM9 lookups):
+
+| metric (ARM9)                | old shift-xor | multiplicative |
+|------------------------------|--------------:|---------------:|
+| collision-misses             | ~86,700       | **~18,700**  (-78%) |
+| evictions (wasted recompiles)| ~86,400       | **~18,700**  (-78%) |
+| touched buckets              | 129           | 48             |
+| buckets in the 16+ band      | 55            | 11             |
+| full-cache flushes @ ~fr1600 | 12            | **6**          |
+| steady-state ARM9 JIT-build  | ~0.45-0.50 ms/f | **~0.10 ms/f** (-78%) |
+| instr wall, window f780-1380 | 25.15 ms/f    | 24.81 ms/f     |
+| eff fps, same window         | 39.8          | 40.3           |
+
+Before the first in-game scene transition the ARM9 cache is essentially
+collision-free with the new hash (9 collisions / 1.3M lookups, arena 14%),
+where the old hash was already thrashing one bucket from boot.
+
+**Residual:** one bucket still climbs to ~2700 evictions, but only *after* a
+scene transition, and it survives the hash change (max 2707 -> 2713). That is
+almost certainly a single guest PC executed in both ARM and THUMB mode: same
+PC -> same bucket under any PC-only hash, and each mode flip re-registers over
+the other mode's block. Folding the ISA bit into the index would fix it; not
+worth the extra emitted-code complexity for one bucket. Left as a note.
+
+### Step 4 (grow HASH_TABLE_SIZE) -- not pursued
+
+Step 3 showed the collision misses were a hash-quality problem, not a
+load-factor problem (129/65536 buckets touched). A 4x table would not have
+moved the colliding PCs apart. Skipped; the multiplicative hash is the fix.
+`JIT_MEM_ACCOUNT` still stands as the headroom reference if a future
+associativity change wants it.
