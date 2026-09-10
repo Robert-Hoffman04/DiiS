@@ -97,6 +97,7 @@ JITCache::JITCache() {
 	memset(&profStats, 0, sizeof profStats);
 #ifdef JIT_HASH_HISTO
 	bucketEvict = nullptr;
+	samePCEvict = 0;
 #endif
 #endif
 }
@@ -491,6 +492,7 @@ void JITCache::profCacheEvict(u32 evictedPC, u32 newPC) {
 			profStats.evictLifetimeSum += (installSeq - installFrame[index]);
 #ifdef JIT_HASH_HISTO
 		if (bucketEvict && bucketEvict[index] != 0xFFFF) bucketEvict[index]++;
+		if (evictedPC == newPC) samePCEvict++;
 #endif
 	}
 	if (installFrame) installFrame[index] = ++installSeq;
@@ -531,13 +533,13 @@ void JITCache::profEmitReport(const char* tag) {
 
 #ifdef JIT_HASH_HISTO
 	if (bucketEvict) {
-		u32 occ = 0, mx = 0;
+		u32 occ = 0, mx = 0, mxIdx = 0;
 		u32 b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0;   // counts of buckets per band
 		u64 ev5 = 0, sumSq = 0;                        // evicts in 16+ band; sum of c^2
 		for (u32 i = 0; i < HASH_TABLE_SIZE; i++) {
 			u32 c = bucketEvict[i];
 			if (!c) continue;
-			occ++; if (c > mx) mx = c; sumSq += (u64)c * c;
+			occ++; if (c > mx) { mx = c; mxIdx = i; } sumSq += (u64)c * c;
 			if      (c == 1)  b1++;
 			else if (c <= 3)  b2++;
 			else if (c <= 7)  b3++;
@@ -555,12 +557,22 @@ void JITCache::profEmitReport(const char* tag) {
 			u64 t2 = (u64)tot * 100 / occ;
 			dispX100 = (t1 > t2) ? (u32)(t1 - t2) : 0;
 		}
+		// Worst bucket: current occupant PC + its cached ISA. If samepc_evict is
+		// a large fraction of total evictions and tracks the worst bucket's count,
+		// the residual thrash is one guest PC flipping ARM<->THUMB at a shared
+		// address (no PC-only hash separates the two).
+		u32 mxPC    = blockTable ? blockTable[mxIdx].startPC : 0;
+		u32 mxThumb = blockTable ? blockTable[mxIdx].thumbCompiled() : 0;
+
 		harness_profile_emitf(
 			"jit hashhisto cache=%s evbuckets=%u/%u max=%u meanx100=%u dispx100=%u "
-			"b1=%u b2_3=%u b4_7=%u b8_15=%u b16+=%u ev_in_b16+=%llu/%llu",
+			"b1=%u b2_3=%u b4_7=%u b8_15=%u b16+=%u ev_in_b16+=%llu/%llu "
+			"samepc_evict=%llu/%llu worstbucket_pc=0x%08x worstbucket_thumb=%u",
 			tag, occ, (unsigned)HASH_TABLE_SIZE, mx, meanX100, dispX100,
 			b1, b2, b3, b4, b5,
-			(unsigned long long)ev5, (unsigned long long)s.evictions);
+			(unsigned long long)ev5, (unsigned long long)s.evictions,
+			(unsigned long long)samePCEvict, (unsigned long long)s.evictions,
+			(unsigned)mxPC, (unsigned)mxThumb);
 	}
 #endif
 

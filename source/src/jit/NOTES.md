@@ -109,12 +109,11 @@ Before the first in-game scene transition the ARM9 cache is essentially
 collision-free with the new hash (9 collisions / 1.3M lookups, arena 14%),
 where the old hash was already thrashing one bucket from boot.
 
-**Residual:** one bucket still climbs to ~2700 evictions, but only *after* a
-scene transition, and it survives the hash change (max 2707 -> 2713). That is
-almost certainly a single guest PC executed in both ARM and THUMB mode: same
-PC -> same bucket under any PC-only hash, and each mode flip re-registers over
-the other mode's block. Folding the ISA bit into the index would fix it; not
-worth the extra emitted-code complexity for one bucket. Left as a note.
+**Residual:** one bucket still climbs to ~2700-3400 evictions after a scene
+transition, and it survives the hash change. Originally guessed to be an
+ARM/THUMB ISA flip -- the "Step 5 follow-up" section below disproves that
+(`samepc_evict = 14/22070`): it is distinct-PC collision clustering. ~14
+buckets carry 99.5% of evictions.
 
 ### Step 4 (grow HASH_TABLE_SIZE) -- not pursued
 
@@ -153,20 +152,85 @@ histo overhead), SM64DS window f780-1200:
   zero code-size cost, cannot miscompile.
 - **Step 4:** not needed / not done.
 
-### What to try next (in rough priority order)
+## Step 5 follow-up -- ISA-flip probe and 16 MB A/B (both negative)
 
-1. **The residual ARM/THUMB same-PC bucket.** One bucket still takes ~2700
-   evictions/run after a scene transition. If a cheap `-DJIT_HASH_HISTO +
-   JIT_LOG_CACHE_EVENT` capture confirms it is one PC flipping ISA, fold the
-   mode bit into the index (`pc ^ (thumb << 1)` before the multiply, mirrored
-   in the 2 stubs). Small, contained, removes the last thrash source.
-2. **Arena still peaks at 99%.** With the eviction churn now gone, the 99% is
-   mostly genuine distinct-block volume. A 16 MB arena would likely stop the
-   remaining 6-7 flushes/run outright; ~8.6 MiB MEM2 would remain. Low-risk,
-   worth a single A/B.
-3. **N-way associativity** is now clearly *not* worth it - Step 3 removed the
-   collision pressure that would have justified the extra branch on the
-   getBlock() hot path.
+Two of the "what to try next" ideas below were tested directly and **both
+failed to reproduce the predicted win.** The section that followed has been
+rewritten accordingly.
+
+### (1) The residual worst bucket is NOT an ARM/THUMB ISA flip
+
+`-DJIT_HASH_HISTO` was extended with `samepc_evict` -- a tally of evictions
+where the outgoing slot held the *same* guest PC as the incoming block (an
+ISA flip re-registering over itself) -- plus the worst bucket's current
+occupant PC / mode. SM64DS, ARM9, ~12.9M lookups:
+
+```
+jit hashhisto cache=arm9 evbuckets=56/65536 max=3416 dispx100=231506
+  b1=21 b2_3=12 b4_7=6 b8_15=3 b16+=14  ev_in_b16+=21963/22070
+  samepc_evict=14/22070   worstbucket_pc=0x02043dc4 worstbucket_thumb=0
+```
+
+**`samepc_evict = 14 / 22070` (0.06%).** The residual thrash is not one PC
+flipping ISA -- it is genuine *distinct-PC* hash collisions: 14 buckets carry
+99.5% of all evictions, the worst one (a plain ARM block at `0x02043dc4`)
+takes 3400+ evictions in a run by colliding with one or more other hot PCs.
+Folding the mode bit into the index would do nothing here. Idea dropped.
+
+The multiplicative hash still leaves this structural clustering: `dispx100`
+is ~2300x a uniform spread, only 56/65536 buckets ever evict, and a handful
+of hot-loop PC pairs map to the same bucket and permanently recompile each
+other. It is a real improvement over the shift-xor (which clustered onto
+~55 buckets from boot) but it did not flatten the tail.
+
+### (2) 16 MB ARM9 arena -- no measurable improvement over 12 MB
+
+Clean A/B, `-DJIT_ARENA_SIZE_ARM9=16 MiB` vs the committed 12 MiB, same
+SM64DS soak:
+
+| metric (window f780-1200) | 12 MB, mult hash | 16 MB, mult hash |
+|---------------------------|-----------------:|-----------------:|
+| instr wall                | 21.52 ms/f       | 21.52 ms/f       |
+| ARM9 JIT-build             | 94 us/f          | 98 us/f          |
+| ARM9 JIT-exec              | ~4.25 ms/f       | 4.23 ms/f        |
+| eff fps                   | 46.5             | 46.5             |
+| full-cache flushes @ fr3360| 8                | 8                |
+| arena peak fill            | 99%              | 99%              |
+| collision-misses / M lk    | ~1715            | ~1752            |
+
+The arena still pins at 99% and still flushes 8x at 16 MB, and the
+`arena-capacity thrash` heuristic still fires. The reason: the ~25k live-block
+evictions are themselves the arena-fill pressure (every collision eviction is
+a wasted recompile that re-consumes arena), so growing the arena cannot drain
+it while the collisions persist. NOTES' earlier guess that 16 MB "would
+likely stop the remaining flushes" is wrong -- the flush driver is the hash,
+not the arena size. **Do not grow the arena further.** 12 MB stays.
+
+### What to try next (revised, in priority order)
+
+1. **A better block-table hash for the ~14 hot collision buckets.** This is
+   now the only cache lever with headroom. The multiplicative hash keeps the
+   top 16 bits of `pc * GOLDEN` (low 32); for SM64DS's tightly-clustered ARM9
+   code addresses the low input bits reach those top bits only weakly through
+   carry. Candidates, cheapest first: `mulhwu` (top 32 of the full 64-bit
+   product) instead of `mullw` -- one-instruction swap in both PPC stubs,
+   different and usually stronger bit slice; or drop the always-zero low bits
+   before the multiply; or a post-multiply xorshift finalizer (costs 2 extra
+   PPC insns per stub, still fits the 2 scratch registers r11/r12). Each needs
+   the same `-DJIT_HASH_HISTO` A/B: success = `b16+` bucket count and total
+   evictions fall, `dispx100` moves toward 100.
+2. **2-way set associativity on `getBlock()`** -- *reconsidered, now the
+   fallback if the hash experiments stall.* Step 3 had removed the pressure
+   that justified it, but (1) above shows ~14 buckets still hard-collide. A
+   2-way bucket (check slot, then slot^1) is one extra load + compare + branch
+   on the hot path and a doubled 2 MiB block table per core (MEM2 headroom
+   ~11.6 MiB, fine per Step 2); the emitted stubs would need the second probe
+   too. Bigger change than a hash swap -- do it only if no hash beats the
+   collision rate.
+3. **HASH_TABLE_SIZE 4x (Step 4)** -- still low-value on its own (56/65536
+   buckets touched; more buckets do not separate two PCs the hash maps
+   together) but *would* compound with a better hash. Not worth doing alone.
 4. Bigger picture: ARM9 JIT-*execute* (~4.25 ms/f) and the GPU 2D compositor
-   (~5 ms/f) now dominate the frame far more than anything cache-related. The
+   (~5 ms/f) now dominate the frame far more than anything cache-related. Even
+   eliminating every remaining collision would save well under 0.1 ms/f. The
    next real frame-time lever is one of those, not the JIT cache.

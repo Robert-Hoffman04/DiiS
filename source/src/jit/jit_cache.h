@@ -180,6 +180,12 @@ class JITCache {
 		// hash weakness (a few buckets hogging evictions) from a plain
 		// load-factor problem (uniform spread). calloc'd in initialize().
 		u16* bucketEvict;          // HASH_TABLE_SIZE entries, or nullptr
+		u64  samePCEvict;         // Step-5 follow-up: evictions where the outgoing
+		                          //   slot held the SAME guest PC as the incoming
+		                          //   block (i.e. one PC re-registering over itself
+		                          //   -- almost always an ARM<->THUMB ISA flip at a
+		                          //   shared address). Distinguishes that from a
+		                          //   genuine different-PC hash collision.
 #endif
 		u32  installSeq;
 		u32  arenaPeak;            // §3.3b high-water arenaOffset since last flush
