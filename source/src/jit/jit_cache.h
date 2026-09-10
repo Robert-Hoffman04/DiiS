@@ -46,8 +46,17 @@
 // Arena sized down from VBA's 8 MB: the Broadway has only 32 KB L1-I and
 // Dolphin doesn't model it, so a smaller, denser arena is the safer default
 // (see the plan, risk "Broadway I-cache vs arena"). Revisit with hardware.
+#ifndef JIT_ARENA_SIZE
 #define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB (ARM7)
-#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 3) // 3 MB (ARM9 is the hot core)
+#endif
+// ARM9 is the hot core. 3 MB filled within ~150 emulated frames in SM64DS and
+// was recycled ~90 times over a 3000-frame run (arenapeak 99%, ~1 ms/frame lost
+// to re-compilation); the profEmitReport heuristic flagged it. 6 MB gives real
+// headroom without crowding MEM1 (ARM7 2 MB + ARM9 6 MB = 8 MB, still under
+// VBA-GX's original single-core 8 MB).
+#ifndef JIT_ARENA_SIZE_ARM9
+#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 6) // 6 MB (ARM9 is the hot core)
+#endif
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
 
