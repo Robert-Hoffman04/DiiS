@@ -19,7 +19,7 @@ TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source/src source/src/metaspu \
 				source/src/addons source/src/utils source/src/gekko_utils \
-				source/src/jit
+				source/src/jit source/src/harness
 DATA		:=	data  
 INCLUDES	:=
 

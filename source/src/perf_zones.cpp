@@ -8,7 +8,10 @@
 #ifdef DESMUME_PERFZONES
 
 #include <stdio.h>
+#include <string.h>
 #include <ogc/lwp_watchdog.h>   // gettime(), ticks_to_microsecs()
+
+#include "harness/harness.h"    // §3.2: PKT_PROFILE sink (self-stubs otherwise)
 
 u64 g_pzAcc[PZ_COUNT];
 u64 g_pzHits[PZ_COUNT];
@@ -48,11 +51,12 @@ static const char* k_name[PZ_COUNT] = {
 	"arm7_interp", "arm7_jit", "arm7_build",
 	"gpu_ge", "gpu_render", "gpu_2d",
 	"spu", "draw",
+	"dma", "gx2dbg_bake", "draw_convert", "draw_present",
 };
 const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 
 //---------------------------------------------------------------------------
-// Per-frame dump to sd:/perfzones.log. Row every PZ_BLOCK frames:
+// Per-block frame-time breakdown. Row every PZ_BLOCK frames:
 //
 //   frame,wall_us,other_us,arm9_interp_us,...,draw_us,<same block's hit counts>
 //
@@ -60,9 +64,119 @@ const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 // spent inside the instrumented regions); it will run a hair under the
 // benchmark's own block_us because the frame-loop glue outside NDS_exec()/
 // Draw() isn't zoned.
+//
+// Sink (§3.2): with -DDESMUME_HARNESS the row goes out as a PKT_PROFILE frame
+// (harness_send routes it to the listener, or to sd:/perfzones.log via the SD
+// backend when there's none). Without the harness it's written to
+// sd:/perfzones.log directly, exactly as before.
 //---------------------------------------------------------------------------
 #ifndef DESMUME_PERFZONES_BLOCK
 #define DESMUME_PERFZONES_BLOCK 60
+#endif
+
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+
+//---------------------------------------------------------------------------
+// §3.3b frame-time percentiles. A ring of the last PZ_FT_RING per-frame
+// wall_us values (sampled at the pzFrameTick() site that already banks the
+// interval - no extra timebase reads). Reported alongside each CSV block as
+// p50/p95/p99/worst, which is what the zone-share averages hide.
+//---------------------------------------------------------------------------
+#define PZ_FT_RING 120
+static u32  s_ftRing[PZ_FT_RING];
+static u32  s_ftCount;   // total frames pushed (caps the sort window)
+static u32  s_ftHead;
+
+static void pz_ft_push(u32 wall_us)
+{
+	s_ftRing[s_ftHead] = wall_us;
+	s_ftHead = (s_ftHead + 1u) % PZ_FT_RING;
+	if (s_ftCount < PZ_FT_RING) s_ftCount++;
+}
+
+static void pz_emit_percentiles(u32 frame)
+{
+	u32 n = s_ftCount;
+	if (!n) return;
+
+	u32 sorted[PZ_FT_RING];
+	for (u32 i = 0; i < n; i++) sorted[i] = s_ftRing[i];
+	for (u32 i = 1; i < n; i++) {          // insertion sort, n <= 120
+		u32 v = sorted[i], j = i;
+		while (j > 0 && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; j--; }
+		sorted[j] = v;
+	}
+	u32 p50 = sorted[(n * 50) / 100];
+	u32 p95 = sorted[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1];
+	u32 p99 = sorted[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1];
+	u32 worst = sorted[n - 1];
+
+	char line[160];
+	snprintf(line, sizeof(line),
+		"frametime frame=%u n=%u p50_us=%u p95_us=%u p99_us=%u worst_us=%u",
+		frame, n, p50, p95, p99, worst);
+	harness_profile_emit(line);
+}
+
+static void pz_emit_header(void)
+{
+	char line[512];
+	int n = snprintf(line, sizeof(line),
+		"# desmumewii perfzones  block=%d\nframe,wall_us", DESMUME_PERFZONES_BLOCK);
+	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
+		n += snprintf(line + n, sizeof(line) - n, ",%s_us", pzName(i));
+	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
+		n += snprintf(line + n, sizeof(line) - n, ",%s_hits", pzName(i));
+	harness_profile_emit(line);
+}
+
+static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_hits[PZ_COUNT])
+{
+	u64 wall_us = 0;
+	for (int i = 0; i < PZ_COUNT; i++) wall_us += ticks_to_microsecs(acc_ticks[i]);
+
+	char line[512];
+	int n = snprintf(line, sizeof(line), "%u,%llu", frame, (unsigned long long)wall_us);
+	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
+		n += snprintf(line + n, sizeof(line) - n, ",%llu",
+			(unsigned long long)ticks_to_microsecs(acc_ticks[i]));
+	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
+		n += snprintf(line + n, sizeof(line) - n, ",%llu", (unsigned long long)acc_hits[i]);
+	harness_profile_emit(line);
+}
+
+#else  // legacy sd:/perfzones.log sink
+
+static inline void pz_ft_push(u32) {}
+static inline void pz_emit_percentiles(u32) {}
+
+static void pz_emit_header(void)
+{
+	FILE* f = fopen("sd:/perfzones.log", "w");
+	if (!f) return;
+	fprintf(f, "# desmumewii perfzones  block=%d\n", DESMUME_PERFZONES_BLOCK);
+	fprintf(f, "frame,wall_us");
+	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_us", pzName(i));
+	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_hits", pzName(i));
+	fprintf(f, "\n");
+	fclose(f);
+}
+
+static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_hits[PZ_COUNT])
+{
+	u64 wall_us = 0;
+	for (int i = 0; i < PZ_COUNT; i++) wall_us += ticks_to_microsecs(acc_ticks[i]);
+	FILE* f = fopen("sd:/perfzones.log", "a");
+	if (!f) return;
+	fprintf(f, "%u,%llu", frame, (unsigned long long)wall_us);
+	for (int i = 0; i < PZ_COUNT; i++)
+		fprintf(f, ",%llu", (unsigned long long)ticks_to_microsecs(acc_ticks[i]));
+	for (int i = 0; i < PZ_COUNT; i++)
+		fprintf(f, ",%llu", (unsigned long long)acc_hits[i]);
+	fprintf(f, "\n");
+	fclose(f);
+}
+
 #endif
 
 void pzFrameTick(void)
@@ -74,15 +188,7 @@ void pzFrameTick(void)
 
 	if (!started) {
 		started = true;
-		FILE* f = fopen("sd:/perfzones.log", "w");
-		if (f) {
-			fprintf(f, "# desmumewii perfzones  block=%d\n", DESMUME_PERFZONES_BLOCK);
-			fprintf(f, "frame,wall_us");
-			for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_us", pzName(i));
-			for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_hits", pzName(i));
-			fprintf(f, "\n");
-			fclose(f);
-		}
+		pz_emit_header();
 		// prime the interval so the first block doesn't count startup time
 		u64 t[PZ_COUNT], h[PZ_COUNT];
 		pzHarvest(t, h);
@@ -92,22 +198,17 @@ void pzFrameTick(void)
 	{
 		u64 t[PZ_COUNT], h[PZ_COUNT];
 		pzHarvest(t, h);
-		for (int i = 0; i < PZ_COUNT; i++) { acc_ticks[i] += t[i]; acc_hits[i] += h[i]; }
+		u64 frame_us = 0;
+		for (int i = 0; i < PZ_COUNT; i++) {
+			acc_ticks[i] += t[i]; acc_hits[i] += h[i];
+			frame_us += ticks_to_microsecs(t[i]);
+		}
+		pz_ft_push((u32)frame_us);   // §3.3b
 	}
 
 	if (frame % DESMUME_PERFZONES_BLOCK == 0) {
-		u64 wall_us = 0;
-		for (int i = 0; i < PZ_COUNT; i++) wall_us += ticks_to_microsecs(acc_ticks[i]);
-		FILE* f = fopen("sd:/perfzones.log", "a");
-		if (f) {
-			fprintf(f, "%u,%llu", frame, (unsigned long long)wall_us);
-			for (int i = 0; i < PZ_COUNT; i++)
-				fprintf(f, ",%llu", (unsigned long long)ticks_to_microsecs(acc_ticks[i]));
-			for (int i = 0; i < PZ_COUNT; i++)
-				fprintf(f, ",%llu", (unsigned long long)acc_hits[i]);
-			fprintf(f, "\n");
-			fclose(f);
-		}
+		pz_emit_row(frame, acc_ticks, acc_hits);
+		pz_emit_percentiles(frame);   // §3.3b
 		for (int i = 0; i < PZ_COUNT; i++) { acc_ticks[i] = 0; acc_hits[i] = 0; }
 	}
 }

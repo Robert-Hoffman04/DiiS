@@ -28,6 +28,7 @@
 #include "armcpu.h"
 #include "arm_instructions.h"
 #include "thumb_instructions.h"
+#include "harness/harness.h"   // §3.2: harness_profile_log (self-stubs otherwise)
 
 std::vector<Logger *> Logger::channels;
 
@@ -162,6 +163,9 @@ void Logger::vprintf(const char * format, va_list l, const char * file, unsigned
 
 	::vsnprintf(cur, 1024, format, l);
 	callback(*this, buffer);
+
+	// §3.2: one fan-in point for every Logger channel -> PKT_LOG.
+	harness_profile_log(buffer);
 }
 
 void Logger::setOutput(std::ostream * o) {

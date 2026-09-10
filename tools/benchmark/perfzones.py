@@ -41,16 +41,21 @@ GROUPS = [
     ("GPU   geometry eng", ["gpu_ge"]),
     ("GPU   3D render",    ["gpu_render"]),
     ("GPU   2D compositor",["gpu_2d"]),
+    ("GPU   GX2DBG bake",  ["gx2dbg_bake"]),
     ("SPU",                ["spu"]),
-    ("GX    present/Draw", ["draw"]),
+    ("GX    screen convert",["draw_convert"]),
+    ("GX    band present", ["draw_present"]),
+    ("GX    present resid",["draw"]),
+    ("DMA   channels",     ["dma"]),
     ("other / glue",       ["other"]),
 ]
 SUPERGROUPS = [
     ("CPU  ARM9",  ["arm9_interp", "arm9_jit", "arm9_build"]),
     ("CPU  ARM7",  ["arm7_interp", "arm7_jit", "arm7_build"]),
-    ("GPU  (GE+3D+2D)", ["gpu_ge", "gpu_render", "gpu_2d"]),
+    ("GPU  (GE+3D+2D)", ["gpu_ge", "gpu_render", "gpu_2d", "gx2dbg_bake"]),
     ("SPU",        ["spu"]),
-    ("GX present",  ["draw"]),
+    ("GX present",  ["draw", "draw_convert", "draw_present"]),
+    ("DMA",        ["dma"]),
     ("other",      ["other"]),
 ]
 

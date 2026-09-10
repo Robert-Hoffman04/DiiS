@@ -11,13 +11,30 @@
 
 #include "jit_trace.h"
 #include "../perf_zones.h"
+#include "../harness/harness.h"
 
 #if defined(DESMUME_JIT_ARM7)
 
 #include <malloc.h>
 #include <string.h>
 #include <ogc/cache.h>
-#include <stdio.h>   // GO-FIX-PH canary diagnostic wants this unconditionally; see below
+
+// The JIT heap canary + "minefield" poison-block checks are heap-corruption
+// detection, so per plan §3.0 they belong with crash reporting: gated on the
+// master harness flag (+ HARNESS_CRASH) and sunk through harness_send(
+// PKT_CRASH, ...) rather than a hardcoded sd:/jit.log open. Without the flag
+// the whole apparatus compiles to nothing and jitCheckCanaries() is a no-op,
+// so a release JIT build is untouched.
+#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+  #define JIT_CANARY_WATCH 1
+#endif
+
+#ifdef JIT_CANARY_WATCH
+#include <stdio.h>
+static const size_t s_jitCanaryPad = 32;
+#else
+static const size_t s_jitCanaryPad = 0;
+#endif
 
 // =========================================================================
 // Lifecycle
@@ -57,12 +74,22 @@ static bool         s_initDone        = false;
 // it never fires for this repro). 32-byte canary directly after each real
 // allocation, checked periodically; the first mismatch pinpoints which
 // buffer and by how much. Trivially removable once the bug is found.
+#ifdef JIT_CANARY_WATCH
+
 #define JIT_CANARY_BYTES 32
 static u8 s_canaryPattern[JIT_CANARY_BYTES];
 struct CanarySlot { void* base; size_t realSize; const char* name; };
 static CanarySlot s_canaries[8];
 static int s_canaryCount = 0;
 static bool s_canaryTripped = false;
+
+// §3.0: heap-corruption trips go out as PKT_CRASH on the harness transport
+// (wii_control.py symbolicates and writes crash_N.txt), replacing the old
+// hardcoded sd:/jit.log open.
+static void jitCanaryEmit(const char* line)
+{
+	harness_send(HARNESS_PKT_CRASH, line, (u32)strlen(line));
+}
 
 static void jitCanaryArm(void* buf, size_t realSize, const char* name)
 {
@@ -109,15 +136,14 @@ static void jitCheckMinefield()
 	for (size_t k = 0; k < JIT_MINE_BYTES; k++) {
 		if (m[k] != jitMineByte(m, k)) {
 			s_mineTripped = true;
-			FILE* f = fopen("sd:/jit.log", "a");
-			if (f) {
-				fprintf(f, "[jit] !!! HEAP MINE HIT mine=%d base=%p off=%u got=%02x want=%02x ctx:",
-				        i, (void*)m, (unsigned)k, m[k], jitMineByte(m, k));
-				size_t s = k > 8 ? k - 8 : 0;
-				for (size_t j = s; j < s + 24 && j < JIT_MINE_BYTES; j++) fprintf(f, " %02x", m[j]);
-				fprintf(f, "\n");
-				fclose(f);
-			}
+			char buf[256];
+			int n = snprintf(buf, sizeof buf,
+			        "[jit] !!! HEAP MINE HIT mine=%d base=%p off=%u got=%02x want=%02x ctx:",
+			        i, (void*)m, (unsigned)k, m[k], jitMineByte(m, k));
+			size_t s = k > 8 ? k - 8 : 0;
+			for (size_t j = s; j < s + 24 && j < JIT_MINE_BYTES && n > 0 && n < (int)sizeof buf - 4; j++)
+				n += snprintf(buf + n, sizeof buf - n, " %02x", m[j]);
+			jitCanaryEmit(buf);
 			return;
 		}
 	}
@@ -134,19 +160,25 @@ void jitCheckCanaries()
 		u8* tail = (u8*)s_canaries[i].base + s_canaries[i].realSize;
 		if (memcmp(tail, s_canaryPattern, JIT_CANARY_BYTES) != 0) {
 			s_canaryTripped = true;
-			FILE* f = fopen("sd:/jit.log", "a");
-			if (f) {
-				fprintf(f, "[jit] !!! CANARY TRIPPED buf=%s base=%p realSize=%u tail=%p bytes:",
-				        s_canaries[i].name, s_canaries[i].base,
-				        (unsigned)s_canaries[i].realSize, (void*)tail);
-				for (int b = 0; b < JIT_CANARY_BYTES; b++) fprintf(f, " %02x", tail[b]);
-				fprintf(f, "\n");
-				fclose(f);
-			}
+			char buf[256];
+			int n = snprintf(buf, sizeof buf,
+			        "[jit] !!! CANARY TRIPPED buf=%s base=%p realSize=%u tail=%p bytes:",
+			        s_canaries[i].name, s_canaries[i].base,
+			        (unsigned)s_canaries[i].realSize, (void*)tail);
+			for (int b = 0; b < JIT_CANARY_BYTES && n > 0 && n < (int)sizeof buf - 4; b++)
+				n += snprintf(buf + n, sizeof buf - n, " %02x", tail[b]);
+			jitCanaryEmit(buf);
 			return;
 		}
 	}
 }
+
+#else // !JIT_CANARY_WATCH -- release JIT build: no-op stubs, nothing emitted
+
+static inline void jitCanaryArm(void*, size_t, const char*) {}
+void jitCheckCanaries() {}
+
+#endif // JIT_CANARY_WATCH
 
 static void jitFreeSlot(int i)
 {
@@ -169,19 +201,20 @@ void jitShutdown()
 
 static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile* profile)
 {
-	// GO-FIX-PH: over-allocate by JIT_CANARY_BYTES on every buffer so a
-	// canary can be armed right after each one's *logical* end -- the size
-	// passed to cache.initialize() below is unchanged, so the JIT's own
-	// bounds checks (allocateJITMemory() vs arenaSize, etc.) see exactly the
-	// same capacity as before this diagnostic was added.
+	// GO-FIX-PH: over-allocate by the canary pad on every buffer so a canary
+	// can be armed right after each one's *logical* end -- the size passed to
+	// cache.initialize() below is unchanged, so the JIT's own bounds checks
+	// (allocateJITMemory() vs arenaSize, etc.) see exactly the same capacity
+	// as before. s_jitCanaryPad is 0 unless JIT_CANARY_WATCH (§3.0), so a
+	// release build allocates exactly what it always did.
 	size_t blockTableBytes  = HASH_TABLE_SIZE * sizeof(BasicBlock);
 	size_t smcRegistryBytes = SMC_MAP_SIZE * sizeof(BasicBlock*);
 	size_t smcFlagsBytes    = SMC_MAP_SIZE;
 
-	s_arena[i]        = (u32*)        memalign(32, arenaBytes        + JIT_CANARY_BYTES);
-	s_blockTable[i]   = (BasicBlock*) memalign(16, blockTableBytes   + JIT_CANARY_BYTES);
-	s_smcRegistry[i]  = (BasicBlock**)memalign(32, smcRegistryBytes  + JIT_CANARY_BYTES);
-	s_smcPageFlags[i] = (u8*)         memalign(32, smcFlagsBytes     + JIT_CANARY_BYTES);
+	s_arena[i]        = (u32*)        memalign(32, arenaBytes        + s_jitCanaryPad);
+	s_blockTable[i]   = (BasicBlock*) memalign(16, blockTableBytes   + s_jitCanaryPad);
+	s_smcRegistry[i]  = (BasicBlock**)memalign(32, smcRegistryBytes  + s_jitCanaryPad);
+	s_smcPageFlags[i] = (u8*)         memalign(32, smcFlagsBytes     + s_jitCanaryPad);
 
 	if (!s_arena[i] || !s_blockTable[i] || !s_smcRegistry[i] || !s_smcPageFlags[i])
 		return false;
@@ -201,7 +234,9 @@ void jitInit()
 {
 	if (s_initDone) return;
 
+#ifdef JIT_CANARY_WATCH
 	memset(s_canaryPattern, 0xC5, JIT_CANARY_BYTES);   // GO-FIX-PH: before either slot inits
+#endif
 
 	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE,      jitCacheArm7, jitBuildArm7Profile())
 	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
@@ -215,7 +250,7 @@ void jitInit()
 	s_arm7DsProfile  = jitProfile[JIT_ARM7];
 	s_arm7GbaProfile = jitBuildArm7GBAProfile();
 
-#ifdef JIT_HEAP_WATCH
+#if defined(JIT_CANARY_WATCH) && defined(JIT_HEAP_WATCH)
 	jitArmMinefield();
 #endif
 	s_initDone = true;

@@ -59,6 +59,35 @@
 
 int lastSaveState = 0;		//Keeps track of last savestate used for quick save/load functions
 
+#ifdef DESMUME_SAVESTATE_DIAG
+// Each call opens/appends/closes sd:/savestate_trace.log so a checkpoint
+// survives even if the very next line hangs the emu thread -- printf() over
+// gecko doesn't help when nobody's holding a Gecko socket open for a manual
+// play session, but a flushed-to-disk file does.
+#include <stdarg.h>
+static void SSTRACE(const char* fmt, ...)
+{
+	FILE* f = fopen("sd:/savestate_trace.log", "a");
+	if (!f) return;
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fclose(f);
+}
+#else
+#define SSTRACE(...) ((void)0)
+#endif
+
+// Upstream DeSmuME's movie system sets this around the NDS_Reset() a
+// savestate load does, so a movie recording in progress isn't torn down by
+// that reset. This Wii port never carried movie.cpp over, so nothing else
+// ever reads it, but savestate_load() below still flips it -- define it here
+// so that code links now that a real caller (the Z+L/Z+R quicksave hotkey in
+// main.cpp) actually reaches it.
+bool _HACK_DONT_STOPMOVIE = false;
+
 //void*v is actually a void** which will be indirected before reading
 //since this isnt supported right now, it is declared in here to make things compile
 #define SS_INDIRECT            0x80000000
@@ -148,26 +177,45 @@ SFORMAT SF_ARM9[]={
 	{ 0 }
 };
 
+// NB: ARM9_ITCM/DTCM/MAIN_MEM/ARM9_REG/ARM9_VMEM became heap pointers (MMU.h,
+// MMU_Alloc()) back in 2010, but this table stayed a static initializer -- so
+// every `.v` here captured a NULL pointer at C++ static-init time (MMU_Alloc()
+// runs much later) and every `sizeof(ptr)` collapsed to 4. SubWrite() then
+// stopped at the very first entry (v == NULL) and chunk 4 was written with a
+// body of 0 bytes: ARM9 main RAM / TCM / VRAM / I/O regs were never in a
+// savestate at all, so every load resumed the CPU against freshly-reset memory
+// and instantly wedged. The explicit sizes below are the real allocation sizes
+// (MMU_Alloc); the live pointers are patched in by SF_MEM_rebind() before each
+// save and load. MAIN_MEM is 4 MB on this port (retail DS), so the old second
+// 4 MB "WRAX" mirror -- which indexed 4 MB past a 4 MB buffer -- is gone.
 SFORMAT SF_MEM[]={
-	{ "ITCM", 1, sizeof(MMU.ARM9_ITCM),   MMU.ARM9_ITCM},
-	{ "DTCM", 1, sizeof(MMU.ARM9_DTCM),   MMU.ARM9_DTCM},
-
-	 //for legacy purposes, WRAX is a separate variable. shouldnt be a problem.
-	{ "WRAM", 1, 0x400000, MMU.MAIN_MEM},
-	{ "WRAX", 1, 0x400000, MMU.MAIN_MEM+0x400000},
+	{ "ITCM", 1, 0x8000,   NULL},   // MMU.ARM9_ITCM
+	{ "DTCM", 1, 0x4000,   NULL},   // MMU.ARM9_DTCM
+	{ "WRAM", 1, 0x400000, NULL},   // MMU.MAIN_MEM
 
 	//NOTE - this is not as large as the allocated memory.
 	//the memory is overlarge due to the way our memory map system is setup
 	//but there are actually no more registers than this
-	{ "9REG", 1, 0x2000,   MMU.ARM9_REG},
+	{ "9REG", 1, 0x2000,   NULL},   // MMU.ARM9_REG (0x40000 allocated)
 
-	{ "VMEM", 1, sizeof(MMU.ARM9_VMEM),    MMU.ARM9_VMEM},
-	{ "OAMS", 1, sizeof(MMU.ARM9_OAM),    MMU.ARM9_OAM},
+	{ "VMEM", 1, 0x800,    NULL},   // MMU.ARM9_VMEM
+	{ "OAMS", 1, sizeof(MMU.ARM9_OAM),    MMU.ARM9_OAM},   // inline array - static bind ok
 
 	//this size is specially chosen to avoid saving the blank space at the end
-	{ "LCDM", 1, 0xA4000,		MMU.ARM9_LCD},
+	{ "LCDM", 1, 0xA4000,		MMU.ARM9_LCD},              // inline array - static bind ok
 	{ 0 }
 };
+
+// Patch the heap-backed SF_MEM entries with their live MMU pointers. Must run
+// after MMU_Alloc() and before any SubWrite()/ReadStateChunk() over SF_MEM.
+static void SF_MEM_rebind()
+{
+	SF_MEM[0].v = MMU.ARM9_ITCM;
+	SF_MEM[1].v = MMU.ARM9_DTCM;
+	SF_MEM[2].v = MMU.MAIN_MEM;
+	SF_MEM[3].v = MMU.ARM9_REG;
+	SF_MEM[4].v = MMU.ARM9_VMEM;
+}
 
 SFORMAT SF_NDS[]={
 	{ "_WCY", 4, 1, &nds.wifiCycle},
@@ -543,16 +591,14 @@ static bool cp15_loadstate(EMUFILE* is, int size)
 	if(version != 0) return false;
 
 	if(!cp15_loadone((armcp15_t *)NDS_ARM9.coproc[15],is)) return false;
-	
-	if(version == 0)
-	{
-		//ARM7 does not have coprocessor
-		u8 *tmp_buf = new u8 [sizeof(armcp15_t)];
-		if (!tmp_buf) return false;
-		if(!cp15_loadone((armcp15_t *)tmp_buf,is)) return false;
-		delete [] tmp_buf;
-		tmp_buf = NULL;
-	}
+
+	// NB: cp15_savestate() writes exactly one cp15_saveone() (the ARM9 one;
+	// the ARM7 has no coprocessor and its save was removed in 2012). Upstream's
+	// old version-0 layout also stored a dummy ARM7 block, and the matching
+	// "read a second cp15_loadone into a throwaway buffer" used to live here --
+	// but against our single-block save that over-read ~492 bytes and desynced
+	// the whole stream, so *every* state load aborted with "failed halfway
+	// through". Load exactly what we save.
 
 	return true;
 }
@@ -612,13 +658,16 @@ void savestate_slot(int num)
    if (strlen(filename) + strlen(".dsx") + strlen("-2147483648") /* = biggest string for num */ >MAX_PATH) return ;
    sprintf(filename+strlen(filename), ".ds%d", num);
 
+   SSTRACE("savestate_slot(%d): enter, file=%s", num, filename);
    if (savestate_save(filename))
    {
+	   SSTRACE("savestate_slot(%d): savestate_save() returned true", num);
 //	   osd->setLineColor(255, 255, 255);
 //	   osd->addLine("Saved to %i slot", num);
    }
    else
    {
+	   SSTRACE("savestate_slot(%d): savestate_save() returned FALSE", num);
 //	   osd->setLineColor(255, 0, 0);
 //	   osd->addLine("Error saving %i slot", num);
 	   return;
@@ -626,12 +675,14 @@ void savestate_slot(int num)
 
    if (num >= 0 && num < NB_STATES)
    {
+	   SSTRACE("savestate_slot(%d): before stat()", num);
 	   if (stat(filename,&sbuf) != -1)
 	   {
 		   savestates[num].exists = TRUE;
 		   strncpy(savestates[num].date, format_time(sbuf.st_mtime),40);
 		   savestates[num].date[40-1] = '\0';
 	   }
+	   SSTRACE("savestate_slot(%d): after stat(), done", num);
    }
 }
 
@@ -888,6 +939,7 @@ bool savestate_save(EMUFILE* outstream, int compressionLevel)
 	EMUFILE_MEMORY ms;
 	EMUFILE* os;
 	
+	SSTRACE("savestate_save(EMUFILE*): enter, compressionLevel=%d", compressionLevel);
 	if(compressionLevel != Z_NO_COMPRESSION)
 	{
 		//generate the savestate in memory first
@@ -900,9 +952,11 @@ bool savestate_save(EMUFILE* outstream, int compressionLevel)
 		os->fseek(32,SEEK_SET); //skip the header
 		writechunks(os);
 	}
+	SSTRACE("savestate_save(EMUFILE*): writechunks() returned");
 
 	//save the length of the file
 	u32 len = os->ftell();
+	SSTRACE("savestate_save(EMUFILE*): len=%u", (unsigned)len);
 
 	u32 comprlen = 0xFFFFFFFF;
 	u8* cbuf = 0;
@@ -916,11 +970,13 @@ bool savestate_save(EMUFILE* outstream, int compressionLevel)
 		//worst case compression.
 		//zlib says "0.1% larger than sourceLen plus 12 bytes"
 		comprlen = (len>>9)+12 + len;
+		SSTRACE("savestate_save(EMUFILE*): before compress2, worst-case=%u", (unsigned)comprlen);
 		cbuf = new u8[comprlen];
 		// Workaround to make it compile under linux 64bit
 		comprlen2 = comprlen;
 		error = compress2(cbuf,&comprlen2,ms.buf(),len,compressionLevel);
 		comprlen = (u32)comprlen2;
+		SSTRACE("savestate_save(EMUFILE*): after compress2, err=%d comprlen=%u", error, (unsigned)comprlen);
 	}
 
 	//dump the header
@@ -933,10 +989,13 @@ bool savestate_save(EMUFILE* outstream, int compressionLevel)
 
 	if(compressionLevel != Z_NO_COMPRESSION)
 	{
+		SSTRACE("savestate_save(EMUFILE*): before final fwrite of %u bytes", comprlen==(u32)-1?len:comprlen);
 		outstream->fwrite((char*)cbuf,comprlen==(u32)-1?len:comprlen);
+		SSTRACE("savestate_save(EMUFILE*): after final fwrite");
 		delete[] cbuf;
 	}
 
+	SSTRACE("savestate_save(EMUFILE*): returning %d", error == Z_OK);
 	return error == Z_OK;
 }
 
@@ -944,19 +1003,30 @@ bool savestate_save (const char *file_name)
 {
 	EMUFILE_MEMORY ms;
 	size_t elems_written;
+	SSTRACE("savestate_save(\"%s\"): enter", file_name);
 #ifdef HAVE_LIBZ
 	if(!savestate_save(&ms, Z_DEFAULT_COMPRESSION))
 #else
 	if(!savestate_save(&ms, 0))
 #endif
+	{
+		SSTRACE("savestate_save(\"%s\"): inner savestate_save() FAILED", file_name);
 		return false;
+	}
+	SSTRACE("savestate_save(\"%s\"): before fopen, total size=%u", file_name, (unsigned)ms.size());
 	FILE* file = fopen(file_name,"wb");
 	if(file)
 	{
+		SSTRACE("savestate_save(\"%s\"): before fwrite", file_name);
 		elems_written = fwrite(ms.buf(), 1, ms.size(), file);
+		SSTRACE("savestate_save(\"%s\"): after fwrite, wrote=%u", file_name, (unsigned)elems_written);
 		fclose(file);
+		SSTRACE("savestate_save(\"%s\"): after fclose, returning %d", file_name, elems_written == (size_t)(ms.size()));
 		return (elems_written == (size_t)(ms.size()));
-	} else return false;
+	} else {
+		SSTRACE("savestate_save(\"%s\"): fopen FAILED", file_name);
+		return false;
+	}
 }
 
 extern SFORMAT SF_RTC[];
@@ -965,22 +1035,35 @@ static void writechunks(EMUFILE* os) {
 	// Hardware-merge mode de-swizzles the GX 3D scene lazily; the SF_GFX3D chunk
 	// (gfx3d_convertedScreen) needs it materialised now.  No-op when merge is off.
 	GXMerge_MaterializeConverted();
-	savestate_WriteChunk(os,1,SF_ARM9);
-	savestate_WriteChunk(os,2,SF_ARM7);
-	savestate_WriteChunk(os,3,cp15_savestate);
-	savestate_WriteChunk(os,4,SF_MEM);
-	savestate_WriteChunk(os,5,SF_NDS);
-	savestate_WriteChunk(os,51,nds_savestate);
-	savestate_WriteChunk(os,60,SF_MMU);
-	savestate_WriteChunk(os,61,mmu_savestate);
-	savestate_WriteChunk(os,7,gpu_savestate);
-	savestate_WriteChunk(os,8,spu_savestate);
-	savestate_WriteChunk(os,81,mic_savestate);
-	savestate_WriteChunk(os,90,SF_GFX3D);
-	savestate_WriteChunk(os,91,gfx3d_savestate);
-	savestate_WriteChunk(os,110,SF_WIFI);
-	savestate_WriteChunk(os,120,SF_RTC);
+	SF_MEM_rebind();   // heap MMU buffers -> SF_MEM[].v (see SF_MEM above)
+#ifdef DESMUME_SAVESTATE_DIAG
+	// ftell() delta around each chunk -- works uniformly for both
+	// savestate_WriteChunk() overloads (one returns a byte count, the other
+	// void) and is what actually correlates with the file growing between
+	// otherwise-identical saves in the same session.
+	#define WC(call) do { u32 _p0 = os->ftell(); call; u32 _p1 = os->ftell(); \
+		SSTRACE("writechunks: %-28s = %u bytes", #call, (unsigned)(_p1 - _p0)); } while(0)
+#else
+	#define WC(call) call
+#endif
+	WC(savestate_WriteChunk(os,1,SF_ARM9));
+	WC(savestate_WriteChunk(os,2,SF_ARM7));
+	WC(savestate_WriteChunk(os,3,cp15_savestate));
+	WC(savestate_WriteChunk(os,4,SF_MEM));
+	WC(savestate_WriteChunk(os,5,SF_NDS));
+	WC(savestate_WriteChunk(os,51,nds_savestate));
+	WC(savestate_WriteChunk(os,60,SF_MMU));
+	WC(savestate_WriteChunk(os,61,mmu_savestate));
+	WC(savestate_WriteChunk(os,7,gpu_savestate));
+	WC(savestate_WriteChunk(os,8,spu_savestate));
+	WC(savestate_WriteChunk(os,81,mic_savestate));
+	WC(savestate_WriteChunk(os,90,SF_GFX3D));
+	WC(savestate_WriteChunk(os,91,gfx3d_savestate));
+	WC(savestate_WriteChunk(os,110,SF_WIFI));
+	WC(savestate_WriteChunk(os,120,SF_RTC));
 	savestate_WriteChunk(os,0xFFFFFFFF,(SFORMAT*)0);
+	SSTRACE("writechunks: done, terminator written");
+	#undef WC
 }
 
 static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
@@ -1006,8 +1089,10 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 			case 7: if(!gpu_loadstate(is,size)) ret=false; break;
 			case 8: if(!spu_loadstate(is,size)) ret=false; break;
 			case 81: if(!mic_loadstate(is,size)) ret=false; break;
-			// No movies
-			//case 90: if(!ReadStateChunk(is,SF_GFX3D,size)) ret=false; break;
+			// writechunks() always emits chunk 90 (SF_GFX3D); this case was
+			// left commented out, so every load hit `default:` and aborted
+			// with "failed halfway through". Restore the upstream reader.
+			case 90: if(!ReadStateChunk(is,SF_GFX3D,size)) ret=false; break;
 			case 91: if(!gfx3d_loadstate(is,size)) ret=false; break;
 			// No movies
 			//case 100: if(!ReadStateChunk(is,SF_MOVIE, size)) ret=false; break;
@@ -1018,8 +1103,15 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 				ret=false;
 				break;
 		}
-		if(!ret)
+		if(!ret) {
+#ifdef DESMUME_SAVESTATE_DIAG
+			printf("[ss] ReadStateChunks FAILED at chunk t=%u size=%u\n", t, size);
+#endif
 			return false;
+		}
+#ifdef DESMUME_SAVESTATE_DIAG
+		printf("[ss] chunk t=%u size=%u ok\n", t, size);
+#endif
 	}
 done:
 
@@ -1124,6 +1216,8 @@ bool savestate_load(EMUFILE* is)
 	//gfx3d_reset();
 	//gpu3D->NDS_3D_Reset();
 	//SPU_Reset();
+
+	SF_MEM_rebind();   // NDS_Reset() above may have realloc'd the MMU buffers
 
 	EMUFILE_MEMORY mstemp(&buf);
 	bool x = ReadStateChunks(&mstemp,(s32)len);

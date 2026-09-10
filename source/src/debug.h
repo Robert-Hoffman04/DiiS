@@ -78,13 +78,17 @@ public:
 	static void log(unsigned int channel, const char * file, unsigned int line, void (*callback)(const Logger& logger, const char * message));
 };
 
-#if defined(DEBUG) || defined(GPUDEBUG) || defined(DIVDEBUG) || defined(SQRTDEBUG) || defined(DMADEBUG) || defined(DEVELOPER)
+// DESMUME_HARNESS activates the generic LOG()/LOGC() path so that every line
+// also fans into PKT_LOG (see Logger::vprintf -> harness_profile_log, §3.2).
+// The per-subsystem channels (GPULOG, DIVLOG, ...) still require their own
+// debug flag; when one is set, its lines reach the harness sink too.
+#if defined(DEBUG) || defined(GPUDEBUG) || defined(DIVDEBUG) || defined(SQRTDEBUG) || defined(DMADEBUG) || defined(DEVELOPER) || defined(DESMUME_HARNESS)
 #define LOGC(channel, ...) Logger::log(channel, __FILE__, __LINE__, __VA_ARGS__)
 #else
 #define LOGC(...) {}
 #endif
 
-#ifdef DEBUG
+#if defined(DEBUG) || defined(DESMUME_HARNESS)
 #define LOG(...) LOGC(0, __VA_ARGS__)
 #else
 #define LOG(...) {}

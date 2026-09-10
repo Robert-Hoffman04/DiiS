@@ -20,6 +20,7 @@
 */
 
 #include "ctrlssdl.h"
+#include "harness/harness.h"
 #include "saves.h"
 #include "SPU.h"
 
@@ -229,7 +230,11 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 
 	// USB Gecko / EXI debug-serial input (see gekko_utils/geckoinput.h).
 	GECKO_Update();
-	u32 gecko_h = GECKO_ButtonsHeld();
+	// §3.5: advance the transport-agnostic remote-input core in lockstep and
+	// fold its level mask in alongside the Gecko's. Self-stubs to 0 without
+	// -DDESMUME_HARNESS -DHARNESS_INPUT.
+	harness_input_update();
+	u32 gecko_h = GECKO_ButtonsHeld() | harness_input_held();
 
 	u32 wpad_h = WPAD_ButtonsHeld(0);
 	// d-pad bits are applied through the explicit CHECK_KEY() lines below, so

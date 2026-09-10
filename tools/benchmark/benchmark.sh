@@ -77,19 +77,20 @@ done
 die() { echo "benchmark: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# dolphin_launch / dolphin_kill now come from the one shared copy (plan §3.7).
+. "$ROOT/tools/harness-control/common.sh"
+
 have mcopy   || die "mtools not found (mcopy)"
 have flatpak || die "flatpak not found"
 [ -f "$DOLPHIN_SD" ] || die "no Dolphin SD image at $DOLPHIN_SD (set DOLPHIN_SD)"
 mdir -i "$DOLPHIN_SD" ::/DS/BIOS >/dev/null 2>&1 || die "SD image has no DS/BIOS/ - stage the DS bios files first"
 [ -f "$HERE/scenes.conf" ] || die "missing $HERE/scenes.conf"
 
-dolphin_kill() {
-	pkill -9 -x dolphin-emu        2>/dev/null || true
-	pkill -9 -f dolphin-emu-wrapper 2>/dev/null || true
-}
-
 defs_for() {
-	local base="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000"
+	# -DDESMUME_AUTOLOADSTATE: load sd:/DS/SAVES/test.ds0 ~90 frames in when the
+	# harness has staged one for the scene (scenes.conf 'state=' column). A clean
+	# no-op when no state file is present, so it is safe on every mode/scene.
+	local base="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_AUTOLOADSTATE"
 	case "$1" in
 		sw)     echo "$base -DDESMUME_FORCE_CORE=2" ;;
 		gx)     echo "$base -DDESMUME_FORCE_CORE=1" ;;
@@ -194,11 +195,21 @@ HAVE_PREV=0
 if mcopy -i "$DOLPHIN_SD" ::/DS/ROMS/test.nds "$RUNDIR/_prev_test.nds" 2>/dev/null; then
 	HAVE_PREV=1
 fi
+HAVE_PREV_STATE=0
+if mcopy -i "$DOLPHIN_SD" ::/DS/SAVES/test.ds0 "$RUNDIR/_prev_test.ds0" 2>/dev/null; then
+	HAVE_PREV_STATE=1
+fi
 restore_rom() {
 	dolphin_kill
 	if [ "$HAVE_PREV" = 1 ]; then
 		mcopy -o -i "$DOLPHIN_SD" "$RUNDIR/_prev_test.nds" ::/DS/ROMS/test.nds 2>/dev/null \
 			&& rm -f "$RUNDIR/_prev_test.nds"
+	fi
+	if [ "$HAVE_PREV_STATE" = 1 ]; then
+		mcopy -o -i "$DOLPHIN_SD" "$RUNDIR/_prev_test.ds0" ::/DS/SAVES/test.ds0 2>/dev/null \
+			&& rm -f "$RUNDIR/_prev_test.ds0"
+	else
+		mdel -i "$DOLPHIN_SD" ::/DS/SAVES/test.ds0 2>/dev/null || true
 	fi
 	mdel -i "$DOLPHIN_SD" ::/bench.log 2>/dev/null || true
 	mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
@@ -207,17 +218,23 @@ trap restore_rom EXIT
 
 #--- run one scene/mode ---------------------------------------------------
 run_one() {
-	local scene="$1" mode="$2" rom="$3" dur="$4"
+	local scene="$1" mode="$2" rom="$3" dur="$4" state="${5:-}"
 	dolphin_kill; sleep 3
 	mdel -i "$DOLPHIN_SD" ::/bench.log 2>/dev/null || true
 	mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 	mcopy -o -i "$DOLPHIN_SD" "$rom" ::/DS/ROMS/test.nds \
 		|| { echo "   mcopy of $rom failed"; return 1; }
+	# Stage (or clear) the scene's autoload savestate as test.ds0. The bench
+	# dols load it ~90 frames in (-DDESMUME_AUTOLOADSTATE); absent file = no-op.
+	if [ -n "$state" ]; then
+		mcopy -o -i "$DOLPHIN_SD" "$state" ::/DS/SAVES/test.ds0 \
+			|| { echo "   mcopy of state $state failed"; return 1; }
+		echo "   state: $(basename "$state")"
+	else
+		mdel -i "$DOLPHIN_SD" ::/DS/SAVES/test.ds0 2>/dev/null || true
+	fi
 	echo ">> $scene / $mode   $(basename "$rom")   ${dur}s"
-	setsid flatpak run org.DolphinEmu.dolphin-emu -b -e "$DOLDIR/bench_$mode.dol" \
-		-C Dolphin.Core.WiiSDCard=True -C Dolphin.DSP.Volume=0 \
-		> "$RUNDIR/raw/dolphin_${scene}_${mode}.log" 2>&1 &
-	disown 2>/dev/null || true   # we reap it with pkill; don't want the job-control "Killed" line
+	dolphin_launch "$DOLDIR/bench_$mode.dol" "$RUNDIR/raw/dolphin_${scene}_${mode}.log"
 	sleep "$dur"
 	dolphin_kill; sleep 3
 	if mcopy -i "$DOLPHIN_SD" ::/bench.log "$RUNDIR/raw/${scene}_${mode}.log" 2>/dev/null; then
@@ -241,20 +258,27 @@ run_one() {
 in_filter() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 
 RAN=0
-while IFS='|' read -r id rom window label dur; do
+while IFS='|' read -r id rom window label dur state; do
 	id="$(echo "${id:-}" | xargs)"
 	[ -z "$id" ] && continue
 	case "$id" in \#*) continue ;; esac
 	rom="$(echo "${rom:-}" | xargs)"; window="$(echo "${window:-}" | xargs)"
 	dur="$(echo "${dur:-}" | xargs | sed 's/[^0-9]//g')"
+	state="$(echo "${state:-}" | xargs)"
 	[ -n "$SCENE_FILTER" ] && ! in_filter "$SCENE_FILTER" "$id" && continue
 
 	rom="${rom/#\~/$HOME}"
 	case "$rom" in /*) : ;; *) rom="$ROOT/$rom" ;; esac
 	if [ ! -f "$rom" ]; then echo ">> skip $id: rom not found ($rom)"; continue; fi
 
+	if [ -n "$state" ]; then
+		state="${state/#\~/$HOME}"
+		case "$state" in /*) : ;; *) state="$ROOT/$state" ;; esac
+		if [ ! -f "$state" ]; then echo ">> skip $id: state not found ($state)"; continue; fi
+	fi
+
 	for m in $MODES; do
-		run_one "$id" "$m" "$rom" "${dur:-$DUR_DEFAULT}"
+		run_one "$id" "$m" "$rom" "${dur:-$DUR_DEFAULT}" "$state"
 		RAN=$((RAN + 1))
 	done
 done < "$HERE/scenes.conf"

@@ -1107,6 +1107,7 @@ template<int procnum, int chan> struct TSequenceItem_DMA : public TSequenceItem
 		IF_DEVELOPER(DEBUG_statistics.sequencerExecutionCounters[5+procnum*4+chan]++);
 
 		//printf("exec from TSequenceItem_DMA: %d %d\n",procnum,chan);
+		PZ_SCOPE(PZ_DMA);
 		controller->exec();
 //		//give gxfifo dmas a chance to re-trigger
 //		if(MMU.DMAStartTime[procnum][chan] == EDMAMode_GXFifo) {

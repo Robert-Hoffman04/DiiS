@@ -44,8 +44,11 @@
 #include "GXRender.h"
 #include "GXMerge.h"
 #include "GX2DBG.h"
+#include "saves.h"
 #include "rasterize.h"
 #include "perf_zones.h"
+#include "fps_overlay.h"
+#include "harness/harness.h"
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 #include "addons.h"
@@ -249,10 +252,34 @@ int main(int argc, char **argv){
 #ifdef DESMUME_FORCE_ROM
 	// Hardcoded ROM path for automated testing (see Makefile TESTDEFS).
 	strcpy(rom_filename, device ? "usb:/DS/ROMS/test.nds" : "sd:/DS/ROMS/test.nds");
+#elif defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+	// §3.4 boot manifest: sd:/harness.cfg (or usb:/) with >=1 rom= line drives
+	// the playlist; no manifest -> fall through to the FileBrowser path.
+	if (harness_boot_load(device ? "usb:" : "sd:") > 0) {
+		strncpy(rom_filename, harness_boot_rom_path(), MAXPATHLEN - 1);
+		rom_filename[MAXPATHLEN - 1] = 0;
+		if (harness_boot_core() > 0)
+			current3Dcore = (u8)harness_boot_core();
+		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d\n",
+			harness_boot_rom_count(),
+			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore);
+	} else if(FileBrowser(rom_filename) != 0) {
+		quit_game = true;
+	}
 #else
 	if(FileBrowser(rom_filename) != 0)
 		quit_game = true;
 #endif
+
+	// Harness transport bring-up (plan §3.1). Probes NET -> GECKO -> SD (or a
+	// pinned backend). No-op without -DDESMUME_HARNESS; on failure it disables
+	// itself and boot continues.
+	harness_transport_init();
+
+	// §3.6: install the PPC exception panic hook now that the transport is up,
+	// so any later trap ships a PKT_CRASH register dump + backtrace before the
+	// machine halts. No-op without -DDESMUME_HARNESS / -DHARNESS_CRASH.
+	harness_crash_init();
 
 	cflash_disk_image_file = NULL;
 
@@ -353,10 +380,19 @@ int main(int argc, char **argv){
 		exit(0);
 	}
 
+#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+	// §3.4: manifest-driven savestate jump for the first playlist ROM (later
+	// ROMs get it inside harness_boot_advance()). -1 / no manifest -> skipped.
+	if (harness_boot_autoload_slot() >= 0)
+		loadstate_slot(harness_boot_autoload_slot());
+	if (harness_boot_frame_every() > 0)
+		harness_frame_set_every(harness_boot_frame_every());
+#endif
+
 	execute = true;
 
 	log_console_enable_video(false);
-	
+
 	Execute();
 	
 	exit(0);
@@ -495,6 +531,8 @@ void init(){
 
 	GXMerge_Init();
 
+	FPSOverlay_Init();
+
 	VIDEO_SetBlack(false);
 }
 
@@ -508,6 +546,7 @@ static void Draw(void) {
 	u16 *dBottom = BottomScreen;
 	LWP_MutexLock(vidmutex);
 
+	{ PZ_SCOPE(PZ_DRAW_CONVERT);
 	for (int y = 0; y < 48; y++) {
 		for (int h = 0; h < 4; h++) {
 			for (int x = 0; x < 64; x++) {
@@ -529,9 +568,12 @@ static void Draw(void) {
 
 	DCFlushRange(TopScreen, 256*192*2);
 	DCFlushRange(BottomScreen, 256*192*2);
+	} // PZ_DRAW_CONVERT
 
-	if (GXMerge_Enabled())
+	if (GXMerge_Enabled()) {
+		PZ_SCOPE(PZ_DRAW_PRESENT);
 		GXMerge_Present();
+	}
 
 	LWP_MutexUnlock(vidmutex);
 
@@ -731,6 +773,9 @@ static void *draw_thread(void*){
 			}
 		}
 
+		// On-screen FPS counter, top-left corner (outside the DS screen area).
+		FPSOverlay_Draw();
+
 		GXDBG_MAIN("draw_thread: calling GX_DrawDone");
 		GX_DrawDone();
 		GXDBG_MAIN("draw_thread: GX_DrawDone returned");
@@ -756,18 +801,40 @@ void Execute() {
 	if(vidthread == LWP_THREAD_NULL)
 		LWP_CreateThread(&vidthread, draw_thread, NULL, NULL, 0, 67);
 
+#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+	// §3.4 multi-ROM playlist: advance after frames_per_rom or a host "next_rom",
+	// reloading via NDS_LoadROM each time. #ifdef'd (not just stubbed) so a
+	// release build keeps the original loop's codegen byte-for-byte.
+	do {
+		harness_boot_announce();
+		u32 romBudget = harness_boot_frames_per_rom();
+		u32 romFrame  = 0;
+
+		while(!quit_game){
+			if(SkipFrameTracker) NDS_SkipNextFrame();
+			DSExec();
+			SkipFrameTracker++;
+			if(SkipFrameTracker > SkipFrame) SkipFrameTracker = 0;
+
+			++romFrame;
+			if(harness_boot_next_requested())      break;
+			if(romBudget && romFrame >= romBudget) break;
+		}
+	} while(!quit_game && harness_boot_advance());
+#else
 	while(!quit_game){
-		 
-		if(SkipFrameTracker) NDS_SkipNextFrame(); 
-	
+
+		if(SkipFrameTracker) NDS_SkipNextFrame();
+
 		DSExec();
 
 		SkipFrameTracker++;
-		
+
 		if(SkipFrameTracker > SkipFrame) SkipFrameTracker = 0;
-		
+
 	}
-	
+#endif
+
 	/*
 	int sys1 = SYS_GetArena1Size();
 	int sys2 = SYS_GetArena2Size();
@@ -1271,6 +1338,10 @@ void DSExec(){
 	// fold its edge events into `pad` too so the emulator-level controls below
 	// (console toggle, layout, GXMerge A/B toggle, ...) are drivable over it.
 	pad |= GECKO_ButtonsDown();
+	// §3.5: same for the transport-agnostic remote-input core (network feed);
+	// process_ctrls_event() above already advanced it. Self-stubs to nothing
+	// without -DDESMUME_HARNESS -DHARNESS_INPUT.
+	pad |= harness_input_down();
 	
 	// Update cursor position and click
 	if(cursor.down) {
@@ -1281,6 +1352,11 @@ void DSExec(){
 		NDS_releaseTouch();
 		cursor.click = false;
 	}
+
+	// §3.5: deterministic keypad record/replay. Record appends this frame's
+	// keypad; replay overwrites it. No-op without -DDESMUME_HARNESS -DHARNESS_INPUT
+	// or when no movie is active.
+	harness_input_movie_tick(&keypad);
 
 	update_keypad(keypad);     /* Update keypad */
 
@@ -1302,6 +1378,59 @@ void DSExec(){
 		if (current3Dcore == 1)
 			GXMerge_SetEnabled(!GXMerge_Enabled());
 	}
+
+	// DS-level quicksave/quickload (saves.cpp): Z held + L/R edge, fixed
+	// slot 0. Deliberately NOT a rewind buffer -- this is a single on-demand
+	// synchronous savestate_slot()/loadstate_slot() file write/read when the
+	// chord fires, nothing runs every frame, so there's no per-frame cost.
+	// The "held" side folds in GECKO_ButtonsHeld() so the chord is drivable
+	// over the USB-Gecko debug-input channel (z byte held 6 frames, then L/R)
+	// -- that's how the headless benchmark harness jumps a run to a savestate.
+	if ((PAD_ButtonsHeld(0) | GECKO_ButtonsHeld()) & PAD_TRIGGER_Z) {
+		if (pad & PAD_TRIGGER_L)
+			savestate_slot(0);
+		else if (pad & PAD_TRIGGER_R)
+			loadstate_slot(0);
+	}
+#ifdef DESMUME_AUTOLOADSTATE
+	// Headless benchmark savestate jump (-DDESMUME_AUTOLOADSTATE): rather than
+	// direct-boot + a frame window chosen to sit past the intro, load a
+	// savestate slot exactly once, early, so every benched frame is real
+	// in-game content from a fixed known point. The benchmark harness stages
+	// the state file as sd:/DS/SAVES/test.ds<slot> (tools/benchmark/benchmark.sh);
+	// a missing file makes loadstate_slot() a clean no-op, so a bench dol built
+	// with this flag still runs scenes that ship no state. The load waits a few
+	// frames so NDS_LoadROM()/direct boot has fully brought up the MMU before
+	// the NDS_Reset() inside savestate_load() runs.
+	#ifndef DESMUME_AUTOLOADSTATE_FRAME
+	#define DESMUME_AUTOLOADSTATE_FRAME 90
+	#endif
+	#ifndef DESMUME_AUTOLOADSTATE_SLOT
+	#define DESMUME_AUTOLOADSTATE_SLOT 0
+	#endif
+	{
+		static unsigned alsFrame = 0;
+		static bool alsDone = false;
+		if (!alsDone && alsFrame++ >= (unsigned)DESMUME_AUTOLOADSTATE_FRAME) {
+			alsDone = true;
+			loadstate_slot(DESMUME_AUTOLOADSTATE_SLOT);
+		}
+	}
+#endif
+#ifdef DESMUME_SAVESTATE_DIAG
+	{
+		static unsigned dframe = 0;
+		unsigned gh = GECKO_ButtonsHeld(), gd = GECKO_ButtonsDown();
+		if ((dframe++ % 60) == 0 || gh || gd) {
+			FILE* f = fopen("sd:/gecko_diag.log", "a");
+			if (f) {
+				fprintf(f, "f=%u alive=%d held=0x%08x down=0x%08x padHeld=0x%08x\n",
+					dframe, GECKO_Available(), gh, gd, (unsigned)PAD_ButtonsHeld(0));
+				fclose(f);
+			}
+		}
+	}
+#endif
 
 #ifdef GPU_DISPCAP_DEBUG_LOG
 	// Dump the DISPCAPCNT/offset ring buffer (GPU.cpp) - GC L trigger for an
@@ -1346,6 +1475,51 @@ void DSExec(){
 	if (!SkipFrameTracker) { PZ_SCOPE(PZ_DRAW); Draw(); } // only update when !Frame skip tracker
 #endif
 	pzFrameTick();
+
+	FPSOverlay_Tick();
+
+#ifdef DESMUME_HARNESS
+	{
+		// Drain any host -> device packets (§3.4 playlist control, §3.5 input).
+		u8 _pt;
+		char _rx[128];
+		u32 _rn;
+		while ((_rn = harness_recv(&_pt, _rx, sizeof(_rx) - 1)) != 0) {
+			if (_pt == HARNESS_PKT_CTRL) {
+				_rx[_rn] = 0;
+				if (!strncmp(_rx, "next_rom", 8)) {
+					harness_boot_request_next();
+				} else if (!strncmp(_rx, "capture_frame", 13)) {
+					const char *_a = _rx + 13;
+					while (*_a == ' ') _a++;
+					harness_frame_request(*_a ? _a : 0);
+				} else if (!strncmp(_rx, "movie", 5)) {
+					harness_input_movie_cmd(_rx + 5);
+				}
+			} else if (_pt == HARNESS_PKT_INPUT) {
+				// §3.5: drive the shared transport-agnostic input core.
+				harness_input_feed_bytes(_rx, (int)_rn);
+			}
+		}
+
+		// One heartbeat/sec, tagged with the current playlist ROM so the desktop
+		// watchdog (§3.4) knows which ROM a stall belongs to.
+		static u32 _hb = 0;
+		++_hb;
+		if ((_hb % 60) == 0) {
+			const char *_rname = harness_boot_rom_name();
+			char _l[96];
+			snprintf(_l, sizeof(_l), "heartbeat frame=%lu%s%s",
+				(unsigned long)_hb,
+				(_rname && *_rname) ? " rom=" : "",
+				(_rname && *_rname) ? _rname : "");
+			harness_send(HARNESS_PKT_CTRL, _l, strlen(_l));
+		}
+
+		// §3.4 on-demand video readout (off unless frame_every set or requested).
+		harness_frame_tick(_hb);
+	}
+#endif
 
 #ifdef DESMUME_FBDUMP
 	// Renderer correctness A/B (-DDESMUME_FBDUMP): on a deterministic direct-boot

@@ -130,6 +130,39 @@ class JITCache {
 		void flushCache();
 		void invalidateSMCTarget(u32 targetEA);
 
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+		// §3.3 JIT cache-pressure telemetry. One counter set per core; the
+		// PROFILER_CACHE_* macros (jit_debug.h) drive these from getBlock() /
+		// registerBlock() / flushCache(). installFrame[] shadows blockTable[]
+		// with an install sequence number per slot so an eviction can price the
+		// displaced block's lifetime (in registrations survived). All of this
+		// compiles out of a release / non-HARNESS_PROFILE build -- BasicBlock and
+		// the hand-emitted stubs are untouched (counters live on JITCache, whose
+		// layout no emitted code depends on).
+		struct CacheStats {
+			u64 hits;
+			u64 coldMisses;        // getBlock miss, slot never populated
+			u64 collisionMisses;   // getBlock miss, slot held a different PC
+			u64 registrations;     // registerBlock calls
+			u64 evictions;         // live executable block displaced by a collision
+			u64 evictLifetimeSum;  // sum of install-seq deltas over those evictions
+			u64 flushes;
+		};
+		CacheStats profStats;
+		u32* installFrame;         // HASH_TABLE_SIZE entries, or nullptr
+		u32  installSeq;
+		u32  arenaPeak;            // §3.3b high-water arenaOffset since last flush
+		u32  arenaPeakEver;        // §3.3b high-water across the whole run
+		u8   lastHeuristic;        // §3.3 follow-up: edge-trigger the note/warning
+		                           //   lines (0=none 1=contention 2=cold 3=arena)
+
+		void profCacheHit();
+		void profCacheMiss(u32 slotPC);
+		void profCacheEvict(u32 evictedPC, u32 newPC);
+		void profCacheFlushStart();
+		void profEmitReport(const char* tag);
+#endif
+
 		inline BasicBlock* getBlock(u32 pc) {
 			if (!isInitialized) return nullptr;
 			u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);

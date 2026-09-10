@@ -23,8 +23,16 @@
 #include "jit_trace.h"
 #include "../armcpu.h"
 #include "../perf_zones.h"
+#include "../harness/harness.h"
 #include <string.h>
 #include <stdio.h>
+
+// §3.0: the JIT heap canary/minefield poll is crash-detection and only runs
+// under the master harness flag (+ HARNESS_CRASH). Without it jitCheckCanaries()
+// is a no-op stub and these poll sites compile away entirely.
+#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+  #define JIT_CANARY_WATCH 1
+#endif
 
 // lightweight liveness telemetry (dumped to sd:/jit.log periodically)
 u64 g_jitBlocksRun = 0;   // blocks that executed >= 1 guest instruction
@@ -56,6 +64,21 @@ static void jitMaybeReport()
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 #include "jit_differential.h"
+#endif
+
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+// §3.3: periodic per-core JIT cache-pressure stat block over PKT_PROFILE. Both
+// cores report (ARM7 always, ARM9 whenever its dispatcher runs). Throttled by a
+// shared dispatch tick rather than a frame boundary (frames land in §3.3b).
+static void jitHarnessCacheReport()
+{
+	static u32 s_tick = 0;
+	if ((++s_tick & 0x1FFFu) != 0) return;   // ~every 8192 dispatches
+	jitCacheArm7.profEmitReport("arm7");
+	jitCacheArm9.profEmitReport("arm9");
+}
+#else
+static inline void jitHarnessCacheReport() {}
 #endif
 
 // A2 coverage profiler (the port of VBA's Profiler): per-ARM9-step tally of
@@ -94,7 +117,10 @@ u32 jitRunArm7()
 	// ARM7 JIT time; jitCompileTrace() re-tags its own interval as ARM7_BUILD.
 	PZ_SCOPE(PZ_ARM7_JIT);
 
+	jitHarnessCacheReport();   // §3.3: throttled internally
+
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
+#ifdef JIT_CANARY_WATCH
 	{
 		static u32 s_canaryPoll7 = 0;
 #ifdef JIT_HEAP_WATCH
@@ -103,6 +129,7 @@ u32 jitRunArm7()
 		if ((++s_canaryPoll7 & 0xFFFFu) == 0) jitCheckCanaries();
 #endif
 	}
+#endif
 
 	armcpu_t& cpu = NDS_ARM7;
 	const u32 pc = cpu.instruct_adr;
@@ -217,9 +244,12 @@ u32 jitRunArm9()
 	// time; jitCompileTrace() re-tags its own interval as ARM9_BUILD.
 	PZ_SCOPE(PZ_ARM9_JIT);
 
+	jitHarnessCacheReport();   // §3.3: throttled internally
+
 	// GO-FIX-PH: cheap periodic canary poll (see jit_trace.cpp / jit.h).
 	// JIT_HEAP_WATCH tightens the interval from 64K to 1K dispatches for §16
 	// host-memory-safety soaks (predicated-branch corruption hunt).
+#ifdef JIT_CANARY_WATCH
 	{
 		static u32 s_canaryPoll = 0;
 #ifdef JIT_HEAP_WATCH
@@ -228,6 +258,7 @@ u32 jitRunArm9()
 		if ((++s_canaryPoll & 0xFFFFu) == 0) jitCheckCanaries();
 #endif
 	}
+#endif
 
 	armcpu_t& cpu = NDS_ARM9;
 	const u32 pc = cpu.instruct_adr;

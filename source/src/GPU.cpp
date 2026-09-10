@@ -28,6 +28,7 @@
 #include <iostream>
 #include "MMU.h"
 #include "GPU.h"
+#include "perf_zones.h"
 
 // Diagnostic log for the DISPCAPCNT display-capture path + per-engine
 // DisplayMode, used to confirm/deny whether a game's dual-3D-screen trick
@@ -3428,6 +3429,7 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 			// per-line recorder can consult GX2DBG_LayerReady), on the core
 			// thread. GX_InitTexObj/DCFlushRange are thread-safe (no FIFO cmds).
 			if (GXMerge_2DBGEnabled()) {
+				PZ_SCOPE(PZ_GX2DBG_BAKE);
 				GX2DBG_FrameUpdate(gpu);
 				GX2DBG_ObjFrameUpdate(gpu);
 			}
@@ -3435,6 +3437,7 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 		// Step 5.1a: SUB engine (no 3D) - arm + bake its own 2D-BG record.
 		if (gpu->core == GPU_SUB && GXMerge_2DBGEnabled()) {
 			GXMerge_Begin2DBGSub(gpu->dispMode);
+			PZ_SCOPE(PZ_GX2DBG_BAKE);
 			GX2DBG_FrameUpdate(gpu);
 			GX2DBG_ObjFrameUpdate(gpu);
 		}

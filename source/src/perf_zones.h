@@ -34,7 +34,11 @@ enum PerfZone {
 	PZ_GPU_RENDER,    // gpu3D->NDS_3D_Render() - GXRender / software rasterizer
 	PZ_GPU_2D,        // GPU_RenderLine() x2 - 2D compositor / merge line walk
 	PZ_SPU,           // SPU_Emulate_core()
-	PZ_DRAW,          // Draw() - screen convert + GXMerge_Present + VI present
+	PZ_DRAW,          // Draw() residual - VI present / vidmutex (convert+present split out below)
+	PZ_DMA,           // DmaController::exec() - all 8 channels (was folded into 'other')
+	PZ_GX2DBG_BAKE,   // GX2DBG_FrameUpdate/ObjFrameUpdate - resolved-plane bake (was in gpu_2d)
+	PZ_DRAW_CONVERT,  // Draw() 4x4-swizzle RGB15_REVERSE of both screens + DCFlushRange
+	PZ_DRAW_PRESENT,  // GXMerge_Present() - band replay draw calls / TEV / scissor
 	PZ_COUNT
 };
 

@@ -47,6 +47,9 @@
 #if defined(DESMUME_JIT_TRACE_FIRST) || defined(DESMUME_ARM_TIME_SPLIT)
 #include <stdio.h>
 #endif
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#include <stdlib.h>   // §3.3: installFrame[] shadow array (calloc/free)
+#endif
 
 JITCache jitCacheArm7;
 JITCache jitCacheArm9;
@@ -85,6 +88,14 @@ JITCache::JITCache() {
 	arenaSize = 0;
 	isInitialized = false;
 	smcBankMask = 0;
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+	installFrame = nullptr;
+	installSeq = 0;
+	arenaPeak = 0;
+	arenaPeakEver = 0;
+	lastHeuristic = 0;
+	memset(&profStats, 0, sizeof profStats);
+#endif
 }
 
 JITCache::~JITCache() {
@@ -102,6 +113,15 @@ void JITCache::initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr
 	smcPageFlags = smcFlagsPtr;
 	smcBankMask = trackedBankMask;
 	arenaOffset = 0;
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+	if (!installFrame)
+		installFrame = (u32*)calloc(HASH_TABLE_SIZE, sizeof(u32));
+	installSeq = 0;
+	arenaPeak = 0;
+	arenaPeakEver = 0;
+	lastHeuristic = 0;
+	memset(&profStats, 0, sizeof profStats);
+#endif
 	flushCache();
 	isInitialized = true;
 }
@@ -114,6 +134,10 @@ void JITCache::destroy() {
 	arenaOffset = 0;
 	arenaSize = 0;
 	isInitialized = false;
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+	free(installFrame);
+	installFrame = nullptr;
+#endif
 }
 
 u32* JITCache::allocateJITMemory(size_t numBytes) {
@@ -421,5 +445,111 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 		}
 	}
 }
+
+// =========================================================================
+// §3.3 JIT cache-pressure telemetry (HARNESS_PROFILE only)
+// =========================================================================
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+
+void JITCache::profCacheHit() { profStats.hits++; }
+
+void JITCache::profCacheMiss(u32 slotPC) {
+	if (slotPC == 0) profStats.coldMisses++;
+	else             profStats.collisionMisses++;
+}
+
+// Called from registerBlock() *before* the slot is overwritten. Prices the
+// outgoing block's lifetime (registrations survived) when a genuinely live,
+// executable block is being displaced by a hash collision -- a "don't JIT"
+// marker (execute==null, len>0) or an SMC-killed slot (execute==null, len==0)
+// is not a thrash eviction. Then stamps the slot with the current sequence
+// number for the block that registerBlock() is about to install.
+void JITCache::profCacheEvict(u32 evictedPC, u32 newPC) {
+	profStats.registrations++;
+	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;  // §3.3b
+	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
+	u32 index = ((newPC >> 1) ^ (newPC >> 13)) & (HASH_TABLE_SIZE - 1);
+	const BasicBlock& ev = blockTable[index];
+	if (evictedPC != 0 && ev.execute != nullptr && ev.length > 0) {
+		profStats.evictions++;
+		if (installFrame)
+			profStats.evictLifetimeSum += (installSeq - installFrame[index]);
+	}
+	if (installFrame) installFrame[index] = ++installSeq;
+}
+
+void JITCache::profCacheFlushStart() {
+	profStats.flushes++;
+	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;  // §3.3b
+	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
+	arenaPeak = 0;   // per-flush high-water resets with the arena
+	if (installFrame) memset(installFrame, 0, HASH_TABLE_SIZE * sizeof(u32));
+	installSeq = 0;
+}
+
+void JITCache::profEmitReport(const char* tag) {
+	const CacheStats& s = profStats;
+	u64 misses  = s.coldMisses + s.collisionMisses;
+	u64 lookups = s.hits + misses;
+	u64 hitPct  = lookups ? s.hits * 100 / lookups : 0;
+	u64 lifeAvg = s.evictions ? s.evictLifetimeSum / s.evictions : 0;
+
+	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;
+	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
+	u32 cap     = arenaSize ? (u32)arenaSize : 1;
+	u32 fillPct = (u32)(((u64)arenaOffset * 100) / cap);
+	u32 peakPct = (u32)(((u64)arenaPeakEver * 100) / cap);
+
+	harness_profile_emitf(
+		"jit cache=%s lookups=%llu hit=%llu%% coldmiss=%llu collmiss=%llu "
+		"reg=%llu evict=%llu evictlife_avg=%llu flush=%llu "
+		"arena=%u/%u(%u%%) arenapeak=%u(%u%%)",
+		tag, (unsigned long long)lookups, (unsigned long long)hitPct,
+		(unsigned long long)s.coldMisses, (unsigned long long)s.collisionMisses,
+		(unsigned long long)s.registrations, (unsigned long long)s.evictions,
+		(unsigned long long)lifeAvg, (unsigned long long)s.flushes,
+		(unsigned)arenaOffset, (unsigned)cap, (unsigned)fillPct,
+		(unsigned)arenaPeakEver, (unsigned)peakPct);
+
+	// §3.3 / §3.3b heuristic, three-way and edge-triggered (emit only when the
+	// verdict changes, not every report):
+	//   1 bucket contention  - many live blocks displacing each other, short
+	//     lifetimes, arena NOT full  => table too small / hash mixing bad.
+	//   3 arena-capacity thrash - repeated full-cache flushes with the arena
+	//     running near full          => real recycling pressure; grow the arena.
+	//   2 healthy exploration - misses mostly cold, survivors long-lived.
+	u8 verdict = 0;
+	if (s.flushes >= 4 && peakPct >= 85 && lookups > 2000)
+		verdict = 3;
+	else if (s.evictions > 64 && lifeAvg < 8 && peakPct < 75 && lookups > 2000)
+		verdict = 1;
+	else if (misses > 2000 && s.collisionMisses * 4 < misses && lifeAvg >= 64)
+		verdict = 2;
+
+	if (verdict && verdict != lastHeuristic) {
+		if (verdict == 3)
+			harness_profile_emitf(
+				"jit cache=%s WARNING arena-capacity thrash: flush=%llu with "
+				"arenapeak=%u%% => recycling pressure, grow JIT_ARENA_SIZE%s",
+				tag, (unsigned long long)s.flushes, (unsigned)peakPct,
+				tag[3] == '9' ? "_ARM9" : "");
+		else if (verdict == 1)
+			harness_profile_emitf(
+				"jit cache=%s WARNING bucket contention: evict=%llu + short "
+				"lifetime (avg=%llu) with arena only %u%% full => widen "
+				"HASH_TABLE_SIZE / hash mixing",
+				tag, (unsigned long long)s.evictions,
+				(unsigned long long)lifeAvg, (unsigned)peakPct);
+		else
+			harness_profile_emitf(
+				"jit cache=%s note: misses mostly cold (coll=%llu/%llu), "
+				"survivors long-lived (avg=%llu) => healthy exploration",
+				tag, (unsigned long long)s.collisionMisses,
+				(unsigned long long)misses, (unsigned long long)lifeAvg);
+	}
+	lastHeuristic = verdict;
+}
+
+#endif // DESMUME_HARNESS && HARNESS_PROFILE
 
 #endif // DESMUME_JIT_ARM7

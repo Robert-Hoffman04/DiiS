@@ -15,13 +15,12 @@ DOLPHIN_SD="${DOLPHIN_SD:-$DOLPHIN_DATA/desmume-sd.raw}"
 DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
 DEVKITPPC="${DEVKITPPC:-$DEVKITPRO/devkitPPC}"
 export DEVKITPRO DEVKITPPC MTOOLS_SKIP_CHECK=1
+. "$ROOT/tools/harness-control/common.sh"   # dolphin_launch / dolphin_kill (plan §3.7)
 
 ROM="$ROOT/Super Mario 64 DS (USA, Australia) (Rev 1).nds"
 OUT="$HERE/results/_jitlog_$(date -u +%Y%m%dT%H%M%SZ).log"
 TESTDEFS="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_FORCE_CORE=2"
 JITDEFS="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_JIT_TRACE_FIRST"
-
-dolphin_kill() { pkill -9 -x dolphin-emu 2>/dev/null||true; pkill -9 -f dolphin-emu-wrapper 2>/dev/null||true; }
 
 echo ">> build (JITDEFS: $JITDEFS)"
 ( cd "$ROOT" && make clean >/dev/null 2>&1 && make -j"$(nproc)" JITDEFS="$JITDEFS" TESTDEFS="$TESTDEFS" ) >"$HERE/results/_jitlog_build.log" 2>&1 \
@@ -41,9 +40,7 @@ mdel -i "$DOLPHIN_SD" ::/jit.log 2>/dev/null||true
 mcopy -o -i "$DOLPHIN_SD" "$ROM" ::/DS/ROMS/test.nds || { echo "mcopy rom failed"; exit 1; }
 
 echo ">> run ${DUR}s"
-setsid flatpak run org.DolphinEmu.dolphin-emu -b -e "$ROOT/desmumewii.dol" \
-	-C Dolphin.Core.WiiSDCard=True -C Dolphin.DSP.Volume=0 >/dev/null 2>&1 &
-disown 2>/dev/null||true
+dolphin_launch "$ROOT/desmumewii.dol" /dev/null
 sleep "$DUR"
 dolphin_kill; sleep 3
 
