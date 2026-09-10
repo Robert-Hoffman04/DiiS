@@ -96,6 +96,8 @@ struct S2Rec {
 	u8   bfac [DS_H];
 	u8   ao   [DS_H];
 	u8   bc   [DS_H];
+	u8           nWSeg[DS_H];                       // §5.3 window x-segments
+	GX2DBGWinSeg wseg [DS_H][GX2DBG_MAX_WSEG];
 	bool armed;                 // this engine's 2D-BG path armed this frame
 	GX2DBGFrame working, present;
 	bool        havePresent;
@@ -336,11 +338,15 @@ void GXMerge_Begin2DBGSub(int subDispMode)
 
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode, u8 brightFactor,
                             u8 alphaOver, u8 behindContent, int nLayers,
-                            const GX2DBGEntry *entries)
+                            const GX2DBGEntry *entries,
+                            int nWSeg, const GX2DBGWinSeg *wseg)
 {
 	if ((unsigned)eng >= 2 || l < 0 || l >= DS_H) return;
 	if (nLayers > GX2DBG_MAX_LAYERS) nLayers = GX2DBG_MAX_LAYERS;
+	if (nWSeg < 0 || nWSeg > GX2DBG_MAX_WSEG) nWSeg = 0;
 	S2Rec *S = &s2[eng];
+	S->nWSeg[l] = (u8)nWSeg;
+	if (nWSeg) memcpy(S->wseg[l], wseg, nWSeg * sizeof(GX2DBGWinSeg));
 	S->used[l]  = 1;
 	S->nLay[l]  = (u8)nLayers;
 	S->bd[l]    = backdrop;
@@ -370,6 +376,10 @@ static bool s2_lineSame(const S2Rec *S, int a, int start)
 	if (S->bd[a] != S->bd[start] || S->bmode[a] != S->bmode[start] ||
 	    S->bfac[a] != S->bfac[start] || S->ao[a] != S->ao[start] ||
 	    S->bc[a] != S->bc[start]) return false;
+	if (S->nWSeg[a] != S->nWSeg[start]) return false;
+	if (S->nWSeg[start] &&
+	    memcmp(S->wseg[a], S->wseg[start], S->nWSeg[start] * sizeof(GX2DBGWinSeg)))
+		return false;
 	for (int i = 0; i < S->nLay[start]; i++)
 		if (memcmp(&S->e[a][i], &S->e[start][i], GX2DBG_ENTRY_KEYLEN)) return false;
 	return true;
@@ -402,6 +412,8 @@ static void GXMerge_End2DBGEng(int eng)
 		b->brightFactor = S->bfac[start];
 		b->alphaOver = S->ao[start];
 		b->behindContent = S->bc[start];
+		b->nWSeg = S->nWSeg[start];
+		if (b->nWSeg) memcpy(b->wseg, S->wseg[start], b->nWSeg * sizeof(GX2DBGWinSeg));
 		for (int i = 0; i < b->nLayers; i++)
 			b->e[i] = S->e[start][i];
 	}
@@ -660,6 +672,103 @@ static void quad(f32 x0, f32 y0, f32 x1, f32 y1,
 	GX_End();
 }
 
+// Step 5.2 sprite pass body: draw every latched sprite for `eng` under whatever
+// scissor the caller set.  §5.3-2: called once full-screen when no window is
+// active, or once per (band y-range x window x-segment where the OBJ bit is set).
+//
+// Sprites are drawn FRONT-TO-BACK (priority 0->3, OAM 0->127) with a unique
+// per-sprite depth and GX_LEQUAL + Z-write, so the EFB depth buffer resolves
+// sprite-vs-sprite exactly as the DS does: one sprite pixel survives per screen
+// pixel.  This matters for OBJ mode-1 (semi-transparent) sprites: the DS blends
+// only the front-most sprite pixel against the layer beneath, ONCE.  Drawing
+// them as independent "over" quads (the old painter's-order pass) double-blends
+// every overlap - SM64DS's minimap cloud band is ~27 overlapping mode-1 puffs,
+// which stacked up into an opaque grey boxy grid.  GX_SetZCompLoc(GX_FALSE)
+// keeps alpha-killed (transparent) texels from writing depth.
+static void GXMerge_DrawSpritePass(int eng, f32 x0, f32 y0, f32 w, f32 h,
+                                   int nObj, u8 objEva)
+{
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GX_SetZCompLoc(GX_FALSE);   // depth test AFTER alpha kill
+
+	// The EFB depth buffer still holds this frame's 3D scene (or stale) depths -
+	// prime the sprite region to the far plane so the sprites always win against
+	// it while GX_LEQUAL still resolves them against each other.  Colour write is
+	// masked so this only touches Z.
+	GX_SetZMode(GX_ENABLE, GX_ALWAYS, GX_TRUE);
+	GX_SetColorUpdate(GX_FALSE);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position3f32(x0,     y0,     299.0f); GX_Color4u8(0, 0, 0, 0);
+		GX_Position3f32(x0,     y0 + h, 299.0f); GX_Color4u8(0, 0, 0, 0);
+		GX_Position3f32(x0 + w, y0 + h, 299.0f); GX_Color4u8(0, 0, 0, 0);
+		GX_Position3f32(x0 + w, y0,     299.0f); GX_Color4u8(0, 0, 0, 0);
+	GX_End();
+	GX_SetColorUpdate(GX_TRUE);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GX_SetZMode(GX_ENABLE, GX_LEQUAL, GX_TRUE);
+
+	const u8 eva8 = (u8)(((objEva > 16 ? 16 : objEva) * 255 + 8) / 16);
+	int curMode = -1;   // 0 = opaque, 1 = semi-transparent EVA blend
+	f32 z = 1.0f;       // front-most sprite nearest; increases as we go back
+
+	for (int pr = 0; pr <= 3; pr++) {
+		for (int i = 0; i < nObj; i++) {
+			s16 sx, sy; u16 fxw, fyh; u8 sp, ss; const f32 *uv = NULL;
+			GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &fxw, &fyh, &sp, &ss, &uv);
+			if (!ot || sp != pr || !uv) continue;
+			const int want = ss ? 1 : 0;
+			if (want != curMode) {
+				if (want == 1) {   // semi-transparent: out.a = TEXA * EVA/16
+					GXColor k = { 0, 0, 0, eva8 };
+					GX_SetTevKColor(GX_KCOLOR0, k);
+					GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
+					GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+					GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_KONST, GX_CA_ZERO);
+					GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+					GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+					GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+					// kill the sprite's transparent texels so they don't write depth
+					GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_OR, GX_NEVER, 0);
+				} else {
+					GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+					GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+					GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
+					GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+				}
+				curMode = want;
+			}
+			GX_LoadTexObj(ot, GX_TEXMAP0);
+			const f32 gx0 = x0 + w * (sx          / (f32)DS_W);
+			const f32 gx1 = x0 + w * ((sx + fxw)  / (f32)DS_W);
+			const f32 gy0 = y0 + h * (sy          / (f32)DS_H);
+			const f32 gy1 = y0 + h * ((sy + fyh)  / (f32)DS_H);
+			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+				GX_Position3f32(gx0, gy0, z); GX_TexCoord2f32(uv[0], uv[1]);  // TL
+				GX_Position3f32(gx0, gy1, z); GX_TexCoord2f32(uv[2], uv[3]);  // BL
+				GX_Position3f32(gx1, gy1, z); GX_TexCoord2f32(uv[4], uv[5]);  // BR
+				GX_Position3f32(gx1, gy0, z); GX_TexCoord2f32(uv[6], uv[7]);  // TR
+			GX_End();
+			z += 1.0f;
+		}
+	}
+
+	// restore the 2D-BG replay's expected state (XY verts, depth off)
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetZCompLoc(GX_TRUE);
+	GX_SetZMode(GX_ENABLE, GX_ALWAYS, GX_FALSE);
+}
+
 // Step 5.1a: draw one engine's recorded 2D-BG bands (backdrop + text BG layers
 // + optional KIND_3D resident-texture entry + MASTER_BRIGHT).  Painter's order,
 // self-contained.  eng: 0 MAIN, 1 SUB.
@@ -707,8 +816,29 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 		const f32 tv0 = (f32)b->yStart      / (f32)DS_H;
 		const f32 tv1 = (f32)(b->yEnd + 1)  / (f32)DS_H;
 
+		// §5.3: replay each window x-segment under its own scissor.  A band with
+		// nWSeg == 0 (no window) runs the layer pass once, full width - the
+		// segMask/segFxOn defaults below make every gate a no-op.
+		const int nSeg = b->nWSeg ? b->nWSeg : 1;
+		for (int si = 0; si < nSeg; si++) {
+			u8 segMask = 0x1F; bool segFxOn = true;
+			if (b->nWSeg) {
+				const GX2DBGWinSeg *ws = &b->wseg[si];
+				segMask = ws->mask; segFxOn = ws->fxOn != 0;
+				const u32 rx0 = (u32)(x0 + w * (ws->x0 / (f32)DS_W));
+				const u32 rx1 = (u32)(x0 + w * (ws->x1 / (f32)DS_W) + 0.999f);
+				const u32 ry0 = (u32)qy0;
+				const u32 ry1 = (u32)(qy1 + 0.999f);
+				GX_SetScissor(rx0, ry0, rx1 - rx0, ry1 - ry0);
+			}
+
 		for (int li = 0; li < b->nLayers; li++) {
 			const GX2DBGEntry *E = &b->e[li];
+			// §5.3: a window segment hides individual layers - skip any entry
+			// (text / affine BG, or the 3D-fold slot which carries layer 0)
+			// whose layer bit is clear in this segment's mask.
+			if (b->nWSeg && !(segMask & (1u << E->layer)))
+				continue;
 			if (E->kind == GX2DBG_KIND_3D) {
 				if (s2_slot < 0) continue;
 				int sx0, cnt, tx0;
@@ -771,7 +901,9 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 			}
 
 			// §5.1a-blend: per-entry BLDCNT colour effect for a blend 1st-target BG.
-			const u8 fx  = E->fx;
+			// §5.3: a window region with its SPECIAL bit clear suppresses colour
+			// effects inside it - drop to a plain textured quad there.
+			const u8 fx  = segFxOn ? E->fx : 0;
 			const u8 fxa = E->fxa > 16 ? 16 : E->fxa;
 			if (fx == 0) {
 				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
@@ -818,6 +950,11 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 			}
+		}
+		}   // §5.3 window x-segment loop
+		if (b->nWSeg) {
+			extern GXRModeObj *rmode;
+			GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
 		}
 
 		// MASTER_BRIGHT: one full-width fade-to-white/black quad over the band
@@ -866,46 +1003,41 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 		GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
 		GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
 		const u8 objEva = GX2DBG_ObjEva(eng);
-		int curMode = 0;   // 0 = opaque, 1 = semi-transparent EVA blend
-		for (int pr = 3; pr >= 0; pr--) {
-			for (int i = nObj - 1; i >= 0; i--) {
-				s16 sx, sy; u16 fxw, fyh; u8 sp, ss; const f32 *uv = NULL;
-				GXTexObj *ot = GX2DBG_ObjGet(eng, i, &sx, &sy, &fxw, &fyh, &sp, &ss, &uv);
-				if (!ot || sp != pr || !uv) continue;
-				const int want = ss ? 1 : 0;
-				if (want != curMode) {
-					if (want == 1) {   // semi-transparent: out.a = TEXA * EVA/16
-						const u8 eva8 = (u8)(((objEva > 16 ? 16 : objEva) * 255 + 8) / 16);
-						GXColor k = { 0, 0, 0, eva8 };
-						GX_SetTevKColor(GX_KCOLOR0, k);
-						GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_K0_A);
-						GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
-						GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_KONST, GX_CA_ZERO);
-						GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-						GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-						GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
-						GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_OR, GX_ALWAYS, 0);
-					} else {
-						GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
-						GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
-						GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
-						GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
+
+		bool anyWin = false;
+		for (int bi = 0; bi < pf->nBands; bi++)
+			if (pf->bands[bi].nWSeg) { anyWin = true; break; }
+
+		if (!anyWin) {
+			// No window on this engine - one full-screen sprite pass.
+			GXMerge_DrawSpritePass(eng, x0, y0, w, h, nObj, objEva);
+		} else {
+			// §5.3-2: the OBJ window bit varies by region, so clip the sprite
+			// pass to each band's y-range x the window x-segments where OBJ is
+			// visible.  Bands are disjoint in y and segments disjoint in x, so
+			// every sprite pixel is emitted at most once (semi-transparent
+			// sprites included).
+			extern GXRModeObj *rmode;
+			for (int bi = 0; bi < pf->nBands; bi++) {
+				const GX2DBGBand *b = &pf->bands[bi];
+				const f32 by0 = y0 + h * (b->yStart     / (f32)DS_H);
+				const f32 by1 = y0 + h * ((b->yEnd + 1)  / (f32)DS_H);
+				const u32 ry0 = (u32)by0, ry1 = (u32)(by1 + 0.999f);
+				const int nS = b->nWSeg ? b->nWSeg : 1;
+				for (int si = 0; si < nS; si++) {
+					f32 sx0 = 0.0f, sx1 = (f32)DS_W;
+					if (b->nWSeg) {
+						if (!(b->wseg[si].mask & 0x10)) continue;  // OBJ hidden here
+						sx0 = (f32)b->wseg[si].x0;
+						sx1 = (f32)b->wseg[si].x1;
 					}
-					curMode = want;
+					const u32 rx0 = (u32)(x0 + w * (sx0 / (f32)DS_W));
+					const u32 rx1 = (u32)(x0 + w * (sx1 / (f32)DS_W) + 0.999f);
+					GX_SetScissor(rx0, ry0, rx1 - rx0, ry1 - ry0);
+					GXMerge_DrawSpritePass(eng, x0, y0, w, h, nObj, objEva);
 				}
-				GX_LoadTexObj(ot, GX_TEXMAP0);
-				const f32 gx0 = x0 + w * (sx          / (f32)DS_W);
-				const f32 gx1 = x0 + w * ((sx + fxw)  / (f32)DS_W);
-				const f32 gy0 = y0 + h * (sy          / (f32)DS_H);
-				const f32 gy1 = y0 + h * ((sy + fyh)  / (f32)DS_H);
-				// field-rect quad with per-corner UVs (affine or flipped sprite)
-				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-					GX_Position2f32(gx0, gy0); GX_TexCoord2f32(uv[0], uv[1]);  // TL
-					GX_Position2f32(gx0, gy1); GX_TexCoord2f32(uv[2], uv[3]);  // BL
-					GX_Position2f32(gx1, gy1); GX_TexCoord2f32(uv[4], uv[5]);  // BR
-					GX_Position2f32(gx1, gy0); GX_TexCoord2f32(uv[6], uv[7]);  // TR
-				GX_End();
 			}
+			GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
 		}
 	}
 }

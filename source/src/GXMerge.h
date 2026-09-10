@@ -91,6 +91,18 @@ typedef struct {
 #define GX2DBG_MAX_LAYERS  5            // 4 BG + the 3D layer
 enum { GX2DBG_KIND_BG = 0, GX2DBG_KIND_3D = 1, GX2DBG_KIND_AFFINE = 2 };
 
+// --- Step 5.3: rectangular WIN0/WIN1 as GX scissor segments -----------------
+// A scanline with WIN0/WIN1 active (no WINOBJ) partitions into a handful of
+// constant-(layer-mask, effect-enable) horizontal segments.  The band replay
+// re-scissors to each segment and draws only the BG entries the segment's mask
+// keeps.  nWSeg == 0 on a band => no window, the whole-line fast path.
+#define GX2DBG_MAX_WSEG 8
+typedef struct {
+	u16 x0, x1;    // segment span, x1 exclusive, 0..256
+	u8  mask;      // visible layers in this segment: bits BG0..3 (0..3), OBJ (4)
+	u8  fxOn;      // 1 => BLDCNT colour effects apply here (region SPECIAL bit)
+} GX2DBGWinSeg;
+
 // One painter's-order layer in a band.  Fields up to (not including) affX/affY
 // are the band-coalesce equality key; affX/affY vary per scanline for an affine
 // layer (the recorder advances them by affPB/affPD) and are taken from the
@@ -116,6 +128,8 @@ typedef struct {
 	u8  brightMode, brightFactor;
 	u8  alphaOver;                  // KIND_3D: real per-pixel alpha blend vs opaque-key
 	u8  behindContent;             // KIND_3D: real 2D sits behind the 3D layer
+	u8  nWSeg;                      // §5.3: window x-segment count (0 => no window)
+	GX2DBGWinSeg wseg[GX2DBG_MAX_WSEG];
 } GX2DBGBand;
 
 typedef struct {
@@ -136,7 +150,8 @@ typedef struct {
 // skipped.
 void GXMerge_Record2DBGLine(int eng, int l, u16 backdrop, u8 brightMode,
                             u8 brightFactor, u8 alphaOver, u8 behindContent,
-                            int nLayers, const GX2DBGEntry *entries);
+                            int nLayers, const GX2DBGEntry *entries,
+                            int nWSeg, const GX2DBGWinSeg *wseg);
 
 // Is engine eng's 2D-BG record armed this frame? (recorder gate)
 bool GXMerge_2DBGLineArmed(int eng);

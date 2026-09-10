@@ -25,6 +25,7 @@
 
 #include <malloc.h>
 #include <string.h>
+#include <stdio.h>
 
 //------------------------------------------------------------------------------
 // Per-engine (0 = MAIN, 1 = SUB), per-layer (0..3) baked "resolved plane".
@@ -105,15 +106,14 @@ static bool rangeDirty(u32 base, u32 len)
 	return false;
 }
 
-// Full re-bake of one layer's plane from current VRAM/palette.
-static void bakeLayer(GPU *gpu, int e, int n)
+// Resolve one layer's plane from current VRAM/palette into `plane` (no texobj /
+// gen bookkeeping - shared by the real bake and the GX2DBG_VERIFY cross-check).
+static void resolveLayerInto(GPU *gpu, int e, int n, u16 *plane)
 {
 	Layer *L = &s_layer[e][n];
-	const u16 W = L->w, H = L->h;         // texture (padded) size
-	const u16 CW = L->cw, CH = L->ch;     // content size
+	const u16 W = L->w;
+	const u16 CW = L->cw, CH = L->ch;
 	const u32 M = L->pad;
-	u16 *plane = L->plane;
-
 	const bool affine = L->affine;
 	if (M) memset(plane, 0, L->bytes);   // transparent apron
 	u16 cell[64];
@@ -131,6 +131,51 @@ static void bakeLayer(GPU *gpu, int e, int n)
 					plane[tex16_ofs(px0 + c, py0 + r, W)] = cell[r * 8 + c];
 		}
 	}
+}
+
+#ifdef GX2DBG_VERIFY
+// Cross-check: layer thought clean this frame - resolve it from scratch anyway
+// and compare against the plane we are still drawing.  A mismatch means a VRAM/
+// palette write reached the layer without tripping a 5.0 dirty hook.
+static u16 *s_verifyScratch = NULL;
+static u32  s_verifyBytes   = 0;
+u32 g_gx2dbgVerifyMiss = 0;
+static void verifyLayerClean(GPU *gpu, int e, int n)
+{
+	Layer *L = &s_layer[e][n];
+	if (!L->plane || !L->ready) return;
+	if (s_verifyBytes < L->bytes) {
+		free(s_verifyScratch);
+		s_verifyScratch = (u16 *)memalign(32, L->bytes);
+		s_verifyBytes = s_verifyScratch ? L->bytes : 0;
+	}
+	if (!s_verifyScratch) return;
+	resolveLayerInto(gpu, e, n, s_verifyScratch);
+	if (memcmp(s_verifyScratch, L->plane, L->bytes)) {
+		g_gx2dbgVerifyMiss++;
+		u32 badCell = 0;
+		for (u32 i = 0; i < L->bytes / 2; i++)
+			if (s_verifyScratch[i] != L->plane[i]) { badCell = i; break; }
+		FILE *f = fopen("sd:/gx2dbg_verify.log", "a");
+		if (f) {
+			fprintf(f, "eng=%d layer=%d miss#%lu firstBadTexel=%lu (fullGen=%lu palGen=%lu)\n",
+			        e, n, (unsigned long)g_gx2dbgVerifyMiss, (unsigned long)badCell,
+			        (unsigned long)g_gxDirty.fullGen, (unsigned long)g_gxDirty.palGen);
+			fclose(f);
+		}
+	}
+}
+#endif
+
+// Full re-bake of one layer's plane from current VRAM/palette.
+static void bakeLayer(GPU *gpu, int e, int n)
+{
+	Layer *L = &s_layer[e][n];
+	const u16 W = L->w, H = L->h;         // texture (padded) size
+	const bool affine = L->affine;
+	u16 *plane = L->plane;
+
+	resolveLayerInto(gpu, e, n, plane);
 
 	DCFlushRange(plane, L->bytes);
 	if (affine) {
@@ -140,7 +185,7 @@ static void bakeLayer(GPU *gpu, int e, int n)
 		// Overflow bit (PaletteSet_Wrap, bit 13) set -> GX_REPEAT the exact
 		// plane; clear -> M-texel transparent apron + GX_CLAMP so outside the
 		// BG's addressable area samples transparent (DS draws nothing there).
-		const u8 wm = M ? GX_CLAMP : GX_REPEAT;
+		const u8 wm = L->pad ? GX_CLAMP : GX_REPEAT;
 		GX_InitTexObj(&L->obj, plane, W, H, GX_TF_RGB5A3, wm, wm, GX_FALSE);
 		GX_InitTexObjFilterMode(&L->obj, GX_NEAR, GX_NEAR);
 	} else {
@@ -255,6 +300,9 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 		if (dirty)
 			bakeLayer(gpu, e, n);
 		L->ready = true;
+#ifdef GX2DBG_VERIFY
+		if (!dirty) verifyLayerClean(gpu, e, n);
+#endif
 	}
 }
 
@@ -342,12 +390,13 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 	// whole engine (§5.1a blend): the sprite pass draws opaque quads, which is
 	// still correct as long as OBJ itself isn't a blend target - if OBJ is a 1st
 	// or 2nd target the per-pixel blend against the layer beneath is genuinely
-	// per-pixel, so fall back.  Windows still disqualify.  Semi-transparent
-	// sprites are caught per-entry in the scan loop below.
+	// per-pixel, so fall back.  §5.3-2: rectangular WIN0/WIN1 no longer
+	// disqualify - the OBJ window bit is applied by the replay as a per-band,
+	// per-segment scissor.  WINOBJ (irregular) still disqualifies.  Semi-
+	// transparent sprites are caught per-entry in the scan loop below.
 	const u16 bld = gpu->BLDCNT;
 	const bool objInBlend = ((bld >> 6) & 3) != 0 && (bld & 0x1010) != 0;
-	if (objInBlend ||
-	    gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) {
+	if (objInBlend || gpu->WINOBJ_ENABLED) {
 		s_objGXable[e] = false;
 #ifdef DESMUME_BENCH
 		{ extern u32 g_gx2objDis[2][4];

@@ -2419,12 +2419,16 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// OBJ as a blend 1st target while sprites are on: the sprite quad pass draws
 	// opaque, so a per-pixel blend against what's beneath is unreachable -> CPU.
 	const bool s5_objBlend = s5_bm != 0 && (s5_t1st & 0x10) && gpu->LayersEnable[4];
+	// §5.3: rectangular WIN0/WIN1 (no WINOBJ) are expressible as GX scissor
+	// segments.  funcNum >= 4 means "a window is in the DISPCNT config"; it is
+	// no longer a hard bail when only WIN0/WIN1 are active.
+	const bool s5_winRect = (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED) && !gpu->WINOBJ_ENABLED;
 #ifdef DESMUME_BENCH
 	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails.
 	extern u32 g_gx2dbgBail[2][8];
 	if (!GXMerge_2DBGLineArmed(gxeng))                                  g_gx2dbgBail[gxeng & 1][1]++;
-	else if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) g_gx2dbgBail[gxeng & 1][3]++;
-	else if (gpu->setFinalColorBck_funcNum >= 4)                       g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
+	else if (gpu->WINOBJ_ENABLED)                                       g_gx2dbgBail[gxeng & 1][3]++;
+	else if (gpu->setFinalColorBck_funcNum >= 4 && !s5_winRect)         g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
 	else if (s5_objBlend)                                              g_gx2dbgBail[gxeng & 1][5]++;  // OBJ blend target
 	else if (gpu->LayersEnable[4] && !GX2DBG_ObjGXable(gxeng))          g_gx2dbgBail[gxeng & 1][2]++;
 	/* else: entered the gate - reason 0/6/7 tallied inside */
@@ -2432,8 +2436,8 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 	if (GXMerge_2DBGLineArmed(gxeng)
 	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
-	    && !gpu->WIN0_ENABLED && !gpu->WIN1_ENABLED && !gpu->WINOBJ_ENABLED
-	    && gpu->setFinalColorBck_funcNum < 4
+	    && !gpu->WINOBJ_ENABLED
+	    && (gpu->setFinalColorBck_funcNum < 4 || s5_winRect)
 	    && !s5_objBlend)
 	{
 		// Fold a backdrop brighten/darken (Increase/Decrease with BD as 1st
@@ -2546,10 +2550,48 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 		if (has3d && threeDAt < 0) ok = false;   // 3D expected but BG0 not in the walk
 		if (has3d && anyFx)        ok = false;   // blended BG + 3D sandwich: too tangled -> CPU
 
+		// §5.3: partition this scanline into rectangular WIN0/WIN1 x-segments,
+		// each with a constant (layer mask, colour-effect-enable).  The replay
+		// re-scissors to each and draws only the BG entries the mask keeps.
+		GX2DBGWinSeg wseg[GX2DBG_MAX_WSEG];
+		int nWSeg = 0;
+		if (ok && s5_winRect) {
+			const u8 *w0 = gpu->curr_win[0];
+			const u8 *w1 = gpu->curr_win[1];
+			const bool e0 = gpu->WIN0_ENABLED, e1 = gpu->WIN1_ENABLED;
+			const u8 mIn0 = gpu->WININ0 & 0x1F, mIn1 = gpu->WININ1 & 0x1F, mOut = gpu->WINOUT & 0x1F;
+			const u8 fIn0 = gpu->WININ0_SPECIAL, fIn1 = gpu->WININ1_SPECIAL, fOut = gpu->WINOUT_SPECIAL;
+			int segStart = 0; u8 curM = 0, curF = 0; bool have = false;
+			for (int x = 0; x <= 256 && ok; x++) {
+				u8 m, f;
+				if (x < 256) {
+					const bool in0 = e0 && w0[x];
+					const bool in1 = e1 && w1[x];
+					if (in0)      { m = mIn0; f = fIn0; }
+					else if (in1) { m = mIn1; f = fIn1; }
+					else          { m = mOut; f = fOut; }
+				} else { m = 0xFF; f = 0xFF; }   // sentinel: flush the final run
+				if (!have) { curM = m; curF = f; have = true; continue; }
+				if (m == curM && f == curF) continue;
+				if (nWSeg >= GX2DBG_MAX_WSEG) { ok = false; break; }
+				wseg[nWSeg].x0 = (u16)segStart; wseg[nWSeg].x1 = (u16)x;
+				wseg[nWSeg].mask = curM; wseg[nWSeg].fxOn = curF ? 1 : 0;
+				nWSeg++;
+				segStart = x; curM = m; curF = f;
+			}
+			// Any entry (text / affine / the 3D-fold slot) is skipped per-segment
+			// by the replay wherever the segment's mask clears its layer bit -
+			// no whole-line bail needed for a windowed layer.
+			// Collapse to the no-window fast path only when the window changes
+			// nothing on this line (one span, every layer visible, effects on).
+			if (nWSeg == 1 && wseg[0].mask == 0x1F && wseg[0].fxOn)
+				nWSeg = 0;
+		}
+
 		if (ok) {
 			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
 			GXMerge_Record2DBGLine(gxeng, l, (u16)(s5_backdrop | 0x8000), bmode, bfac,
-			                       ao ? 1 : 0, behindContent, gxn, ent);
+			                       ao ? 1 : 0, behindContent, gxn, ent, nWSeg, wseg);
 			// advance each affine BG's param block by one scanline, exactly as
 			// lineRot would have if the CPU path had run this line.
 			for (int j = 0; j < gxn; j++)
