@@ -123,3 +123,50 @@ load-factor problem (129/65536 buckets touched). A 4x table would not have
 moved the colliding PCs apart. Skipped; the multiplicative hash is the fix.
 `JIT_MEM_ACCOUNT` still stands as the headroom reference if a future
 associativity change wants it.
+
+## Step 5 -- summary and recommendation
+
+Clean apples-to-apples, 12 MB ARM9 arena both sides, plain harness build (no
+histo overhead), SM64DS window f780-1200:
+
+| metric              | 6 MB, old hash | 12 MB, old hash | 12 MB, mult. hash |
+|---------------------|---------------:|----------------:|------------------:|
+| p99 frame time      | ~41-48 ms      | ~28-34 ms       | ~28-34 ms         |
+| worst frame         | ~49 ms         | ~44 ms          | ~34-40 ms         |
+| ARM9 JIT-build ms/f  | 0.53           | 0.475           | **0.094** (-80%)  |
+| ARM9 JIT-exec ms/f   | ~4.3           | ~4.26           | ~4.25 (unchanged) |
+| eff fps (window)    | ~40.6          | 45.8            | 46.5              |
+| ARM9 collision-miss | ~46.7k         | ~86k / 11M lk   | **~17.8k** (-79%) |
+| ARM9 evictions      | -              | ~86k            | **~17.8k**        |
+| full-cache flushes  | ~1/130 fr      | 12 @ fr1600     | **6-7 @ fr1600**  |
+| arena peak fill     | 99%            | 99%             | 89-99%            |
+
+- **Step 1 (12 MB arena, `d527dc9`):** confirmed - kills the 6 MB p99 tail
+  (~44 -> ~30 ms) and cuts flush frequency; +6 MiB MEM2, which Step 2 shows is
+  affordable. Median frame time unchanged (not flush-bound).
+- **Step 2 (`1e0957a`):** the JIT backing store is in **MEM2**, not MEM1
+  (~17 MiB, ~11.6 MiB MEM2 left, MEM1 arena untouched). Removes the memory
+  objection to further growth.
+- **Step 3 (`6bcd977`):** the collision misses were a bad hash, not load
+  factor. Multiplicative hash: -78-80% collision-misses / evictions / ARM9
+  JIT-build cost, flushes roughly halved, ~+1.5% fps in the steady window,
+  zero code-size cost, cannot miscompile.
+- **Step 4:** not needed / not done.
+
+### What to try next (in rough priority order)
+
+1. **The residual ARM/THUMB same-PC bucket.** One bucket still takes ~2700
+   evictions/run after a scene transition. If a cheap `-DJIT_HASH_HISTO +
+   JIT_LOG_CACHE_EVENT` capture confirms it is one PC flipping ISA, fold the
+   mode bit into the index (`pc ^ (thumb << 1)` before the multiply, mirrored
+   in the 2 stubs). Small, contained, removes the last thrash source.
+2. **Arena still peaks at 99%.** With the eviction churn now gone, the 99% is
+   mostly genuine distinct-block volume. A 16 MB arena would likely stop the
+   remaining 6-7 flushes/run outright; ~8.6 MiB MEM2 would remain. Low-risk,
+   worth a single A/B.
+3. **N-way associativity** is now clearly *not* worth it - Step 3 removed the
+   collision pressure that would have justified the extra branch on the
+   getBlock() hot path.
+4. Bigger picture: ARM9 JIT-*execute* (~4.25 ms/f) and the GPU 2D compositor
+   (~5 ms/f) now dominate the frame far more than anything cache-related. The
+   next real frame-time lever is one of those, not the JIT cache.
