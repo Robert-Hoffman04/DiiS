@@ -29,5 +29,17 @@ firmware.bin
 # Runtime-generated config
 key.cfg
 
-# Local analysis notes
-desmumewii-findings.md
+# Build / tooling logs and scratch output
+build_out.log
+build_err.log
+*.log
+bisect-log.csv
+
+# Benchmark save states (derived from copyrighted ROMs)
+/tools/benchmark/states/
+*.ds0
+*.dst
+
+# Local analysis notes and planning docs (root-level only; keep tools/**/README.md etc.)
+/*.md
+!/README.md
