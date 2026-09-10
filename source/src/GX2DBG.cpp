@@ -32,7 +32,9 @@
 struct Layer {
 	u16     *plane;        // swizzled RGB5A3, w*h*2 bytes, 32-aligned
 	u32      bytes;        // current allocation
-	u16      w, h;         // plane size the buffer was allocated / baked at
+	u16      w, h;         // texture size (= content + 2*pad)
+	u16      cw, ch;       // content size (the BG's own dimensions)
+	u8       pad;          // transparent apron per side (0, or GX2DBG_AFF_MARGIN)
 	GXTexObj obj;
 	u32      builtPalGen;
 	u32      builtFullGen;
@@ -65,11 +67,12 @@ static void freeLayer(int e, int n)
 
 // (re)allocate layer's plane buffer for a w*h texture; false if that would blow
 // the MEM1 budget (the layer then stays on the CPU path).
-static bool ensureLayer(int e, int n, u16 w, u16 h)
+static bool ensureLayer(int e, int n, u16 cw, u16 ch, u8 margin)
 {
 	Layer *L = &s_layer[e][n];
+	const u16 w = (u16)(cw + 2 * margin), h = (u16)(ch + 2 * margin);
 	u32 need = (u32)w * h * 2;
-	if (L->plane && L->bytes == need)
+	if (L->plane && L->bytes == need && L->cw == cw && L->ch == ch && L->pad == margin)
 		return true;
 
 	if (s_totalBytes - L->bytes + need > GX2DBG_BUDGET)
@@ -81,8 +84,9 @@ static bool ensureLayer(int e, int n, u16 w, u16 h)
 	if (!L->plane) { L->bytes = 0; return false; }
 	L->bytes = need;
 	s_totalBytes += need;
-	L->w = w;
-	L->h = h;
+	L->w = w;   L->h = h;
+	L->cw = cw; L->ch = ch;
+	L->pad = margin;
 	L->builtFullGen = g_gxDirty.fullGen - 1;   // force a bake
 	L->builtPalGen  = g_gxDirty.palGen - 1;
 	return true;
@@ -105,20 +109,23 @@ static bool rangeDirty(u32 base, u32 len)
 static void bakeLayer(GPU *gpu, int e, int n)
 {
 	Layer *L = &s_layer[e][n];
-	const u16 W = L->w, H = L->h;
+	const u16 W = L->w, H = L->h;         // texture (padded) size
+	const u16 CW = L->cw, CH = L->ch;     // content size
+	const u32 M = L->pad;
 	u16 *plane = L->plane;
 
 	const bool affine = L->affine;
+	if (M) memset(plane, 0, L->bytes);   // transparent apron
 	u16 cell[64];
-	for (u32 cy = 0; cy < (u32)(H >> 3); cy++) {
-		for (u32 cx = 0; cx < (u32)(W >> 3); cx++) {
+	for (u32 cy = 0; cy < (u32)(CH >> 3); cy++) {
+		for (u32 cx = 0; cx < (u32)(CW >> 3); cx++) {
 			if (affine) {
 				if (!GPU_ResolveAffineTile8x8(gpu, (u8)n, cx, cy, cell))
 					memset(cell, 0, sizeof cell);
 			} else {
 				GPU_ResolveTextTile8x8(gpu, (u8)n, cx, cy, cell);
 			}
-			const u32 px0 = cx << 3, py0 = cy << 3;
+			const u32 px0 = (cx << 3) + M, py0 = (cy << 3) + M;
 			for (u32 r = 0; r < 8; r++)
 				for (u32 c = 0; c < 8; c++)
 					plane[tex16_ofs(px0 + c, py0 + r, W)] = cell[r * 8 + c];
@@ -126,7 +133,19 @@ static void bakeLayer(GPU *gpu, int e, int n)
 	}
 
 	DCFlushRange(plane, L->bytes);
-	GX_InitTexObj(&L->obj, plane, W, H, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+	if (affine) {
+		// Point-sample to match the DS affine renderer - GX's default GX_LINEAR
+		// bilinearly blends across the wrap seam / between minified minimap
+		// texels, which reads as a translucent grid/ghost over the minimap.
+		// Overflow bit (PaletteSet_Wrap, bit 13) set -> GX_REPEAT the exact
+		// plane; clear -> M-texel transparent apron + GX_CLAMP so outside the
+		// BG's addressable area samples transparent (DS draws nothing there).
+		const u8 wm = M ? GX_CLAMP : GX_REPEAT;
+		GX_InitTexObj(&L->obj, plane, W, H, GX_TF_RGB5A3, wm, wm, GX_FALSE);
+		GX_InitTexObjFilterMode(&L->obj, GX_NEAR, GX_NEAR);
+	} else {
+		GX_InitTexObj(&L->obj, plane, W, H, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+	}
 	L->builtPalGen  = g_gxDirty.palGen;
 	L->builtFullGen = g_gxDirty.fullGen;
 }
@@ -201,7 +220,11 @@ void GX2DBG_FrameUpdate(GPU *gpu)
 
 		const u16 w = gpu->BGSize[n][0];
 		const u16 h = gpu->BGSize[n][1];
-		if (!ensureLayer(e, n, w, h))          // over budget -> CPU path
+		// affine BG with the overflow bit clear gets a transparent apron so
+		// out-of-bounds samples read transparent (see GX2DBG_AFF_MARGIN).
+		const u8 margin = (isAffine && !gpu->bgcnt(n).PaletteSet_Wrap)
+		                  ? GX2DBG_AFF_MARGIN : 0;
+		if (!ensureLayer(e, n, w, h, margin))  // over budget -> CPU path
 			continue;
 
 		if (isText && extPal && gpu->bgcnt(n).Palette_256 &&

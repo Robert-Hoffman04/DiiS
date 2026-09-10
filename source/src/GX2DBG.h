@@ -50,6 +50,12 @@ struct GPU;
 // the CPU path).  4 * 512*512*2 == 2 MB worst case; cap below that.
 #define GX2DBG_BUDGET (1536 * 1024)
 
+// Transparent apron (texels per side) added around an affine plane whose BGxCNT
+// overflow bit is clear, so GX_CLAMP outside the BG's addressable area samples a
+// 0x0000 (transparent) border - matching the DS, which draws nothing there.
+// Affine planes with the overflow bit set are unpadded and GX_REPEAT-wrapped.
+#define GX2DBG_AFF_MARGIN 4
+
 // Called from GXMerge_Set2DBG().  false teardown frees every plane.
 void GX2DBG_SetEnabled(bool on);
 bool GX2DBG_Enabled(void);

@@ -745,16 +745,20 @@ static void GXMerge_Draw2DBGBandsEng(int eng, f32 x0, f32 y0, f32 w, f32 h)
 				GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 				GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 				GX_SetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
-				// transparent-outside (affWrap 0): a GX_CLAMP border reads through;
-				// the bake leaves out-of-plane areas... actually the plane has no
-				// border, so rely on index-0 discard + CLAMP.  wrap: GX_REPEAT.
+				// The plane texobj already carries the right wrap mode (bakeLayer:
+				// GX_REPEAT if the BGxCNT overflow bit is set, else GX_CLAMP into
+				// a transparent apron) and GX_NEAR filtering.  Index-0 texels are
+				// transparent -> discard.
 				GX_SetAlphaCompare(GX_GEQUAL, 8, GX_AOP_OR, GX_NEVER, 0);
 				const int dh = (b->yEnd + 1) - b->yStart;
 				const f32 fx0 = (f32)E->affX, fy0 = (f32)E->affY;
 				const f32 pa = (f32)E->affPA, pb = (f32)E->affPB;
 				const f32 pc = (f32)E->affPC, pd = (f32)E->affPD;
-				#define AFF_U(I,S) ((fx0 + (I) * pa + (S) * pb) / 256.0f / pw)
-				#define AFF_V(I,S) ((fy0 + (I) * pc + (S) * pd) / 256.0f / ph)
+				// apron offset: content sits at [M, M+size) in the padded plane
+				// (only when the overflow bit is clear; wrapped planes are exact).
+				const f32 am = E->affWrap ? 0.0f : (f32)GX2DBG_AFF_MARGIN;
+				#define AFF_U(I,S) (((fx0 + (I) * pa + (S) * pb) / 256.0f + am) / pw)
+				#define AFF_V(I,S) (((fy0 + (I) * pc + (S) * pd) / 256.0f + am) / ph)
 				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 					GX_Position2f32(x0,     qy0); GX_TexCoord2f32(AFF_U(0,0),      AFF_V(0,0));
 					GX_Position2f32(x0,     qy1); GX_TexCoord2f32(AFF_U(0,dh),     AFF_V(0,dh));
