@@ -947,6 +947,10 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 	acc_exec += ticks_to_microsecs(exec_ticks);
 	acc_draw += ticks_to_microsecs(draw_ticks);
 
+#ifdef JIT_MEM_ACCOUNT
+	{ extern void jitMemAccountTick(u32 frame); jitMemAccountTick(frame); }
+#endif
+
 	if (frame % DESMUME_BENCH_BLOCK == 0) {
 		u64 block_us = ticks_to_microsecs(now - t_block);
 		u64 wall_us  = ticks_to_microsecs(now - t_first);

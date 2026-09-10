@@ -36,6 +36,41 @@ static const size_t s_jitCanaryPad = 32;
 static const size_t s_jitCanaryPad = 0;
 #endif
 
+// -DJIT_MEM_ACCOUNT: one-off tuning instrumentation (jit/NOTES.md). Prints
+// which libogc arena the JIT backing store (arena + block table + SMC tables)
+// actually comes out of, and how much of that pool is left afterwards, so a
+// table-growth experiment can be sized against real MEM1 headroom rather than
+// the assumption that these allocations land in the near-idle MEM2. Not
+// defined by any build config; compiles out entirely otherwise.
+#ifdef JIT_MEM_ACCOUNT
+#include <stdio.h>
+#include <ogc/system.h>
+#include <ogc/machine/processor.h>
+static void jitMemAccountReport(const char* when)
+{
+	// arena1/arena2 = the still-unclaimed tail of each physical pool (the
+	// default malloc heap is carved from arena1 at startup, so this moves
+	// only if something calls SYS_SetArenaX). mallinfo = the malloc heap
+	// itself: uordblks is live bytes, fordblks free bytes.
+	struct mallinfo mi = mallinfo();
+	FILE* f = fopen("sd:/jitmem.log", "a");
+	if (!f) return;
+	fprintf(f, "[jitmem] %-6s  SYS_arena1=%d KiB  SYS_arena2=%d KiB  |  "
+	           "malloc: arena=%d KiB  used=%d KiB  free=%d KiB\n",
+	        when, SYS_GetArena1Size() >> 10, SYS_GetArena2Size() >> 10,
+	        mi.arena >> 10, mi.uordblks >> 10, mi.fordblks >> 10);
+	fclose(f);
+}
+// Steady-state samples, driven from bench_tick() (main.cpp): after the game
+// has allocated its textures / audio / etc, so the remaining MEM1 headroom
+// is real rather than the value right after boot.
+void jitMemAccountTick(u32 frame)
+{
+	if (frame == 300)  jitMemAccountReport("f300");
+	if (frame == 1200) jitMemAccountReport("f1200");
+}
+#endif
+
 // =========================================================================
 // Lifecycle
 // =========================================================================
@@ -238,10 +273,31 @@ void jitInit()
 	memset(s_canaryPattern, 0xC5, JIT_CANARY_BYTES);   // GO-FIX-PH: before either slot inits
 #endif
 
+#ifdef JIT_MEM_ACCOUNT
+	{
+		size_t blockTableBytes  = HASH_TABLE_SIZE * sizeof(BasicBlock);
+		size_t smcTablesBytes   = SMC_MAP_SIZE * (sizeof(BasicBlock*) + 1);
+		FILE* f = fopen("sd:/jitmem.log", "a");
+		if (f) {
+			fprintf(f, "[jitmem] want: arm7 arena=%u KiB  arm9 arena=%u KiB  "
+			           "per-core blockTable=%u KiB  smcTables=%u KiB  (HASH_TABLE_SIZE=%u)\n",
+			        (unsigned)(JIT_ARENA_SIZE >> 10), (unsigned)(JIT_ARENA_SIZE_ARM9 >> 10),
+			        (unsigned)(blockTableBytes >> 10), (unsigned)(smcTablesBytes >> 10),
+			        (unsigned)HASH_TABLE_SIZE);
+			fclose(f);
+		}
+	}
+	jitMemAccountReport("before");
+#endif
+
 	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE,      jitCacheArm7, jitBuildArm7Profile())
 	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 
 	if (!ok) { jitShutdown(); return; }
+
+#ifdef JIT_MEM_ACCOUNT
+	jitMemAccountReport("after");
+#endif
 
 	// §12.3 step 5: jitInitSlot() above already published the DS profile into
 	// jitProfile[JIT_ARM7] -- remember that pointer, then build the GBA
