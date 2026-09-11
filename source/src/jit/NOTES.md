@@ -385,3 +385,43 @@ Findings:
    "ARM7 MMIO routes through heavier checked memory paths" hypothesis at the
    per-instruction level -- if ARM7's `p` were materially higher the fit
    would not close with a positive `F`.
+
+### Step 4 -- idle-loop demotion coverage
+
+`-DJIT_CORE_COST_HISTO` extended: the noBlock return is split into
+"landed on a pre-existing matching-mode length-1 marker" vs "fresh compile /
+collision / mode-flip", and two small open-addressing PC sets count distinct
+PCs demoted via the exec-side length-1 path, and distinct PCs that bail0 with
+`insnCount() != 1` (the shape the single-terminator check misses).
+
+| window f1200-2400                       |    ARM7 |    ARM9 |
+|----------------------------------------|--------:|--------:|
+| noBlock -- pre-existing marker re-hit  | 2289/f  |   653/f |
+| noBlock -- fresh compile / collision   |     0/f |     0/f |
+| distinct PCs demoted (exec-side len-1) |       0 |       0 |
+| bail0 with `insnCount() != 1` -- PCs   |    ~18 (full run) | 0 |
+| bail0 with `insnCount() != 1` -- hits  |   624/f |     0/f |
+| "don't JIT" markers registered (full run) | 157 |    ~360 |
+
+Findings:
+
+1. **Every ARM7 noBlock event is a clean re-hit on a marker that already
+   exists** -- zero fresh compiles, zero hash-collision churn on ARM7. The
+   fallback mechanism works exactly as designed; ARM7 simply hits ~2289
+   uncompilable guest PCs per frame and the interpreter takes each one an
+   instruction at a time.
+2. **The exec-side length-1 demotion (`r.instructions == 0 &&
+   b->insnCount() == 1`) essentially never fires** (0-4 distinct PCs in the
+   whole run, both cores). ARM7's 157 markers are all registered by the
+   *compile* side -- `jitCompileTrace()` scanning a PC, emitting nothing
+   (predicated LDR/STR, MSR/MRS, coprocessor, ...) and caching a length-1
+   fallback. The exec-side demote is dead code in practice.
+3. **~18 distinct ARM7 PCs are compiled multi-instruction blocks that bail
+   on their first instruction on every single entry** (~600 hits/frame) and
+   are never demoted because the check demands `insnCount() == 1`. Confirmed
+   Step 4 hypothesis. Cross-referenced with Step 2 these sit in the 2-4 insn
+   bucket. Each costs a getBlock + trampoline entry + immediate bail +
+   return, ~600 times a frame -> order 0.2-0.4 ms/f of pure waste.
+   A demote-on-repeated-zero-progress rule (regardless of block length) would
+   convert those into cheap marker re-hits. Small but real; flagged for the
+   Step 5 recommendation, not fixed here.

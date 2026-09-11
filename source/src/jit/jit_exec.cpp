@@ -85,8 +85,32 @@ struct JitCoreCost {
 	                //   dispatch that ran one. zone_time - exec_time == the true
 	                //   dispatch/lookup/compile overhead; exec_time / retired
 	                //   insns == the true per-instruction execute cost.
+	// Step 4: idle-loop demotion coverage.
+	u64 markerHits; // noBlock calls that landed on a pre-existing matching-mode
+	                //   length-1 "don't JIT" marker (interpreter fallback working
+	                //   as intended -- no compile, just a getBlock + return)
+	u64 freshNoBlk; // noBlock calls that were NOT a clean pre-existing marker
+	                //   (fresh compile -> instrCount 0, or hash-collision slot,
+	                //   or mode flip) -- these paid the compile scan
+	u32 demoPC[4096]; u32 demoDistinct;              // distinct PCs demoted via the exec-side len-1 path
+	u32 spinPC[4096]; u32 spinDistinct; u64 spinHits;// bail0 with insnCount() != 1: a block that keeps
+	                //   bailing on its first instruction but the single-terminator
+	                //   demotion check never fires (2-3 insn spin-wait shape)
 };
 static JitCoreCost g_coreCost[2];   // [0] = ARM7, [1] = ARM9
+
+// tiny open-addressing u32 set for distinct-PC counting; returns true if newly added
+static bool jccSetAdd(u32* set, u32 cap, u32 key, u32* distinct)
+{
+	if (!key) key = 0xFFFFFFFFu;
+	u32 h = (key * 2654435761u) & (cap - 1);
+	for (u32 i = 0; i < cap; i++) {
+		u32 s = (h + i) & (cap - 1);
+		if (set[s] == key) return false;
+		if (set[s] == 0)   { set[s] = key; (*distinct)++; return true; }
+	}
+	return false;   // table full -- distinct count saturates, hits still counted
+}
 
 extern "C" void jitCoreCostEmit(u32 frame)
 {
@@ -106,17 +130,24 @@ extern "C" void jitCoreCostEmit(u32 frame)
 			(unsigned long long)x.entryLen[0], (unsigned long long)x.entryLen[1],
 			(unsigned long long)x.entryLen[2], (unsigned long long)x.entryLen[3],
 			(unsigned long long)x.entryLen[4]);
-		harness_profile_emitf("jitcorecost2 frame=%u core=%s exec_us=%llu",
+		harness_profile_emitf("jitcorecost2 frame=%u core=%s exec_us=%llu "
+			"marker_hits=%llu fresh_noblk=%llu demoted_pcs=%u spin_pcs=%u spin_hits=%llu",
 			frame, c ? "arm9" : "arm7",
-			(unsigned long long)ticks_to_microsecs(x.execTicks));
+			(unsigned long long)ticks_to_microsecs(x.execTicks),
+			(unsigned long long)x.markerHits, (unsigned long long)x.freshNoBlk,
+			(unsigned)x.demoDistinct, (unsigned)x.spinDistinct,
+			(unsigned long long)x.spinHits);
 	}
 	jitCacheArm7.ccBlockLenReport("arm7");   // Step 2: compiled-block-length distribution
 	jitCacheArm9.ccBlockLenReport("arm9");
 }
   #define JCC_CALL(core)          (g_coreCost[core].calls++)
   #define JCC_NOENTER(core)       (g_coreCost[core].noEnter++)
-  #define JCC_NOBLOCK(core)       (g_coreCost[core].noBlock++)
-  #define JCC_BAIL0(core, len1)   do { g_coreCost[core].bail0++; if (len1) g_coreCost[core].demote1++; } while (0)
+  #define JCC_NOBLOCK(core, pre)  do { JitCoreCost& _x = g_coreCost[core]; _x.noBlock++; \
+        if (pre) _x.markerHits++; else _x.freshNoBlk++; } while (0)
+  #define JCC_BAIL0(core, len1, pc, len) do { JitCoreCost& _x = g_coreCost[core]; _x.bail0++; \
+        if (len1) { _x.demote1++; jccSetAdd(_x.demoPC, 4096, (pc), &_x.demoDistinct); } \
+        else { _x.spinHits++; jccSetAdd(_x.spinPC, 4096, (pc), &_x.spinDistinct); } } while (0)
   #define JCC_RAN(core, _c, _i, _el) do { JitCoreCost& _x = g_coreCost[core]; _x.ran++; _x.cyc += (_c); _x.ins += (_i); \
         _x.entryLen[(_el) <= 1 ? 0 : (_el) <= 4 ? 1 : (_el) <= 8 ? 2 : (_el) <= 16 ? 3 : 4]++; } while (0)
   #define JCC_EXEC_BEGIN()        const u64 _jccE0 = gettime()
@@ -124,8 +155,8 @@ extern "C" void jitCoreCostEmit(u32 frame)
 #else
   #define JCC_CALL(core)          ((void)0)
   #define JCC_NOENTER(core)       ((void)0)
-  #define JCC_NOBLOCK(core)       ((void)0)
-  #define JCC_BAIL0(core, len1)   ((void)0)
+  #define JCC_NOBLOCK(core, pre)  ((void)0)
+  #define JCC_BAIL0(core, len1, pc, len) ((void)0)
   #define JCC_RAN(core, _c, _i, _el) ((void)0)
   #define JCC_EXEC_BEGIN()        ((void)0)
   #define JCC_EXEC_END(core)      ((void)0)
@@ -223,9 +254,12 @@ u32 jitRunArm7()
 	if (!canEnter) { JCC_NOENTER(0); return 0; }   // uncompilable region -> interpreter
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
+#ifdef JIT_CORE_COST_HISTO
+	const bool _preMarker7 = (b && b->execute == nullptr && b->insnCount() == 1 && b->thumbCompiled() == thumb);
+#endif
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
-	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0); return 0; } // uncompilable / "don't JIT" -> interpreter
+	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0, _preMarker7); return 0; } // uncompilable / "don't JIT" -> interpreter
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm7Checked(&cpu, b, pc);
@@ -265,7 +299,7 @@ u32 jitRunArm7()
 	if (r.instructions == 0) {
 		const bool len1 = (b->insnCount() == 1);
 		if (len1) jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(0, len1);
+		JCC_BAIL0(0, len1, pc, b->insnCount());
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
 		jitMaybeReport();
@@ -370,9 +404,12 @@ u32 jitRunArm9()
 #ifdef DESMUME_JIT_TRACE_FIRST
 	const bool wasMiss = !b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb;
 #endif
+#ifdef JIT_CORE_COST_HISTO
+	const bool _preMarker9 = (b && b->execute == nullptr && b->insnCount() == 1 && b->thumbCompiled() == thumb);
+#endif
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
-	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1); return 0; }
+	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1, _preMarker9); return 0; }
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm9Checked(&cpu, b, pc);
@@ -474,7 +511,7 @@ u32 jitRunArm9()
 	if (r.instructions == 0) {
 		const bool len1 = (b->insnCount() == 1);
 		if (len1) jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(1, len1);
+		JCC_BAIL0(1, len1, pc, b->insnCount());
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
 	}
