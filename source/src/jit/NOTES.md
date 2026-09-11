@@ -425,3 +425,70 @@ Findings:
    A demote-on-repeated-zero-progress rule (regardless of block length) would
    convert those into cheap marker re-hits. Small but real; flagged for the
    Step 5 recommendation, not fixed here.
+
+### Step 5 -- summary and what to try next
+
+Per-core numbers side by side (SM64DS, 12 MB arena, GX hw 3D + GX2DBG,
+autoload savestate; the two established windows):
+
+| metric                                  | ARM7 f780-1200 | ARM9 f780-1200 | ARM7 f1200-2400 | ARM9 f1200-2400 |
+|-----------------------------------------|---------------:|---------------:|----------------:|----------------:|
+| `arm{7,9}_jit` zone                      |   5.0-5.2 ms/f |   4.3-4.7 ms/f |    5.7-5.9 ms/f |    5.4-5.6 ms/f |
+| dispatch calls / frame                   |           5497 |           3531 |            6050 |            3972 |
+| wasted-call ratio                        |        **48%** |            17% |         **48%** |            16% |
+| -- marker re-hits / frame                |           2031 |            597 |            2289 |             653 |
+| -- bail0 / frame                         |            610 |              0 |             624 |               0 |
+| executed block avg length (guest insns)  |        **5.9** |           11.8 |         **5.9** |            12.0 |
+| -- length-1 blocks / frame               |            632 |             79 |             730 |              78 |
+| dispatch overhead / call                 |         ~485 ns |        ~505 ns |          ~510 ns |         ~525 ns |
+| exec-only / retired guest insn           |        ~78 ns  |        ~38 ns  |         ~79 ns  |         ~40 ns  |
+| compiled blocks registered (window)      |            4   |          2982  |           21    |         11 833  |
+| distinct exec-side demotions (whole run) |            0   |            4   |             --  |             --  |
+| bail0-never-demoted PCs (whole run)      |          ~18   |            0   |             --  |             --  |
+
+**Which hypothesis the data supports:** call/dispatch **frequency** plus
+**short-trace amortization** -- and those two only. Concretely:
+
+- The dispatch loop costs the *same* per call on both cores (~500 ns). ARM7 is
+  not paying a heavier dispatch path; it runs the same path 1.5x as often and
+  ~48% of those runs make zero progress (2289/f re-hits on uncompilable-PC
+  markers + 624/f blocks that bail on instruction 1).
+- When ARM7 does run a block it retires 5.9 guest insns vs ARM9's 12.0, so the
+  fixed ~780 ns per-block trampoline cost (measured, shared across cores)
+  amortizes ~2x worse -> the 78-vs-40 ns per-retired-instruction gap. A
+  two-core fit gives an equal ~10.6 ns/insn execute rate, so there is **no
+  ARM7-specific per-instruction (MMIO / memory-check) penalty** -- hypothesis 3
+  is disproved.
+- The idle-loop-demotion gap (hypothesis 4) is real but small: ~18 PCs,
+  ~0.2-0.4 ms/f. Not the main story.
+
+Caveat: the ~500 ns/call dispatch-overhead floor includes the `PZ_SCOPE`
+zone-transition cost (two timebase reads per call) which only exists in a
+`-DDESMUME_PERFZONES` build. The ARM7-vs-ARM9 comparison is unaffected (both
+pay it) and the frame breakdown that motivated this investigation was itself a
+perfzones build, but a release build's absolute dispatch overhead is lower.
+
+**Most promising next experiment, for a human to prioritize** (against the
+ARM9 hash-collision thrash and the 2D compositor, which are still the bigger
+frame-time levers -- ARM7 JIT is ~5.9 ms of a ~27 ms frame and roughly half
+of that is genuine work):
+
+1. **Longer ARM7 block chains.** ARM7 retires 11.5 guest insns per productive
+   dispatch vs ARM9's 26. If chaining kept ARM7 in JIT for ~25 insns/dispatch
+   the ARM7 zone would roughly halve (fewer trampoline round-trips, the
+   dominant cost per Step 3). Diagnostic: instrument *why* the ARM7 chain
+   breaks -- `r.bailedOut` / dynamic-exit / IRQ-check / quota per dispatch,
+   split by core. ARM7's IO-poll-heavy code almost certainly trips the
+   dynamic-exit and IRQ paths far more often; some of those exits may be
+   chainable (static targets the linker stub could patch) that currently
+   aren't.
+2. **Shrink the uncompilable-PC set.** 2289 marker re-hits/frame are 2289
+   guest instructions/frame the interpreter runs one at a time. They cluster
+   on a few hundred distinct PCs (Step 2: ARM7 registers only ~950 blocks +
+   157 markers all run). A `-DDESMUME_JIT_TRACE_FIRST` `dontJIT top:` capture
+   would name the offending opcodes; widening the emitter for the top few
+   (predicated LDR/STR is the usual ARM7 offender) is the highest-leverage
+   coverage work, though a bigger project than (1).
+3. **Cheap:** demote any block that makes zero forward progress on N
+   consecutive entries, not just `insnCount() == 1` blocks (Step 4). Converts
+   ~600 failed dispatches/frame into marker re-hits. ~0.2-0.4 ms/f.
