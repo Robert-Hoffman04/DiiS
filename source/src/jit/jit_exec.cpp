@@ -46,6 +46,65 @@ u64 g_jitBail0     = 0;   // attempts that bailed with 0 instructions
 u64 g_jitPredBcc7  = 0;
 u64 g_jitPredBcc9  = 0;
 extern u64 g_jitSmcKills; // jit_cache.cpp -- real (non-empty-bucket) SMC invalidations
+
+// ---------------------------------------------------------------------------
+// -DJIT_CORE_COST_HISTO (off by default, zero-cost when undefined): per-core
+// dispatch accounting for the "ARM7 JIT execute costs as much wall time as
+// ARM9 for half the guest work" investigation (jit/NOTES.md). Step 1 asks:
+// is ARM7 paying the fixed per-call overhead (cache report, canary poll,
+// canEnter + getBlock lookup, occasional compile) more often, for less
+// forward progress per call, than ARM9?
+//
+// Counters are cumulative; jitCoreCostEmit() is called once per perfzones
+// block (60 frames) from perf_zones.cpp with the frame number, so a window
+// (f780-1200, f1200-2400) is just the delta between two emitted lines --
+// same method the zone-breakdown table already uses.
+// ---------------------------------------------------------------------------
+#ifdef JIT_CORE_COST_HISTO
+struct JitCoreCost {
+	u64 calls;      // entries into jitRunArmX() (before the canEnter check)
+	u64 noEnter;    // returned 0: canEnter*() said the region is uncompilable
+	u64 noBlock;    // returned 0: getBlock/compile gave null or a "don't JIT"
+	                //   marker (execute==nullptr) -- includes re-hits on an
+	                //   already-demoted idle-loop PC
+	u64 bail0;      // ran a block but it made zero forward progress
+	                //   (r.instructions == 0, the bail-and-demote path)
+	u64 demote1;    // of those, blocks that were length-1 terminators and got
+	                //   registered as a permanent "don't JIT" marker
+	u64 ran;        // executed >= 1 guest instruction
+	u64 cyc;        // sum of r.cycles over the "ran" calls (guest progress)
+	u64 ins;        // sum of r.instructions over the "ran" calls
+};
+static JitCoreCost g_coreCost[2];   // [0] = ARM7, [1] = ARM9
+
+extern "C" void jitCoreCostEmit(u32 frame)
+{
+	for (int c = 0; c < 2; c++) {
+		const JitCoreCost& x = g_coreCost[c];
+		u64 wasted = x.noBlock + x.bail0;
+		harness_profile_emitf(
+			"jitcorecost frame=%u core=%s calls=%llu noenter=%llu noblock=%llu "
+			"bail0=%llu demote1=%llu ran=%llu wasted=%llu cyc=%llu ins=%llu",
+			frame, c ? "arm9" : "arm7",
+			(unsigned long long)x.calls, (unsigned long long)x.noEnter,
+			(unsigned long long)x.noBlock, (unsigned long long)x.bail0,
+			(unsigned long long)x.demote1, (unsigned long long)x.ran,
+			(unsigned long long)wasted, (unsigned long long)x.cyc,
+			(unsigned long long)x.ins);
+	}
+}
+  #define JCC_CALL(core)          (g_coreCost[core].calls++)
+  #define JCC_NOENTER(core)       (g_coreCost[core].noEnter++)
+  #define JCC_NOBLOCK(core)       (g_coreCost[core].noBlock++)
+  #define JCC_BAIL0(core, len1)   do { g_coreCost[core].bail0++; if (len1) g_coreCost[core].demote1++; } while (0)
+  #define JCC_RAN(core, _c, _i)   do { JitCoreCost& _x = g_coreCost[core]; _x.ran++; _x.cyc += (_c); _x.ins += (_i); } while (0)
+#else
+  #define JCC_CALL(core)          ((void)0)
+  #define JCC_NOENTER(core)       ((void)0)
+  #define JCC_NOBLOCK(core)       ((void)0)
+  #define JCC_BAIL0(core, len1)   ((void)0)
+  #define JCC_RAN(core, _c, _i)   ((void)0)
+#endif
 static void jitMaybeReport()
 {
 #ifdef DESMUME_JIT_TRACE_FIRST
@@ -135,12 +194,13 @@ u32 jitRunArm7()
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);     // P11: ARM mode is JITted too
 	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
-	if (!canEnter) return 0;                       // uncompilable region -> interpreter
+	JCC_CALL(0);
+	if (!canEnter) { JCC_NOENTER(0); return 0; }   // uncompilable region -> interpreter
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
-	if (!b || b->execute == nullptr) return 0;     // uncompilable / "don't JIT" -> interpreter
+	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0); return 0; } // uncompilable / "don't JIT" -> interpreter
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm7Checked(&cpu, b, pc);
@@ -176,7 +236,9 @@ u32 jitRunArm7()
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		if (b->insnCount() == 1) jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
+		const bool len1 = (b->insnCount() == 1);
+		if (len1) jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
+		JCC_BAIL0(0, len1);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
 		jitMaybeReport();
@@ -204,6 +266,7 @@ u32 jitRunArm7()
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
+	JCC_RAN(0, r.cycles, r.instructions);
 	jitMaybeReport();
 
 	return r.cycles ? r.cycles : 1;
@@ -264,6 +327,7 @@ u32 jitRunArm9()
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);
 	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
+	JCC_CALL(1);
 
 #ifdef DESMUME_JIT_TRACE_FIRST
 	g_jit9Steps++;
@@ -273,7 +337,7 @@ u32 jitRunArm9()
 	jit9ProfileReport();
 #endif
 
-	if (!canEnter) return 0;                       // uncompilable region / ARM off
+	if (!canEnter) { JCC_NOENTER(1); return 0; }   // uncompilable region / ARM off
 
 	BasicBlock* b = jitCacheArm9.getBlock(pc);
 #ifdef DESMUME_JIT_TRACE_FIRST
@@ -281,7 +345,7 @@ u32 jitRunArm9()
 #endif
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
-	if (!b || b->execute == nullptr) return 0;
+	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1); return 0; }
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 	return jitRunArm9Checked(&cpu, b, pc);
@@ -379,7 +443,9 @@ u32 jitRunArm9()
 		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
-		if (b->insnCount() == 1) jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
+		const bool len1 = (b->insnCount() == 1);
+		if (len1) jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
+		JCC_BAIL0(1, len1);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
 	}
@@ -424,6 +490,7 @@ u32 jitRunArm9()
 		cpu.R[15]            = npc + 8;
 	}
 
+	JCC_RAN(1, r.cycles, r.instructions);
 	return r.cycles ? r.cycles : 1;
 }
 

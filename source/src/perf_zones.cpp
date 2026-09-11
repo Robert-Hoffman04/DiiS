@@ -16,6 +16,10 @@
 u64 g_pzAcc[PZ_COUNT];
 u64 g_pzHits[PZ_COUNT];
 
+#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT_ARM7)
+extern "C" void jitCoreCostEmit(u32 frame);   // jit/jit_exec.cpp
+#endif
+
 static PerfZone s_cur  = PZ_OTHER;
 static u64      s_last = 0;      // timebase of the last bank(); 0 => not started
 
@@ -209,6 +213,9 @@ void pzFrameTick(void)
 	if (frame % DESMUME_PERFZONES_BLOCK == 0) {
 		pz_emit_row(frame, acc_ticks, acc_hits);
 		pz_emit_percentiles(frame);   // §3.3b
+#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT_ARM7)
+		jitCoreCostEmit(frame);       // -DJIT_CORE_COST_HISTO per-core dispatch accounting
+#endif
 		for (int i = 0; i < PZ_COUNT; i++) { acc_ticks[i] = 0; acc_hits[i] = 0; }
 	}
 }

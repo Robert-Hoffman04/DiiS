@@ -234,3 +234,64 @@ not the arena size. **Do not grow the arena further.** 12 MB stays.
    (~5 ms/f) now dominate the frame far more than anything cache-related. Even
    eliminating every remaining collision would save well under 0.1 ms/f. The
    next real frame-time lever is one of those, not the JIT cache.
+
+
+## ARM7 vs ARM9 JIT execute-cost investigation
+
+The per-zone frame breakdown shows `arm7_jit` (dispatch + execute) costing as
+much wall time as `arm9_jit` -- ~5.7 ms/f each in the f1200-2400 window --
+even though `armInnerLoop()` already credits ARM7 progress as `jitCycles << 1`,
+i.e. gives ARM7 half the guest work per unit of the shared timeline. So ARM7
+burns the same host time for half the guest instructions. This section is
+diagnostic only (behind `-DJIT_CORE_COST_HISTO`, off by default); no fix is
+proposed until the data says which mechanism dominates.
+
+### Step 1 -- per-core dispatch accounting
+
+`-DJIT_CORE_COST_HISTO` splits `jitRunArm7()`/`jitRunArm9()` bookkeeping per
+core and emits a cumulative line every perfzones block (60 frames) via
+`jitCoreCostEmit()`, so a window is the delta between two lines. SM64DS soak,
+12 MB arena, GX hw 3D + GX2DBG, autoload savestate, to frame ~4000.
+
+| per-frame, window f1200-2400        |    ARM7 |    ARM9 |
+|-------------------------------------|--------:|--------:|
+| dispatch calls / frame              |    6050 |    3972 |
+| calls that ran >= 1 guest insn      |    3137 |    3319 |
+| **wasted calls (zero progress)**    | **2913 (48.2%)** | **653 (16.4%)** |
+| -- no compilable block / "don't JIT" |    2289 |     653 |
+| -- ran a block, retired 0 insns      |     624 |       0 |
+| guest insns / productive call        |    11.5 |    26.3 |
+| guest cycles / productive call       |    25.9 |    76.6 |
+| `arm{7,9}_jit` zone                   | 5.69 ms/f | 5.32 ms/f |
+| host-ns / dispatch call              |     940 |    1340 |
+| host-ns / productive call            |    1814 |    1604 |
+| **host-ns / retired guest insn**    | **157** |  **61** |
+
+Findings:
+
+1. **ARM7 dispatches 1.5x as often as ARM9** (6050 vs 3972/f) despite its
+   halved cycle budget -- the interpreter hands control to `jitRunArm7()`
+   far more frequently, in shorter slices.
+2. **~48% of ARM7 dispatch calls make zero forward progress**, vs ~16% for
+   ARM9. The bulk (2289/f) is `getBlock()`/compile returning nothing usable
+   -- either a cached "don't JIT" marker being re-hit, or a fresh scan that
+   finds nothing compilable. Another 624/f are compiled blocks that bail on
+   their own first instruction (`r.instructions == 0`).
+3. **ARM9 has essentially zero first-instruction bailouts** (0/f). Its wasted
+   calls are all "no block", none are "ran but retired nothing".
+4. The length-1 idle-loop demotion (`b->insnCount() == 1` in the bail path)
+   almost never fires -- 3 new demotions in the whole 4000-frame run. The
+   624/f ARM7 bail0 calls are therefore multi-instruction blocks bailing on
+   instruction 1 and never getting demoted (this is exactly Step 4's
+   hypothesis).
+5. **Per *productive* call the two cores cost about the same** (~1.8 vs
+   ~1.6 us). Solving the two zone-time equations with a ~300 ns wasted-call
+   cost puts the productive-call cost at ~1.54 us for *both* cores. So the
+   gap is NOT intrinsically slower ARM7 dispatch -- it is (a) 1.5x the call
+   frequency, (b) half of those calls buying nothing, and (c) each productive
+   call retiring 2.3x fewer guest instructions, so the fixed per-block
+   entry/exit (trampoline, `ExecuteJITTrace` prologue, pipeline re-prime)
+   amortizes 2.6x worse -> 157 vs 61 host-ns per retired guest instruction.
+
+Steps 2-4 quantify (b) block length, (c) demotion coverage, and whether any
+residual per-instruction cost is left once those are accounted for.
