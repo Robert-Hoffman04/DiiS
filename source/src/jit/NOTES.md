@@ -339,3 +339,49 @@ Findings:
    over 2x fewer retired instructions on ARM7, which is most of the 2.6x
    host-ns-per-retired-instruction gap. Step 3 checks whether anything is
    left once block length and wasted calls are subtracted.
+
+### Step 3 -- dispatch overhead vs emitted-code execution cost
+
+`-DJIT_CORE_COST_HISTO` extended once more: a `gettime()` bracket around the
+`ExecuteJITTrace()` call accumulates per-core "time strictly inside the
+trampoline + emitted block" (`jitcorecost2` line, `exec_us`). `zone -
+exec` is then the true dispatch/lookup/compile/pipeline-reprime overhead;
+`exec / retired-insns` is the true per-instruction execution cost. (The two
+extra timebase reads per dispatch inflate the zone by ~1%; `exec_us` itself
+is clean.) Same SM64DS soak, windows to frame ~2400.
+
+| per-frame, window f1200-2400          |     ARM7 |     ARM9 | ratio |
+|---------------------------------------|---------:|---------:|------:|
+| `arm{7,9}_jit` zone                    | 5.87 ms  | 5.56 ms  | 1.06  |
+| -- inside ExecuteJITTrace (exec-only)  | 2.83 ms  | 3.51 ms  | 0.81  |
+| -- dispatch/lookup/compile overhead   | 3.04 ms  | 2.05 ms  | 1.48  |
+| **dispatch overhead / dispatch call** | **502 ns** | **515 ns** | **1.0** |
+| dispatch overhead / *productive* call |   968 ns |   617 ns | 1.57  |
+| exec-only / retired guest insn        |    78 ns |    40 ns | 1.94  |
+
+Findings:
+
+1. **The dispatch loop costs the same per call on both cores** (502 vs
+   515 ns) -- canary poll, cache-report throttle, `canEnter*()`, `getBlock()`,
+   trampoline setup and pipeline re-prime are not slower for ARM7. ARM7's
+   aggregate dispatch overhead is higher only because it makes 1.5x the calls
+   and ~48% of them are wasted: ARM7 pays for ~2.4 wasted calls per
+   productive call, ARM9 for ~0.2.
+2. **The per-retired-instruction execution cost is ~1.9x on ARM7 (78 vs
+   40 ns), but it is fully consistent with fixed-per-block-overhead
+   amortization, not an ARM7-specific per-instruction penalty.** Fitting
+   `exec_per_productive_call = F + insns * p` to both cores (ARM7:
+   F + 11.5 p = 902 ns; ARM9: F + 26.25 p = 1058 ns) with a shared `p`
+   gives **p ~= 10.6 ns/insn (equal both cores)** and **F ~= 780 ns fixed
+   per block** -- the trampoline prologue/epilogue (GPR+CPSR save/restore,
+   `jit_cpu_state` setup, chain-guard checks, exit accounting) sitting inside
+   the timed region. ARM7's blocks are half as long, so that 780 ns
+   amortizes over 11.5 insns instead of 26.25. The guest-cycle rate confirms
+   ARM7 instructions are not intrinsically heavier: 2.25 guest cyc/insn on
+   ARM7 vs 2.92 on ARM9.
+3. So there is **no third mechanism**. The gap is entirely Steps 1-2: (a)
+   1.5x dispatch frequency, (b) ~48% wasted calls, (c) 2x shorter blocks
+   amortizing the fixed ~780 ns trampoline worse. No evidence of the
+   "ARM7 MMIO routes through heavier checked memory paths" hypothesis at the
+   per-instruction level -- if ARM7's `p` were materially higher the fit
+   would not close with a positive `F`.

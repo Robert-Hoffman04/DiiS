@@ -26,6 +26,9 @@
 #include "../harness/harness.h"
 #include <string.h>
 #include <stdio.h>
+#ifdef JIT_CORE_COST_HISTO
+#include <ogc/lwp_watchdog.h>   // gettime(), ticks_to_microsecs() -- Step 3 exec timing
+#endif
 
 // §3.0: the JIT heap canary/minefield poll is crash-detection and only runs
 // under the master harness flag (+ HARNESS_CRASH). Without it jitCheckCanaries()
@@ -77,6 +80,11 @@ struct JitCoreCost {
 	u64 entryLen[5];// Step 2: entry-block insnCount() bucket over "ran" calls
 	                //   (1, 2-4, 5-8, 9-16, 17+) -- length of the block actually
 	                //   dispatched, independent of compile churn
+	u64 execTicks;  // Step 3: timebase ticks spent strictly inside ExecuteJITTrace()
+	                //   (the trampoline + emitted block), summed over every
+	                //   dispatch that ran one. zone_time - exec_time == the true
+	                //   dispatch/lookup/compile overhead; exec_time / retired
+	                //   insns == the true per-instruction execute cost.
 };
 static JitCoreCost g_coreCost[2];   // [0] = ARM7, [1] = ARM9
 
@@ -98,6 +106,9 @@ extern "C" void jitCoreCostEmit(u32 frame)
 			(unsigned long long)x.entryLen[0], (unsigned long long)x.entryLen[1],
 			(unsigned long long)x.entryLen[2], (unsigned long long)x.entryLen[3],
 			(unsigned long long)x.entryLen[4]);
+		harness_profile_emitf("jitcorecost2 frame=%u core=%s exec_us=%llu",
+			frame, c ? "arm9" : "arm7",
+			(unsigned long long)ticks_to_microsecs(x.execTicks));
 	}
 	jitCacheArm7.ccBlockLenReport("arm7");   // Step 2: compiled-block-length distribution
 	jitCacheArm9.ccBlockLenReport("arm9");
@@ -108,12 +119,16 @@ extern "C" void jitCoreCostEmit(u32 frame)
   #define JCC_BAIL0(core, len1)   do { g_coreCost[core].bail0++; if (len1) g_coreCost[core].demote1++; } while (0)
   #define JCC_RAN(core, _c, _i, _el) do { JitCoreCost& _x = g_coreCost[core]; _x.ran++; _x.cyc += (_c); _x.ins += (_i); \
         _x.entryLen[(_el) <= 1 ? 0 : (_el) <= 4 ? 1 : (_el) <= 8 ? 2 : (_el) <= 16 ? 3 : 4]++; } while (0)
+  #define JCC_EXEC_BEGIN()        const u64 _jccE0 = gettime()
+  #define JCC_EXEC_END(core)      (g_coreCost[core].execTicks += gettime() - _jccE0)
 #else
   #define JCC_CALL(core)          ((void)0)
   #define JCC_NOENTER(core)       ((void)0)
   #define JCC_NOBLOCK(core)       ((void)0)
   #define JCC_BAIL0(core, len1)   ((void)0)
   #define JCC_RAN(core, _c, _i, _el) ((void)0)
+  #define JCC_EXEC_BEGIN()        ((void)0)
+  #define JCC_EXEC_END(core)      ((void)0)
 #endif
 static void jitMaybeReport()
 {
@@ -221,7 +236,9 @@ u32 jitRunArm7()
 
 	JITResult r;
 	memset(&r, 0, sizeof r);
+	JCC_EXEC_BEGIN();
 	ExecuteJITTrace(b->execute, &r, &st);
+	JCC_EXEC_END(0);
 	g_jitAttempts++;
 
 	if (r.smcHit)
@@ -366,7 +383,9 @@ u32 jitRunArm9()
 
 	JITResult r;
 	memset(&r, 0, sizeof r);
+	JCC_EXEC_BEGIN();
 	ExecuteJITTrace(b->execute, &r, &st);
+	JCC_EXEC_END(1);
 
 #ifdef DESMUME_JIT_TRACE_FIRST
 	{
