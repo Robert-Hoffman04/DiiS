@@ -200,6 +200,19 @@ class JITCache {
 		void profEmitReport(const char* tag);
 #endif
 
+#ifdef JIT_CORE_COST_HISTO
+		// Step 2 of the ARM7-vs-ARM9 execute-cost investigation (jit/NOTES.md):
+		// per-cache compiled-block-length accounting, sampled at registerBlock()
+		// time. Independent of HARNESS_PROFILE. ccBlockLenReport() emits a
+		// cumulative line; jitCoreCostEmit() (jit_exec.cpp) calls it per core.
+		u64 ccRbCount   = 0;   // registerBlock() with a real compiled block
+		u64 ccRbInsnSum = 0;   // sum of insnCount() over those
+		u64 ccRbBucket[5] = {0,0,0,0,0};  // 1, 2-4, 5-8, 9-16, 17+ guest insns
+		u64 ccRbThumb   = 0;   // of the compiled blocks, how many THUMB
+		u64 ccRbDontJit = 0;   // registerBlock(pc, 1, nullptr) "don't JIT" markers
+		void ccBlockLenReport(const char* tag);
+#endif
+
 		inline BasicBlock* getBlock(u32 pc) {
 			if (!isInitialized) return nullptr;
 			u32 index = jitHashPC(pc);

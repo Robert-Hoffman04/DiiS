@@ -180,6 +180,19 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bo
 	u32 index = jitHashPC(pc);
 	length = (length & 0x7FFFFFFFu) | (thumb ? 0x80000000u : 0u);
 
+#ifdef JIT_CORE_COST_HISTO
+	{
+		u32 n = length & 0x7FFFFFFFu;
+		if (execute != nullptr) {
+			ccRbCount++; ccRbInsnSum += n;
+			ccRbBucket[ n <= 1 ? 0 : n <= 4 ? 1 : n <= 8 ? 2 : n <= 16 ? 3 : 4 ]++;
+			if (thumb) ccRbThumb++;
+		} else if (n == 1) {
+			ccRbDontJit++;    // deliberate "don't JIT" fallback marker
+		}
+	}
+#endif
+
 	u32 evictedPC = blockTable[index].startPC;
 	PROFILER_CACHE_EVICT(evictedPC, pc);
 
@@ -616,5 +629,19 @@ void JITCache::profEmitReport(const char* tag) {
 }
 
 #endif // DESMUME_HARNESS && HARNESS_PROFILE
+
+#ifdef JIT_CORE_COST_HISTO
+void JITCache::ccBlockLenReport(const char* tag) {
+	u64 n = ccRbCount ? ccRbCount : 1;
+	harness_profile_emitf(
+		"jitblocklen cache=%s compiled=%llu dontjit=%llu thumb=%llu avg_insx100=%llu "
+		"b1=%llu b2_4=%llu b5_8=%llu b9_16=%llu b17+=%llu",
+		tag, (unsigned long long)ccRbCount, (unsigned long long)ccRbDontJit,
+		(unsigned long long)ccRbThumb, (unsigned long long)(ccRbInsnSum * 100 / n),
+		(unsigned long long)ccRbBucket[0], (unsigned long long)ccRbBucket[1],
+		(unsigned long long)ccRbBucket[2], (unsigned long long)ccRbBucket[3],
+		(unsigned long long)ccRbBucket[4]);
+}
+#endif
 
 #endif // DESMUME_JIT_ARM7

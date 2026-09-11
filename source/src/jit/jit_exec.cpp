@@ -74,6 +74,9 @@ struct JitCoreCost {
 	u64 ran;        // executed >= 1 guest instruction
 	u64 cyc;        // sum of r.cycles over the "ran" calls (guest progress)
 	u64 ins;        // sum of r.instructions over the "ran" calls
+	u64 entryLen[5];// Step 2: entry-block insnCount() bucket over "ran" calls
+	                //   (1, 2-4, 5-8, 9-16, 17+) -- length of the block actually
+	                //   dispatched, independent of compile churn
 };
 static JitCoreCost g_coreCost[2];   // [0] = ARM7, [1] = ARM9
 
@@ -84,26 +87,33 @@ extern "C" void jitCoreCostEmit(u32 frame)
 		u64 wasted = x.noBlock + x.bail0;
 		harness_profile_emitf(
 			"jitcorecost frame=%u core=%s calls=%llu noenter=%llu noblock=%llu "
-			"bail0=%llu demote1=%llu ran=%llu wasted=%llu cyc=%llu ins=%llu",
+			"bail0=%llu demote1=%llu ran=%llu wasted=%llu cyc=%llu ins=%llu "
+			"elen1=%llu elen2_4=%llu elen5_8=%llu elen9_16=%llu elen17=%llu",
 			frame, c ? "arm9" : "arm7",
 			(unsigned long long)x.calls, (unsigned long long)x.noEnter,
 			(unsigned long long)x.noBlock, (unsigned long long)x.bail0,
 			(unsigned long long)x.demote1, (unsigned long long)x.ran,
 			(unsigned long long)wasted, (unsigned long long)x.cyc,
-			(unsigned long long)x.ins);
+			(unsigned long long)x.ins,
+			(unsigned long long)x.entryLen[0], (unsigned long long)x.entryLen[1],
+			(unsigned long long)x.entryLen[2], (unsigned long long)x.entryLen[3],
+			(unsigned long long)x.entryLen[4]);
 	}
+	jitCacheArm7.ccBlockLenReport("arm7");   // Step 2: compiled-block-length distribution
+	jitCacheArm9.ccBlockLenReport("arm9");
 }
   #define JCC_CALL(core)          (g_coreCost[core].calls++)
   #define JCC_NOENTER(core)       (g_coreCost[core].noEnter++)
   #define JCC_NOBLOCK(core)       (g_coreCost[core].noBlock++)
   #define JCC_BAIL0(core, len1)   do { g_coreCost[core].bail0++; if (len1) g_coreCost[core].demote1++; } while (0)
-  #define JCC_RAN(core, _c, _i)   do { JitCoreCost& _x = g_coreCost[core]; _x.ran++; _x.cyc += (_c); _x.ins += (_i); } while (0)
+  #define JCC_RAN(core, _c, _i, _el) do { JitCoreCost& _x = g_coreCost[core]; _x.ran++; _x.cyc += (_c); _x.ins += (_i); \
+        _x.entryLen[(_el) <= 1 ? 0 : (_el) <= 4 ? 1 : (_el) <= 8 ? 2 : (_el) <= 16 ? 3 : 4]++; } while (0)
 #else
   #define JCC_CALL(core)          ((void)0)
   #define JCC_NOENTER(core)       ((void)0)
   #define JCC_NOBLOCK(core)       ((void)0)
   #define JCC_BAIL0(core, len1)   ((void)0)
-  #define JCC_RAN(core, _c, _i)   ((void)0)
+  #define JCC_RAN(core, _c, _i, _el) ((void)0)
 #endif
 static void jitMaybeReport()
 {
@@ -266,7 +276,7 @@ u32 jitRunArm7()
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
-	JCC_RAN(0, r.cycles, r.instructions);
+	JCC_RAN(0, r.cycles, r.instructions, b->insnCount());
 	jitMaybeReport();
 
 	return r.cycles ? r.cycles : 1;
@@ -490,7 +500,7 @@ u32 jitRunArm9()
 		cpu.R[15]            = npc + 8;
 	}
 
-	JCC_RAN(1, r.cycles, r.instructions);
+	JCC_RAN(1, r.cycles, r.instructions, b->insnCount());
 	return r.cycles ? r.cycles : 1;
 }
 

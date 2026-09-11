@@ -295,3 +295,47 @@ Findings:
 
 Steps 2-4 quantify (b) block length, (c) demotion coverage, and whether any
 residual per-instruction cost is left once those are accounted for.
+
+### Step 2 -- compiled- and executed-block length per core
+
+`-DJIT_CORE_COST_HISTO` extended: `registerBlock()` tallies compiled-block
+insnCount() per cache (`jitblocklen` line), and the dispatch path buckets the
+entry block's insnCount() over every productive call (`elen*` on the
+`jitcorecost` line -- the length of the block actually *run*, which is what
+matters for amortization). Same SM64DS soak.
+
+**Executed entry-block length, window f1200-2400:**
+
+| bucket (guest insns) | ARM7 /frame |  %  | ARM9 /frame |  %  |
+|----------------------|------------:|----:|------------:|----:|
+| 1                    |         730 | 23% |          78 |  2% |
+| 2-4                  |        1331 | 42% |         911 | 27% |
+| 5-8                  |         378 | 12% |         464 | 14% |
+| 9-16                 |         434 | 14% |         746 | 22% |
+| 17+                  |         263 |  8% |        1120 | 34% |
+| **weighted avg**     |    **~5.9** |     |   **~12.0** |     |
+
+**Compiled-block churn, window f1200-2400:** ARM7 registers **21** compiled
+blocks + 1 "don't JIT" marker; ARM9 registers **11 833** compiled blocks + 76
+markers. (Full run: ARM7 955 / ARM9 44 252.)
+
+Findings:
+
+1. **ARM7 executed blocks are half the length of ARM9's** (~5.9 vs ~12.0
+   guest insns) and the distribution is sharply bimodal toward the bottom:
+   **65% of ARM7 dispatched blocks are <= 4 instructions**, and 23% are a
+   single instruction. ARM9's mass is at the top -- 34% are 17+.
+2. A length-1 block that runs and returns retires one guest instruction for a
+   full trampoline round-trip + pipeline re-prime -- the worst possible
+   amortization, and ARM7 does 730 of them per frame vs ARM9's 78.
+3. **ARM7 barely compiles anything in steady state** -- 21 blocks over 1200
+   frames vs ARM9's ~12 k. ARM7's hot working set is small and stable; the
+   cost is not compile churn (that is an ARM9 problem, tracked in the
+   hash-collision section). ARM7's problem is that its stable set is mostly
+   tiny blocks plus uncompilable spots the interpreter picks up one
+   instruction at a time.
+4. This is the "(c) short-block amortization" mechanism from Step 1's
+   summary, now quantified: the fixed ~1.5 us productive-call cost is spread
+   over 2x fewer retired instructions on ARM7, which is most of the 2.6x
+   host-ns-per-retired-instruction gap. Step 3 checks whether anything is
+   left once block length and wasted calls are subtracted.
