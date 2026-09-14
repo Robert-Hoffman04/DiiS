@@ -433,6 +433,18 @@ void emitAlu(JitTraceCtx& ctx, u8 aluOp, bool S, bool testOnly, bool isLogical,
 // and any predicated form bail at the dispatch site. Covers `MOV pc,lr`,
 // `ADD pc,pc,rN` jump tables and the like -- a real block-length win in
 // function-return-heavy ARM code. Block terminator.
+//
+// TODO item 6 (jit/NOTES.md Step 7): the register-form `ADD/SUB pc,pc,Rm{,shift}`
+// jump-table shape used to bail here despite the comment above claiming to
+// cover it -- only the immediate-operand2 form (`ADD/SUB pc,#k`, below) special-
+// cased rn==15. Widened: rn==15 is now allowed through for ADD/SUB (the only
+// aluOps a real jump table uses pc as the base for) by materializing
+// currentPC+8 into a scratch host reg (PPC_R9 -- unused elsewhere in this translation
+// unit, and chosen deliberately to survive emitOp2's R8/R11/R12 scratch use)
+// instead of trying to "read" a live PC guest register. Rm is still a runtime
+// value (the table index), so this is still a dynamic exit, not a static one --
+// no new differential-testing risk from a wrong compile-time target, just one
+// fewer trampoline round-trip per jump-table dispatch.
 void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
 {
 	const bool immForm   = (op >> 25) & 1;
@@ -443,11 +455,12 @@ void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
 	const bool ignoresRn = (aluOp == 13 || aluOp == 15);
 	const bool isLogical = (aluOp <= 1) || (aluOp >= 12);
 	const bool regShift  = !immForm && ((op >> 4) & 1) && !((op >> 7) & 1);
+	const bool pcBaseOk  = (aluOp == 2 || aluOp == 4);   // SUB / ADD: real jump-table shapes
 
 	if (!immForm) {
 		if (((op >> 4) & 1) && ((op >> 7) & 1)) { ctx.endBlock = true; return; }  // not a DP encoding
 		if (rm == 15)                           { ctx.endBlock = true; return; }
-		if (!ignoresRn && rn == 15)             { ctx.endBlock = true; return; }
+		if (!ignoresRn && rn == 15 && !pcBaseOk) { ctx.endBlock = true; return; }
 		if (regShift && rs == 15)               { ctx.endBlock = true; return; }
 	}
 
@@ -480,7 +493,18 @@ void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
 	u8 hRs = 0;
 	if (regShift)   hRs = ctx.readReg(rs, lockedMask);
 	u8 hRn = 0;
-	if (!ignoresRn) hRn = ctx.readReg(rn, lockedMask);
+	if (!ignoresRn) {
+		if (rn == 15) {
+			// register-form ADD/SUB pc,pc,Rm{,shift} jump table: pc isn't a
+			// live host-backed guest register, materialize the constant base
+			// directly. Must happen before emitOp2 touches its own scratch
+			// (R8/R11/R12) -- PPC_R9 is untouched by every emitOp2* path.
+			hRn = PPC_R9;
+			emitLoadImm32(ctx.emitPtr, hRn, ctx.currentPC + 8);
+		} else {
+			hRn = ctx.readReg(rn, lockedMask);
+		}
+	}
 
 	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, /*wantCarry=*/false);
 	emitAlu(ctx, aluOp, /*S=*/false, /*testOnly=*/false, isLogical, hRn, PPC_R12, o2);

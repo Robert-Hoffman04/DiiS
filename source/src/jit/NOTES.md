@@ -734,3 +734,117 @@ involved. `MSR CPSR_c` / `SUBS pc,lr,#4` / predicated LDM{...,pc} touch real
 mode-switch and exception-return semantics and need their own scope
 discussion before attempting (same category as item 12's predication
 project) -- do not start unprompted.
+
+## Step 8 -- jump-table widening: `ADD/SUB pc,pc,Rm` register form
+
+Implemented the item announced above. `emitDataProcToPc()`'s header comment
+already claimed to cover `ADD pc,pc,rN` jump tables, but the code only
+special-cased `rn==15` for the *immediate*-operand2 form (`ADD/SUB pc,#k` --
+a compile-time-constant target, static exit). The register-operand form
+(`ADD pc,pc,Rm,LSL#2`, the actual jump-table dispatch idiom -- `Rm` is the
+runtime table index) unconditionally bailed at `rn == 15` alongside every
+other data-processing opcode's PC-as-source-operand restriction.
+
+Fix: allow `rn==15` through for `aluOp == SUB(2) || ADD(4)` in the register
+path (the only two ops a real jump table uses `pc` as the base for), and
+materialize `currentPC+8` into `PPC_R9` (confirmed unused anywhere else in
+`jit_arm.cpp`, so safe to hardcode as a scratch reg here) instead of trying
+to `readReg(15, ...)` -- there's no live host-backed slot for the guest PC
+register. Materializing happens *before* `emitOp2()` runs (its own shift
+paths use `R8`/`R11`/`R12` as scratch), so nothing clobbers it. `Rm` is still
+a runtime register, so this stays a dynamic exit -- no static-target risk,
+just one fewer trampoline round-trip per jump-table dispatch, on both cores
+(this shape isn't gated by ISA level -- ARM7 and ARM9 both hit it).
+
+Validated the same way as Step 6's BXcc-lr fix: 180s in-game differential-
+testing soak, no DIFF/MISMATCH/CANARY/OVERRUN lines.
+
+## Step 9 -- performance write-up: items 6's two chain-length fixes
+
+A/B methodology: `tools/benchmark/item6-ab.sh`. Since the BXcc-lr half of
+this pair was already committed (77175ae) by the time the jump-table half
+was ready, a plain `git stash` baseline can't reach "before either fix" --
+the script instead checks `jit_arm.cpp` out from `f92719a` (the commit right
+after item 4, i.e. immediately before items 5/6 touched anything) for the
+baseline leg, and restores the working tree for the "after" leg. Both legs:
+`-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_FORCE_GX2DBG
+-DDESMUME_PERFZONES -DJIT_CORE_COST_HISTO` over the unified harness's
+`PKT_PROFILE` net sink (`wii_control.py` -> `profile.log`), 150s in-game
+SM64DS soak (autoload savestate) each.
+
+### Dispatch-level effect (jitcorecost, ARM7)
+
+Rates from the two runs' first (frame=60) and last jitcorecost line,
+averaged over the whole ~4920-4980-frame run (this averages out any single
+60-frame window's game-state noise -- see the ARM9 caveat below):
+
+| metric (per DS frame)         | baseline (f92719a) | after (both fixes) | delta |
+|--------------------------------|--------------------:|--------------------:|------:|
+| `jitRunArm7()` calls            |               5440  |               4673  | **-14.1%** |
+| wasted calls (noblock+bail0)    |               2610  |               2199  | **-15.8%** |
+| productive ("ran") calls        |               2829  |               2474  | -12.6% |
+| guest cycles retired            |             72 470  |             73 516  | +1.4% |
+| guest instructions retired      |             32 227  |             32 552  | +1.0% |
+| exec time inside `ExecuteJITTrace` |         2258 us  |             2236 us | -1.0% |
+
+Read together: **the same guest work (cycles/instructions retired per frame,
+flat within noise) now takes ~14% fewer dispatcher round-trips.** That's
+exactly the "longer chains" effect items 5/6 were aimed at -- each call to
+`jitRunArm7()` now more often runs a longer chained sequence before
+returning, instead of bailing out to the interpreter at a `BXcc lr` or a
+jump-table dispatch it used to refuse. `exec_us`/frame staying flat while
+call count drops confirms the savings are in per-call dispatch overhead
+(`PZ_SCOPE` transition, canary poll, `getBlock` lookup, occasional compile),
+not in the emitted code itself running any faster per retired instruction.
+
+Block-length-bucket shift (entries per frame, `elen2_4` -> `elen5_8`):
+`elen2_4` -412 (-26% mid-window; the short conditional-return-terminated
+blocks that used to end 2-4 instructions in), `elen5_8` +33 (+10%) -- blocks
+that used to hand off at a `BXcc lr` boundary now continue a few
+instructions further into what used to be the *next* block.
+
+### Frame-time effect (perf_zones, `arm7_jit` / `arm9_jit`)
+
+Matched 60-frame perfzones windows (same nominal frame range, both runs --
+`grep -E "^[0-9]+," profile.log`, columns `wall_us`/`arm7_jit_us`/
+`arm9_jit_us`), 7 windows spanning frame 4620-4980:
+
+| window (frame) | wall_us delta | `arm7_jit` delta | `arm9_jit` delta |
+|---:|---:|---:|---:|
+| 4620 | -3.1% | -12.7% | -0.1% |
+| 4680 | -3.1% | -11.2% | -0.3% |
+| 4740 | -3.7% | -15.7% | +1.8% |
+| 4800 | -3.5% | -14.2% | +1.5% |
+| 4860 | -3.6% | -9.5%  | -2.9% |
+| 4920 | -2.7% | -5.8%  | -4.0% |
+| 4980 | -0.8% | -3.7%  | -0.4% |
+| **average** | **-2.9%** | **-10.4%** | **-0.6%** |
+
+**`arm7_jit` zone time down ~10% on average, consistently across every
+window** (range -3.7% to -15.7%, never a regression). `arm9_jit` is flat
+within noise (-4.0% to +1.8%, averaging -0.6%) -- expected, since the
+dominant fix (BXcc-lr) was ARM9-only-already; the jump-table widening
+applies to both cores but is evidently a much smaller contributor than
+BXcc-lr was. Total frame wall time down ~2.9% on average -- consistent with
+`arm7_jit` (~5 ms of a ~25-29 ms frame per Step 5's table, so a 10% cut
+there is ~0.5 ms/frame, ~1.7-2% of total -- the observed ~2.9% total-wall
+drop is in the same ballpark, plus whatever the fewer-round-trips effect
+does to cache locality / branch prediction elsewhere, which this data can't
+separate out).
+
+**Caveat on window selection:** the ARM9 corecost rates in particular showed
+a ~4-5x swing between adjacent 60-frame windows in the raw data (SM64DS's
+scripted/no-input demo trajectory has genuinely uneven per-frame ARM9 load --
+cutscene triggers, area loads). The whole-run-average rates in the first
+table and the matched-window perfzones table above both average across many
+windows for exactly this reason; a single-window snapshot would have been
+misleading in either direction depending on which window got sampled.
+
+**Bottom line:** items 5+6 (BXcc-lr on ARM7, jump-table register-form
+widening on both cores) measurably shrink the ARM7 JIT zone by roughly a
+tenth, for zero guest-work-per-frame cost and no differential-testing
+regressions -- a real, if modest (~0.5 ms/frame, ~2-3% of total frame time),
+win on top of item 4's cache-pressure fix. The bigger remaining levers are
+still item 12 (real predicate-path compilation, which per Step 6 would
+address ~33%/~83% of ARM7/ARM9 dispatches, an order of magnitude more than
+this) and the 2D compositor (~5 ms/frame, untouched by any of this work).

@@ -63,16 +63,25 @@
    within a short soak). Top offenders collapse into a few instruction
    shapes: BXcc lr (conditional return), MSR CPSR_c (mode switch), ADD{cc}
    pc,pc,Rm,LSL#2 (jump table), SUBS pc,lr,#4 (IRQ return), LDMcc{...,pc}
-   (conditional epilogue), predicated STM. Fixed one: BXcc lr now compiles
+   (conditional epilogue), predicated STM. Fixed two: BXcc lr now compiles
    on ARM7 too (was gated ARM9/v5-only for no functional reason - predicated
    execution is base ARMv4T, and the existing ARM9 guarded-exit mechanism
-   has nothing v5-specific in it). Validated via differential-testing soak,
-   no mismatches. Committed. Remaining shapes: the ADD{cc} pc,pc,Rm jump-
-   table register-form widening is next up (scoped, low-risk, pure dynamic-
-   exit target computation - jit/NOTES.md Step 7); MSR CPSR_c / SUBS
-   pc,lr,#4 / predicated LDM{...,pc} touch real CPU-mode/exception semantics
-   and need their own scope discussion first - do not start unprompted. See
-   jit/NOTES.md Step 7.
+   has nothing v5-specific in it), and the ADD/SUB{cc} pc,pc,Rm register-form
+   jump-table dispatch now compiles on both cores (emitDataProcToPc's header
+   comment already claimed to cover this but only the immediate-operand2
+   form was actually special-cased for rn==15 - materializes currentPC+8
+   into a scratch reg instead of trying to read a live PC register; still a
+   dynamic exit since Rm is a runtime table index, no static-target risk).
+   Both validated via differential-testing soak, no mismatches. Perf A/B
+   (tools/benchmark/item6-ab.sh, jit/NOTES.md Step 9): arm7_jit perf_zones
+   time down ~10% on average across 7 matched windows (range -3.7% to
+   -15.7%, never a regression), arm9_jit flat within noise as expected
+   (BXcc-lr was already ARM9-only-fixed). Same guest work (cycles/insns
+   retired per frame, flat) now costs ~14% fewer jitRunArm7() dispatcher
+   round-trips - the intended "longer chains" effect. Committed. Remaining
+   shapes (MSR CPSR_c / SUBS pc,lr,#4 / predicated LDM{...,pc}) touch real
+   CPU-mode/exception semantics and need their own scope discussion first -
+   do not start unprompted. See jit/NOTES.md Steps 7-9.
 
 ## Known bugs / unfinished features tracked in memory
 7. [ ] GX2DBG SUB-screen affine-BG bug - ghosting/grey-grid artifacts on the
