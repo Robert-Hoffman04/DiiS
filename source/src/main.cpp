@@ -356,13 +356,15 @@ int main(int argc, char **argv){
 
 	NDS_3D_ChangeCore(current3Dcore);
 
-	// Hardware 3D/2D compositing path (see GXMerge.h).  Default-on for the GX
-	// core as of this branch: MAIN-screen visual A/B and the SUB-screen
-	// sprite-compositing fix (see BUGS.md "Graphics") are both verified, and
-	// the -61%/+45fps win is worth shipping as the main execution path here.
-	// GC D-pad Down (see ~line 1382) still hotkey-toggles it off per-session;
-	// the old DESMUME_FORCE_GXCOMPOSITE/DESMUME_FORCE_GX2DBG bench flags are
-	// now redundant for this but kept for the benchmark scripts that set them.
+	// Hardware 3D/2D compositing path (see GXMerge.h).  Mandatory for the GX
+	// core as of this branch, not opt-in: MAIN-screen visual A/B and the
+	// SUB-screen sprite-compositing fix (see BUGS.md "Graphics") are both
+	// verified, and the -61%/+45fps win means GX2DBG is the only 2D
+	// compositor the GX core runs - there is no build flag or runtime
+	// toggle to fall back to the CPU compositor while on the GX core (the
+	// old DESMUME_FORCE_GXCOMPOSITE/DESMUME_FORCE_GX2DBG bench flags no
+	// longer gate anything here; they're vestigial in the benchmark scripts
+	// that still pass them).
 	GXMerge_SetEnabled(current3Dcore == 1);
 	GXMerge_Set2DBG(current3Dcore == 1);
 
@@ -1376,12 +1378,6 @@ void DSExec(){
 	
 	if ((wpad & WPAD_BUTTON_B) || (pad & PAD_BUTTON_RIGHT)){
 		drawcursor ^= 1;
-	}
-
-	// A/B toggle for the hardware 3D/2D merge path (GC D-pad Down; GX core only).
-	if (pad & PAD_BUTTON_DOWN){
-		if (current3Dcore == 1)
-			GXMerge_SetEnabled(!GXMerge_Enabled());
 	}
 
 	// DS-level quicksave/quickload (saves.cpp): Z held + L/R edge, fixed
