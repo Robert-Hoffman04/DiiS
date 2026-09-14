@@ -150,6 +150,15 @@ def build_results(rundir, scenes_path):
             continue
         if fn.endswith(".perfzones.log"):
             continue                       # handled by perfzones.py, not here
+        if fn.endswith(".gx2dbg.log"):
+            continue                       # Step 5.1a coverage probe, not a
+                                            # renderer capture - has its own
+                                            # (much wider) column layout, and
+                                            # every gx capture writes one now
+                                            # that GX2DBG is mandatory, so
+                                            # this used to fire rarely (only
+                                            # under the old profile2dbg mode)
+                                            # and now fires on every gx run
         base = fn[:-4]
         if "_" not in base:
             continue
