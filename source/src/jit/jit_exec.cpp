@@ -319,6 +319,50 @@ u32 jitRunArm7()
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
 	}
+	// TODO item 5: ARM7 counterpart of the ARM9 "why didn't this chain?"
+	// classification below (jitRunArm9(), same #ifdef). ARM7 chains are
+	// shorter than ARM9's (NOTES.md Step 5): this answers whether that's
+	// dynamic-exit-heavy control flow (BX/POP{pc}/hi-reg branches -- nothing
+	// to fix, the target genuinely isn't known at compile time), quota
+	// trips (JIT_YIELD_NUMBER -- chains are fine, just capped), or the same
+	// slot-eviction/dontJIT/SMC edges ARM9 sees (cache-pressure family,
+	// already addressed for ARM9 by 2-way associativity -- item 4). Slot
+	// classification mirrors jitRunArm9() exactly: resident=should have
+	// chained in (bug), other=hash-collision evicted the target, empty=
+	// first visit/arena churn, dontJIT=hit the real ARM7 emitter-coverage
+	// ceiling (item 6), smc=recompile due.
+	{
+		static u64 s_disp = 0, s_edge = 0, s_slotResident = 0, s_slotOther = 0,
+		           s_slotEmpty = 0, s_slotDontJit = 0, s_slotSmc = 0,
+		           s_yield = 0, s_edgeShort = 0, s_lastRep = 0;
+		s_disp++;
+		if (r.instructions != 0 && !r.bailedOut && !r.smcHit) {
+			s_edge++;
+			if (r.cycles >= JIT_YIELD_NUMBER) s_yield++;
+			if (r.instructions < 4)           s_edgeShort++;
+			u32 tpc = r.nextPC & ~1u;
+			u32 idx = jitHashPC(tpc);
+			const BasicBlock& sl = jitCacheArm7.debugSlot(idx);
+			if      (sl.startPC == 0)      s_slotEmpty++;
+			else if (sl.startPC != tpc)    s_slotOther++;
+			else if (sl.execute != 0)      s_slotResident++;
+			else if (sl.insnCount() == 1)  s_slotDontJit++;
+			else                           s_slotSmc++;
+		}
+		if (s_disp - s_lastRep >= 500000) {
+			s_lastRep = s_disp;
+			FILE* f = fopen("sd:/jit.log", "a");
+			if (f) { fprintf(f, "[jit] a7 edge: edge=%llu (%llu%% of disp) | slot: resident=%llu other=%llu"
+			                 " empty=%llu dontJIT=%llu smc=%llu | short(<4)=%llu quota=%llu\n",
+			                 (unsigned long long)s_edge,
+			                 (unsigned long long)(s_disp ? s_edge * 100 / s_disp : 0),
+			                 (unsigned long long)s_slotResident, (unsigned long long)s_slotOther,
+			                 (unsigned long long)s_slotEmpty, (unsigned long long)s_slotDontJit,
+			                 (unsigned long long)s_slotSmc,
+			                 (unsigned long long)s_edgeShort, (unsigned long long)s_yield);
+			         fclose(f); }
+		}
+	}
 #endif
 
 	// A block that made zero forward progress (bailed on its first instruction)

@@ -17,6 +17,7 @@
 
 #include <malloc.h>
 #include <string.h>
+#include <stdio.h>
 #include <ogc/cache.h>
 
 // The JIT heap canary + "minefield" poison-block checks are heap-corruption

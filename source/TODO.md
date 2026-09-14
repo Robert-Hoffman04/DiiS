@@ -42,12 +42,30 @@
    same-PC ISA-mode-flip re-registrations, not hash weakness) - essentially
    total elimination of the structural hot-bucket thrash Step 5's follow-up
    identified. See jit/NOTES.md and tools/benchmark/assoc-ab.sh. Committed.
-5. [ ] Longer ARM7 JIT block chains - instrument why ARM7 chains break
-   (bailedOut / dynamic-exit / IRQ-check / quota, split by core) to see if
-   some exits are staticly chainable.
-6. [ ] Shrink the ARM7 uncompilable-PC set - capture dontJIT top: PCs
+5. [x] Longer ARM7 JIT block chains - instrumented why chains break (added
+   the ARM9-side DESMUME_JIT_TRACE_FIRST "why didn't this chain?" slot
+   classification to jitRunArm7() too, split by core). 180s in-game SM64DS
+   soak result: hash-collision/cache-pressure slot eviction is now a
+   non-factor on both cores (item 4 confirmed from the chain angle too).
+   When a chain DOES end cleanly ("edge": 64% of ARM7 dispatches, 17% of
+   ARM9), the next PC is essentially always (~99.9%) already a dontJIT
+   marker - not staticly chainable without item 6 first. Bigger finding:
+   most round-trips are NOT clean edges - ~33% of ARM7 and ~83% of ARM9
+   dispatches return via a mid-chain deferred-bailout guard trip (a
+   predicated instruction resolving opposite to its compiled fast-path
+   assumption), previously uninstrumented. See jit/NOTES.md Step 6. Real
+   fix (compile both predicate outcomes) is a new, larger, separately-scoped
+   project - see item 12. Also fixed a pre-existing missing
+   `#include <stdio.h>` in jit_trace.cpp (DESMUME_JIT_TRACE_FIRST alone
+   failed to build without it). Committed.
+6. [ ] Shrink the ARM7+ARM9 uncompilable-PC set - capture dontJIT top: PCs
    (likely predicated LDR/STR) and widen the emitter for the top offenders;
-   2289 marker re-hits/frame is the largest single ARM7 cost.
+   2289 marker re-hits/frame is the largest single ARM7 cost, and per item 5
+   this now matters for ARM9 too (99.8% of its clean chain-exits land on a
+   dontJIT marker). Needs a soak from a COLD JIT cache (flush/restart) to
+   catch the "dontJIT tot=... top:" opcode dump, which only fires on a fresh
+   zero-length compile - a mid-soak capture missed it (markers were already
+   cache-resident).
 
 ## Known bugs / unfinished features tracked in memory
 7. [ ] GX2DBG SUB-screen affine-BG bug - ghosting/grey-grid artifacts on the
@@ -63,3 +81,12 @@
 11. [ ] After ARM9 hash-collision work lands, scope the next investigation:
     ARM9 JIT-exec (~4.25 ms/f) and the 2D compositor (~5 ms/f) become the
     real remaining frame-time levers.
+12. [ ] New from item 5's investigation: real conditional-execution support
+    in the JIT - compile a path for both predicate outcomes (or a compiled,
+    not interpreted, fallback for a predicate miss) instead of always
+    bailing to the interpreter on a deferred-bailout guard trip. This is
+    what actually lengthens chains (~33% of ARM7 / ~83% of ARM9 dispatches
+    currently end this way) - substantially bigger and riskier than items
+    1-4 (touches the condition-check emitter for every predicated opcode on
+    both fronts, ARM and THUMB). Needs its own scope discussion before
+    starting - do not start unprompted.

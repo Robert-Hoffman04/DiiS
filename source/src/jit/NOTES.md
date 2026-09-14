@@ -581,3 +581,95 @@ of that is genuine work):
 3. **Cheap:** demote any block that makes zero forward progress on N
    consecutive entries, not just `insnCount() == 1` blocks (Step 4). Converts
    ~600 failed dispatches/frame into marker re-hits. ~0.2-0.4 ms/f.
+
+## Step 6 -- why do ARM7 (and ARM9) chains break? (TODO item 5)
+
+Item (1) above asked for `r.bailedOut` / dynamic-exit / IRQ-check / quota
+telemetry per dispatch, split by core. Added a `DESMUME_JIT_TRACE_FIRST`
+classification block to `jitRunArm7()` mirroring the one that already existed
+in `jitRunArm9()` (jit_exec.cpp): of every dispatch that reaches
+`ExecuteJITTrace` and returns with `r.instructions != 0 && !r.bailedOut &&
+!r.smcHit` (a genuine "edge" -- dynamic exit, quota trip, or block-table end,
+as opposed to a mid-chain guard bail), classify the block-table slot sitting
+at the resume PC (`resident` / `other` / `empty` / `dontJIT` / `smc`) plus
+whether the exit was a quota trip (`r.cycles >= JIT_YIELD_NUMBER`) or a short
+chain (`r.instructions < 4`).
+
+Ran a 180s in-game SM64DS soak (autoload savestate, `-DDESMUME_JIT_TRACE_FIRST
+-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_FORCE_GX2DBG`) and captured
+`sd:/jit.log`. Also had to add a missing `#include <stdio.h>` to
+`jit_trace.cpp` -- `DESMUME_JIT_TRACE_FIRST` alone (without
+`JIT_CORE_COST_HISTO`, which pulls in an ogc header that happens to drag
+`<cstdio>` in transitively) failed to build; pre-existing gap, fixed alongside.
+
+### The "edge" (clean-exit) breakdown
+
+Last window of the soak, per-core:
+
+| | ARM7 | ARM9 |
+|---|---:|---:|
+| edge exits, as % of ExecuteJITTrace calls | **64%** | **17%** |
+| -- of those, next-PC slot is `dontJIT` | **99.98%** | **99.8%** |
+| -- of those, next-PC slot is `resident`/`other` (cache pressure) | ~0% | ~0.01% |
+| -- of those, `empty` (first visit / flush) | ~0.02% | ~0.2% |
+| quota trips, as % of edges | ~5% | ~3.3% |
+| zero-progress bail0, as % of ExecuteJITTrace calls | ~3% | ~0.0004% |
+
+Two things fall out immediately:
+
+- **Hash-collision / cache-pressure slot eviction is now a non-factor for
+  chain breaks on both cores** (`other` is 0-687 hits against edge counts in
+  the millions) -- confirms item 4's 2-way associativity fix from the *chain*
+  angle as well as the eviction-count angle it was originally validated with.
+- **When an ARM7 or ARM9 chain *does* end cleanly, the very next instruction
+  is almost always already known to be uncompilable** (a resident `dontJIT`
+  marker). Static chaining across that boundary is not possible without first
+  shrinking the uncompilable-PC set (item 6) -- there's no "guard too strict /
+  self-patch not sticking" bug to fix here, the target genuinely can't be
+  compiled today.
+
+### The bigger finding: most round-trips are NOT clean edges
+
+The "edge" percentages above (64% ARM7, 17% ARM9) are of *all* dispatches,
+and bail0 is negligible on both cores (3% / ~0%) -- so the remainder,
+**~33% of ARM7 dispatches and ~83% of ARM9 dispatches, return with
+`r.bailedOut == 1` and `r.instructions != 0`**: a mid-chain deferred-bailout
+guard tripped (`JitTraceCtx::registerBailout` / the per-instruction predicate
+check jit_arm.cpp/jit_thumb.cpp emit for every predicated ARM/THUMB
+instruction the front end *does* compile), not a block-table-end or dynamic
+exit at all.
+
+This is a different, previously uninstrumented root cause from anything in
+Step 5's list, and for ARM9 it is the dominant one by a wide margin: most
+ARM9 chain terminations are a predicated instruction (Bcc/data-processing/
+LDR-STR-with-S-bit-style condition check) resolving the *opposite* way from
+whatever the compiled fast path assumed, not the chain reaching a real
+boundary. Combined with item 6's `dontJIT` set (predicated LDR/STR that can't
+be compiled *at all*), the picture is consistent: **conditional execution is
+the ARM7/ARM9 JIT's central coverage gap**, at two severities -- fully
+uncompilable (dontJIT, item 6) and compiled-but-guarded (deferred bailout,
+this section).
+
+**What would actually lengthen chains**, in priority order:
+1. Item 6 (shrink the `dontJIT` set) still stands and now matters for ARM9
+   too, not just ARM7 -- the `dontJIT tot=... top:` opcode capture in
+   `jit_trace.cpp` (fires on a *fresh* zero-length compile) didn't trigger in
+   this run because the markers were already cache-resident from earlier in
+   the soak; a longer soak from a *cold* JIT cache (flush first, or capture
+   from process start) is needed to get the top-offender opcode list.
+2. **New, larger project (not scoped for this pass):** real conditional-
+   execution support -- compile both predicate outcomes (or the common
+   AL/never-taken fast path plus a compiled, not interpreted, fallback for
+   the guard) instead of always bailing to the interpreter on a predicate
+   miss. This is what would move the ~33%/~83% guard-bail share into chained
+   execution. Substantially bigger and riskier than items 1-4 (touches the
+   condition-check emitter for every predicated opcode); needs its own scope
+   discussion before starting.
+3. Quota trips are a minor factor on both cores (~3-5% of edges) --
+   raising `JIT_YIELD_NUMBER` would help only that slice and risks longer
+   uninterruptible stretches (IRQ latency); not worth pursuing on its own.
+
+See `tools/benchmark` scratch capture pattern (mcopy the autoload-savestate
+ROM+state, run, `mcopy` back `sd:/jit.log`, `grep -a "a7 edge:"` / `"a9
+edge:"`) -- not checked in as a script since it's a one-shot diagnostic
+capture, not an A/B.
