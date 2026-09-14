@@ -97,6 +97,10 @@ gecko_send()  { [ -n "${GECKO_FD:-}" ] || return 1; printf '%s' "$1" >&"$GECKO_F
 # tap a button: send the byte, wait (button auto-releases after GECKO_TAP_FRAMES)
 gecko_tap() { gecko_send "$1"; sleep "${2:-0.2}"; }
 
-# GC D-pad Down (byte 'd') is the desmumewii runtime GXMerge on/off toggle
-# (main.cpp DSExec:  pad & PAD_BUTTON_DOWN  ->  GXMerge_SetEnabled toggle).
-merge_toggle() { gecko_send d; sleep 2; }
+# NOTE: there used to be a merge_toggle() here (GC D-pad Down -> runtime
+# GXMerge_SetEnabled toggle in main.cpp DSExec). GXMerge/GX2DBG compositing
+# is now mandatory whenever the GX core runs - main.cpp has no runtime
+# toggle left to send 'd' to, so this helper (and tools/vsd-testrom/
+# harness/abtoggle.sh, which only existed to drive it) were removed rather
+# than kept as dead code that would silently produce false-positive
+# ON/ON diffs.

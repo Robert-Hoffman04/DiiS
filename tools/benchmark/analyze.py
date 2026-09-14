@@ -31,11 +31,14 @@ import argparse
 import statistics
 
 TARGET_HZ = 59.8261
-MODE_LABEL = {"sw": "software rasterizer", "gx": "GX hardware 3D", "merge": "GXMerge sandwich",
+# GXMerge/GX2DBG compositing is mandatory whenever the GX core runs, so
+# there is no separate "merge" build to isolate anymore (removed, not kept
+# as an alias - see tools/benchmark/README.md).
+MODE_LABEL = {"sw": "software rasterizer", "gx": "GX hardware 3D + GXMerge",
               "jitoff": "ARM7 interpreter", "jiton": "ARM7 JIT",
               "jit9off": "ARM9 interpreter", "jit9on": "ARM9 JIT",
               "jitfull": "full JIT (GXMerge)"}
-MODE_ORDER = ["sw", "gx", "merge", "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
+MODE_ORDER = ["sw", "gx", "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
 REGRESSION_REL = 0.03   # >3% relative eff_fps drop vs baseline -> flag
 
 

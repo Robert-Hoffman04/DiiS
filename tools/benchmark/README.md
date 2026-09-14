@@ -7,14 +7,25 @@ run so a change's perf cost is visible.
 | dol | renderer | build defines |
 |---|---|---|
 | `bench_sw`      | all-CPU software rasterizer            | `DESMUME_FORCE_CORE=2` |
-| `bench_gx`      | stock GX hardware 3D                   | `DESMUME_FORCE_CORE=1` |
-| `bench_merge`   | GXMerge 3-draw sandwich                | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` |
+| `bench_gx`      | GX hardware 3D + GXMerge/GX2DBG        | `DESMUME_FORCE_CORE=1` |
 | `bench_jitoff`  | ARM7 interpreter (JIT A/B baseline)    | `DESMUME_FORCE_CORE=2` |
 | `bench_jiton`   | ARM7 JIT (JIT A/B)                     | `DESMUME_FORCE_CORE=2` + `DESMUME_JIT_ARM7` |
 | `bench_jit9off` | ARM9 interpreter (JIT A/B baseline)    | `DESMUME_FORCE_CORE=2` |
 | `bench_jit9on`  | ARM9 JIT (JIT A/B)                     | `DESMUME_FORCE_CORE=2` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
-| `bench_jitfull` | full JIT (ARM7 + ARM9) over GXMerge    | `DESMUME_FORCE_CORE=1` + `DESMUME_FORCE_GXCOMPOSITE` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
+| `bench_jitfull` | full JIT (ARM7 + ARM9) over GXMerge    | `DESMUME_FORCE_CORE=1` + `DESMUME_JIT_ARM7` + `DESMUME_JIT_ARM9_ON` |
 | `bench_profile` | `jitfull` + per-zone frame-time breakdown | ...as `jitfull` + `DESMUME_PERFZONES` |
+
+**GXMerge/GX2DBG compositing is mandatory whenever the GX core runs**
+(`source/src/main.cpp`, tied 1:1 to `DESMUME_FORCE_CORE=1` /
+`current3Dcore==1`) — there is no build flag or runtime switch left to get
+"stock GX hardware 3D + CPU 2D compositor" as a separate configuration, so
+`bench_gx` already includes it. The old `bench_merge`/`bench_profile2dbg`
+modes, which used to build that config separately via
+`DESMUME_FORCE_GXCOMPOSITE`/`DESMUME_FORCE_GX2DBG`, are **removed** (not kept
+as aliases) - those flags no longer gate anything in the source, so building
+a second dol under a different mode name would just be a duplicate. Any old
+result directory or script still referencing `merge`/`profile2dbg` predates
+this and should be treated as `gx`/`profile`.
 
 The `jit*off`/`jit*on` pairs deliberately keep the software rasterizer fixed so
 the only delta between the two builds is the CPU core under test. `jitfull`

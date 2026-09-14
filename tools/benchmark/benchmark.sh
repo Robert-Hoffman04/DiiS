@@ -8,18 +8,26 @@
 # results.json + report.md and diffs against the previous run.
 #
 #   bench_sw     software rasterizer    DESMUME_FORCE_CORE=2
-#   bench_gx     GX hardware 3D         DESMUME_FORCE_CORE=1
-#   bench_merge  GXMerge sandwich       DESMUME_FORCE_CORE=1 + DESMUME_FORCE_GXCOMPOSITE
+#   bench_gx     GX hardware 3D +       DESMUME_FORCE_CORE=1
+#                GXMerge/GX2DBG         (GXMerge/GX2DBG compositing is
+#                                       mandatory whenever the GX core runs -
+#                                       source/src/main.cpp has no build flag
+#                                       or runtime switch left to get "stock
+#                                       GX 3D + CPU 2D compositor" as a
+#                                       separate config, so there is no
+#                                       distinct "merge" mode anymore - it was
+#                                       removed, not aliased, to keep this
+#                                       matrix from carrying duplicate builds.)
 #   bench_jitoff ARM7 interpreter       DESMUME_FORCE_CORE=2, no JITDEFS (P5 A/B baseline)
 #   bench_jiton  ARM7 JIT               DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
 #   bench_jit9off ARM9 interpreter      DESMUME_FORCE_CORE=2, no JITDEFS (A3 baseline)
 #   bench_jit9on  ARM9 JIT              DESMUME_FORCE_CORE=2 + DESMUME_JIT_ARM7
 #                                       + DESMUME_JIT_ARM9_ON (jitArm9Enabled=true)
-#   bench_jitfull full JIT + GXMerge    DESMUME_FORCE_CORE=1 + DESMUME_FORCE_GXCOMPOSITE
-#                                       + DESMUME_JIT_ARM7 + DESMUME_JIT_ARM9_ON
-#                                       (both cores JIT'd, real GXMerge renderer
-#                                       instead of the sw core used by the A/B pairs
-#                                       above - "how fast is it for real" number)
+#   bench_jitfull full JIT + GXMerge    DESMUME_FORCE_CORE=1 + DESMUME_JIT_ARM7
+#                                       + DESMUME_JIT_ARM9_ON (both cores JIT'd,
+#                                       real GXMerge renderer instead of the sw
+#                                       core used by the A/B pairs above - "how
+#                                       fast is it for real" number)
 #
 # Prerequisites:
 #   - devkitPPC toolchain           (DEVKITPPC / DEVKITPRO in the environment)
@@ -34,7 +42,7 @@
 #     --no-build           reuse tools/benchmark/dols/*.dol
 #     --clean              `make clean` before the first build
 #     --duration N         seconds per run          (default 90; scenes.conf 'dur=' wins)
-#     --modes "sw gx"      subset of renderers      (default "sw gx merge";
+#     --modes "sw gx"      subset of renderers      (default "sw gx";
 #                          also available: jitoff jiton jit9off jit9on jitfull
 #                          profile [= jitfull + perf_zones frame-time breakdown])
 #     --scenes "vsd ph"    subset of scene ids from scenes.conf
@@ -56,7 +64,7 @@ export DEVKITPRO DEVKITPPC MTOOLS_SKIP_CHECK=1
 TARGET=desmumewii
 DOLDIR="$HERE/dols"
 DUR_DEFAULT=90
-MODES="sw gx merge"
+MODES="sw gx"
 SCENE_FILTER=""
 DO_BUILD=1 DO_CLEAN=0 COMPARE_ARG=""
 
@@ -93,8 +101,10 @@ defs_for() {
 	local base="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_AUTOLOADSTATE"
 	case "$1" in
 		sw)     echo "$base -DDESMUME_FORCE_CORE=2" ;;
+		# GXMerge/GX2DBG compositing is mandatory whenever the GX core runs
+		# (source/src/main.cpp) - DESMUME_FORCE_CORE=1 is the only knob left,
+		# there is no separate flag to add.
 		gx)     echo "$base -DDESMUME_FORCE_CORE=1" ;;
-		merge)  echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
 		# ARM7 JIT A/B (P5): same renderer (sw) as the "sw" baseline so any
 		# delta is purely the ARM7 core, not a renderer swap.
 		jitoff) echo "$base -DDESMUME_FORCE_CORE=2" ;;
@@ -104,12 +114,10 @@ defs_for() {
 		jit9on)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
 		# Full JIT: both cores JIT'd, GXMerge doing the actual compositing -
 		# not an A/B baseline, this is the "real" fast-path configuration.
-		jitfull) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
+		jitfull) echo "$base -DDESMUME_FORCE_CORE=1" ;;
 		# Same config as jitfull, plus the perf_zones frame-time accountant
 		# (dumps sd:/perfzones.log). "where does the full-JIT frame go" mode.
-		profile) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE" ;;
-		# profile + the Step 5.1a MAIN-text-BG-on-GX path armed at boot.
-		profile2dbg) echo "$base -DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_GXCOMPOSITE -DDESMUME_FORCE_GX2DBG" ;;
+		profile) echo "$base -DDESMUME_FORCE_CORE=1" ;;
 		*)      die "unknown mode '$1'" ;;
 	esac
 }
@@ -123,7 +131,6 @@ jitdefs_for() {
 		jit9on)  base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		jitfull) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		profile) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_PERFZONES" ;;
-		profile2dbg) base="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DDESMUME_PERFZONES" ;;
 		*)       base="" ;;
 	esac
 	# BENCH_EXTRA_JITDEFS: append experimental JIT flags to every JIT mode without
@@ -247,7 +254,8 @@ run_one() {
 		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.perfzones.log") perfzone rows"
 		mdel -i "$DOLPHIN_SD" ::/perfzones.log 2>/dev/null || true
 	fi
-	# Step 5.1a 2D-BG-on-GX coverage probe (only a profile2dbg build writes it)
+	# Step 5.1a 2D-BG-on-GX coverage probe (every GX-core build writes it now -
+	# GX2DBG is mandatory whenever DESMUME_FORCE_CORE=1)
 	if mcopy -i "$DOLPHIN_SD" ::/gx2dbg.log "$RUNDIR/raw/${scene}_${mode}.gx2dbg.log" 2>/dev/null; then
 		echo "   captured $(grep -c ',' "$RUNDIR/raw/${scene}_${mode}.gx2dbg.log") gx2dbg rows"
 		mdel -i "$DOLPHIN_SD" ::/gx2dbg.log 2>/dev/null || true

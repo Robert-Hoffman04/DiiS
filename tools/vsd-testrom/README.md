@@ -59,7 +59,8 @@ OBJ1 = blue    prio 2   BEHIND the 3D, over the checker (behind bucket)
 | `MT_MASTERBRIGHT` | drive `MASTER_BRIGHT` bright-down (fade-to-black, factor 8) over the whole main screen - exercises the Phase-3 per-band GX brightness pass (`GXMerge` draw 4). The CPU `GPU_RenderLine_MasterBrightness` pass is suppressed for merged lines; merge ON should match `ds_sw`'s faded output within RGB8-vs-RGB555 precision. Built as `merge_mbright.nds`. |
 | `MT_MB_SPLIT` | with `MT_MASTERBRIGHT`: an HBlank IRQ rewrites the factor at scanline 96 (top half factor 8, bottom half factor 14), forcing a 2-band brightness split. Built as `merge_mbsplit.nds`. |
 
-**Status:** renders correctly under `ds_sw`, `ds_gx` and `ds_merge`. The GX-core
+**Status:** renders correctly under `ds_sw` and `ds_gx` (the latter always
+includes what used to be the separate `ds_merge` build). The GX-core
 stall that used to wedge this ROM before `MT READY` is **fixed** (plan Phase 5
 Symptom B - a six-bug chain in `GXRender.cpp`); `ds_mergedbg` now shows the merge
 status marker **green** (reason 0) and the sandwich renders the scene
@@ -80,18 +81,21 @@ Drives the flatpak Dolphin build; input over the USB Gecko serial (below). Paths
 flatpak layout; override `DOLPHIN_DATA`, `DOLPHIN_SD`, `DOL_DIR`, `WIN_NAME` (see
 `harness/common.sh`). Put the desmumewii `.dol` builds under `$DOL_DIR` (default
 `$DOLPHIN_DATA/mergetest`): `ds_sw` (`-DDESMUME_FORCE_CORE=2`), `ds_gx`
-(`-DDESMUME_FORCE_CORE=1`), `ds_merge` (`... -DDESMUME_FORCE_GXCOMPOSITE`),
-`ds_mergedbg` (`... -DGXMERGE_DEBUG`).
+(`-DDESMUME_FORCE_CORE=1`), `ds_mergedbg` (`... -DGXMERGE_DEBUG`).
+
+GXMerge/GX2DBG compositing is mandatory whenever the GX core runs (no build
+flag or runtime toggle left to disable it - see `source/src/main.cpp`), so
+`ds_gx` **is** what `ds_merge` used to be; a separate `ds_merge` build with
+`-DDESMUME_FORCE_GXCOMPOSITE` would be byte-identical to `ds_gx` and isn't
+built anymore. `abtoggle.sh`, which A/B'd merge-ON vs merge-OFF by flipping
+the old runtime toggle (GC D-pad Down -> `GXMerge_SetEnabled`) mid-session,
+is likewise **removed** - that toggle no longer exists, so the script could
+only have produced a false-positive ON/ON comparison.
 
 ```sh
 harness/setrom.sh   out/vsd_det.nds        # -> sd:/DS/ROMS/test.nds
 harness/dettest.sh  ds_mergedbg            # frame-to-frame stability (want AE=0)
-harness/abtoggle.sh ds_merge              # merge ON/OFF in ONE session, diff
 ```
-
-`abtoggle.sh` flips the runtime toggle (GC D-pad Down -> `GXMerge_SetEnabled`)
-without relaunching, so `abt_1_mergeON.png` vs `abt_2_mergeOFF.png` is a clean
-comparison at constant window geometry.
 
 `ds_mergedbg` draws a corner marker on the MAIN screen: **green** = the sandwich
 drew this frame, **red** = fell back to legacy; a coloured cell to its right
@@ -121,7 +125,7 @@ Wire protocol (one byte per event, case-sensitive; whitespace ignored):
 | `u` `d` `l` `r` | D-pad U/D/L/R | D-pad (`r` = SELECT) |
 | `z` | Z trigger | touch-screen tap |
 | `L` `R` | L / R triggers | L / R |
-| `d` | D-pad Down | **also toggles `GXMerge_SetEnabled` (emulator-level)** |
+| `d` | D-pad Down | D-pad Down only (no longer also toggles `GXMerge_SetEnabled` - that runtime toggle was removed; GXMerge/GX2DBG is mandatory on the GX core now) |
 
 Each byte "taps" the button for `GECKO_TAP_FRAMES` (~6) frames then auto-releases;
 resend to repeat (`ddddd` = five downs).
@@ -138,8 +142,9 @@ shift - legacy `srgb(0,33,0)` vs merge `srgb(0,0,0)` on the room's "black" texel
 (24 225 px, `R:0 G:24225 B:0`). Gating the hooks on `GXMerge_FrameArmed()` /
 `GXMerge_HasPresentFrame()`, and checking `dispMode`/capture *before* the "no 3D
 this frame" early-out in `GXMerge_FrameMergeable`, makes an un-armed frame
-byte-identical to legacy. `abtoggle.sh ds_merge` on `vsd_det.nds` -> **AE = 0** on
-all four comparisons.
+byte-identical to legacy. Verified at the time via `abtoggle.sh ds_merge` on
+`vsd_det.nds` -> **AE = 0** on all four comparisons (historical result -
+`abtoggle.sh` and the runtime toggle it drove are since removed, see above).
 
 **Pre-existing GX-core issues (not merge-related), tracked as Phase 5 of the plan:**
 - the VSD room texture renders as a hard checker under both GX paths vs a smooth
