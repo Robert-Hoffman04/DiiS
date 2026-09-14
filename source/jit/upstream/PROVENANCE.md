@@ -22,7 +22,7 @@ Files:
 | `Profiler.{h,cpp}`     | `source/vba/gba/Profiler.{h,cpp}` |
 
 **Nothing in this `upstream/` directory is compiled.** It is a frozen reference
-copy so the DeSmuMEWii port in `source/src/jit/` can be diffed against its
+copy so the DeSmuMEWii port in `source/jit/` can be diffed against its
 origin. The compiled port files (`jit_*.{h,cpp,S}` one level up) are derived
 from these and carry their own headers noting the port.
 

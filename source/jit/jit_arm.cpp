@@ -434,17 +434,14 @@ void emitAlu(JitTraceCtx& ctx, u8 aluOp, bool S, bool testOnly, bool isLogical,
 // `ADD pc,pc,rN` jump tables and the like -- a real block-length win in
 // function-return-heavy ARM code. Block terminator.
 //
-// TODO item 6 (jit/NOTES.md Step 7): the register-form `ADD/SUB pc,pc,Rm{,shift}`
-// jump-table shape used to bail here despite the comment above claiming to
-// cover it -- only the immediate-operand2 form (`ADD/SUB pc,#k`, below) special-
-// cased rn==15. Widened: rn==15 is now allowed through for ADD/SUB (the only
-// aluOps a real jump table uses pc as the base for) by materializing
-// currentPC+8 into a scratch host reg (PPC_R9 -- unused elsewhere in this translation
-// unit, and chosen deliberately to survive emitOp2's R8/R11/R12 scratch use)
-// instead of trying to "read" a live PC guest register. Rm is still a runtime
-// value (the table index), so this is still a dynamic exit, not a static one --
-// no new differential-testing risk from a wrong compile-time target, just one
-// fewer trampoline round-trip per jump-table dispatch.
+// The register-form `ADD/SUB pc,pc,Rm{,shift}` jump-table shape is also
+// covered, alongside the immediate-operand2 form below: rn==15 is allowed
+// through for ADD/SUB (the only aluOps a real jump table uses pc as the base
+// for) by materializing currentPC+8 into a scratch host reg (PPC_R9 --
+// unused elsewhere in this translation unit, and chosen deliberately to
+// survive emitOp2's R8/R11/R12 scratch use) instead of trying to "read" a
+// live PC guest register. Rm is still a runtime value (the table index), so
+// this is still a dynamic exit, not a static one.
 void emitDataProcToPc(JitTraceCtx& ctx, u32 op)
 {
 	const bool immForm   = (op >> 25) & 1;
@@ -1271,11 +1268,10 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 // The state flush is UNCONDITIONAL and sits *before* the predication guard, so
 // guest memory is coherent on both the taken exit and the cond-false path, and
 // invalidateRegCache() on the fall-through makes later instructions reload from
-// it. The reverted first attempt (c375880 -> 5d00119) put the flush inside the
-// taken region: flushDirtyRegisters() cleared the compile-time dirty bits while
-// its stores were branched over on cond-false, so a guest reg written before
-// the BXcc and spilled later lost its value -> SM64DS free-run hang. Same fix
-// as the predicated LDR/STR family (b81fa91).
+// it. Do not move the flush inside the taken region: flushDirtyRegisters()
+// would clear the compile-time dirty bits while its stores are branched over
+// on cond-false, losing a guest reg written before the BXcc and spilled
+// later. Same requirement as the predicated LDR/STR family.
 void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 {
 	const u8 rm = op & 0xF;
@@ -1809,18 +1805,13 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
 		const bool isBlx = (op & 0x20u) != 0;
 		if (isBlx && !v5) { ctx.endBlock = true; return; }   // BLX reg: ARMv5 only
-		// Predicated: `BXcc lr` (the conditional return -- TODO item 6's
-		// single hottest dontJIT opcode, 012fff1e/BXEQ lr) gets the
-		// taken-exit + cond-false fall-through path on EITHER core. This was
-		// originally gated to ARM9/v5 (comment used to say "only on ARM9"),
-		// but nothing in emitBranchExchange()'s guarded-dispatch mechanism
-		// (emitEvalCond / dynamic exit / CPSR.T bit-0 interworking) is a v5
-		// feature -- predicated execution applies to every ARM instruction
-		// back to ARMv4T, so ARM7's BXcc lr qualifies too. Widened once the
-		// dontJIT capture showed BXEQ lr re-hitting the ARM7 front end just
-		// as hard as it used to on ARM9 pre-fix. Other predicated BX
-		// (polymorphic Rm) and all predicated BLX still bail (isBlx is
-		// genuinely ARMv5-only via the check above).
+		// Predicated: `BXcc lr` (the conditional return) gets the taken-exit +
+		// cond-false fall-through path on EITHER core -- nothing in
+		// emitBranchExchange()'s guarded-dispatch mechanism (emitEvalCond /
+		// dynamic exit / CPSR.T bit-0 interworking) is ARMv5-specific;
+		// predicated execution applies to every ARM instruction back to
+		// ARMv4T. Other predicated BX (polymorphic Rm) and all predicated BLX
+		// still bail (isBlx is genuinely ARMv5-only via the check above).
 		if (cond != COND_AL && (isBlx || (op & 0xF) != 14)) { ctx.endBlock = true; return; }
 		emitBranchExchange(ctx, op, isBlx, cond);
 		return;

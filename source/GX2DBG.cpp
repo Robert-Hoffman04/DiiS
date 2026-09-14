@@ -386,14 +386,14 @@ void GX2DBG_ObjFrameUpdate(GPU *gpu)
 	// bails, exactly as it would once it reached the OBJ check.
 	if (!s_bakeGo[e]) { s_objGXable[e] = false; return; }
 
-	// Frame-level early-out.  A BLDCNT colour effect no longer disqualifies the
-	// whole engine (§5.1a blend): the sprite pass draws opaque quads, which is
-	// still correct as long as OBJ itself isn't a blend target - if OBJ is a 1st
-	// or 2nd target the per-pixel blend against the layer beneath is genuinely
-	// per-pixel, so fall back.  §5.3-2: rectangular WIN0/WIN1 no longer
-	// disqualify - the OBJ window bit is applied by the replay as a per-band,
-	// per-segment scissor.  WINOBJ (irregular) still disqualifies.  Semi-
-	// transparent sprites are caught per-entry in the scan loop below.
+	// Frame-level early-out.  A BLDCNT colour effect does not disqualify the
+	// whole engine: the sprite pass draws opaque quads, which is still correct
+	// as long as OBJ itself isn't a blend target - if OBJ is a 1st or 2nd
+	// target the per-pixel blend against the layer beneath is genuinely
+	// per-pixel, so fall back.  Rectangular WIN0/WIN1 do not disqualify either
+	// - the OBJ window bit is applied by the replay as a per-band, per-segment
+	// scissor.  WINOBJ (irregular) still disqualifies.  Semi-transparent
+	// sprites are caught per-entry in the scan loop below.
 	const u16 bld = gpu->BLDCNT;
 	const bool objInBlend = ((bld >> 6) & 3) != 0 && (bld & 0x1010) != 0;
 	if (objInBlend || gpu->WINOBJ_ENABLED) {

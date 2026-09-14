@@ -17,9 +17,9 @@ include $(DEVKITPPC)/wii_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
-SOURCES		:=	source/src source/src/metaspu \
-				source/src/addons source/src/utils source/src/gekko_utils \
-				source/src/jit source/src/harness
+SOURCES		:=	source source/metaspu \
+				source/addons source/utils source/gekko_utils \
+				source/jit source/harness
 DATA		:=	data  
 INCLUDES	:=
 
@@ -41,7 +41,7 @@ OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizati
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 
 # JITDEFS: empty by default. Pass  make JITDEFS=-DDESMUME_JIT_ARM7  to compile
-# the ARM7 trace-JIT infrastructure in source/src/jit/ (see
+# the ARM7 trace-JIT infrastructure in source/jit/ (see
 # desmumewii-arm7-jit-plan.md). Not yet wired into execution. Toggling this
 # needs a  make clean  -- the flag is not tracked in the dependency files.
 JITDEFS     ?=
@@ -100,7 +100,7 @@ endif
 export OFILES	:=	$(addsuffix .o,$(BINFILES)) \
 					$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) \
 					$(sFILES:.s=.o) $(SFILES:.S=.o) \
-					$(CURDIR)/source/src/gekko_utils/ehcmodule.elf.o
+					$(CURDIR)/source/gekko_utils/ehcmodule.elf.o
 
 #---------------------------------------------------------------------------------
 # build a list of include paths

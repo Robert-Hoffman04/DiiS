@@ -16,10 +16,9 @@
  *   - registerBlock(): installs a freshly compiled (or intentionally
  *     null/"don't JIT this") block into its hash bucket, evicting whatever
  *     was there before and carefully unlinking the evicted block from the
- *     SMC registry first so no dangling pointer is left behind (this was
- *     the root cause of one strand of the original cold-boot bug).
+ *     SMC registry first so no dangling pointer is left behind.
  *   - flushCache(): resets the arena and block table, and re-emits the
- *     shared self-modifying linker stub fresh into the arena's start �
+ *     shared self-modifying linker stub fresh into the arena's start --
  *     every JIT exit branches into this one stub, which re-derives the
  *     hash bucket for the target PC and either patches the caller's branch
  *     directly to the target block (cache hit) or falls through to

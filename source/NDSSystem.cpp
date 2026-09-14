@@ -383,27 +383,19 @@ void GameInfo::populate()
 	}
 }
 
-// roadmap #20 (GBA compat), post-step-6 regression fix: NDS_LoadROM()'s own
-// GBA-routing peek below used to gate on the single GBATEK offset-0xB2 fixed
-// byte (0x96) alone. Real DS regression testing (tools/rockwrestler) found
-// that this single byte isn't decisive enough: RockWrestler's own hand-built
-// (non-ndstool) DS header happens to carry 0x96 at that exact offset too,
-// so the old check misrouted it into the GBA load path and it never booted
-// as DS content at all (confirmed by tracing a suddenly-permanent
-// -DDESMUME_ROCKWRESTLER_PROBE timeout with an untouched slot-2 result
-// buffer back to this exact branch). A real GBA cartridge's header also
-// always carries this fixed 156-byte Nintendo-logo bitmap at offset
-// 0x04..0x9F (GBATEK; the real GBA BIOS itself refuses to boot anything
-// that doesn't match it) -- checked byte-for-byte here against a real,
-// unmodified commercial dump (The Legend of Zelda: The Minish Cap (USA)),
-// not just CRC'd. Requiring the full logo match alongside the 0xB2 byte
-// (see the peek[] check below) is decisive enough that a legitimate DS
-// header colliding on both is not a realistic risk. Duplicated (documented,
-// not shared) from utils/decrypt/header.cpp's own DetectRomType(), which
-// carries the identical table and the same reasoning but isn't presently
-// compiled into this port's build (source/src/utils/decrypt/ isn't one of
-// the Makefile's SOURCES directories) -- kept in sync by comment, not by
-// linkage.
+// NDS_LoadROM()'s GBA-routing peek below requires both the GBATEK
+// offset-0xB2 fixed byte (0x96) AND this fixed 156-byte Nintendo-logo bitmap
+// at offset 0x04..0x9F (GBATEK; the real GBA BIOS itself refuses to boot
+// anything that doesn't match it, checked byte-for-byte against a real,
+// unmodified commercial dump: The Legend of Zelda: The Minish Cap (USA)).
+// The 0xB2 byte alone is not decisive -- a hand-built (non-ndstool) DS
+// header can carry 0x96 at that same offset -- so both checks must pass
+// (see the peek[] check below) before routing to the GBA load path.
+// Duplicated (documented, not shared) from utils/decrypt/header.cpp's own
+// DetectRomType(), which carries the identical table and reasoning but isn't
+// presently compiled into this port's build (source/utils/decrypt/ isn't
+// one of the Makefile's SOURCES directories) -- kept in sync by comment, not
+// by linkage.
 static const u8 GBA_LOGO[156] = {
 	0x24,0xFF,0xAE,0x51,0x69,0x9A,0xA2,0x21,0x3D,0x84,0x82,0x0A,0x84,0xE4,0x09,0xAD,
 	0x11,0x24,0x8B,0x98,0xC0,0x81,0x7F,0x21,0xA3,0x52,0xBE,0x19,0x93,0x09,0xCE,0x20,

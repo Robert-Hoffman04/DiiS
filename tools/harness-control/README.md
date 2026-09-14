@@ -12,7 +12,7 @@ concern, kept separate on purpose.
 | File | What it is |
 |---|---|
 | `common.sh` | The **one** copy of `dolphin_launch` / `dolphin_kill` / `gecko_*` / `shot` / `ae_diff`. `tools/vsd-testrom/harness/common.sh` and `tools/benchmark/lib.sh` both source this now instead of keeping their own copies. |
-| `wire.py` | Single source of truth for the §2 framed wire protocol (`magic \| version \| type \| len \| payload`, big-endian). Packet types, encoder, incremental `Decoder`, FRAME payload helpers. The device side (`source/src/harness/`) must stay byte-compatible with this. |
+| `wire.py` | Single source of truth for the §2 framed wire protocol (`magic \| version \| type \| len \| payload`, big-endian). Packet types, encoder, incremental `Decoder`, FRAME payload helpers. The device side (`source/harness/`) must stay byte-compatible with this. |
 | `wii_control.py` | The transport **server**. Listens on one TCP port (default 4300), same server whether the peer is Dolphin (network passthrough) or a real Wii on the LAN. Prints LOG, saves FRAME (PNG if Pillow is present, else raw `.bin`), records PROFILE, symbolicates CRASH, tallies ASSERT into the process exit code. Built-in watchdog (`--watchdog SECONDS`) sends `CTRL next_rom` on device silence. stdin line commands send INPUT / CTRL. |
 | `symbolicate.py` | Turns raw `0x8xxxxxxx` addresses from a CRASH into `<func+0xNN>` using the build's `-Wl,-Map` linker `.map`. Usable standalone. |
 | `launch.sh` | One entry point: `launch.sh dolphin <dol>` (headless Dolphin, network passthrough) or `launch.sh wiiload <dol>` (real `wiiload` transfer to `WIILOAD=tcp:<host>`). Sending/launching on a **physical** Wii still needs explicit per-run permission (plan §6.3). |

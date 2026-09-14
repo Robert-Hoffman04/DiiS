@@ -50,24 +50,16 @@ u64 g_jitPredBcc7  = 0;
 u64 g_jitPredBcc9  = 0;
 extern u64 g_jitSmcKills; // jit_cache.cpp -- real (non-empty-bucket) SMC invalidations
 
-// ---------------------------------------------------------------------------
-// Repeated-bail demotion (always on -- this is a real fix, not diagnostic
-// instrumentation). The existing bail-and-demote path below only registers a
-// permanent "don't JIT" marker for a block that is a lone terminator
-// (insnCount()==1): a BX/POP{pc} that immediately mispredicts. It does NOT
-// catch a compiled multi-instruction block that bails on its very first
-// instruction every single visit -- e.g. a 2-3 instruction IRQ-poll/spin-wait
-// whose entry instruction is a dynamic branch that resolves the same way
-// every time in practice. That block re-pays the full getBlock+trampoline
-// cost on every dispatch forever (confirmed on ARM7: ~18 distinct PCs,
-// ~600 hits/frame, jit/NOTES.md Step 4).
-//
-// Fix: track a small fixed-size table of "PC currently failing" per core; once
-// a PC racks up BAIL_DEMOTE_THRESHOLD consecutive zero-progress hits, demote
-// it the same way the length-1 path does, regardless of its compiled length.
-// A direct-mapped table (not a full LRU) is fine here -- collisions just delay
-// demotion by resetting the counter, never demote incorrectly.
-// ---------------------------------------------------------------------------
+// Repeated-bail demotion (always on). The bail-and-demote path below only
+// registers a permanent "don't JIT" marker for a lone-terminator block
+// (insnCount()==1) -- a BX/POP{pc} that immediately mispredicts. It misses a
+// compiled multi-instruction block whose first instruction bails every visit
+// (e.g. an IRQ-poll/spin-wait with a dynamic-branch entry), which then
+// re-pays the full getBlock+trampoline cost forever. This tracks a small
+// fixed-size "PC currently failing" table per core and demotes a PC the same
+// way once it racks up BAIL_DEMOTE_THRESHOLD consecutive zero-progress hits,
+// regardless of compiled length. Direct-mapped, not LRU: a collision only
+// delays demotion by resetting the counter, never demotes incorrectly.
 struct BailTrack { u32 pc; u8 count; };
 static BailTrack s_bailTrack7[64];
 static BailTrack s_bailTrack9[64];
@@ -81,19 +73,13 @@ static inline bool trackRepeatedBail(BailTrack* tbl, u32 pc)
 	return e.count >= BAIL_DEMOTE_THRESHOLD;
 }
 
-// ---------------------------------------------------------------------------
 // -DJIT_CORE_COST_HISTO (off by default, zero-cost when undefined): per-core
-// dispatch accounting for the "ARM7 JIT execute costs as much wall time as
-// ARM9 for half the guest work" investigation (jit/NOTES.md). Step 1 asks:
-// is ARM7 paying the fixed per-call overhead (cache report, canary poll,
-// canEnter + getBlock lookup, occasional compile) more often, for less
-// forward progress per call, than ARM9?
-//
-// Counters are cumulative; jitCoreCostEmit() is called once per perfzones
-// block (60 frames) from perf_zones.cpp with the frame number, so a window
-// (f780-1200, f1200-2400) is just the delta between two emitted lines --
-// same method the zone-breakdown table already uses.
-// ---------------------------------------------------------------------------
+// dispatch accounting -- calls, forward progress, and fixed per-call overhead
+// (cache report, canary poll, canEnter + getBlock lookup, occasional compile)
+// broken out by core. Counters are cumulative; jitCoreCostEmit() is called
+// once per perfzones block (60 frames) from perf_zones.cpp with the frame
+// number, so a window is just the delta between two emitted lines -- same
+// method the zone-breakdown table uses.
 #ifdef JIT_CORE_COST_HISTO
 struct JitCoreCost {
 	u64 calls;      // entries into jitRunArmX() (before the canEnter check)
@@ -388,7 +374,7 @@ u32 jitRunArm7()
 	// clears CPSR.T itself before returning here, so check it rather than
 	// assuming THUMB: landing an ARM-mode target through a 16-bit THUMB
 	// fetch misdecodes the real first opcode and sends ARM7's PC off into
-	// unmapped memory (see the plan memory's boot-window regression writeup).
+	// unmapped memory.
 	const u32 npc = r.nextPC;
 	cpu.instruct_adr = npc;
 	if (cpu.CPSR.bits.T) {
@@ -409,23 +395,18 @@ u32 jitRunArm7()
 	return r.cycles ? r.cycles : 1;
 }
 
-// ---------------------------------------------------------------------------
 // ARM9 counterpart. Structurally identical to jitRunArm7() above (same shared
 // scanner, trampoline and resume-pipeline logic) but against NDS_ARM9 /
-// jitCacheArm9 / the ARM9 profile.
+// jitCacheArm9 / the ARM9 profile. canEnterThumb() is a real region check and
+// the THUMB emitter table is reused as-is (+ BLX). In a JIT_DIFFERENTIAL_TESTING
+// build the enable check is bypassed so a full boot+gameplay capture runs
+// every ARM9 THUMB block through jitRunArm9Checked() against the hardened
+// harness.
 //
-// A2: the ARM9 profile's canEnterThumb() is now a real region check and the
-// THUMB emitter table is reused as-is (+ BLX). In a normal build jitArm9Enabled
-// still defaults false -- ARM9 blast radius = whole game -- so this returns 0
-// until A4 flips it. In a JIT_DIFFERENTIAL_TESTING build the enable is bypassed
-// so a full boot+gameplay capture runs every ARM9 THUMB block through
-// jitRunArm9Checked() against the hardened harness.
-// ---------------------------------------------------------------------------
 // Default OFF -- the ARM9 JIT's blast radius is the whole game, so it stays
-// opt-in until A4 signs off the "is it worth it" benchmark + soak. The
-// benchmark's jit9on A/B mode and any manual test build define
-// DESMUME_JIT_ARM9_ON to start it enabled without touching the production
-// default (the mirror of the jitoff/jiton renderer A/B for ARM7).
+// opt-in pending a benchmark + soak sign-off. -DDESMUME_JIT_ARM9_ON starts it
+// enabled without touching the production default (mirrors the jitoff/jiton
+// renderer A/B used for ARM7).
 #ifdef DESMUME_JIT_ARM9_ON
 bool jitArm9Enabled = true;
 #else

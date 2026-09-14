@@ -61,20 +61,13 @@
 //	return CalcCrc16((unsigned char *)&header + 0xC0, 156);
 //}
 //
-// roadmap #20 (GBA compat), post-step-6 regression fix: the real GBA header's
-// fixed Nintendo-logo bitmap (GBATEK, header offset 0x04..0x9F, 156 bytes --
-// checked byte-for-byte, not just CRC'd, against a real unmodified commercial
-// dump: The Legend of Zelda: The Minish Cap (USA).gba). Every genuine GBA
-// cartridge carries this exact blob (the real GBA BIOS itself refuses to
-// boot anything that doesn't), so matching all 156 bytes is a far more
-// decisive signal than the single fixed byte at 0xB2 used to gate this alone
-// (see DetectRomType()'s history) -- that single-byte check turned out to
-// have a real false-positive: tools/rockwrestler's own hand-built (non-
-// ndstool) DS header happens to carry 0x96 at that exact offset too,
-// misdetecting it as ROMTYPE_GBA and outright refusing to load it. Confirmed
-// via the DS regression suite (RockWrestler timing out with a virgin/
-// never-written slot-2 result buffer -- the ROM was rejected before ever
-// executing) and root-caused by inspecting the raw header bytes directly.
+// The real GBA header's fixed Nintendo-logo bitmap (GBATEK, header offset
+// 0x04..0x9F, 156 bytes -- checked byte-for-byte, not just CRC'd, against a
+// real unmodified commercial dump: The Legend of Zelda: The Minish Cap
+// (USA).gba). Every genuine GBA cartridge carries this exact blob (the real
+// GBA BIOS itself refuses to boot anything that doesn't). Matching all 156
+// bytes -- not just the single fixed byte at offset 0xB2 -- avoids
+// misdetecting a hand-built DS header that happens to share that one byte.
 static const unsigned char GBA_LOGO[156] = {
 	0x24,0xFF,0xAE,0x51,0x69,0x9A,0xA2,0x21,0x3D,0x84,0x82,0x0A,0x84,0xE4,0x09,0xAD,
 	0x11,0x24,0x8B,0x98,0xC0,0x81,0x7F,0x21,0xA3,0x52,0xBE,0x19,0x93,0x09,0xCE,0x20,

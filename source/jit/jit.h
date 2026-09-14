@@ -72,10 +72,9 @@ void jitCheckCanaries();
 extern bool jitArm7Enabled;
 u32 jitRunArm7();
 
-// ARM9 counterpart. Spliced into armInnerLoop()'s ARM9 arm. Inert until the
-// ARM9 THUMB front-end lands (A2): jitArm9Enabled defaults false and the ARM9
-// profile's canEnter* return false, so this compiles nothing and always
-// returns 0. See desmumewii-arm9-jit-plan.md.
+// ARM9 counterpart. Spliced into armInnerLoop()'s ARM9 arm. jitArm9Enabled
+// defaults false (see jit_exec.cpp), so this compiles nothing and returns 0
+// unless -DDESMUME_JIT_ARM9_ON or JIT_DIFFERENTIAL_TESTING is set.
 extern bool jitArm9Enabled;
 u32 jitRunArm9();
 

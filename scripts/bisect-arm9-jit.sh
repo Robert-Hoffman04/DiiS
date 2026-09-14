@@ -45,7 +45,7 @@ TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM}"  # 2 = softwa
 # this is a no-op and JITDEFS handles it normally.
 # ---------------------------------------------------------------------------
 force_arm9_if_ungated() {
-    local f="source/src/jit/jit_exec.cpp"
+    local f="source/jit/jit_exec.cpp"
     [ -f "$f" ] || return 0
     if grep -q "DESMUME_JIT_ARM9_ON" "$f"; then
         return 0

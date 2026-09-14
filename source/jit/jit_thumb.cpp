@@ -569,20 +569,15 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			// The popped value's bit0 is the real ARMv4T mode switch (same
 			// convention as BX Rs, case 8/sub==3 above) -- POP{...,PC} is by
 			// far the most common function-return shape in THUMB code, and a
-			// return into an ARM-mode caller is completely ordinary. This
-			// used to unconditionally treat every POP{PC} as a THUMB
-			// continuation (masking bit0 and calling emitDynamicExit
-			// regardless), silently dropping the mode switch: the C++ resume
-			// path always re-fetched 16-bit THUMB from the target and never
-			// touched CPSR.T. Landing on a real ARM-mode return address, that
-			// misdecodes the first real ARM opcode as THUMB and free-runs
-			// from there -- observed as ARM7's PC escaping to a garbage
-			// 32-bit address and never recovering (see the plan memory).
+			// return into an ARM-mode caller is completely ordinary. Must check
+			// bit0 rather than assume THUMB: landing an ARM-mode target through
+			// a THUMB fetch misdecodes the first real ARM opcode and free-runs
+			// from a garbage address.
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 100);                  // R12 = raw popped PC
 			*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);   // R11 = bit0 (mode bit)
 			*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
 			u32* toArm = emitPtr++;                                  // BEQ -> ARM-mode path
-			// bit0==1: stay THUMB (previously the only path taken)
+			// bit0==1: stay THUMB
 			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);    // & ~1
 			ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, ctx.cpu.cyclesForThumb(opcode), /*targetThumb=*/true);
 			*toArm = PPC_BEQ((u32)((emitPtr - toArm) * 4));

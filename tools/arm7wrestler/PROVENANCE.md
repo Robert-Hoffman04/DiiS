@@ -91,7 +91,7 @@ Produces `out/arm7wrestler.nds`.
 
 ## Running against desmumewii
 
-Build desmumewii with `-DDESMUME_ARM7WRESTLER_PROBE` (`source/src/main.cpp`):
+Build desmumewii with `-DDESMUME_ARM7WRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM9 JIT (this ROM's ARM9
 side is a trivial idle/vram-copy stub -- nothing to gain there; **leaves the
 ARM7 JIT setting alone**, unlike `-DDESMUME_ARMWRESTLER_PROBE` which forces

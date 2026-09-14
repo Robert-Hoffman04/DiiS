@@ -84,7 +84,7 @@ flatpak layout; override `DOLPHIN_DATA`, `DOLPHIN_SD`, `DOL_DIR`, `WIN_NAME` (se
 (`-DDESMUME_FORCE_CORE=1`), `ds_mergedbg` (`... -DGXMERGE_DEBUG`).
 
 GXMerge/GX2DBG compositing is mandatory whenever the GX core runs (no build
-flag or runtime toggle left to disable it - see `source/src/main.cpp`), so
+flag or runtime toggle left to disable it - see `source/main.cpp`), so
 `ds_gx` **is** what `ds_merge` used to be; a separate `ds_merge` build with
 `-DDESMUME_FORCE_GXCOMPOSITE` would be byte-identical to `ds_gx` and isn't
 built anymore. `abtoggle.sh`, which A/B'd merge-ON vs merge-OFF by flipping
@@ -105,7 +105,7 @@ per-band by GXMerge draw 4, no longer a fallback reason).
 
 ### Input over the USB Gecko debug serial
 
-The `.dol` builds carry [`source/src/gekko_utils/geckoinput.cpp`](../../source/src/gekko_utils/geckoinput.cpp):
+The `.dol` builds carry [`source/gekko_utils/geckoinput.cpp`](../../source/gekko_utils/geckoinput.cpp):
 it reads command bytes off USB Gecko channel 1 (EXI Slot B) and turns them into
 synthetic pad presses that the normal `process_ctrls_event()` / `GetInput()`
 paths pick up. No `GCPadNew.ini`, no `mkfifo`, no synthetic X11 events.

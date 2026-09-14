@@ -57,7 +57,7 @@ Produces `out/armwrestler.nds`.
 
 ## Running against desmumewii
 
-Build desmumewii with `-DDESMUME_ARMWRESTLER_PROBE` (`source/src/main.cpp`):
+Build desmumewii with `-DDESMUME_ARMWRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM7 JIT (armwrestler's
 ARM7 side is a no-op stub, nothing to gain there), and polls slot-2 for the
 sentinel once per frame; on completion it writes `sd:/armwrestler.log` (ARM

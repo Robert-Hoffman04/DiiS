@@ -12,7 +12,7 @@ greppable and the framing survives the fact that payloads range from UTF-8 log
 lines to raw framebuffer bytes - never assume one send() == one recv().
 
 This module is the single source of truth for the constants; the device side
-(source/src/harness/) must be kept byte-compatible with it.
+(source/harness/) must be kept byte-compatible with it.
 """
 
 import struct
