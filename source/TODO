@@ -22,13 +22,17 @@
    baseline vs after: the length-1 path is untouched by this change).
 
 ## Highest-leverage next steps (NOTES.md's own priority order)
-3. [ ] Better ARM9 block-table hash - try mulhwu (top 32 bits of full
-   product) instead of mullw in the two PPC hash stubs; A/B with
-   -DJIT_HASH_HISTO, target b16+ bucket count and dispx100 moving toward
-   100.
-4. [ ] 2-way set associativity on getBlock() - fallback if (3) doesn't
-   flatten the ~14 hot collision buckets. +2 MiB/core MEM2 cost (headroom
-   confirmed fine).
+3. [x] Better ARM9 block-table hash - tried mulhwu (top 32 bits of full
+   product) instead of mullw, A/B'd with -DJIT_HASH_HISTO. REJECTED: total
+   collapse to 1/65536 touched buckets (100% of evictions in one bucket,
+   worse than the original shift-xor hash). Root cause: mulhwu's high-word
+   result scales ~linearly with pc with no modular wraparound, so it barely
+   moves across SM64DS's ~4MB clustered ARM9 working set. mullw (committed)
+   stays the hash; mulhwu kept in-tree as an off-by-default, documented
+   -DJIT_HASH_HISTO negative result (see jit/NOTES.md). Committed.
+4. [ ] 2-way set associativity on getBlock() - now the primary lever per
+   NOTES.md's own fallback plan, since the mulhwu hash experiment failed.
+   +2 MiB/core MEM2 cost (headroom confirmed fine).
 5. [ ] Longer ARM7 JIT block chains - instrument why ARM7 chains break
    (bailedOut / dynamic-exit / IRQ-check / quota, split by core) to see if
    some exits are staticly chainable.

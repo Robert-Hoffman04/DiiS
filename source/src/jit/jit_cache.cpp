@@ -265,10 +265,17 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 
 	// jitHashPC(pc): (pc * golden) >> (32 - hashBits), pre-shifted by 4 for the
 	// 16-byte BasicBlock stride -> RLWINM(x, 32-maskBegin, maskBegin, 27), since
-	// maskBegin == 28 - hashBits (see flushCache()).
+	// maskBegin == 28 - hashBits (see flushCache()). -DJIT_HASH_MULHWU swaps
+	// mullw (top bits of the low 32-bit product) for mulhwu (top 32 bits of
+	// the full 64-bit product) -- must mirror jit_cache.h's jitHashPC()
+	// exactly, same rlwinm extract either way.
 	*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
+#ifdef JIT_HASH_MULHWU
+	*emitPtr++ = PPC_MULHWU(PPC_R11, PPC_R4, PPC_R12);
+#else
 	*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
+#endif
 	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
 	*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
 
@@ -333,7 +340,11 @@ void JITCache::flushCache() {
 
 		*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
+#ifdef JIT_HASH_MULHWU
+		*emitPtr++ = PPC_MULHWU(PPC_R11, PPC_R4, PPC_R12);
+#else
 		*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
+#endif
 		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
 		*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
 

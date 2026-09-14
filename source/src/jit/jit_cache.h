@@ -79,10 +79,24 @@
 // constant, keep the top HASH_TABLE_SIZE-log2 bits (which depend on every
 // input bit). The hand-emitted stub in jit_cache.cpp mirrors this exactly
 // (lis/ori/mullw + one rlwinm), so getBlock() and JIT-emitted lookups agree.
+//
+// -DJIT_HASH_MULHWU (NOTES.md "what to try next" #1): the mullw variant above
+// keeps the top bits of the *low* 32 bits of pc*GOLDEN; for SM64DS's tightly
+// clustered ARM9 code addresses those top bits are reached only weakly
+// through carry, leaving ~14 hot buckets still hard-colliding after the
+// mullw switch. mulhwu gives the top 32 bits of the full 64-bit product
+// instead - a different, usually stronger bit slice - for the cost of one
+// PPC instruction (mulhwu instead of mullw; the downstream rlwinm extract is
+// unchanged, same top-N-bits-of-a-32-bit-word shape either way).
 #define JIT_HASH_GOLDEN					0x9E3779B1u
 #define JIT_HASH_BITS					(__builtin_ctz(HASH_TABLE_SIZE))
 static inline u32 jitHashPC(u32 pc) {
+#ifdef JIT_HASH_MULHWU
+	u32 hi = (u32)(((u64)pc * JIT_HASH_GOLDEN) >> 32);
+	return hi >> (32 - JIT_HASH_BITS);
+#else
 	return (pc * JIT_HASH_GOLDEN) >> (32 - JIT_HASH_BITS);
+#endif
 }
 
 // -------------------------------------------------------------------------

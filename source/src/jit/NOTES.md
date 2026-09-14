@@ -219,6 +219,33 @@ not the arena size. **Do not grow the arena further.** 12 MB stays.
    PPC insns per stub, still fits the 2 scratch registers r11/r12). Each needs
    the same `-DJIT_HASH_HISTO` A/B: success = `b16+` bucket count and total
    evictions fall, `dispx100` moves toward 100.
+
+   **Tried: `-DJIT_HASH_MULHWU` -- rejected, much worse.** Swapped `mullw`
+   for `mulhwu` in both PPC hash stubs and `jitHashPC()`'s C mirror (one
+   instruction, same downstream `rlwinm` extract). `-DJIT_HASH_HISTO` A/B,
+   SM64DS, 30s smoke soak:
+
+   | metric (ARM9)        | mullw (committed) | mulhwu |
+   |-----------------------|-------------------:|-------:|
+   | touched buckets       | 38/65536           | **1/65536** |
+   | worst bucket          | ~815 (of ~5100 total evictions, 16%) | **saturated at the u16 cap (65535); is 100% of all ~155k evictions** |
+   | dispx100               | ~650 (6.5x uniform) | 0 (single point, no dispersion to measure) |
+
+   Total hash collapse, worse than even the original shift-xor (which spread
+   across ~55-129 buckets). Root cause: `mulhwu`'s result is
+   `floor(pc * GOLDEN / 2^32)`, which for GOLDEN ~ 0.618 * 2^32 is
+   approximately `0.618 * pc` with no modular wraparound. SM64DS's ARM9 working
+   set lives in a ~4 MB window of a 4 GB address space, so that linear scaling
+   barely moves the *high* word at all across the whole working set -- nearly
+   every hot PC lands in the same bucket after `>> 16`. `mullw`'s low-word
+   product wraps modulo 2^32 many times over that same 4 MB span, which is
+   exactly what makes it sensitive to every input bit. **`mulhwu` is only a
+   good multiplicative-hash choice when keys span close to the full 32-bit
+   range; it is the wrong tool for a narrow, clustered key space like a
+   single DS title's code addresses.** Left in the tree as an off-by-default,
+   documented-negative `-DJIT_HASH_HISTO` experiment (jit_cache.h /
+   jit_cache.cpp), not enabled anywhere. Do not revisit without a
+   fundamentally different key-space assumption.
 2. **2-way set associativity on `getBlock()`** -- *reconsidered, now the
    fallback if the hash experiments stall.* Step 3 had removed the pressure
    that justified it, but (1) above shows ~14 buckets still hard-collide. A
