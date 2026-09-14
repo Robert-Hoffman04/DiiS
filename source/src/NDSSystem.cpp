@@ -168,7 +168,13 @@ int NDS_Init( void) {
 
 #ifdef DESMUME_JIT_ARM7
 	jitInit();
+#ifdef DESMUME_JIT_SELFTEST_BOOT
+	// P1 JIT-bringup smoke test (trampoline/arena/cache/linker-stub round
+	// trip) - stale scaffolding once P2+ landed, so no longer run on every
+	// DESMUME_JIT_ARM7 boot (that includes normal/production JIT builds,
+	// not just test builds). Opt in explicitly if this is ever needed again.
 	jitSelfTest();
+#endif
 #ifdef DESMUME_JIT_SELFTEST
 	jitThumbSelfTest();
 #endif
