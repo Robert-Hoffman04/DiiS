@@ -364,8 +364,9 @@ int main(int argc, char **argv){
 	// toggle to fall back to the CPU compositor while on the GX core (the
 	// old DESMUME_FORCE_GXCOMPOSITE/DESMUME_FORCE_GX2DBG bench flags no
 	// longer gate anything here; they're vestigial in the benchmark scripts
-	// that still pass them).
-	GXMerge_SetEnabled(current3Dcore == 1);
+	// that still pass them). One call, not two: GXMerge_Set2DBG(true) turns
+	// the base merge path on internally, there's nothing left to enable
+	// separately.
 	GXMerge_Set2DBG(current3Dcore == 1);
 
 	printf("Initialization successful!\n");

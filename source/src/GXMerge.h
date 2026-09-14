@@ -162,11 +162,18 @@ void GXMerge_Begin2DBGSub(int subDispMode);
 // draw_thread: replay the SUB engine's 2D-BG bands over the SUB screen quad.
 void GXMerge_DrawSubScreen(f32 x0, f32 y0, f32 w, f32 h);
 
-//--- toggle -------------------------------------------------------------------
+//--- state --------------------------------------------------------------------
+// GXMerge_SetEnabled() is an internal helper (called by GXMerge_Set2DBG()
+// below); nothing outside GXMerge.cpp should call it directly. The single
+// entry point for callers is GXMerge_Set2DBG() - there is no standalone
+// "merge without 2DBG" mode to opt into.
 void GXMerge_SetEnabled(bool en);
 bool GXMerge_Enabled(void);
 
-// Step 5.1a: also composite MAIN-engine text BG layers on GX (implies GXMerge).
+// Step 5.1a: the single call site (main.cpp) that turns the whole GX
+// 2D/3D compositing path on for the GX core; calling this with en=true
+// activates GXMerge_SetEnabled(true) internally, so there is exactly one
+// call to make, not two.
 void GXMerge_Set2DBG(bool en);
 bool GXMerge_2DBGEnabled(void);
 
