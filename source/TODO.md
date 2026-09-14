@@ -84,13 +84,13 @@
    do not start unprompted. See jit/NOTES.md Steps 7-9.
 
 ## Known bugs / unfinished features tracked in memory
-7. [skip] GX2DBG SUB-screen affine-BG bug - moved to BUGS.md ("Graphics").
-   Turned out to already be fixed (sprite front-to-back EFB-depth
-   compositing, commit b73d12c) - both screens visually verified now. Given
-   that plus the -61%/+45fps win, GX2DBG is promoted from bench-only opt-in
-   to the default execution path for the GX core on this branch
-   (source/src/main.cpp) - see BUGS.md for residual, non-blocking polish
-   items.
+7. [skip] GX2DBG SUB-screen affine-BG bug - moved to docs/PLAN.md ("Known
+   bugs and residual items"). Turned out to already be fixed (sprite
+   front-to-back EFB-depth compositing, commit b73d12c) - both screens
+   visually verified now. Given that plus the -61%/+45fps win, GX2DBG is
+   promoted from bench-only opt-in to the default execution path for the GX
+   core on this branch (source/src/main.cpp) - see docs/PLAN.md for
+   residual, non-blocking polish items.
 8. [ ] Unified harness Step 11 - real-hardware cutover per plan §6. Needs
    explicit per-launch permission each time - do not do unprompted.
 

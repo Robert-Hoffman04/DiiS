@@ -1,7 +1,7 @@
 # tools/harness-control
 
 Desktop side of the DeSmuMEWii unified test harness
-(`desmumewii-harness-and-network-plan.md`). This is **live session control**:
+(`docs/PLAN.md`, "Test harness & network transport"). This is **live session control**:
 launching a build, talking to it over the network transport, receiving
 logs / frames / profiles / crashes, driving input and control commands.
 
