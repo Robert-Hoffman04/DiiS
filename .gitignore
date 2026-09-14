@@ -49,6 +49,7 @@ bisect-log.csv
 *.ds0
 *.dst
 
-# Local analysis notes and planning docs (root-level only; keep tools/**/README.md etc.)
+# Local analysis notes and planning docs (root and docs/ only; keep tools/**/README.md etc.)
 /*.md
 !/README.md
+/docs/*.md
