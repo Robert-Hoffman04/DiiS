@@ -356,14 +356,15 @@ int main(int argc, char **argv){
 
 	NDS_3D_ChangeCore(current3Dcore);
 
-	// Hardware 3D/2D compositing path (see GXMerge.h).  Opt-in; GX core only.
-	// Automated-test switch mirrors the DESMUME_FORCE_* pattern (see Makefile).
-#ifdef DESMUME_FORCE_GXCOMPOSITE
+	// Hardware 3D/2D compositing path (see GXMerge.h).  Default-on for the GX
+	// core as of this branch: MAIN-screen visual A/B and the SUB-screen
+	// sprite-compositing fix (see BUGS.md "Graphics") are both verified, and
+	// the -61%/+45fps win is worth shipping as the main execution path here.
+	// GC D-pad Down (see ~line 1382) still hotkey-toggles it off per-session;
+	// the old DESMUME_FORCE_GXCOMPOSITE/DESMUME_FORCE_GX2DBG bench flags are
+	// now redundant for this but kept for the benchmark scripts that set them.
 	GXMerge_SetEnabled(current3Dcore == 1);
-#ifdef DESMUME_FORCE_GX2DBG
 	GXMerge_Set2DBG(current3Dcore == 1);
-#endif
-#endif
 
 	printf("Initialization successful!\n");
 
