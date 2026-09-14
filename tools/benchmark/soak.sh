@@ -15,7 +15,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib.sh"
 
 DUR=210
-ROM="$BENCH_ROOT/Super Mario 64 DS (USA, Australia) (Rev 1).nds"
+ROM="$BENCH_ROOT/testdata/Super Mario 64 DS (USA, Australia) (Rev 1).nds"
 JITDEFS="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DJIT_DIFFERENTIAL_TESTING"
 
 usage() {
