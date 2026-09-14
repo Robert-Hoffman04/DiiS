@@ -119,7 +119,7 @@ void JITCache::initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr
 	arenaOffset = 0;
 #if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 	if (!installFrame)
-		installFrame = (u32*)calloc(HASH_TABLE_SIZE, sizeof(u32));
+		installFrame = (u32*)calloc(BLOCK_TABLE_SLOTS, sizeof(u32));
 #ifdef JIT_HASH_HISTO
 	if (!bucketEvict)
 		bucketEvict = (u16*)calloc(HASH_TABLE_SIZE, sizeof(u16));
@@ -177,8 +177,24 @@ void JITCache::rewindJITMemory(size_t numBytes) {
 }
 
 BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bool thumb) {
-	u32 index = jitHashPC(pc);
+	u32 set = jitHashPC(pc);
+	u32 way0 = set * BLOCK_TABLE_WAYS, way1 = way0 + 1;
 	length = (length & 0x7FFFFFFFu) | (thumb ? 0x80000000u : 0u);
+
+	// 2-way slot pick: prefer a way that already holds this exact PC (an
+	// ISA-mode flip or a plain recompile -- overwrite in place, no eviction),
+	// then an untouched ("cold", length==0) way, else evict one of the two
+	// live occupants. Eviction alternates ways via a free-running counter --
+	// cheap round-robin, not true LRU, but with 3+ PCs contending for one set
+	// it still lets each spend part of its time cached instead of one way
+	// permanently starving the other (which "always evict way0" would do).
+	static u32 s_evictRR = 0;
+	u32 index;
+	if      (blockTable[way0].startPC == pc)  index = way0;
+	else if (blockTable[way1].startPC == pc)  index = way1;
+	else if (blockTable[way0].length == 0)    index = way0;
+	else if (blockTable[way1].length == 0)    index = way1;
+	else                                       index = (s_evictRR++ & 1) ? way1 : way0;
 
 #ifdef JIT_CORE_COST_HISTO
 	{
@@ -194,7 +210,7 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bo
 #endif
 
 	u32 evictedPC = blockTable[index].startPC;
-	PROFILER_CACHE_EVICT(evictedPC, pc);
+	PROFILER_CACHE_EVICT(evictedPC, pc, index);
 
 	BasicBlock* block = &blockTable[index];
 
@@ -263,11 +279,11 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 	*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
 
-	// jitHashPC(pc): (pc * golden) >> (32 - hashBits), pre-shifted by 4 for the
-	// 16-byte BasicBlock stride -> RLWINM(x, 32-maskBegin, maskBegin, 27), since
-	// maskBegin == 28 - hashBits (see flushCache()). -DJIT_HASH_MULHWU swaps
-	// mullw (top bits of the low 32-bit product) for mulhwu (top 32 bits of
-	// the full 64-bit product) -- must mirror jit_cache.h's jitHashPC()
+	// jitHashPC(pc): (pc * golden) >> (32 - hashBits), pre-shifted by 5 to land
+	// on way0 of the 32-byte 2-way SET -> RLWINM(x, 32-maskBegin, maskBegin, 26),
+	// since maskBegin == 27 - hashBits (see flushCache()). -DJIT_HASH_MULHWU
+	// swaps mullw (top bits of the low 32-bit product) for mulhwu (top 32 bits
+	// of the full 64-bit product) -- must mirror jit_cache.h's jitHashPC()
 	// exactly, same rlwinm extract either way.
 	*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
@@ -276,21 +292,30 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 #else
 	*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
 #endif
-	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
-	*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
+	*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 26);
+	*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);   // r11 = way0 address
 
-	// Guard 1: PC collision (hash-slot occupant is a different address)
+	// Way0 guard chain. PC mismatch or mode mismatch both fall through to
+	// tryWay1 (a mode mismatch here can legitimately mean "this PC's other
+	// ISA variant lives in way1", e.g. an ARM<->THUMB flip at a shared
+	// address -- letting both coexist is the whole point of 2-way here).
+	// Guard 3 (execute==nullptr) is the one definitive miss: PC *and* mode
+	// both matched, so this is the authoritative "don't JIT" answer for
+	// (pc, expectThumb) and there is no reason to also check way1.
 	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 0);
 	*emitPtr++ = PPC_CMPW(0, PPC_R12, PPC_R4);
-	u32* missPc = emitPtr++;
+	u32* missPc0 = emitPtr++;
 
-	// Guard 2: mode mismatch (right address, wrong ISA cached there)
 	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 4);              // length (thumb bit + count)
 	*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 1, 31, 31);   // isolate bit31 -> 0/1
 	*emitPtr++ = PPC_CMPWI(0, PPC_R12, expectThumb ? 1 : 0);
-	u32* missMode = emitPtr++;
+	u32* missMode0 = emitPtr++;
 
-	// Guard 3: uncompiled / "don't JIT" fallback marker (execute == nullptr)
+	// hitBody: shared by a way0 hit and a way1 hit (tryWay1 branches back up
+	// here once its own PC+mode checks pass) -- r11 points at whichever way
+	// matched.
+	u32* hitBody = emitPtr;
+
 	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 8);
 	*emitPtr++ = PPC_CMPWI(0, PPC_R12, 0);
 	u32* missExec = emitPtr++;
@@ -301,10 +326,25 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 	*emitPtr++ = PPC_MTCTR(PPC_R12);
 	*emitPtr++ = PPC_BCTR();
 
+	// tryWay1: reached only on a way0 PC or mode miss. way1 is always
+	// way0 + 16 (one BasicBlock).
+	u32* tryWay1 = emitPtr;
+	*emitPtr++ = PPC_ADDI(PPC_R11, PPC_R11, 16);
+	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 0);
+	*emitPtr++ = PPC_CMPW(0, PPC_R12, PPC_R4);
+	u32* missPc1 = emitPtr++;
+	*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 4);
+	*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 1, 31, 31);
+	*emitPtr++ = PPC_CMPWI(0, PPC_R12, expectThumb ? 1 : 0);
+	u32* missMode1 = emitPtr++;
+	*emitPtr++ = PPC_B((s32)((u8*)hitBody - (u8*)emitPtr));
+
 	u32* fallback = emitPtr;
-	*missPc   = PPC_BNE((u32)((fallback - missPc) * 4));
-	*missMode = PPC_BNE((u32)((fallback - missMode) * 4));
-	*missExec = PPC_BEQ((u32)((fallback - missExec) * 4));
+	*missPc0   = PPC_BNE((u32)((tryWay1 - missPc0) * 4));
+	*missMode0 = PPC_BNE((u32)((tryWay1 - missMode0) * 4));
+	*missExec  = PPC_BEQ((u32)((fallback - missExec) * 4));
+	*missPc1   = PPC_BNE((u32)((fallback - missPc1) * 4));
+	*missMode1 = PPC_BNE((u32)((fallback - missMode1) * 4));
 	{ s32 o = (s32)((u8*)linkerReturnAddress - (u8*)emitPtr); *emitPtr++ = PPC_B(o); }
 
 	return entry;
@@ -320,7 +360,7 @@ void JITCache::flushCache() {
 	// is now also called from outside jit_trace.cpp's own lifecycle (P4 --
 	// MMU_Reset()/savestate-load bulk memory overwrites), so it must tolerate
 	// being invoked before initialize() has ever run.
-	if (blockTable)   memset(blockTable, 0, HASH_TABLE_SIZE * sizeof(BasicBlock));
+	if (blockTable)   memset(blockTable, 0, BLOCK_TABLE_SLOTS * sizeof(BasicBlock));
 	if (smcRegistry)  memset(smcRegistry, 0, SMC_MAP_SIZE * sizeof(BasicBlock*));
 	if (smcPageFlags) memset(smcPageFlags, 0, SMC_MAP_SIZE * sizeof(u8));
 
@@ -333,10 +373,12 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
 
 		// 2. Native Hash Calculation -- jitHashPC(pc): multiplicative
-		//    (pc * JIT_HASH_GOLDEN) >> (32 - hashBits), then << 4 for the
-		//    16-byte BasicBlock stride, folded into the one RLWINM.
+		//    (pc * JIT_HASH_GOLDEN) >> (32 - hashBits), then << 5 to land on
+		//    way0 of the 32-byte 2-way SET (2 x 16-byte BasicBlock), folded
+		//    into the one RLWINM. Way1 is way0 + 16 (see the tryWay1 probe
+		//    below) -- jitHashPC() itself is unchanged, still a plain set index.
 		u32 hashBits = __builtin_ctz(HASH_TABLE_SIZE); // 8192 = 13, 32768 = 15, 65536 = 16
-		u32 maskBegin = 27 - hashBits + 1;            // == 28 - hashBits
+		u32 maskBegin = 26 - hashBits + 1;            // == 27 - hashBits (stride 32 = 1<<5)
 
 		*emitPtr++ = PPC_LIS(PPC_R12, JIT_HASH_GOLDEN >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, JIT_HASH_GOLDEN & 0xFFFF);
@@ -345,19 +387,27 @@ void JITCache::flushCache() {
 #else
 		*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R4, PPC_R12);
 #endif
-		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 27);
-		*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);
+		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 32 - maskBegin, maskBegin, 26);
+		*emitPtr++ = PPC_ADD(PPC_R11, PPC_R10, PPC_R11);   // r11 = way0 address
 
-		// 3. Miss Guard 1: PC Collision Check
+		// 3. Miss Guard 1 (way0): PC Collision Check -- on mismatch, probe
+		// way1 (tryWay1 below) before giving up.
 		*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 0);
 		*emitPtr++ = PPC_CMPW(0, PPC_R12, PPC_R4);
-		u32* branchCollision = emitPtr;
+		u32* branchToWay1 = emitPtr;
 		*emitPtr++ = PPC_BNE(0);
+
+		// hitBody: shared by a way0 hit and a way1 hit (tryWay1 branches back
+		// up here once its own PC check passes) -- r11 already points at
+		// whichever way matched.
+		u32* hitBody = emitPtr;
 
 		// 4. CACHE HIT: Extract Block execution address (execute is at offset 8)
 		*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 8);
 
-		// 5. Miss Guard 2: Hard Stop for Fallback Blocks (execute == nullptr)
+		// 5. Miss Guard 2: Hard Stop for Fallback Blocks (execute == nullptr).
+		// PC matched at this way and it's a deliberate "don't JIT" marker --
+		// definitive, no reason to also probe the other way.
 		*emitPtr++ = PPC_CMPWI(0, PPC_R12, 0);
 		u32* branchFailBlock = emitPtr;
 		*emitPtr++ = PPC_BEQ(0);
@@ -381,13 +431,26 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_MTCTR(PPC_R12);
 		*emitPtr++ = PPC_BCTR();
 
+		// tryWay1: way0 missed on PC. r11 still holds way0's address (the
+		// patch/jump path above never survives to here on that route -- this
+		// is only reached via branchToWay1, before r11 is repurposed as
+		// scratch in step 6). way1 is always way0 + 16 (one BasicBlock).
+		u32* tryWay1 = emitPtr;
+		*emitPtr++ = PPC_ADDI(PPC_R11, PPC_R11, 16);
+		*emitPtr++ = PPC_LWZ(PPC_R12, PPC_R11, 0);
+		*emitPtr++ = PPC_CMPW(0, PPC_R12, PPC_R4);
+		u32* branchMissWay1 = emitPtr;
+		*emitPtr++ = PPC_BNE(0);
+		*emitPtr++ = PPC_B((s32)((u8*)hitBody - (u8*)emitPtr));
+
 		// 9. CACHE MISS / FALLBACK YIELD TARGET
 		u32* missTarget = emitPtr;
 		linkerReturnAddress = missTarget;
 
 		// Correctly route code collisions and fail blocks out to the C++ handler
-		*branchCollision = PPC_BNE((u32)((missTarget - branchCollision) * 4));
+		*branchToWay1    = PPC_BNE((u32)((tryWay1 - branchToWay1) * 4));
 		*branchFailBlock = PPC_BEQ((u32)((missTarget - branchFailBlock) * 4));
+		*branchMissWay1  = PPC_BNE((u32)((missTarget - branchMissWay1) * 4));
 
 		*emitPtr++ = PPC_LIS(PPC_R12, (u32)&ExecuteJITTrace_Return >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, (u32)&ExecuteJITTrace_Return & 0xFFFF);
@@ -504,22 +567,26 @@ void JITCache::profCacheMiss(u32 slotPC) {
 // marker (execute==null, len>0) or an SMC-killed slot (execute==null, len==0)
 // is not a thrash eviction. Then stamps the slot with the current sequence
 // number for the block that registerBlock() is about to install.
-void JITCache::profCacheEvict(u32 evictedPC, u32 newPC) {
+// physIndex is the *physical* slot registerBlock() already chose (one of the
+// set's 2 ways) -- unlike newPC/jitHashPC(), it can't be recomputed here,
+// since which way gets evicted depends on registerBlock()'s occupancy-based
+// pick, not on newPC alone.
+void JITCache::profCacheEvict(u32 evictedPC, u32 newPC, u32 physIndex) {
 	profStats.registrations++;
 	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;  // §3.3b
 	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
-	u32 index = jitHashPC(newPC);
-	const BasicBlock& ev = blockTable[index];
+	const BasicBlock& ev = blockTable[physIndex];
 	if (evictedPC != 0 && ev.execute != nullptr && ev.length > 0) {
 		profStats.evictions++;
 		if (installFrame)
-			profStats.evictLifetimeSum += (installSeq - installFrame[index]);
+			profStats.evictLifetimeSum += (installSeq - installFrame[physIndex]);
 #ifdef JIT_HASH_HISTO
-		if (bucketEvict && bucketEvict[index] != 0xFFFF) bucketEvict[index]++;
+		u32 set = physIndex / BLOCK_TABLE_WAYS;   // bucketEvict is per-set, not per-way
+		if (bucketEvict && bucketEvict[set] != 0xFFFF) bucketEvict[set]++;
 		if (evictedPC == newPC) samePCEvict++;
 #endif
 	}
-	if (installFrame) installFrame[index] = ++installSeq;
+	if (installFrame) installFrame[physIndex] = ++installSeq;
 }
 
 void JITCache::profCacheFlushStart() {
@@ -527,7 +594,7 @@ void JITCache::profCacheFlushStart() {
 	if ((u32)arenaOffset > arenaPeak)     arenaPeak     = (u32)arenaOffset;  // §3.3b
 	if (arenaPeak         > arenaPeakEver) arenaPeakEver = arenaPeak;
 	arenaPeak = 0;   // per-flush high-water resets with the arena
-	if (installFrame) memset(installFrame, 0, HASH_TABLE_SIZE * sizeof(u32));
+	if (installFrame) memset(installFrame, 0, BLOCK_TABLE_SLOTS * sizeof(u32));
 	installSeq = 0;
 }
 

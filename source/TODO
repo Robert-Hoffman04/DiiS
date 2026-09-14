@@ -30,9 +30,18 @@
    moves across SM64DS's ~4MB clustered ARM9 working set. mullw (committed)
    stays the hash; mulhwu kept in-tree as an off-by-default, documented
    -DJIT_HASH_HISTO negative result (see jit/NOTES.md). Committed.
-4. [ ] 2-way set associativity on getBlock() - now the primary lever per
-   NOTES.md's own fallback plan, since the mulhwu hash experiment failed.
-   +2 MiB/core MEM2 cost (headroom confirmed fine).
+4. [x] 2-way set associativity on getBlock() - DONE. BLOCK_TABLE_WAYS=2 in
+   jit_cache.h; every set-index->slot-address site updated (getBlock,
+   registerBlock, both hand-emitted PPC hash stubs, profCacheEvict,
+   blockTable/installFrame allocation). Validated: -DJIT_DIFFERENTIAL_TESTING
+   clean over ~450s combined soak (vs an identical pre-existing sd:/jit.log
+   FAT-capture artifact confirmed present on the baseline too, so not a
+   regression); -DJIT_HASH_HISTO shows ARM9 collision evictions fell from
+   ~43,775/150s (touching 82 buckets, worst bucket 10231 evictions) to
+   8/150s (touching 8 buckets, worst bucket 1 eviction, and all 8 are
+   same-PC ISA-mode-flip re-registrations, not hash weakness) - essentially
+   total elimination of the structural hot-bucket thrash Step 5's follow-up
+   identified. See jit/NOTES.md and tools/benchmark/assoc-ab.sh. Committed.
 5. [ ] Longer ARM7 JIT block chains - instrument why ARM7 chains break
    (bailedOut / dynamic-exit / IRQ-check / quota, split by core) to see if
    some exits are staticly chainable.

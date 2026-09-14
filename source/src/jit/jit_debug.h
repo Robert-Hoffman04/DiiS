@@ -27,13 +27,13 @@
 #if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 #define PROFILER_CACHE_HIT()              this->profCacheHit()
 #define PROFILER_CACHE_MISS()             this->profCacheMiss(block ? block->startPC : 0u)
-#define PROFILER_CACHE_EVICT(evicted, pc) this->profCacheEvict((evicted), (pc))
+#define PROFILER_CACHE_EVICT(evicted, pc, idx) this->profCacheEvict((evicted), (pc), (idx))
 #define PROFILER_CACHE_FLUSH_START()      this->profCacheFlushStart()
 #define PROFILER_CACHE_FLUSH_END()        ((void)0)
 #else
 #define PROFILER_CACHE_HIT()                                   ((void)0)
 #define PROFILER_CACHE_MISS()                                  ((void)0)
-#define PROFILER_CACHE_EVICT(evicted, pc)                      ((void)0)
+#define PROFILER_CACHE_EVICT(evicted, pc, idx)                 ((void)0)
 #define PROFILER_CACHE_FLUSH_START()                           ((void)0)
 #define PROFILER_CACHE_FLUSH_END()                             ((void)0)
 #endif

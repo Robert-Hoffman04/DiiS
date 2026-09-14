@@ -254,6 +254,68 @@ not the arena size. **Do not grow the arena further.** 12 MB stays.
    ~11.6 MiB, fine per Step 2); the emitted stubs would need the second probe
    too. Bigger change than a hash swap -- do it only if no hash beats the
    collision rate.
+
+   **Done.** `mulhwu` (above) failed, so this became the primary lever.
+   `BLOCK_TABLE_WAYS=2` in jit_cache.h: each of the 65536 *sets* jitHashPC()
+   names now holds 2 physical BasicBlock slots ("ways") instead of 1 --
+   `blockTable[set*2 + way]`. `jitHashPC()` itself is unchanged (still a
+   plain set index); only the physical array size (2x, 1 MiB -> 2 MiB/core)
+   and every C-/PPC-side "set index -> slot address" site changed:
+   `getBlock()` / `registerBlock()` (jit_cache.h/.cpp), the two hand-emitted
+   PPC hash stubs (the static linker stub in `flushCache()` and
+   `emitDynamicLinkerStub()`, both in jit_cache.cpp), `profCacheEvict()`
+   (now takes the resolved physical slot as a parameter instead of
+   recomputing it, since which way gets evicted is a runtime decision --
+   see below), and the `blockTable`/`installFrame` allocation sites
+   (jit_trace.cpp). `bucketEvict` (`-DJIT_HASH_HISTO`) stays indexed per
+   *set*, matching its existing "touched buckets out of 65536" semantics.
+
+   Insert/evict policy (`registerBlock()`, pure C, no asm changes needed
+   here): prefer a way already holding this exact PC (overwrite in place --
+   covers an ISA-mode flip at a shared address without evicting anything),
+   then an untouched ("cold", `length==0`) way, else evict one of the two
+   live occupants via a free-running round-robin counter (cheap, not true
+   LRU, but keeps 3+-way contention from permanently starving one slot the
+   way "always evict way0" would).
+
+   Lookup (`getBlock()`, the two PPC stubs): probe way0's 3 guards (PC,
+   mode, execute!=null); a PC or mode miss falls through to a way1 probe
+   (same 3 guards) before giving up to the interpreter; an execute==nullptr
+   "don't JIT" marker hit is definitive (PC+mode both matched) and does not
+   check way1. The static linker stub's way1 probe reuses the *same*
+   hit/patch/jump code as way0 via a backward branch (only ~5 extra
+   instructions, since the self-patching logic runs once regardless of
+   which way matched); the dynamic stub fully duplicates its 3-guard chain
+   for way1 (~9 extra instructions per dynamic-exit site, since it has no
+   shared patch tail to branch back into) -- both costs were anticipated
+   and accepted above.
+
+   Correctness: no `-DJIT_DIFFERENTIAL_TESTING` mismatches over ~450s of
+   combined soak (mixed cold-boot and autoloaded-state SM64DS runs) vs a
+   matching baseline run that showed the identical (pre-existing,
+   unrelated) sd:/jit.log FAT-capture truncation artifact -- see
+   `tools/benchmark/assoc-ab.sh`.
+
+   Perf (`-DJIT_HASH_HISTO`, SM64DS, 150s, autoloaded gameplay state, same
+   window class as Step 5):
+
+   | metric (ARM9)        | 1-way (mult. hash) | 2-way |
+   |-----------------------|--------------------:|------:|
+   | touched buckets        | 82/65536            | **8/65536** |
+   | worst bucket            | 10231 evictions      | **1 eviction** |
+   | total evictions (run)  | ~43,775              | **8**  (-99.98%) |
+   | ev_in_b16+ band          | 43,553 (99.5%)       | 0      |
+   | samePCEvict / evictions | 28/43,775            | **8/8** (100%) |
+
+   Essentially total elimination of ARM9 block-table collision churn: the
+   ~14-30 hot hard-collision buckets Step 5's follow-up identified as
+   structural (distinct-PC clustering the multiplicative hash could not
+   separate) are resolved by giving each set 2 physical slots instead of
+   fixing the hash further -- confirms the follow-up's own prediction. The
+   8 residual evictions are *all* same-PC (ISA-mode flip) re-registrations,
+   i.e. genuine third-visit collisions at an already-full 2-way set, not
+   hash weakness. `mullw` stays the hash (no reason to revisit `mulhwu`
+   now). Committed.
 3. **HASH_TABLE_SIZE 4x (Step 4)** -- still low-value on its own (56/65536
    buckets touched; more buckets do not separate two PCs the hash maps
    together) but *would* compound with a better hash. Not worth doing alone.

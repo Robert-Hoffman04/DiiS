@@ -242,7 +242,7 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 	// (allocateJITMemory() vs arenaSize, etc.) see exactly the same capacity
 	// as before. s_jitCanaryPad is 0 unless JIT_CANARY_WATCH (§3.0), so a
 	// release build allocates exactly what it always did.
-	size_t blockTableBytes  = HASH_TABLE_SIZE * sizeof(BasicBlock);
+	size_t blockTableBytes  = BLOCK_TABLE_SLOTS * sizeof(BasicBlock);   // 2-way: 2 slots/set
 	size_t smcRegistryBytes = SMC_MAP_SIZE * sizeof(BasicBlock*);
 	size_t smcFlagsBytes    = SMC_MAP_SIZE;
 
@@ -275,7 +275,7 @@ void jitInit()
 
 #ifdef JIT_MEM_ACCOUNT
 	{
-		size_t blockTableBytes  = HASH_TABLE_SIZE * sizeof(BasicBlock);
+		size_t blockTableBytes  = BLOCK_TABLE_SLOTS * sizeof(BasicBlock);   // 2-way: 2 slots/set
 		size_t smcTablesBytes   = SMC_MAP_SIZE * (sizeof(BasicBlock*) + 1);
 		FILE* f = fopen("sd:/jitmem.log", "a");
 		if (f) {

@@ -70,6 +70,19 @@
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
 
+// 2-way set associativity (NOTES.md "what to try next" #2, fallback once the
+// hash experiments stalled -- see the JIT_HASH_MULHWU rejection above). Each
+// of the HASH_TABLE_SIZE *sets* jitHashPC() indexes now holds two physical
+// BasicBlock slots ("ways") instead of one, so two guest PCs that hash to the
+// same set no longer have to evict each other every time both are hot --
+// physical slot for (set, way) is blockTable[set * BLOCK_TABLE_WAYS + way].
+// jitHashPC() itself is UNCHANGED (still returns a plain set index 0..65535);
+// only the physical array size and the C-/PPC-side indexing that turns a set
+// index into a slot address changed. Doubles the block table's MEM2 footprint
+// (1 MiB -> 2 MiB per core; see jit/NOTES.md Step 2 for the headroom budget).
+#define BLOCK_TABLE_WAYS				2
+#define BLOCK_TABLE_SLOTS				(HASH_TABLE_SIZE * BLOCK_TABLE_WAYS)
+
 // Block-table index hash. Was ((pc>>1) ^ (pc>>13)) & (HASH_TABLE_SIZE-1): a
 // -DJIT_HASH_HISTO capture (SM64DS, jit/NOTES.md) showed that shift-xor mix
 // collapsing the hot ARM9 working set into ~55 buckets - one bucket alone took
@@ -188,11 +201,14 @@ class JITCache {
 			u64 flushes;
 		};
 		CacheStats profStats;
-		u32* installFrame;         // HASH_TABLE_SIZE entries, or nullptr
+		u32* installFrame;         // BLOCK_TABLE_SLOTS entries (one per physical
+		                           //   way, not per set), or nullptr
 #ifdef JIT_HASH_HISTO
 		// Step 3 one-off: per-bucket real-eviction tally, to tell a structural
 		// hash weakness (a few buckets hogging evictions) from a plain
 		// load-factor problem (uniform spread). calloc'd in initialize().
+		// Indexed by *set* (not physical way) -- a "bucket" is still one of the
+		// HASH_TABLE_SIZE sets jitHashPC() names, now with 2 ways inside it.
 		u16* bucketEvict;          // HASH_TABLE_SIZE entries, or nullptr
 		u64  samePCEvict;         // Step-5 follow-up: evictions where the outgoing
 		                          //   slot held the SAME guest PC as the incoming
@@ -209,7 +225,7 @@ class JITCache {
 
 		void profCacheHit();
 		void profCacheMiss(u32 slotPC);
-		void profCacheEvict(u32 evictedPC, u32 newPC);
+		void profCacheEvict(u32 evictedPC, u32 newPC, u32 physIndex);
 		void profCacheFlushStart();
 		void profEmitReport(const char* tag);
 #endif
@@ -229,11 +245,20 @@ class JITCache {
 
 		inline BasicBlock* getBlock(u32 pc) {
 			if (!isInitialized) return nullptr;
-			u32 index = jitHashPC(pc);
-			BasicBlock* block = &blockTable[index];
+			u32 set = jitHashPC(pc);
+			// PROFILER_CACHE_MISS() (jit_debug.h) reads a local named `block` for
+			// its cold/collision classification -- way0 stands in for it on a
+			// full miss (an arbitrary but stable choice between the two slots
+			// actually probed).
+			BasicBlock* block = &blockTable[set * BLOCK_TABLE_WAYS];
 			if (block->startPC == pc) {
 				PROFILER_CACHE_HIT();
 				return block;
+			}
+			BasicBlock* way1 = block + 1;
+			if (way1->startPC == pc) {
+				PROFILER_CACHE_HIT();
+				return way1;
 			}
 			PROFILER_CACHE_MISS();
 			return nullptr;
@@ -244,10 +269,12 @@ class JITCache {
 		// returns the slot even when a different PC occupies it, so the caller can
 		// tell a hash collision from a never-compiled / SMC-killed slot. Returns a
 		// zeroed sentinel before initialize().
+		// `index` is a set index (jitHashPC()'s return value); peeks way0 only
+		// (diagnostic build, not correctness-relevant which way it shows).
 		inline const BasicBlock& debugSlot(u32 index) const {
 			static const BasicBlock kZero = {};
 			if (!blockTable) return kZero;
-			return blockTable[index & (HASH_TABLE_SIZE - 1)];
+			return blockTable[(index & (HASH_TABLE_SIZE - 1)) * BLOCK_TABLE_WAYS];
 		}
 #endif
 };
