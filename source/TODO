@@ -1,0 +1,51 @@
+# TODO (branch arm9-jit-infra)
+
+## Immediate - finish current work in flight
+1. [x] Validate the uncommitted repeated-bail demotion fix (source/src/jit/jit_exec.cpp).
+   Implements NOTES.md Step 5 item 3 ("demote on N consecutive zero-progress
+   hits"). Built an A/B harness (tools/benchmark/corecost-ab.sh: baseline =
+   fix stashed out, after = fix in, both -DJIT_CORE_COST_HISTO over the
+   unified harness PKT_PROFILE sink) and ran a 30s SM64DS smoke soak.
+   Confirmed: ARM7 bail0/spin_hits fell from ~586/frame to ~93/frame (-84%,
+   5 PCs demoted after the 4-hit threshold), noBlock/marker_hits rose by the
+   same amount, and total calls/ran/wasted counts were byte-identical
+   baseline vs after (same guest trace, purely cheaper handling of the same
+   events - no behavior change). arm7_jit zone time was flat-to-slightly-
+   better within the noise of a 30s run, consistent with NOTES.md's own
+   ~0.2-0.4 ms/f estimate out of a ~5.9 ms/f zone. Committed.
+2. [x] Double-check the BailTrack direct-mapped table ((pc>>2)&63) for
+   correctness under PC aliasing. trackRepeatedBail() is only called from
+   the r.instructions==0 (bail0) path, so a hash collision with a different
+   PC just resets the counter (delays demotion) - it can never fire for a
+   PC that isn't itself bailing, so no spurious demotion of a good block.
+   Confirmed by inspection and by the A/B run above (demote1 count unchanged
+   baseline vs after: the length-1 path is untouched by this change).
+
+## Highest-leverage next steps (NOTES.md's own priority order)
+3. [ ] Better ARM9 block-table hash - try mulhwu (top 32 bits of full
+   product) instead of mullw in the two PPC hash stubs; A/B with
+   -DJIT_HASH_HISTO, target b16+ bucket count and dispx100 moving toward
+   100.
+4. [ ] 2-way set associativity on getBlock() - fallback if (3) doesn't
+   flatten the ~14 hot collision buckets. +2 MiB/core MEM2 cost (headroom
+   confirmed fine).
+5. [ ] Longer ARM7 JIT block chains - instrument why ARM7 chains break
+   (bailedOut / dynamic-exit / IRQ-check / quota, split by core) to see if
+   some exits are staticly chainable.
+6. [ ] Shrink the ARM7 uncompilable-PC set - capture dontJIT top: PCs
+   (likely predicated LDR/STR) and widen the emitter for the top offenders;
+   2289 marker re-hits/frame is the largest single ARM7 cost.
+
+## Known bugs / unfinished features tracked in memory
+7. [ ] GX2DBG SUB-screen affine-BG bug - ghosting/grey-grid artifacts on the
+   SUB screen GX-offload path (MAIN is visually verified OK).
+8. [ ] Unified harness Step 11 - real-hardware cutover per plan §6. Needs
+   explicit per-launch permission each time - do not do unprompted.
+
+## Housekeeping
+9. [ ] source/TODO was empty - now tracked here.
+10. [ ] source/src/jit/jit_thumb.cpp:270 - stale inline TODO (clamp) on a
+    differential-harness flag comment; resolve or promote to a tracked item.
+11. [ ] After ARM9 hash-collision work lands, scope the next investigation:
+    ARM9 JIT-exec (~4.25 ms/f) and the 2D compositor (~5 ms/f) become the
+    real remaining frame-time levers.

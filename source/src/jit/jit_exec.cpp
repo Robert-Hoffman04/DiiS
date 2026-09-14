@@ -51,6 +51,37 @@ u64 g_jitPredBcc9  = 0;
 extern u64 g_jitSmcKills; // jit_cache.cpp -- real (non-empty-bucket) SMC invalidations
 
 // ---------------------------------------------------------------------------
+// Repeated-bail demotion (always on -- this is a real fix, not diagnostic
+// instrumentation). The existing bail-and-demote path below only registers a
+// permanent "don't JIT" marker for a block that is a lone terminator
+// (insnCount()==1): a BX/POP{pc} that immediately mispredicts. It does NOT
+// catch a compiled multi-instruction block that bails on its very first
+// instruction every single visit -- e.g. a 2-3 instruction IRQ-poll/spin-wait
+// whose entry instruction is a dynamic branch that resolves the same way
+// every time in practice. That block re-pays the full getBlock+trampoline
+// cost on every dispatch forever (confirmed on ARM7: ~18 distinct PCs,
+// ~600 hits/frame, jit/NOTES.md Step 4).
+//
+// Fix: track a small fixed-size table of "PC currently failing" per core; once
+// a PC racks up BAIL_DEMOTE_THRESHOLD consecutive zero-progress hits, demote
+// it the same way the length-1 path does, regardless of its compiled length.
+// A direct-mapped table (not a full LRU) is fine here -- collisions just delay
+// demotion by resetting the counter, never demote incorrectly.
+// ---------------------------------------------------------------------------
+struct BailTrack { u32 pc; u8 count; };
+static BailTrack s_bailTrack7[64];
+static BailTrack s_bailTrack9[64];
+static const u8 BAIL_DEMOTE_THRESHOLD = 4;
+
+static inline bool trackRepeatedBail(BailTrack* tbl, u32 pc)
+{
+	BailTrack& e = tbl[(pc >> 2) & 63];
+	if (e.pc != pc) { e.pc = pc; e.count = 1; return false; }
+	if (e.count < 0xFF) e.count++;
+	return e.count >= BAIL_DEMOTE_THRESHOLD;
+}
+
+// ---------------------------------------------------------------------------
 // -DJIT_CORE_COST_HISTO (off by default, zero-cost when undefined): per-core
 // dispatch accounting for the "ARM7 JIT execute costs as much wall time as
 // ARM9 for half the guest work" investigation (jit/NOTES.md). Step 1 asks:
@@ -298,7 +329,8 @@ u32 jitRunArm7()
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
 		const bool len1 = (b->insnCount() == 1);
-		if (len1) jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
+		if (len1 || trackRepeatedBail(s_bailTrack7, pc))
+			jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
 		JCC_BAIL0(0, len1, pc, b->insnCount());
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
@@ -510,7 +542,8 @@ u32 jitRunArm9()
 
 	if (r.instructions == 0) {
 		const bool len1 = (b->insnCount() == 1);
-		if (len1) jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
+		if (len1 || trackRepeatedBail(s_bailTrack9, pc))
+			jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
 		JCC_BAIL0(1, len1, pc, b->insnCount());
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
