@@ -66,6 +66,16 @@ static u8 decal_table[32][64][64];
 static u8 index_lookup_table[65];
 static u8 index_start_table[8];
 
+// The DS geometry engine hard-caps a single frame at 2048 polygons / 6144
+// vertices (GBATEK) - no legitimate ROM content can ever submit more than
+// that per frame, so this per-frame clip scratch buffer only needs
+// headroom over the real hardware limit, not POLYLIST_SIZE (40000, sized
+// for the raw command-list bookkeeping, not actual per-frame poly counts).
+// sizeof(TClippedPoly) is ~400 bytes, so allocating POLYLIST_SIZE of them
+// is a ~16MB single allocation - it fits fine on desktop but overruns the
+// Wii's heap and hangs the whole console during boot before a frame is
+// ever rendered (BUGS.md: "Software rasterizer hangs on boot").
+#define SOFTRAST_MAX_CLIPPED_POLYS 4096
 static GFX3D_Clipper clipper;
 static GFX3D_Clipper::TClippedPoly *clippedPolys = NULL;
 static TexCacheItem* polyTexKeys[POLYLIST_SIZE];
@@ -997,7 +1007,7 @@ static char SoftRastInit(void)
 			Why is this POLYLIST_SIZE*2?  I can't for the life of me find where you need 2*POLLYLIST_SIZE
 
 		*/
-		clipper.clippedPolys = clippedPolys = new GFX3D_Clipper::TClippedPoly[POLYLIST_SIZE];
+		clipper.clippedPolys = clippedPolys = new GFX3D_Clipper::TClippedPoly[SOFTRAST_MAX_CLIPPED_POLYS];
 
 		for(int i=0;i<64;i++)
 		{
@@ -1280,9 +1290,12 @@ static void SoftRastRender()
 	for(int i=0;i<gfx3d.vertlist->count;i++)
 		gfx3d.vertlist->list[i].color_to_float();
 
-	//submit all polys to clipper
+	//submit all polys to clipper (clamped to the clip-scratch buffer's
+	//capacity - see SOFTRAST_MAX_CLIPPED_POLYS above; real DS content
+	//can't legitimately exceed the hardware's own 2048-poly frame limit)
 	clipper.clippedPolyCounter = 0;
-	for(int i=0;i<gfx3d.polylist->count;i++)
+	int numPolysToClip = min<int>(gfx3d.polylist->count, SOFTRAST_MAX_CLIPPED_POLYS);
+	for(int i=0;i<numPolysToClip;i++)
 	{
 		POLY* poly = &gfx3d.polylist->list[gfx3d.indexlist[i]];
 		VERT* clipVerts[4] = {
