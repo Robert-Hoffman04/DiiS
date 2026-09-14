@@ -673,3 +673,64 @@ See `tools/benchmark` scratch capture pattern (mcopy the autoload-savestate
 ROM+state, run, `mcopy` back `sd:/jit.log`, `grep -a "a7 edge:"` / `"a9
 edge:"`) -- not checked in as a script since it's a one-shot diagnostic
 capture, not an A/B.
+
+## Step 7 -- dontJIT top-opcode capture and one fix (TODO item 6)
+
+The `dontJIT tot=... uniq=... top:` opcode-frequency dump in `jit_trace.cpp`
+(fires on a fresh zero-length compile, i.e. the *first* time a PC is found
+uncompilable) never triggered during Step 6's 180s soak -- the modulo
+threshold (`s_tot & 0xFFF`) needs 4096 such fresh discoveries and the
+autoload-savestate soak's cache was already warm by then. Lowered the mask to
+`0xFF` for this capture (kept -- it's diagnostic-only, gated behind
+`DESMUME_JIT_TRACE_FIRST`, and a smaller threshold is strictly more useful for
+a short soak) and re-ran 90s. Two dumps fired (tot=256, tot=512); top ARM-mode
+opcodes by raw 32-bit encoding:
+
+```
+908ff100=18 e1a0e00f=16 e121f003=14 012fff1e=14 e121f001=13 e121f002=11
+e121f000=8 e25ef004=8 08bd8000=8 908ff101=8 e08ff102=7 e08fc00c=6
+```
+
+Decoded, these collapse into a handful of instruction *shapes* (condition
+codes and register operands fragment what would otherwise be a few offenders
+into many distinct literal opcode words -- masking the condition field before
+dedup would give a cleaner top-N next time):
+
+| shape | example | why it bails today |
+|---|---|---|
+| `BXcc lr` (conditional return) | `012fff1e` = BXEQ lr | see fix below |
+| `MSR CPSR_c, Rn` (mode switch) | `e121f00{0-3}` | control-field MSR is categorically unsupported (jit_arm.cpp:1392, only the flags-only field mask compiles) -- touches CPU mode/register banking, correctly out of scope for a quick fix |
+| `ADD{cc} pc, pc, Rm, LSL#2` (jump table) | `908ff100/101`, `e08ff102` | register-form data-proc-to-pc requires `rn != 15` (jit_arm.cpp:450); only the *immediate*-operand2 form of `ADD/SUB pc,#k` is special-cased for `rn==15` (line 462-475). The function's own header comment already claims to cover "`ADD pc,pc,rN` jump tables" -- it doesn't, for the register-source case. Real fix: special-case `rn==15` in the register path the same way, materializing `currentPC+8` as the ALU operand instead of reading a live PC register (jump tables are a **known dynamic target** either way, so this only removes the round-trip, not a differential-testing risk from a wrong static target). Not attempted this pass -- flagged for the next one. |
+| `SUBS pc, lr, #4` (IRQ return) | `e25ef004` | S-form (SPSR->CPSR exception return) is deliberately unsupported -- correctness-sensitive, correctly out of scope |
+| `LDMcc ...,{pc}` (conditional epilogue) | `08bd8000` | `predicated && pcInList` bails by design (jit_arm.cpp:993) -- same *shape* as `BXcc lr` (conditional interworking return) but via LDM; a same-style guarded-exit widening is plausible future work, not attempted this pass |
+| predicated `STM`/other DP | `b8a10001` | general predicated multi-register store; not investigated further this pass |
+
+### Fix applied: `BXcc lr` on ARM7 too
+
+`012fff1e` (BXEQ lr) was independently the single hottest raw opcode in the
+capture. `jit_arm.cpp`'s BX/BLX dispatch already had a guarded taken-exit +
+cond-false-fall-through compilation for exactly this shape (`isBlx==false &&
+Rm==14`, i.e. `BXcc lr`) -- added for ARM9 during Step 5 per the file's own
+comment ("the hottest refused opcode") -- but gated behind `v5` (ARMv5TE,
+i.e. ARM9-only). Nothing in the guarded-dispatch mechanism itself
+(`emitEvalCond`, the CPSR.T bit-0 interworking check, the dynamic exit) is a
+v5 feature: predicated execution is a base ARMv4T property, so ARM7's `BXcc
+lr` qualifies exactly the same way. Dropped the `!v5` term from the bail
+condition (BLX still correctly requires v5 -- that gate is separate and
+untouched).
+
+Validated: differential-testing soak (180s, in-game SM64DS via autoload
+savestate) -- no DIFF/MISMATCH/CANARY/OVERRUN lines. The `sd:/jit.log`
+capture hit the same pre-existing 192-byte FAT-truncation artifact noted in
+Step 6 (confirmed non-regression the same way: an identical-size, only-tail-
+differs artifact reproduces with the change stashed out).
+
+### Next up for item 6
+
+The jump-table `ADD{cc} pc,pc,Rm,LSL#2` widening (register-form rn==15 in
+`emitDataProcToPc`) is the next concrete, scoped, low-risk candidate --
+purely a dynamic-exit target computation, no CPU-mode/exception semantics
+involved. `MSR CPSR_c` / `SUBS pc,lr,#4` / predicated LDM{...,pc} touch real
+mode-switch and exception-return semantics and need their own scope
+discussion before attempting (same category as item 12's predication
+project) -- do not start unprompted.

@@ -1103,7 +1103,8 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			int i = 0; for (; i < s_n; i++) if (s_seen[i] == opc) break;
 			if (i == s_n && s_n < 256) { s_seen[s_n] = opc; s_cnt[s_n] = 0; s_n++; }
 			if (i < 256) s_cnt[i]++;
-			if ((s_tot & 0xFFF) == 0) {
+			if ((s_tot & 0xFF) == 0) {   // TODO item 6: lowered from 0xFFF so a
+			                             // short soak actually reaches a dump
 				// bubble the top few to the front, then dump
 				for (int a = 0; a < s_n; a++)
 					for (int b2 = a + 1; b2 < s_n; b2++)

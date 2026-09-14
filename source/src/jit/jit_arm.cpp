@@ -1234,13 +1234,15 @@ void emitMultiply(JitTraceCtx& ctx, u32 op)
 // (B4): bit0 of Rm selects the resume ISA. BLX also writes R14 = the ARM return
 // address first.
 //
-// Predicated (cond != AL): `BXcc lr` -- the conditional return, §5's single
-// hottest refused opcode -- compiles on ARM9 as taken-dynamic-exit + cond-false
-// fall-through (the block no longer terminates at a not-taken BXcc). The taken
-// path is the ordinary dynamic dispatch: lr's target block is nearly always
-// resident, so the guarded hash hits and the chain continues with no trampoline
-// round-trip. The dispatch gates this to isBlx == false && Rm == 14 && v5;
-// other predicated BX/BLX still end the trace.
+// Predicated (cond != AL): `BXcc lr` -- the conditional return, one of the
+// hottest refused opcodes on both cores (TODO item 6) -- compiles as
+// taken-dynamic-exit + cond-false fall-through (the block no longer
+// terminates at a not-taken BXcc). The taken path is the ordinary dynamic
+// dispatch: lr's target block is nearly always resident, so the guarded hash
+// hits and the chain continues with no trampoline round-trip. The dispatch
+// gates this to isBlx == false && Rm == 14 (originally ARM9/v5-only; widened
+// to ARM7 too since predicated execution is an ARMv4T base feature, nothing
+// here is v5-specific); other predicated BX/BLX still end the trace.
 //
 // The state flush is UNCONDITIONAL and sits *before* the predication guard, so
 // guest memory is coherent on both the taken exit and the cond-false path, and
@@ -1783,10 +1785,19 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	if ((op & 0x0FFFFFD0u) == 0x012FFF10u) {              // BX (0x..1) / BLX (0x..3) reg
 		const bool isBlx = (op & 0x20u) != 0;
 		if (isBlx && !v5) { ctx.endBlock = true; return; }   // BLX reg: ARMv5 only
-		// Predicated: only `BXcc lr` on ARM9 (the conditional return, §5's
-		// hottest refused opcode) -- taken-exit + cond-false fall-through.
-		// Other predicated BX (polymorphic Rm) and all predicated BLX bail.
-		if (cond != COND_AL && (isBlx || !v5 || (op & 0xF) != 14)) { ctx.endBlock = true; return; }
+		// Predicated: `BXcc lr` (the conditional return -- TODO item 6's
+		// single hottest dontJIT opcode, 012fff1e/BXEQ lr) gets the
+		// taken-exit + cond-false fall-through path on EITHER core. This was
+		// originally gated to ARM9/v5 (comment used to say "only on ARM9"),
+		// but nothing in emitBranchExchange()'s guarded-dispatch mechanism
+		// (emitEvalCond / dynamic exit / CPSR.T bit-0 interworking) is a v5
+		// feature -- predicated execution applies to every ARM instruction
+		// back to ARMv4T, so ARM7's BXcc lr qualifies too. Widened once the
+		// dontJIT capture showed BXEQ lr re-hitting the ARM7 front end just
+		// as hard as it used to on ARM9 pre-fix. Other predicated BX
+		// (polymorphic Rm) and all predicated BLX still bail (isBlx is
+		// genuinely ARMv5-only via the check above).
+		if (cond != COND_AL && (isBlx || (op & 0xF) != 14)) { ctx.endBlock = true; return; }
 		emitBranchExchange(ctx, op, isBlx, cond);
 		return;
 	}

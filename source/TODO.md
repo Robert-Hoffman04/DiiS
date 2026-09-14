@@ -58,14 +58,21 @@
    project - see item 12. Also fixed a pre-existing missing
    `#include <stdio.h>` in jit_trace.cpp (DESMUME_JIT_TRACE_FIRST alone
    failed to build without it). Committed.
-6. [ ] Shrink the ARM7+ARM9 uncompilable-PC set - capture dontJIT top: PCs
-   (likely predicated LDR/STR) and widen the emitter for the top offenders;
-   2289 marker re-hits/frame is the largest single ARM7 cost, and per item 5
-   this now matters for ARM9 too (99.8% of its clean chain-exits land on a
-   dontJIT marker). Needs a soak from a COLD JIT cache (flush/restart) to
-   catch the "dontJIT tot=... top:" opcode dump, which only fires on a fresh
-   zero-length compile - a mid-soak capture missed it (markers were already
-   cache-resident).
+6. [~] Shrink the ARM7+ARM9 uncompilable-PC set - captured the dontJIT top:
+   opcode dump (lowered its report threshold, jit_trace.cpp, to get a hit
+   within a short soak). Top offenders collapse into a few instruction
+   shapes: BXcc lr (conditional return), MSR CPSR_c (mode switch), ADD{cc}
+   pc,pc,Rm,LSL#2 (jump table), SUBS pc,lr,#4 (IRQ return), LDMcc{...,pc}
+   (conditional epilogue), predicated STM. Fixed one: BXcc lr now compiles
+   on ARM7 too (was gated ARM9/v5-only for no functional reason - predicated
+   execution is base ARMv4T, and the existing ARM9 guarded-exit mechanism
+   has nothing v5-specific in it). Validated via differential-testing soak,
+   no mismatches. Committed. Remaining shapes: the ADD{cc} pc,pc,Rm jump-
+   table register-form widening is next up (scoped, low-risk, pure dynamic-
+   exit target computation - jit/NOTES.md Step 7); MSR CPSR_c / SUBS
+   pc,lr,#4 / predicated LDM{...,pc} touch real CPU-mode/exception semantics
+   and need their own scope discussion first - do not start unprompted. See
+   jit/NOTES.md Step 7.
 
 ## Known bugs / unfinished features tracked in memory
 7. [ ] GX2DBG SUB-screen affine-BG bug - ghosting/grey-grid artifacts on the
