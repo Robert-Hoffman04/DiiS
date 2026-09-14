@@ -56,7 +56,8 @@
    explicit per-launch permission each time - do not do unprompted.
 
 ## Housekeeping
-9. [ ] source/TODO was empty - now tracked here.
+9. [x] source/TODO was empty - now tracked here. Renamed to source/TODO.md
+   so it opens with a Markdown viewer.
 10. [ ] source/src/jit/jit_thumb.cpp:270 - stale inline TODO (clamp) on a
     differential-harness flag comment; resolve or promote to a tracked item.
 11. [ ] After ARM9 hash-collision work lands, scope the next investigation:
