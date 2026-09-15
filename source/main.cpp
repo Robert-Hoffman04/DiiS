@@ -81,6 +81,10 @@
 #include "addons.h"
 #endif
 
+#ifdef DESMUME_GBA_DMA_SOAK
+#include "addons.h"
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -324,6 +328,13 @@ int main(int argc, char **argv){
 	// PLAN.md §4.3 item 4: same default-CFlash-slot-2 boot hang under
 	// -DDESMUME_FORCE_ROM sidestepped the same way. The companion synthetic
 	// ROM (tools/gba-refcheck/waitcnt.s) never touches slot-2 either.
+	addonsChangePak(NDS_ADDON_NONE);
+#endif
+
+#ifdef DESMUME_GBA_DMA_SOAK
+	// PLAN.md §4.3 item 2: same default-CFlash-slot-2 boot hang under
+	// -DDESMUME_FORCE_ROM sidestepped the same way. The companion synthetic
+	// ROM (tools/gba-refcheck/dmavcap.s) never touches slot-2 either.
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
@@ -1594,6 +1605,44 @@ void DSExec(){
 			if (slow != 0 && fast != 0) {
 				harness_profile_emitf("waitcntsoak slow=%lu fast=%lu\n",
 					(unsigned long)slow, (unsigned long)fast);
+				emitted = true;
+			}
+		}
+	}
+#endif
+
+#ifdef DESMUME_GBA_DMA_SOAK
+	// PLAN.md §4.3 item 2: DMA3 Video Capture Special-timing trigger
+	// verification. The companion synthetic ROM (tools/gba-refcheck/
+	// dmavcap.s) arms DMA3 with src fixed at REG_VCOUNT and dst incrementing
+	// into EWRAM 0x02010000, Special timing, repeat=1 -- so each firing
+	// records the VCOUNT value it fired at into the next buffer slot, then
+	// disarms itself and sets a liveness marker at EWRAM 0x0200FF00 once it
+	// observes VCOUNT==163 (just past frame 1's capture window). Once that
+	// marker is set, dump the first 165 recorded halfwords (safely past the
+	// expected 160) as one PKT_PROFILE line so the host side can check the
+	// exact fired-scanline sequence is 2,3,...,161 with nothing else mixed
+	// in (which would indicate a bug firing this channel from the plain
+	// HBlank/VBlank trigger paths too, or firing outside the documented
+	// VCOUNT range).
+	{
+		static bool emitted = false;
+		if (!emitted && gameInfo.isGBA) {
+			u32 live = T1ReadLong(MMU.GBA_EWRAM, 0x0FF00);
+			if (live != 0) {
+				// harness_profile_emitf's internal buffer is 512 bytes
+				// (harness_profile.cpp), too small for all 165 entries in
+				// one line -- split into 80-value chunks.
+				for (int chunk = 0; chunk < 165; chunk += 80) {
+					char line[600];
+					int off = snprintf(line, sizeof(line), "dmasoak part=%d vals=", chunk / 80);
+					int end = (chunk + 80 < 165) ? chunk + 80 : 165;
+					for (int i = chunk; i < end && off < (int)sizeof(line) - 8; i++) {
+						u16 v = T1ReadWord(MMU.GBA_EWRAM, 0x10000 + i * 2);
+						off += snprintf(line + off, sizeof(line) - off, "%u,", (unsigned)v);
+					}
+					harness_profile_emitf("%s\n", line);
+				}
 				emitted = true;
 			}
 		}

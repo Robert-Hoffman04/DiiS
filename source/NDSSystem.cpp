@@ -35,6 +35,13 @@
 #include "utils/decrypt/crc.h"
 #include "bios.h"
 #include "bios_gba.h"
+#include "gba_ppu.h"
+#include "gba_timers.h"
+#include "gba_keypad.h"
+#include "gba_dma.h"
+#include "gba_irq.h"
+#include "gba_backup.h"
+#include "gba_apu.h"
 #include "debug.h"
 #include "Disassembler.h"
 #include "readwrite.h"
@@ -535,6 +542,26 @@ int NDS_LoadROM(const char *filename, const char *logicalFilename)
 			// function's own comments. This is the real-load call site its
 			// comment already anticipated.
 			NDS_DebugForceGBAMode(true);
+
+			// §4.3 step 4 (cartridge save memory): detect SRAM/EEPROM/Flash
+			// from the ID string the real cart's linker embeds (gbaData is
+			// the actual file content; gbaMask+1 may be larger, zero-padded
+			// out to the next power of two, so scan just `size` real bytes)
+			// and load any existing save next to where DS .dsv saves already
+			// go (path.BATTERY), as <romname>.sav -- a flat raw dump, the
+			// same format real backup devices and other GBA emulators use.
+			// Both calls are here, once, at ROM-load time -- NOT in
+			// NDS_Reset()'s GBA block below, or a soft reset (or this
+			// function's own NDS_Reset() call two lines down) would wipe
+			// the player's save.
+			gbaBackupDetect(gbaData, size);
+			{
+				char savPath[MAX_PATH];
+				memset(savPath, 0, sizeof(savPath));
+				path.getpathnoext(path.BATTERY, savPath);
+				strcat(savPath, ".sav");
+				gbaBackupLoadFile(savPath);
+			}
 
 			NDS_Reset();
 
@@ -1866,6 +1893,120 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 	return std::make_pair(arm9, arm7);
 }
 
+// roadmap #20 (GBA compat), §4.3 step 1 (peripherals): GBA video timing.
+// Real hardware: 4 CPU cycles/dot, 308 dots/scanline (240 HDraw + 68
+// HBlank), 228 scanlines/frame (160 visible + 68 VBlank) -- GBATEK. The
+// GBA ARM7 core runs at the same clock DS ARM7 does, and armInnerLoop's
+// `arm7 += armcpu_exec<ARMCPU_ARM7>() << 1` already doubles ARM7 cycles
+// into nds_timer's unit (ARM9-clock ticks) to share a timeline with the
+// ARM9 side -- GBA mode has no ARM9, but nds_timer stays the shared clock
+// armInnerLoop<false,true> advances against, so the same x2 applies here.
+static const s32 GBA_HDRAW_TICKS  = 240 * 4 * 2;
+static const s32 GBA_HBLANK_TICKS = 68  * 4 * 2;
+static const int GBA_LINES_TOTAL  = 228;
+
+// Runs exactly one GBA video frame's worth of ARM7 execution, rendering
+// each visible scanline as its HDraw period ends -- so mid-frame register
+// rewrites (raster effects) take effect, matching how the DS side already
+// calls GPU_RenderLine() once per scanline rather than once per frame.
+// Used instead of the DS for(;;)/sequencer loop below when gameInfo.isGBA.
+// Timers now advance alongside the PPU (gbaTimersStep, once per HDraw/
+// HBlank segment -- same GBA_HDRAW_TICKS/GBA_HBLANK_TICKS windows, divided
+// by 2 to undo the nds_timer ARM9-clock doubling and get real GBA cycles);
+// keypad IRQ is checked once per frame against whatever input this frame's
+// caller already latched into KEYINPUT before NDS_exec was reached. DMA
+// (gbaDmaOnHblank/OnVblank) fires any channel armed for those timings at
+// the matching scanline boundary, plus DMA3's Video Capture Special timing
+// (also driven from gbaDmaOnHblank, gated on the current VCOUNT) -- see
+// gba_dma.h for why that's "all at once", not cycle-accurate. APU (gba_apu.cpp) has no per-scanline hook of
+// its own -- it's driven entirely by gbaTimersStep's timer-overflow calls
+// (DirectSound FIFO latching) and pulled independently by SPU.cpp's
+// SPU_Emulate_user() at the host audio callback's own rate.
+static void gbaExecFrame()
+{
+	gbaPpuBeginFrame();
+	gbaKeypadCheckIrq();
+	for (int line = 0; line < GBA_LINES_TOTAL; line++)
+	{
+		// armInnerLoop keeps the global `nds_timer` advanced as it runs
+		// (nds_timer = nds_timer_base + timer, each iteration of its own
+		// while loop) -- same as the DS for(;;) loop below relies on, so
+		// there is nothing else to do with it here.
+		//
+		// armInnerLoop's own while loop also bails out as soon as
+		// sequencer.reschedule is set (NDS_Reschedule(), called from all
+		// over -- armcpu_init, MMU register writes, etc. -- regardless of
+		// GBA/DS mode). The DS for(;;) loop below clears it once per
+		// iteration before calling armInnerLoop; this loop must do the
+		// same per chunk, or the first stray reschedule request from
+		// anywhere (observed: armcpu_init's own NDS_Reschedule() call
+		// during NDS_Reset, i.e. before this function is ever even
+		// called) permanently truncates every remaining chunk of every
+		// remaining frame to zero executed cycles -- found by
+		// instrumenting a direct-boot that looked stuck: PC advanced a
+		// few instructions into frame 1, then never moved again.
+		sequencer.reschedule = false;
+		u64 base = nds_timer;
+		s32 arm7in = (s32)(nds_arm7_timer - nds_timer);
+		s32 target = arm7in + GBA_HDRAW_TICKS;
+		s32 arm7out = armInnerLoop<false,true>(base, target, 0, arm7in).second;
+		nds_arm7_timer = base + arm7out;
+
+		// §4.3 item 1: real ARM-level IRQ dispatch, deferred to exactly
+		// this point (between armInnerLoop calls, never nested inside
+		// one) -- see gba_irq.cpp's file comment for why that placement
+		// is load-bearing, not cosmetic.
+		gbaIrqDispatchIfPending();
+
+		gbaPpuHDrawEnd(line);
+		gbaDmaOnHblank(line); // HBlank starts right after HDraw ends, for every line (incl. VBlank lines, matching GBATEK); `line` == current VCOUNT at this point in the loop (gba_ppu.cpp's gbaPpuHBlankEnd only advances VCOUNT to line+1 after this call), also gates DMA3 Video Capture Special timing
+		gbaTimersStep(GBA_HDRAW_TICKS / 2);
+
+		sequencer.reschedule = false;
+		base = nds_timer;
+		arm7in = (s32)(nds_arm7_timer - nds_timer);
+		target = arm7in + GBA_HBLANK_TICKS;
+		arm7out = armInnerLoop<false,true>(base, target, 0, arm7in).second;
+		nds_arm7_timer = base + arm7out;
+
+		gbaIrqDispatchIfPending();
+
+		gbaPpuHBlankEnd(line);
+		if (line == GBA_SCREEN_H - 1) gbaDmaOnVblank(); // VBlank starts as line 159's HBlank ends (VCOUNT -> 160)
+		gbaTimersStep(GBA_HBLANK_TICKS / 2);
+	}
+	gbaPpuEndFrame();
+
+	// Diagnostic for the Minish Cap post-cutscene freeze (docs/PLAN.md §4.3
+	// item 1): this file already documents one exact-match bug shape above
+	// (the sequencer.reschedule comment on this function) -- the outer
+	// per-line/per-frame loop keeps completing and ticking PROFILE's frame
+	// counter forward even when armInnerLoop makes zero real progress each
+	// chunk, so "frames are advancing" is not proof the ARM7 core is doing
+	// anything. Throttled PC dump to tell stalled-CPU-but-ticking-loop
+	// apart from genuine slow progress. Temporary -- remove once root-caused.
+	{
+		static u32 s_dbgFrame = 0;
+		static u32 s_lastPC = 0xFFFFFFFF;
+		static u32 s_samePcRun = 0;
+		if ((++s_dbgFrame % 30) == 0)
+		{
+			u32 pc = NDS_ARM7.instruct_adr;
+			if (pc == s_lastPC) s_samePcRun++; else s_samePcRun = 0;
+			s_lastPC = pc;
+			INFO("gbaExecFrame: frame#%u PC=0x%08X CPSR=0x%08X samePcRun=%u\n",
+				(unsigned)s_dbgFrame, (unsigned)pc,
+				(unsigned)NDS_ARM7.CPSR.val, (unsigned)s_samePcRun);
+		}
+	}
+
+	// §4.3 step 4 (cartridge save memory): cheap unconditional call --
+	// checks a dirty flag before doing any file I/O -- so once per frame
+	// is fine; keeps a save on disk current within a frame of the game
+	// actually writing it, without flushing mid-write byte-by-byte.
+	gbaBackupFlushIfDirty();
+}
+
 template<bool FORCE>
 void NDS_exec(s32 nb)
 {
@@ -1883,6 +2024,15 @@ void NDS_exec(s32 nb)
 		{
 			nds.sleeping = FALSE;
 		}
+	}
+	else if (gameInfo.isGBA)
+	{
+		// §4.3 step 1: GBA has no DMA/timer/interrupt controller here yet,
+		// so there's no DS-style hardware-event scheduler to drive -- the
+		// scanline boundaries gbaExecFrame() hits are the only timing that
+		// exists to schedule around. One call renders exactly one frame,
+		// matching sequencer.nds_vblankEnded's role for the DS loop below.
+		gbaExecFrame();
 	}
 	else
 	{
@@ -2270,6 +2420,13 @@ void NDS_Reset()
 		// call (e.g. from a "continue"/game-over screen) resolves back to
 		// the cartridge instead of jumping into empty EWRAM.
 		MMU.GBA_IWRAM[0x7FFA] = 1;
+
+		gbaPpuReset();
+		gbaTimersReset();
+		gbaKeypadReset();
+		gbaDmaReset();
+		gbaApuReset();
+		gbaIrqInstallTrampoline();
 	}
 	else
 	{
@@ -2658,6 +2815,16 @@ static void NDS_applyFinalInput()
 
 	((u16 *)MMU.ARM9_REG)[0x130>>1] = (u16)pad;
 	((u16 *)MMU.ARM7_REG)[0x130>>1] = (u16)pad;
+
+	// roadmap #20 (GBA compat), §4.3 step 1 (peripherals): GBA's KEYINPUT
+	// (0x04000130) uses the exact same active-low A/B/Select/Start/Right/
+	// Left/Up/Down/R/L bit layout as `pad` above -- mirror it into
+	// MMU.GBA_IOREG too so gba_keypad.cpp's IRQ check and any game code
+	// polling KEYINPUT directly both see live input. Bits 10-15 are
+	// unused on real hardware and read as 1 (matches MMU_Reset's idle
+	// preset for this register).
+	if (gameInfo.isGBA)
+		T1WriteWord(MMU.GBA_IOREG, 0x130, (u16)(pad | 0xFC00));
 
 
 	if(input.touch.isTouch)
