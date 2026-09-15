@@ -34,7 +34,21 @@ def build_header(title: bytes, game_code: bytes) -> bytes:
     # PC-relative: ((0xC0 - (0x00 + 8)) >> 2) = 0x2E
     h[0:4] = (0xEA000000 | 0x2E).to_bytes(4, "little")
     h[0x04:0x04 + 156] = GBA_LOGO
-    h[0xA0:0xA0 + len(title)] = title.ljust(12, b"\x00")
+    # Fixed 12-byte slice, not 0xA0:0xA0+len(title) -- that old form let
+    # Python's slice-assignment silently RESIZE the bytearray whenever
+    # title was shorter than 12 bytes (assigning a 12-byte value into an
+    # N<12-byte slice grows the buffer by 12-N), shifting every byte after
+    # it -- including the appended code body -- by that many bytes, while
+    # the entry-point branch at offset 0 stays hardcoded for a 192-byte
+    # header (target 0x080000C0). Found via a real, reproducible bug hunt
+    # (docs/PLAN.md §4.3 item 6): every hand-titled test ROM with a title
+    # shorter than 12 chars booted to a PC runaway (CPU executing
+    # misaligned garbage from the shifted code) -- "GRADIENT"/"CHECKER"
+    # (both exactly 8 chars) happened to shift by a whole 4-byte word,
+    # which decodes as one skippable ANDEQ no-op and silently self-heals,
+    # masking the bug; 5-char titles ("TEST4" etc, shift=7) are not
+    # word-aligned and corrupt every subsequent instruction.
+    h[0xA0:0xA0 + 12] = title.ljust(12, b"\x00")
     h[0xAC:0xAC + 4] = game_code
     h[0xB0:0xB2] = b"\x00\x00"     # maker code
     h[0xB2] = 0x96                  # fixed value

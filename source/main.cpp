@@ -68,6 +68,10 @@
 #include "addons.h"
 #endif
 
+#ifdef DESMUME_GBA_IRQ_SOAK
+#include "addons.h"
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -282,6 +286,21 @@ int main(int argc, char **argv){
 	harness_crash_init();
 
 	cflash_disk_image_file = NULL;
+
+#ifdef DESMUME_GBA_IRQ_SOAK
+	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.
+	// The default CFlash slot-2 passthrough (addonsInit()'s default pak)
+	// has a known, separately-documented boot hang when a GBA ROM is
+	// staged as sd:/DS/ROMS/test.nds under -DDESMUME_FORCE_ROM (see
+	// PLAN.md §4.3 item 8's "Dolphin/DeSmuME-side result" -- reproduced
+	// twice, console frozen at "Using CFlash directory:", not root-caused
+	// there). Sidestepped here the same way DESMUME_ARMWRESTLER_PROBE
+	// above sidesteps it for its own unrelated reason: switch slot-2 to
+	// NDS_ADDON_NONE before MMU_Init()/addonsInit() runs. This synthetic
+	// ROM never touches slot-2 either way, so the addon choice is inert
+	// to the test itself.
+	addonsChangePak(NDS_ADDON_NONE);
+#endif
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 	// Slot-2 = flat host RAM (see armwrestler_probe_tick() below) instead of
@@ -1477,6 +1496,36 @@ void DSExec(){
 	if (!SkipFrameTracker) { PZ_SCOPE(PZ_DRAW); Draw(); } // only update when !Frame skip tracker
 #endif
 	pzFrameTick();
+
+#ifdef DESMUME_GBA_IRQ_SOAK
+	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.
+	// The companion synthetic ROM (tools/gba-refcheck/irqsoak.s) maintains
+	// five u32 counters at GBA_EWRAM+0x0/0x4/0x8/0xC/0x10 (total_irq,
+	// vblank_count, timer_count, mainloop_iters, bad_source_count) --
+	// total_irq/vblank_count/timer_count from its ISR (called through the
+	// real armcpu_irqException()/BIOS-trampoline path, gba_irq.cpp),
+	// mainloop_iters from its main busy loop, entirely independent of the
+	// ISR. Emitted every 256 frames as one PKT_PROFILE line so a long soak
+	// run over the network harness produces periodic checkpoints instead
+	// of one silent black box; also stamps ARM7's live PC (stuck-PC / JIT
+	// runaway detection -- a real GBA cart's PC should never sit still
+	// across two consecutive 256-frame checkpoints once past setup).
+	{
+		static u32 soakFrame = 0;
+		if (gameInfo.isGBA && (++soakFrame % 256) == 0) {
+			u32 total = T1ReadLong(MMU.GBA_EWRAM, 0x0);
+			u32 vbl   = T1ReadLong(MMU.GBA_EWRAM, 0x4);
+			u32 tmr   = T1ReadLong(MMU.GBA_EWRAM, 0x8);
+			u32 loop  = T1ReadLong(MMU.GBA_EWRAM, 0xC);
+			u32 bad   = T1ReadLong(MMU.GBA_EWRAM, 0x10);
+			harness_profile_emitf(
+				"irqsoak frame=%lu total=%lu vbl=%lu tmr=%lu loop=%lu bad=%lu pc=0x%08lx\n",
+				(unsigned long)soakFrame, (unsigned long)total, (unsigned long)vbl,
+				(unsigned long)tmr, (unsigned long)loop, (unsigned long)bad,
+				(unsigned long)NDS_ARM7.instruct_adr);
+		}
+	}
+#endif
 
 	FPSOverlay_Tick();
 
