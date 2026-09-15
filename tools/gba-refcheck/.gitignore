@@ -3,3 +3,9 @@
 *.raw
 *.gba
 mgba_headless
+
+# gba-conformance suite (run_conformance.sh): built dols and per-run
+# captures, same convention as tools/benchmark/.gitignore. golden/ (the
+# committed expected output) is NOT listed here - it must stay tracked.
+dols/
+results/

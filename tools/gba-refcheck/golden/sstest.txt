@@ -1,0 +1,4 @@
+sstest checkpoint saved=1 frame=300
+sstest phase=truth frame=600 total=21008 vbl=600 tmr=20573 loop=2097915 bad=0 pc=0x08000144
+sstest reload_ok=1
+sstest phase=reload frame=900 total=21008 vbl=600 tmr=20573 loop=2097915 bad=0 pc=0x08000144

@@ -85,6 +85,18 @@
 #include "addons.h"
 #endif
 
+#ifdef DESMUME_GBA_SAVESTATE_SOAK
+// PLAN.md §4.3 item 7 / item 9's gba-conformance sstest: addonsChangePak()/
+// NDS_ADDON_NONE below (this soak's own CFlash-boot-hang sidestep, same as
+// its siblings above) needs this declared -- missing here until the
+// gba-conformance harness's first real build of this flag combo caught it
+// (a plain compile error, not a behavior bug: every prior session that
+// exercised DESMUME_GBA_SAVESTATE_SOAK apparently did so incrementally
+// against a tree where another *_SOAK flag was still also defined and had
+// already pulled this header in).
+#include "addons.h"
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,

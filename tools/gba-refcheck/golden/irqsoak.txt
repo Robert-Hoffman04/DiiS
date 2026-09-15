@@ -1,0 +1,4 @@
+irqsoak frame=256 total=8963 vbl=256 tmr=8777 loop=895110 bad=0 pc=0x08000144
+irqsoak frame=512 total=17927 vbl=512 tmr=17555 loop=1790220 bad=0 pc=0x08000144
+irqsoak frame=768 total=26891 vbl=768 tmr=26333 loop=2685330 bad=0 pc=0x08000144
+irqsoak frame=1024 total=35855 vbl=1024 tmr=35111 loop=3580440 bad=0 pc=0x08000144
