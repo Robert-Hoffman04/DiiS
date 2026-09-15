@@ -30,6 +30,7 @@
 #include "mem.h"
 #include "armcpu.h"
 #include "debug.h"
+#include "readwrite.h"
 
 enum { DMA_BASE = 0xB0, DMA_STRIDE = 0x0C };
 static inline u32 offSAD(int c)  { return DMA_BASE + c * DMA_STRIDE + 0x0; }
@@ -312,4 +313,46 @@ void gbaDmaOnFifoTrigger(u32 fifoAddr)
 		// armed until the game disables the channel itself.
 		if (d.irq) gbaRequestIrq((u16)(1 << (8 + i)));
 	}
+}
+
+// PLAN.md §4.3 item 7 (GBA savestate support). See gba_dma.h's comment.
+void gbaDmaSaveState(EMUFILE* os)
+{
+	write32le(1, os); // version
+	for (int i = 0; i < 4; i++)
+	{
+		GbaDmaChan &d = s_d[i];
+		write32le(d.liveSrc, os);
+		write32le(d.liveDst, os);
+		write8le(d.enabled ? 1 : 0, os);
+		write8le(d.repeat ? 1 : 0, os);
+		write8le(d.size32 ? 1 : 0, os);
+		write32le((u32)d.destCtrl, os);
+		write32le((u32)d.srcCtrl, os);
+		write32le((u32)d.timing, os);
+		write8le(d.irq ? 1 : 0, os);
+	}
+}
+
+bool gbaDmaLoadState(EMUFILE* is, int size)
+{
+	u32 version;
+	if (!read32le(&version, is)) return false;
+	if (version != 1) return false;
+
+	for (int i = 0; i < 4; i++)
+	{
+		GbaDmaChan &d = s_d[i];
+		u8 b; u32 v;
+		if (!read32le(&d.liveSrc, is)) return false;
+		if (!read32le(&d.liveDst, is)) return false;
+		if (!read8le(&b, is)) return false; d.enabled = b != 0;
+		if (!read8le(&b, is)) return false; d.repeat  = b != 0;
+		if (!read8le(&b, is)) return false; d.size32  = b != 0;
+		if (!read32le(&v, is)) return false; d.destCtrl = (int)v;
+		if (!read32le(&v, is)) return false; d.srcCtrl  = (int)v;
+		if (!read32le(&v, is)) return false; d.timing   = (int)v;
+		if (!read8le(&b, is)) return false; d.irq = b != 0;
+	}
+	return true;
 }

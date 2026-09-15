@@ -51,6 +51,13 @@
 #include "mic.h"
 #include "MMU_timing.h"
 
+// PLAN.md §4.3 item 7 (GBA savestate support).
+#include "gba_dma.h"
+#include "gba_timers.h"
+#include "gba_apu.h"
+#include "gba_backup.h"
+#include "gba_ppu.h"
+
 #include "path.h"
 
 #ifdef _WINDOWS
@@ -217,6 +224,27 @@ static void SF_MEM_rebind()
 	SF_MEM[4].v = MMU.ARM9_VMEM;
 }
 
+// PLAN.md §4.3 item 7 (GBA savestate support): the flat GBA memory-map
+// backing buffers (MMU.h, roadmap #20 §12.3 step 3) plus the GBA I/O
+// register block. Inline arrays inside the global MMU struct (like
+// ARM9_OAM/ARM9_LCD above), not heap pointers, so -- same as those -- no
+// SF_MEM_rebind()-style pointer patch is needed; the static initializer
+// below binds directly. GBA_BIOS is included even though it's fixed at
+// ROM-load time and never written afterward: cheap (16 KB) and it means
+// this table needs no asterisk about "everything except the BIOS".
+// GBA_screen (the composited pixel output, gba_ppu.h) is deliberately
+// NOT here -- see that header's savestate comment for why.
+SFORMAT SF_GBA_MEM[]={
+	{ "GBIO", 1, sizeof(MMU.GBA_BIOS),    MMU.GBA_BIOS},
+	{ "GEWR", 1, sizeof(MMU.GBA_EWRAM),   MMU.GBA_EWRAM},
+	{ "GIWR", 1, sizeof(MMU.GBA_IWRAM),   MMU.GBA_IWRAM},
+	{ "GPAL", 1, sizeof(MMU.GBA_PALETTE), MMU.GBA_PALETTE},
+	{ "GVRM", 1, sizeof(MMU.GBA_VRAM),    MMU.GBA_VRAM},
+	{ "GOAM", 1, sizeof(MMU.GBA_OAM),     MMU.GBA_OAM},
+	{ "GIOR", 1, sizeof(MMU.GBA_IOREG),   MMU.GBA_IOREG},
+	{ 0 }
+};
+
 SFORMAT SF_NDS[]={
 	{ "_WCY", 4, 1, &nds.wifiCycle},
 	{ "_TCY", 8, 8, nds.timerCycle},
@@ -319,6 +347,40 @@ static void mmu_savestate(EMUFILE* os)
 	MMU_timing.arm7dataFetch.savestate(os, version);
 	MMU_timing.arm9codeCache.savestate(os, version);
 	MMU_timing.arm9dataCache.savestate(os, version);
+}
+
+// PLAN.md §4.3 item 7 (GBA savestate support): each GBA peripheral
+// module's own private runtime state (see each gba_*.h header's savestate
+// comment for exactly what and why). Only ever written/read when
+// gameInfo.isGBA (writechunks() below gates chunk 201 on it) -- ARM7's CPU
+// registers/CPSR are NOT duplicated here, GBA mode reuses NDS_ARM7 (see
+// bios_gba.cpp's `#define cpu (&NDS_ARM7)`) so chunk 2 (SF_ARM7) already
+// covers them. Likewise gba_irq.cpp and gba_keypad.cpp own no state beyond
+// what's already in MMU.GBA_IOREG/GBA_IWRAM (chunk 200, SF_GBA_MEM) or
+// NDS_ARM7 (chunk 2) -- see those headers' file comments -- so neither
+// module appears here.
+static void gba_modules_savestate(EMUFILE* os)
+{
+	write32le(1, os); // version, in case a module's own sub-format ever needs a coordinated bump
+	gbaDmaSaveState(os);
+	gbaTimersSaveState(os);
+	gbaApuSaveState(os);
+	gbaBackupSaveState(os);
+	gbaPpuSaveState(os);
+}
+
+static bool gba_modules_loadstate(EMUFILE* is, int size)
+{
+	u32 version;
+	if (!read32le(&version, is)) return false;
+	if (version != 1) return false;
+
+	if (!gbaDmaLoadState(is, size)) return false;
+	if (!gbaTimersLoadState(is, size)) return false;
+	if (!gbaApuLoadState(is, size)) return false;
+	if (!gbaBackupLoadState(is, size)) return false;
+	if (!gbaPpuLoadState(is, size)) return false;
+	return true;
 }
 
 SFORMAT SF_WIFI[]={
@@ -1061,6 +1123,13 @@ static void writechunks(EMUFILE* os) {
 	WC(savestate_WriteChunk(os,91,gfx3d_savestate));
 	WC(savestate_WriteChunk(os,110,SF_WIFI));
 	WC(savestate_WriteChunk(os,120,SF_RTC));
+	// PLAN.md §4.3 item 7 (GBA savestate support): only emitted for a GBA
+	// session -- a DS savestate carries no GBA chunks at all, so loading an
+	// old (pre-this-feature) or DS-mode savestate is unaffected either way.
+	if (gameInfo.isGBA) {
+		WC(savestate_WriteChunk(os,200,SF_GBA_MEM));
+		WC(savestate_WriteChunk(os,201,gba_modules_savestate));
+	}
 	savestate_WriteChunk(os,0xFFFFFFFF,(SFORMAT*)0);
 	SSTRACE("writechunks: done, terminator written");
 	#undef WC
@@ -1099,6 +1168,10 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 			//case 101: if(!mov_loadstate(is, size)) ret=false; break;
 			case 110: if(!ReadStateChunk(is,SF_WIFI,size)) ret=false; break;
 			case 120: if(!ReadStateChunk(is,SF_RTC,size)) ret=false; break;
+			// PLAN.md §4.3 item 7 (GBA savestate support): only present when
+			// the chunk was written by a GBA session (see writechunks()).
+			case 200: if(!ReadStateChunk(is,SF_GBA_MEM,size)) ret=false; break;
+			case 201: if(!gba_modules_loadstate(is,size)) ret=false; break;
 			default:
 				ret=false;
 				break;

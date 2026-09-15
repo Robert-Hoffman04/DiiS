@@ -22,6 +22,8 @@
 
 #include "types.h"
 
+class EMUFILE;
+
 // docs/PLAN.md §4.3: the four GBA DMA channels (DMA0SAD..DMA3CNT_H,
 // 0x040000B0-0x040000DF). This is a "fires all at once" HLE, not a
 // cycle-accurate one: an immediate-timing transfer runs to completion the
@@ -64,5 +66,17 @@ void gbaDmaOnVblank();
 // Per GBATEK, a Sound-FIFO Special DMA always transfers exactly 4 words
 // (16 bytes), ignoring DMAxCNT_L's count, with a fixed destination.
 void gbaDmaOnFifoTrigger(u32 fifoAddr);
+
+// PLAN.md §4.3 item 7 (GBA savestate support): the per-channel shadow
+// state (GbaDmaChan) that a plain DMAxSAD/DAD/CNT_L/CNT_H register replay
+// can't reconstruct -- liveSrc/liveDst are the in-flight source/dest
+// cursors (meaningful mid-repeat for VBlank/HBlank/Special-timing channels,
+// e.g. DMA3 Video Capture across scanlines), and enabled/repeat/size32/
+// destCtrl/srcCtrl/timing/irq are the decoded CNT_H bits latched at
+// arm-time (CNT_H's raw bits are already covered by the GBA_IOREG chunk,
+// but this decoded shadow copy is what doTransfer()/gbaDmaOnHblank() etc.
+// actually read).
+void gbaDmaSaveState(EMUFILE* os);
+bool gbaDmaLoadState(EMUFILE* is, int size);
 
 #endif

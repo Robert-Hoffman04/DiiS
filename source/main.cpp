@@ -338,6 +338,13 @@ int main(int argc, char **argv){
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
+#ifdef DESMUME_GBA_SAVESTATE_SOAK
+	// PLAN.md §4.3 item 7: same default-CFlash-slot-2 boot hang under
+	// -DDESMUME_FORCE_ROM sidestepped the same way -- this soak reuses
+	// irqsoak.gba, which never touches slot-2 either.
+	addonsChangePak(NDS_ADDON_NONE);
+#endif
+
 #ifdef DESMUME_ARMWRESTLER_PROBE
 	// Slot-2 = flat host RAM (see armwrestler_probe_tick() below) instead of
 	// the default CFlash passthrough, before MMU_Init()/addonsInit() runs.
@@ -1559,6 +1566,81 @@ void DSExec(){
 				(unsigned long)soakFrame, (unsigned long)total, (unsigned long)vbl,
 				(unsigned long)tmr, (unsigned long)loop, (unsigned long)bad,
 				(unsigned long)NDS_ARM7.instruct_adr);
+		}
+	}
+#endif
+
+#ifdef DESMUME_GBA_SAVESTATE_SOAK
+	// PLAN.md §4.3 item 7: GBA savestate determinism test. Rides on the same
+	// irqsoak.gba ROM/counters as DESMUME_GBA_IRQ_SOAK above (timers +
+	// VBlank IRQ + a main-loop counter, all continuously active) instead of
+	// a new synthetic ROM. `sframe` is a host-side counter, untouched by
+	// savestate_load()'s internal NDS_Reset()/chunk restore, so it keeps
+	// counting monotonically straight across the reload below -- that's
+	// what lets a single run compare "N frames executed from the checkpoint
+	// the first time" against "N frames executed from the checkpoint after
+	// an explicit save+reload round-trip" without needing two separate
+	// process runs:
+	//   sframe==300: savestate_save() a checkpoint (mid-run: timers and
+	//                VBlank IRQ already active for hundreds of dispatches).
+	//   sframe==600: emit "sstest phase=truth ..." (the 5 EWRAM counters +
+	//                live ARM7 PC) -- this is "what should happen" 300
+	//                frames past the checkpoint, then immediately
+	//                savestate_load() the checkpoint back.
+	//   300 frames later (own counter, since sframe keeps climbing through
+	//                the reload): emit "sstest phase=reload ..." with the
+	//                same fields. A correct, deterministic
+	//                save/restore makes this line byte-for-byte identical
+	//                to phase=truth (same counters, same PC) since both are
+	//                exactly 300 emulated frames past the identical
+	//                checkpoint state.
+	{
+		static u32 sframe = 0;
+		static bool saved = false, didTruth = false, reloaded = false, didReload = false;
+		static u32 framesSinceReload = 0;
+		if (gameInfo.isGBA) {
+			sframe++;
+			if (!saved && sframe == 300) {
+				saved = savestate_save("sd:/gba_sstest.dst");
+				harness_profile_emitf("sstest checkpoint saved=%d frame=%lu\n",
+					(int)saved, (unsigned long)sframe);
+			}
+			if (saved && !didTruth && sframe == 600) {
+				u32 total = T1ReadLong(MMU.GBA_EWRAM, 0x0);
+				u32 vbl   = T1ReadLong(MMU.GBA_EWRAM, 0x4);
+				u32 tmr   = T1ReadLong(MMU.GBA_EWRAM, 0x8);
+				u32 loop  = T1ReadLong(MMU.GBA_EWRAM, 0xC);
+				u32 bad   = T1ReadLong(MMU.GBA_EWRAM, 0x10);
+				harness_profile_emitf(
+					"sstest phase=truth frame=%lu total=%lu vbl=%lu tmr=%lu loop=%lu bad=%lu pc=0x%08lx\n",
+					(unsigned long)sframe, (unsigned long)total, (unsigned long)vbl,
+					(unsigned long)tmr, (unsigned long)loop, (unsigned long)bad,
+					(unsigned long)NDS_ARM7.instruct_adr);
+				didTruth = true;
+				reloaded = savestate_load("sd:/gba_sstest.dst");
+				harness_profile_emitf("sstest reload_ok=%d\n", (int)reloaded);
+			}
+			// sframe > 600 guards against double-counting: the reload above
+			// happens *after* sframe==600's own NDS_exec already ran (on the
+			// pre-reload state), so the first NDS_exec actually run against
+			// the reloaded checkpoint is the one that bumps sframe to 601,
+			// not 600 itself.
+			if (reloaded && !didReload && sframe > 600) {
+				framesSinceReload++;
+				if (framesSinceReload == 300) {
+					u32 total = T1ReadLong(MMU.GBA_EWRAM, 0x0);
+					u32 vbl   = T1ReadLong(MMU.GBA_EWRAM, 0x4);
+					u32 tmr   = T1ReadLong(MMU.GBA_EWRAM, 0x8);
+					u32 loop  = T1ReadLong(MMU.GBA_EWRAM, 0xC);
+					u32 bad   = T1ReadLong(MMU.GBA_EWRAM, 0x10);
+					harness_profile_emitf(
+						"sstest phase=reload frame=%lu total=%lu vbl=%lu tmr=%lu loop=%lu bad=%lu pc=0x%08lx\n",
+						(unsigned long)sframe, (unsigned long)total, (unsigned long)vbl,
+						(unsigned long)tmr, (unsigned long)loop, (unsigned long)bad,
+						(unsigned long)NDS_ARM7.instruct_adr);
+					didReload = true;
+				}
+			}
 		}
 	}
 #endif
