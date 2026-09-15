@@ -311,6 +311,16 @@ struct MMU_struct
 	u8 GBA_PALETTE[0x400];    // 1 KB,   0x05000000
 	u8 GBA_VRAM[0x18000];     // 96 KB,  0x06000000
 	u8 GBA_OAM[0x400];        // 1 KB,   0x07000000
+	// roadmap #20 (GBA compat), §4.3 step 1 (peripherals): I/O register
+	// backing buffer, 0x04000000-0x040003FF. Generic raw storage -- most
+	// registers (BGxCNT, BGxOFS, affine params, OAM/VRAM addressing) are
+	// just read back by gba_ppu.cpp's renderer with no side effects,
+	// mirroring how DS registers work (GPU.h's dispx_st overlays MMU.
+	// ARM9_REG directly). DISPSTAT/VCOUNT are hardware-driven and get a
+	// read/write special-case in _MMU_ARM7GBA_read/write16 (MMU.cpp) since
+	// their bits are split between CPU-writable (IRQ enables, VCount
+	// setting) and hardware-owned (VBlank/HBlank/VCounter-match flags).
+	u8 GBA_IOREG[0x400];      // 1 KB,   0x04000000
 
 	// roadmap #20 (GBA compat), §12.3 step 4: a synchronized mirror of
 	// gameInfo.isGBA (NDSSystem.h), NOT a second source of truth.

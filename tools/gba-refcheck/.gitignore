@@ -2,6 +2,8 @@
 *.elf
 *.raw
 *.gba
+*.pcm
+*.ppm
 mgba_headless
 
 # gba-conformance suite (run_conformance.sh): built dols and per-run

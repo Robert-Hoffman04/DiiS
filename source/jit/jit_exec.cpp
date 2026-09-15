@@ -406,7 +406,13 @@ u32 jitRunArm7()
 // Default OFF -- the ARM9 JIT's blast radius is the whole game, so it stays
 // opt-in pending a benchmark + soak sign-off. -DDESMUME_JIT_ARM9_ON starts it
 // enabled without touching the production default (mirrors the jitoff/jiton
-// renderer A/B used for ARM7).
+// renderer A/B used for ARM7). This flag only picks the runtime default --
+// it no longer decides whether the ~17 MB ARM9 slot gets allocated (see
+// jitRunArm9()'s jitEnsureArm9() call and jit_trace.cpp's jitInit()): that
+// slot is lazily allocated on first real dispatch through here regardless of
+// this flag's value, so a DS session pays for it only once actually needed
+// and a GBA session (which never reaches this function at all) never pays
+// for it either way. One build now serves both.
 #ifdef DESMUME_JIT_ARM9_ON
 bool jitArm9Enabled = true;
 #else
@@ -415,11 +421,21 @@ bool jitArm9Enabled = false;
 
 u32 jitRunArm9()
 {
-	JitCpuProfile* prof = jitProfile[JIT_ARM9];
-	if (!prof) return 0;
 #if !defined(JIT_DIFFERENTIAL_TESTING)
 	if (!jitArm9Enabled) return 0;
 #endif
+
+	// Lazy allocation (jit_trace.cpp): the ~17 MB ARM9 slot is only ever
+	// touched from here, and this function is only ever called from the DS
+	// scanline loop (NDSSystem.cpp) -- gbaExecFrame() has no ARM9 side at
+	// all -- so a GBA session never reaches this line and never pays for it.
+	JitCpuProfile* prof = jitProfile[JIT_ARM9];
+	if (!prof)
+	{
+		if (!jitEnsureArm9()) return 0;
+		prof = jitProfile[JIT_ARM9];
+		if (!prof) return 0;
+	}
 
 	// perf_zones: dispatch + compile + trampoline + resume-pipeline is ARM9 JIT
 	// time; jitCompileTrace() re-tags its own interval as ARM9_BUILD.

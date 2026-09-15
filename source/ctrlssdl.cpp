@@ -23,6 +23,7 @@
 #include "harness/harness.h"
 #include "saves.h"
 #include "SPU.h"
+#include "NDSSystem.h"
 
 //u16 keyboard_cfg[NB_KEYS];
 //u16 joypad_cfg[NB_KEYS];
@@ -30,8 +31,6 @@ u16 wiimote_cfg[NB_KEYS];
 u16 gamecube_cfg[NB_KEYS];
 //u16 nbr_joy;
 cursor_status cursor;
-
-extern volatile BOOL execute;
 
 // Bottom (touch) screen quad geometry, set by do_screen_layout() in main.cpp
 // (FrontEnd.h). WPAD_SetVRes() reports the IR pointer in full Wii video-mode
@@ -153,6 +152,20 @@ void update_keypad(u16 keys)
 #endif
   /* Update X and Y buttons */
   MMU.ARM7_REG[0x136] = ( ~( keys >> 10) & 0x3 ) | (MMU.ARM7_REG[0x136] & ~0x3);
+
+  // GBA mode: this Wii-frontend path (DSExec() -> update_keypad()) writes
+  // straight into MMU.ARM9_REG/ARM7_REG, the DS-native KEYINPUT backing --
+  // never into MMU.GBA_IOREG, which is what the isGBA memory-map guard
+  // routes every ARM7 access to (and what gba_keypad.cpp's IRQ check reads).
+  // NDS_applyFinalInput() (NDSSystem.cpp) already does this same mirror for
+  // its own input path; this frontend bypasses that path entirely (calls
+  // update_keypad() directly instead of NDS_setPad()+begin/endProcessingInput),
+  // so without this a GBA game's KEYINPUT never moves and no button (Start
+  // included) has any effect. Bit layout is identical between the two --
+  // GBA KEYINPUT is bit-for-bit the same active-low A/B/Select/Start/Right/
+  // Left/Up/Down/R/L encoding as the DS one `keys` already targets above.
+  if (gameInfo.isGBA)
+    T1WriteWord(MMU.GBA_IOREG, 0x130, (u16)((~keys & 0x3FF) | 0xFC00));
 }
 
 /* Retrieve current NDS keypad */

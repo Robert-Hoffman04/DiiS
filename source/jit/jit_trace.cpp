@@ -291,8 +291,17 @@ void jitInit()
 	jitMemAccountReport("before");
 #endif
 
-	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE,      jitCacheArm7, jitBuildArm7Profile())
-	       && jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
+	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE, jitCacheArm7, jitBuildArm7Profile());
+
+	// The ARM9 slot (~17 MB: 12 MB arena + ~4 MB block table + ~1 MB SMC
+	// tables) is deliberately NOT allocated here -- see jitEnsureArm9() below.
+	// A GBA session never calls jitRunArm9() at all (gbaExecFrame() has no
+	// ARM9 side, JIT or interpreted -- GBA has no ARM9), so lazy allocation
+	// there means this slot simply never gets allocated for a GBA session
+	// regardless of whether ARM9 JIT is compiled in or runtime-enabled,
+	// leaving that memory free for a GBA cart's own 16+ MB full-ROM buffer
+	// (NDSSystem.cpp's GBA branch) -- one build now serves both, instead of
+	// needing -DDESMUME_JIT_ARM9_ON left off specifically for GBA work.
 
 	if (!ok) { jitShutdown(); return; }
 
@@ -311,6 +320,21 @@ void jitInit()
 	jitArmMinefield();
 #endif
 	s_initDone = true;
+}
+
+// Lazily allocates the ARM9 slot on first real use (jitRunArm9(), jit_exec.cpp)
+// instead of unconditionally in jitInit() -- see that function's comment.
+// Idempotent: jitProfile[JIT_ARM9] being non-null already is the "done" state,
+// same check jitRunArm9() itself uses. Requires jitInit() to have already run
+// (ARM7's slot init also builds s_arm7DsProfile/s_arm7GbaProfile); returns
+// false harmlessly if it hasn't, or if this allocation itself fails (OOM --
+// jitRunArm9() falls back to the interpreter either way, same as any other
+// jitCompileTrace() failure).
+bool jitEnsureArm9()
+{
+	if (jitProfile[JIT_ARM9]) return true;
+	if (!s_initDone) return false;
+	return jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 }
 
 void jitSetArm7GBAMode(bool enable)

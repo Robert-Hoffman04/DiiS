@@ -40,6 +40,7 @@
 #include "readwrite.h"
 #include "armcpu.h"
 #include "NDSSystem.h"
+#include "gba_apu.h"
 
 #include "metaspu/metaspu.h"
 
@@ -924,7 +925,13 @@ void SPU_Emulate_user(bool mix)
 			audiosize = SPU_user->bufsize;
 
 		int samplesOutput;
-		if(synchmode == ESynchMode_Synchronous)
+		if (gameInfo.isGBA)
+			// GBA mode has no DS-style SPU channels to synthesize from -- pull
+			// straight from gba_apu.cpp's DirectSound FIFO latches instead of
+			// going through the synchronizer/SPU_MixAudio path above, which
+			// exists for the DS's per-hline channel model this doesn't have.
+			samplesOutput = (gbaApuMixAudio(SPU_user->outbuf, audiosize), audiosize);
+		else if(synchmode == ESynchMode_Synchronous)
 			samplesOutput = synchronizer->output_samples(SPU_user->outbuf, audiosize);
 		else
 			samplesOutput = (SPU_MixAudio(mix,SPU_user,audiosize), audiosize);

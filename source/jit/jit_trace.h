@@ -21,6 +21,14 @@
 
 #if defined(DESMUME_JIT_ARM7)
 
+// Lazily allocates the ARM9 JIT slot (arena/block table/SMC tables) on first
+// real ARM9 JIT dispatch instead of unconditionally in jitInit() -- see
+// jit_trace.cpp's jitInit()/jitEnsureArm9() comments. Called from
+// jitRunArm9() (jit_exec.cpp) when jitProfile[JIT_ARM9] is still null.
+// Returns true once the slot is ready (idempotent), false if jitInit()
+// hasn't run yet or the allocation itself fails.
+bool jitEnsureArm9();
+
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
 #define JIT_YIELD_NUMBER           64
