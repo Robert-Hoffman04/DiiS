@@ -80,10 +80,27 @@ static bool arm7gba_canEnterArm(u32 pc)   { (void)pc; return true; }
 // *identical*: armcpu_exec<ARMCPU_ARM7>() (arm_instructions.cpp /
 // thumb_instructions.cpp via MMU_aluMemCycles<PROCNUM>) is one template,
 // not specialized per gameInfo.isGBA, so these are exactly what the
-// interpreter also computes for GBA-mode ARM7 as of today. Real GBA
-// wait-state timing (EWRAM 2-3 wait / IWRAM 0 wait, unlike DS's own
-// numbers) isn't modeled by the interpreter either yet -- that's §12.3
-// step 7. If either copy's cost model changes, keep this one in sync (or
+// interpreter also computes for GBA-mode ARM7 as of today.
+//
+// §4.3 item 4 update: WAITCNT-driven cartridge ROM/SRAM wait-state cost IS
+// now modeled by the interpreter (MMU_timing.h's isGBA branch in
+// _MMU_accesstime/Fetch<>/MMU_fetchExecuteCycles, gated on MMU.isGBA &&
+// PROCNUM==ARMCPU_ARM7) -- but *not* here: this file's cost tables are a
+// static per-opcode-class estimate baked in at JIT compile time, with no
+// per-access runtime address lookup at all (unlike the interpreter's
+// dynamic per-memory-access accounting), so a compiled block has no way to
+// react to the cartridge ROM address it's actually touching, let alone to
+// a WAITCNT rewrite happening after the block was compiled. Per §4.1's
+// reference-first methodology ("implement and validate in the DeSmuME
+// interpreter first... only then bring in the ARM7 JIT"), that's out of
+// scope for this item -- teaching the JIT wait-state timing would need
+// either a runtime cost callout per cart-ROM access (undoing much of the
+// point of compiling the cost in) or WAITCNT-keyed block invalidation, and
+// is left as a documented follow-up, not silently approximated as already
+// done. Real GBA wait-state timing for regions outside cart ROM/SRAM
+// (EWRAM 2-3 wait / IWRAM 0 wait, unlike DS's own numbers) still isn't
+// modeled anywhere yet -- that's a separate, smaller gap. If either
+// interpreter or JIT copy's cost model changes, keep this one in sync (or
 // extract both to one shared file) rather than let them silently drift.
 static u8 arm7gba_cyclesForThumb(u16 op)
 {

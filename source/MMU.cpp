@@ -32,6 +32,9 @@
 #include "wifi.h"
 #include "registers.h"
 #include "GPU.h"
+#include "gba_ppu.h"
+#include "gba_io.h"
+#include "gba_backup.h"
 #include "render3D.h"
 #include "gfx3d.h"
 #include "rtc.h"
@@ -1039,6 +1042,15 @@ void MMU_Reset()
 	memset(MMU.GBA_PALETTE,   0, sizeof(MMU.GBA_PALETTE));
 	memset(MMU.GBA_VRAM,      0, sizeof(MMU.GBA_VRAM));
 	memset(MMU.GBA_OAM,       0, sizeof(MMU.GBA_OAM));
+	memset(MMU.GBA_IOREG,     0, sizeof(MMU.GBA_IOREG));
+	// KEYINPUT (0x04000130) is active-low: real hardware idles at 0x03FF
+	// (nothing pressed). The keypad peripheral itself isn't implemented
+	// yet (§4.3 step 1), so nothing else drives this register -- leaving
+	// it zeroed would read back as "every button held", not "no BIOS/
+	// keypad ever ran yet". Preset the idle value so untouched reads are
+	// at least not actively wrong ahead of real keypad wiring.
+	T1WriteWord(MMU.GBA_IOREG, 0x130, 0x03FF);
+	gbaWaitcntReset(); // §4.3 item 4: WAITCNT-driven cartridge bus timing
 
 	IPC_FIFOinit(ARMCPU_ARM9);
 	IPC_FIFOinit(ARMCPU_ARM7);
@@ -4353,12 +4365,21 @@ enum GBAMemRegion
 	GBA_REGION_PALETTE,
 	GBA_REGION_VRAM,
 	GBA_REGION_OAM,
+	// §4.3 step 1 (peripherals): I/O registers now have a real backing
+	// buffer (MMU.GBA_IOREG) -- see gba_ppu.cpp for the PPU that reads it.
+	GBA_REGION_IO,
 	// Cartridge ROM (0x08000000+) got a real backing store once loading a
 	// real .gba file existed to fill one (NDS_LoadROM, NDSSystem.cpp) --
-	// see GBA_REGION_CART_ROM below. I/O (0x04000000) and SRAM
-	// (0x0E000000) still have no backing buffer, deferred to §12.3 step 7
-	// (peripherals).
+	// see GBA_REGION_CART_ROM below.
 	GBA_REGION_CART_ROM,
+	// §4.3 step 4 (cartridge save memory): flat 32 KB backing, gba_backup.cpp.
+	// EEPROM (0x0D bank) is deliberately NOT a distinct region here -- it
+	// overlaps GBA_REGION_CART_ROM's own address range and which one an
+	// access actually means depends on gbaBackupType(), not the address
+	// alone, so keeping gbaDecodeAddr() a pure function (see its own
+	// comment) means that decision has to live in the accessors below
+	// instead, via gbaEepromAddrHit().
+	GBA_REGION_SRAM,
 	GBA_REGION_UNMAPPED
 };
 
@@ -4389,6 +4410,14 @@ static GBADecodedAddr gbaDecodeAddr(u32 addr)
 			// IWRAM: 32 KB, mirrors every 0x8000 across the whole 0x03
 			// bank.
 			return GBADecodedAddr{ GBA_REGION_IWRAM, addr & 0x00007FFF };
+		case 0x04:
+			// I/O registers: real hardware only decodes 0x04000000-
+			// 0x040003FE (plus a separate, unimplemented 0x04000800-ish
+			// mirror quirk) and returns open-bus garbage for anything
+			// else in the 0x04 bank; masking the whole bank down to the
+			// known 1 KB register block is a documented simplification,
+			// not modeled hardware behavior.
+			return GBADecodedAddr{ GBA_REGION_IO, addr & 0x000003FF };
 		case 0x05:
 			// Palette RAM: 1 KB, mirrors every 0x400 across the whole
 			// 0x05 bank.
@@ -4420,6 +4449,13 @@ static GBADecodedAddr gbaDecodeAddr(u32 addr)
 			// keeps gbaDecodeAddr a pure function touching no globals,
 			// matching its existing verbatim-copy unit-test methodology.
 			return GBADecodedAddr{ GBA_REGION_CART_ROM, addr & 0x01FFFFFF };
+		case 0x0E: case 0x0F:
+			// SRAM: 32 KB physical (real hardware also only decodes 8 bits
+			// per bus cycle here -- an 8-bit-wide chip -- so a 16/32-bit
+			// CPU access is off-spec; this pass still services one at the
+			// flat byte offset rather than rejecting it, a documented
+			// simplification, not modeled hardware behavior).
+			return GBADecodedAddr{ GBA_REGION_SRAM, addr & 0x00007FFF };
 		default:
 			return GBADecodedAddr{ GBA_REGION_UNMAPPED, 0 };
 	}
@@ -4441,6 +4477,7 @@ static u8* gbaWritableBuffer(GBAMemRegion region)
 		case GBA_REGION_PALETTE: return MMU.GBA_PALETTE;
 		case GBA_REGION_VRAM:    return MMU.GBA_VRAM;
 		case GBA_REGION_OAM:     return MMU.GBA_OAM;
+		case GBA_REGION_IO:      return MMU.GBA_IOREG;
 		default:                 return NULL;
 	}
 }
@@ -4457,11 +4494,26 @@ static u8* gbaWritableBuffer(GBAMemRegion region)
 // NDS_LoadROM has already set both.
 static u32 gbaCartRomOffset(u32 windowOffset) { return windowOffset & MMU.CART_ROM_MASK; }
 
+// EEPROM (§4.3 step 4, gba_backup.cpp) overlaps GBA_REGION_CART_ROM's own
+// address range -- see the enum comment above gbaDecodeAddr. Real hardware
+// only defines the bit-serial protocol via DMA (gba_dma.cpp special-cases
+// a whole transfer that targets this window, bypassing these accessors
+// entirely); a direct, non-DMA 16-bit touch here has no real protocol
+// meaning, so it's serviced as an inert "always ready" stub (1) rather
+// than corrupting cart-ROM data that happens to share the address, and an
+// 8-/32-bit touch (never used by the real protocol) is just unmapped.
+static bool gbaEepromRegionHit(const GBADecodedAddr& d, u32 adr)
+{
+	return d.region == GBA_REGION_CART_ROM && gbaEepromAddrHit(adr);
+}
+
 u8 FASTCALL _MMU_ARM7GBA_read08(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadByte(MMU.GBA_BIOS, d.offset);
+	if (gbaEepromRegionHit(d, adr)) return 0;
 	if (d.region == GBA_REGION_CART_ROM) return T1ReadByte(MMU.CART_ROM, gbaCartRomOffset(d.offset));
+	if (d.region == GBA_REGION_SRAM) return gbaSramRead8(d.offset);
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadByte(buf, d.offset);
@@ -4471,7 +4523,9 @@ u16 FASTCALL _MMU_ARM7GBA_read16(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadWord_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	if (gbaEepromRegionHit(d, adr)) return 1;
 	if (d.region == GBA_REGION_CART_ROM) return T1ReadWord_guaranteedAligned(MMU.CART_ROM, gbaCartRomOffset(d.offset));
+	if (d.region == GBA_REGION_SRAM) return gbaSramRead8(d.offset);
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadWord_guaranteedAligned(buf, d.offset);
@@ -4481,7 +4535,9 @@ u32 FASTCALL _MMU_ARM7GBA_read32(u32 adr)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
 	if (d.region == GBA_REGION_BIOS) return T1ReadLong_guaranteedAligned(MMU.GBA_BIOS, d.offset);
+	if (gbaEepromRegionHit(d, adr)) return 0;
 	if (d.region == GBA_REGION_CART_ROM) return T1ReadLong_guaranteedAligned(MMU.CART_ROM, gbaCartRomOffset(d.offset));
+	if (d.region == GBA_REGION_SRAM) return gbaSramRead8(d.offset);
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return 0;
 	return T1ReadLong_guaranteedAligned(buf, d.offset);
@@ -4490,6 +4546,15 @@ u32 FASTCALL _MMU_ARM7GBA_read32(u32 adr)
 void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
+	// I/O writes route through gba_io.cpp's per-register dispatcher (video
+	// regs to gba_ppu.cpp -- DISPSTAT/VCOUNT split their bits between
+	// CPU-writable and hardware-owned, see gbaPpuIoWrite8's own comment --
+	// timers to gba_timers.cpp, keypad IRQ config to gba_keypad.cpp); every
+	// other register just falls through to a plain buffer write there,
+	// same as this function's generic path below.
+	if (d.region == GBA_REGION_IO) { gbaIoWrite8(d.offset, val); return; }
+	if (gbaEepromRegionHit(d, adr)) return;
+	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteByte(buf, d.offset, val);
@@ -4498,6 +4563,9 @@ void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val)
 void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
+	if (d.region == GBA_REGION_IO) { gbaIoWrite16(d.offset, val); return; }
+	if (gbaEepromRegionHit(d, adr)) return;   // see gbaEepromRegionHit's comment
+	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteWord_guaranteedAligned(buf, d.offset, val);
@@ -4506,6 +4574,9 @@ void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
 void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val)
 {
 	GBADecodedAddr d = gbaDecodeAddr(adr);
+	if (d.region == GBA_REGION_IO) { gbaIoWrite32(d.offset, val); return; }
+	if (gbaEepromRegionHit(d, adr)) return;
+	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, (u8)val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteLong_guaranteedAligned(buf, d.offset, val);

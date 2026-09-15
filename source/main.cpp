@@ -77,6 +77,10 @@
 #include "addons.h"
 #endif
 
+#ifdef DESMUME_GBA_WAITCNT_SOAK
+#include "addons.h"
+#endif
+
 // See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
 // whether draw_thread keeps making progress while GXRender is on the core
 // thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
@@ -313,6 +317,13 @@ int main(int argc, char **argv){
 	// to any GBA ROM staged that way -- sidestep it the same way. The
 	// companion synthetic ROM (tools/gba-refcheck/dsound.s) never touches
 	// slot-2 either.
+	addonsChangePak(NDS_ADDON_NONE);
+#endif
+
+#ifdef DESMUME_GBA_WAITCNT_SOAK
+	// PLAN.md §4.3 item 4: same default-CFlash-slot-2 boot hang under
+	// -DDESMUME_FORCE_ROM sidestepped the same way. The companion synthetic
+	// ROM (tools/gba-refcheck/waitcnt.s) never touches slot-2 either.
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
@@ -1562,6 +1573,29 @@ void DSExec(){
 			gbaApuMixAudio(buf, 1);
 			harness_profile_emitf("apusoak frame=%lu left=%d right=%d\n",
 				(unsigned long)apuFrame, (int)buf[0], (int)buf[1]);
+		}
+	}
+#endif
+
+#ifdef DESMUME_GBA_WAITCNT_SOAK
+	// PLAN.md §4.3 item 4: WAITCNT-driven cartridge ROM wait-state cost
+	// verification. The companion synthetic ROM (tools/gba-refcheck/
+	// waitcnt.s) times a fixed number of non-sequential cartridge-ROM
+	// reads against Timer0 under two WAITCNT configs in turn (0x0000
+	// slow-default, then 0x0018 fastest-WS0) and lands both elapsed-tick
+	// counts in EWRAM once both runs finish. Emitted once, the first
+	// frame both are observed non-zero, so the harness's PKT_PROFILE
+	// stream stays a single line instead of spamming every frame.
+	{
+		static bool emitted = false;
+		if (!emitted && gameInfo.isGBA) {
+			u32 slow = T1ReadLong(MMU.GBA_EWRAM, 0x0);
+			u32 fast = T1ReadLong(MMU.GBA_EWRAM, 0x4);
+			if (slow != 0 && fast != 0) {
+				harness_profile_emitf("waitcntsoak slow=%lu fast=%lu\n",
+					(unsigned long)slow, (unsigned long)fast);
+				emitted = true;
+			}
 		}
 	}
 #endif

@@ -29,6 +29,7 @@
 #include "MMU.h"
 #include "cp15.h"
 #include "readwrite.h"
+#include "gba_io.h"
 
 ////////////////////////////////////////////////////////////////
 // MEMORY TIMING ACCURACY CONFIGURATION
@@ -180,6 +181,26 @@ public:
 	template<int READSIZE, MMU_ACCESS_DIRECTION DIRECTION>
 	FORCEINLINE u32 Fetch(u32 address)
 	{
+		// §4.3 item 4 (docs/PLAN.md): WAITCNT-driven cartridge bus timing
+		// needs real sequential-vs-non-sequential tracking, which the DS
+		// side of this file keeps behind ACCOUNT_FOR_NON_SEQUENTIAL_ACCESS
+		// (off by default) -- but that flag is a DS accuracy/speed knob,
+		// not something this GBA-only path should depend on. Track it here
+		// unconditionally for isGBA using the same m_lastAddress storage
+		// this class already carries per (PROCNUM,AT) instance (so code
+		// and data streams -- arm7codeFetch/arm7dataFetch -- are tracked
+		// independently, matching real GBA prefetch/bus behavior). This
+		// also has to bypass the "code fetch always costs 1" short-circuit
+		// below (a DS-era approximation that discards fetch cost entirely
+		// -- see MMU_fetchExecuteCycles), since WAITCNT cost is
+		// overwhelmingly a code-fetch cost for real GBA content.
+		if (PROCNUM == ARMCPU_ARM7 && MMU.isGBA)
+		{
+			bool sequential = (address == m_lastAddress + (READSIZE >> 3));
+			m_lastAddress = address;
+			return _MMU_accesstime<PROCNUM, AT, READSIZE, DIRECTION>(address, sequential);
+		}
+
 #ifndef ACCOUNT_FOR_CODE_FETCH_CYCLES
 		if(AT == MMU_AT_CODE)
 			return 1;
@@ -261,6 +282,26 @@ FORCEINLINE u32 _MMU_accesstime(u32 addr, bool sequential)
 	static const int M32 = (PROCNUM==ARMCPU_ARM9) ? 2 : 1; // access through 32-bit bus
 	static const int M16 = M32 * ((READSIZE>16) ? 2 : 1); // access through 16-bit bus
 	static const int MSLW = M16 * 8; // this needs tuning
+
+	// §4.3 item 4 (docs/PLAN.md): WAITCNT-driven cartridge ROM/SRAM wait
+	// states. Scoped narrowly to the two region classes WAITCNT actually
+	// governs -- everything else in GBA's address space (BIOS/EWRAM/IWRAM/
+	// palette/VRAM/OAM/I-O) keeps exactly the behavior it had before this
+	// change (flat 1 for code fetch, matching the DS-derived table below
+	// for data), since those regions' real fixed wait-state costs are a
+	// separate, not-yet-modeled gap (out of scope for this item).
+	if(PROCNUM==ARMCPU_ARM7 && MMU.isGBA)
+	{
+		u32 region8 = addr >> 24;
+		if(region8 >= 0x08 && region8 <= 0x0D)
+			return gbaCartRomAccessCycles((int)((region8 - 0x08) >> 1), READSIZE, sequential);
+		if(region8 == 0x0E || region8 == 0x0F)
+			return gbaSramAccessCycles();
+		if(AT == MMU_AT_CODE)
+			return 1;
+		// else: DATA access outside cart ROM/SRAM -- fall through to the
+		// pre-existing flat table below, unchanged from before this item.
+	}
 
 	if(PROCNUM==ARMCPU_ARM9 && AT == MMU_AT_CODE && addr < 0x02000000)
 		return MC; // ITCM
@@ -397,6 +438,22 @@ FORCEINLINE u32 MMU_fetchExecuteCycles(u32 executeCycles, u32 fetchCycles)
 	//  in the case of a conflict this should be:
 	//  return std::max(aluCycles, memCycles + fetchCycles);
 #else
+	// §4.3 item 4 (docs/PLAN.md): with ACCOUNT_FOR_CODE_FETCH_CYCLES off
+	// (this build's default), fetch cost is normally discarded entirely --
+	// each instruction's own base executeCycles constant already assumes a
+	// flat minimum 1-cycle bus turnaround for its fetch. That assumption is
+	// what Fetch<>() returns for every GBA region outside cartridge ROM/
+	// SRAM (see _MMU_accesstime's isGBA branch), so `fetchCycles - 1` is
+	// exactly 0 there -- this changes nothing for BIOS/EWRAM/IWRAM/etc.
+	// code, and for DS mode entirely (PROCNUM/isGBA gated). For cartridge
+	// ROM code -- the overwhelming majority of a real GBA game's fetch
+	// traffic -- fetchCycles is now WAITCNT's real N/S cost (>=2), so this
+	// charges the wait-state cost *beyond* that already-assumed baseline
+	// on top of the instruction's base cost, rather than either discarding
+	// it (silently modeling no wait states at all, the bug this item
+	// fixes) or double-counting the baseline cycle.
+	if(PROCNUM==ARMCPU_ARM7 && MMU.isGBA && fetchCycles > 1)
+		return executeCycles + (fetchCycles - 1);
 	return executeCycles;
 #endif
 }
