@@ -68,6 +68,11 @@
 #include "addons.h"
 #endif
 
+#ifdef DESMUME_GBA_APU_SOAK
+#include "addons.h"
+#include "gba_apu.h"
+#endif
+
 #ifdef DESMUME_GBA_IRQ_SOAK
 #include "addons.h"
 #endif
@@ -299,6 +304,15 @@ int main(int argc, char **argv){
 	// NDS_ADDON_NONE before MMU_Init()/addonsInit() runs. This synthetic
 	// ROM never touches slot-2 either way, so the addon choice is inert
 	// to the test itself.
+	addonsChangePak(NDS_ADDON_NONE);
+#endif
+
+#ifdef DESMUME_GBA_APU_SOAK
+	// PLAN.md §4.3 item 3 (APU): same default-CFlash-slot-2 boot hang under
+	// -DDESMUME_FORCE_ROM documented above for DESMUME_GBA_IRQ_SOAK applies
+	// to any GBA ROM staged that way -- sidestep it the same way. The
+	// companion synthetic ROM (tools/gba-refcheck/dsound.s) never touches
+	// slot-2 either.
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
@@ -1523,6 +1537,31 @@ void DSExec(){
 				(unsigned long)soakFrame, (unsigned long)total, (unsigned long)vbl,
 				(unsigned long)tmr, (unsigned long)loop, (unsigned long)bad,
 				(unsigned long)NDS_ARM7.instruct_adr);
+		}
+	}
+#endif
+
+#ifdef DESMUME_GBA_APU_SOAK
+	// PLAN.md §4.3 item 3 (APU): DirectSound FIFO reference-check probe.
+	// The companion synthetic ROM (tools/gba-refcheck/dsound.s) arms Timer0
+	// (32768 Hz cadence) + DMA1 Special-timing FIFO-A refill with a known,
+	// deterministic +-100 (0x64/0x9C) 8-bit PCM square wave and enables
+	// DirectSound FIFO A at full volume, both channels. Calls the same
+	// public gbaApuMixAudio() SPU.cpp's isGBA branch uses, so this reads
+	// exactly the mixed L/R sample a real audio callback would get right
+	// now (zero-order hold of the last DMA'd byte -- see gba_apu.h) --
+	// emitted every frame for the first 32 frames only (one soak run's
+	// worth of setup + a handful of Timer0 periods per frame at ~549
+	// samples/frame @32768Hz/59.7fps is plenty to see the known waveform
+	// land) so the harness's PKT_PROFILE stream stays small.
+	{
+		static u32 apuFrame = 0;
+		apuFrame++;
+		if (gameInfo.isGBA && apuFrame <= 32) {
+			s16 buf[2];
+			gbaApuMixAudio(buf, 1);
+			harness_profile_emitf("apusoak frame=%lu left=%d right=%d\n",
+				(unsigned long)apuFrame, (int)buf[0], (int)buf[1]);
 		}
 	}
 #endif

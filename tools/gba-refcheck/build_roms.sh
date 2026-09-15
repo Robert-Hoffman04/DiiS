@@ -26,5 +26,6 @@ build_one() {
 build_one gradient      "GRADIENT"   "AGRE"
 build_one checkerboard  "CHECKER"    "ACHE"
 build_one irqsoak       "IRQSOAK"    "AIRQ"
+build_one dsound        "DSOUND"     "ADSN"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/irqsoak.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba"

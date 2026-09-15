@@ -19,6 +19,7 @@
 
 #include <mgba/core/core.h>
 #include <mgba/core/log.h>
+#include <mgba/core/blip_buf.h>
 #include <mgba-util/vfs.h>
 
 /* Matches struct ARMCore's layout closely enough for gprs[]/cpsr access
@@ -35,13 +36,18 @@ static void nullLogger(struct mLogger* logger, int category, enum mLogLevel leve
 }
 
 int main(int argc, char** argv) {
-	if (argc != 4) {
-		fprintf(stderr, "usage: %s <rom.gba> <frames> <out.ppm>\n", argv[0]);
+	if (argc != 4 && argc != 5) {
+		fprintf(stderr, "usage: %s <rom.gba> <frames> <out.ppm> [out.pcm]\n", argv[0]);
+		fprintf(stderr, "  out.pcm (optional, PLAN.md §4.3 item 3): raw interleaved\n"
+			"  stereo s16le PCM, drained via mCore's public getAudioChannel()/\n"
+			"  blip_buf API once per runFrame() -- final mixed DirectSound+PSG\n"
+			"  output at mGBA's own internal sample rate, not resampled further.\n");
 		return 2;
 	}
 	const char* romPath = argv[1];
 	int frames = atoi(argv[2]);
 	const char* outPath = argv[3];
+	const char* pcmPath = argc == 5 ? argv[4] : NULL;
 
 	static struct mLogger logger = { .log = nullLogger };
 	mLogSetDefaultLogger(&logger);
@@ -62,14 +68,65 @@ int main(int argc, char** argv) {
 	color_t* vbuf = calloc((size_t)width * height, sizeof(color_t));
 	core->setVideoBuffer(core, vbuf, width);
 
+	/* PLAN.md §4.3 item 3 (APU): pure I/O plumbing added on top of the
+	 * existing headless driver -- taps mCore's public audio API, no PPU/
+	 * CPU/APU code touched. getAudioChannel(core, 0/1) returns the two
+	 * blip_t* stereo output buffers (left/right) that every mGBA platform
+	 * core feeds its final mixed audio into; draining them with
+	 * blip_read_samples() after each runFrame() gives the actual DirectSound
+	 * + PSG mixed PCM stream mGBA would hand to a real audio backend. */
+	if (pcmPath) {
+		core->setAudioBufferSize(core, 8192);
+	}
+
 	if (!mCoreLoadFile(core, romPath)) {
 		fprintf(stderr, "mCoreLoadFile failed: %s\n", romPath);
 		return 1;
 	}
 	core->reset(core);
 
+	FILE* pcmFile = NULL;
+	blip_t* chanL = NULL;
+	blip_t* chanR = NULL;
+	long totalSamples = 0;
+	short minSample = 0, maxSample = 0;
+	if (pcmPath) {
+		pcmFile = fopen(pcmPath, "wb");
+		if (!pcmFile) { fprintf(stderr, "fopen %s failed\n", pcmPath); return 1; }
+		chanL = core->getAudioChannel(core, 0);
+		chanR = core->getAudioChannel(core, 1);
+	}
+
 	for (int i = 0; i < frames; i++) {
 		core->runFrame(core);
+
+		if (pcmFile && chanL && chanR) {
+			int avail = blip_samples_avail(chanL);
+			int availR = blip_samples_avail(chanR);
+			if (availR < avail) avail = availR;
+			if (avail > 0) {
+				short* tmp = malloc(sizeof(short) * 2 * avail);
+				/* Interleave: left into even slots, right into odd slots --
+				 * blip_read_samples(..., stereo=1) writes every other
+				 * element starting at out[0], so offsetting the right
+				 * channel's out pointer by 1 short interleaves the two. */
+				blip_read_samples(chanL, tmp, avail, 1);
+				blip_read_samples(chanR, tmp + 1, avail, 1);
+				fwrite(tmp, sizeof(short), (size_t)avail * 2, pcmFile);
+				for (int s = 0; s < avail * 2; s++) {
+					if (tmp[s] < minSample) minSample = tmp[s];
+					if (tmp[s] > maxSample) maxSample = tmp[s];
+				}
+				totalSamples += avail;
+				free(tmp);
+			}
+		}
+	}
+
+	if (pcmFile) {
+		fclose(pcmFile);
+		fprintf(stderr, "wrote %s (%ld stereo samples, min=%d max=%d)\n",
+			pcmPath, totalSamples, minSample, maxSample);
 	}
 
 	/* PPM dump (P6, 8-bit RGB). color_t default layout on this build
