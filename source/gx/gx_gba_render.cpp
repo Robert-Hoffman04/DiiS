@@ -195,6 +195,19 @@ static GxWindowPlan gxBuildWindowPlan(const GxGbaBandRegs &r, int bandY0, int ba
 struct GxBgPlaneCache {
 	GXTexObj texObj;
 	void *texData;
+	// gx-next-steps-log.md task 6: this plane's dedicated TLUT (see "Native
+	// CI4/CI8" in gx_gba_render.h) -- tlutData holds a 256-entry RGB5A3
+	// table built from the live BG palette bank at bake time; tlutObj wraps
+	// it for GX_LoadTlut(). Each BG index gets its OWN permanently-dedicated
+	// GX_TLUTn name (GX_TLUT0+bg for text mode, GX_TLUT6/7 for the affine
+	// variant of BG2/BG3 -- see gxBakeAffineBgPlane) rather than sharing one
+	// slot between a BG index's text and affine bakes, specifically so a
+	// mode switch (text <-> affine) can never leave a cache's `valid` flag
+	// true while the TMEM slot it references was silently overwritten by
+	// the other variant's bake in between -- see the "Deviations" section
+	// of task 6's log entry for the cross-mode-clobber hazard this avoids.
+	GXTlutObj tlutObj;
+	void *tlutData;
 	u16 mapWpx, mapHpx;
 	bool valid;
 	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
@@ -207,7 +220,8 @@ struct GxBgPlaneCache {
 };
 static GxBgPlaneCache s_bgPlane[4];
 static const int kBgPlaneMaxPx = 512;
-static u16 *s_bgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG
+static u16 *s_bgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG (toEffectScratch RGB5A3 path only -- see gxBakeBgPlane)
+static u8 *s_bgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-index scratch for the persistent CI8 bake, reused per-BG
 
 // ---------------------------------------------------------------------
 // Affine BG plane cache (BG2/BG3 in modes 1/2), index 0=BG2, 1=BG3. Affine
@@ -225,8 +239,16 @@ struct GxAffineBgPlaneCache {
 	GXTexObj texObj;
 	void *texData;
 	u32 texDataCap; // bytes currently allocated at texData; regrown on demand
+	// gx-next-steps-log.md task 6: dedicated TLUT, same pattern/rationale as
+	// GxBgPlaneCache's tlutObj/tlutData above -- GX_TLUT6 (which=0, BG2) /
+	// GX_TLUT7 (which=1, BG3), deliberately NOT shared with the text-mode
+	// GX_TLUT0-3 slots, so a mode switch can't clobber a still-"valid"
+	// cache's TMEM TLUT contents out from under it (see GxBgPlaneCache's
+	// comment for the full hazard this avoids).
+	GXTlutObj tlutObj;
+	void *tlutData; // fixed 256-entry RGB5A3 table (affine BG is always 8bpp) -- allocated once at init, not regrown
 	u16 mapPx;      // logical (unbordered) map size, square
-	u16 bufPx;      // baked/allocated texture size (mapPx, or mapPx+4 if bordered)
+	u16 bufPx;      // baked/allocated texture size (mapPx, or mapPx+8 if bordered -- see gxBakeAffineBgPlane's CI8 padding note)
 	bool wrap;
 	bool valid;
 	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
@@ -235,8 +257,15 @@ struct GxAffineBgPlaneCache {
 	u32 cfgCharBase, cfgMapBase;
 };
 static GxAffineBgPlaneCache s_affBgPlane[2];
-static const int kAffineBgPlaneMaxPx = 1024 + 4;
-static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG
+// gx-next-steps-log.md task 6: +8 (not +4) so the persistent CI8 bake's
+// bordered buffer size (mapPx+8, see gxBakeAffineBgPlane) always fits --
+// CI8's block shape is 8x4 (gx_texformat.h), wider than RGB5A3's 4x4, so a
+// +4 pad (only ever a multiple of 4) isn't guaranteed to be a multiple of 8
+// the way +8 is (mapPx itself is always a multiple of 8). The toEffectScratch
+// RGB5A3 path is unaffected -- it still only ever needs mapPx+4.
+static const int kAffineBgPlaneMaxPx = 1024 + 8;
+static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG (toEffectScratch RGB5A3 path only)
+static u8 *s_affBgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-index scratch for the persistent CI8 bake, reused per-BG
 
 // ---------------------------------------------------------------------
 // OBJ: one persistent texture slot per OAM index (128), sized to the max
@@ -250,24 +279,43 @@ static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG
 struct GxObjTexSlot {
 	GXTexObj texObj;
 	void *texData;
+	// gx-next-steps-log.md task 6: this sprite's dedicated TLUT source data
+	// (up to 256 RGB5A3 entries -- 16 for CI4/4bpp, 256 for CI8/8bpp). All
+	// 128 slots share ONE hardware TLUT name, GX_TLUT5 (unlike the BG planes
+	// above, which each get their own permanently-dedicated slot): 128
+	// sprites can't each have a dedicated TMEM TLUT (only 16 GX_TLUTn names
+	// exist), so instead every draw of a persistent-cache OBJ texture
+	// reloads GX_TLUT5 from this slot's own tlutData immediately before
+	// GX_LoadTexObj (see gxDrawObjLayerWindowed) -- the index texture data
+	// itself is still cached/reused across frames exactly as task 4 already
+	// does; only the TLUT is reloaded (cheap: 32-512 bytes) every draw.
+	GXTlutObj tlutObj;
+	void *tlutData;
 	bool valid;       // false until this slot has been baked at least once
 	bool oneDim;       // DISPCNT bit6 at bake time
 	bool colorMode;    // attribute0 bit13 (4bpp/8bpp) at bake time
 	u16 tileNum;       // attribute2 bits0-9 at bake time
 	u8  palNum;        // attribute2 bits12-15 at bake time (4bpp only, harmless for 8bpp)
 	u16 texW, texH;    // resolved source pixel size at bake time (shape+size)
+	u16 bufW, bufH;    // gx-next-steps-log.md task 6: actual baked/allocated CI4/CI8 texture size (texW/texH + 8 -- see gxBakeObjTexture's padding note), needed by gxDrawOneObj's UV normalization since it now differs from the toEffectScratch RGB5A3 path's own texW/texH+4 scheme
 };
 static GxObjTexSlot s_objTex[128];
 static const int kObjTexMaxPx = 64; // max regular-OBJ box (visibility/size gate)
-// Every OBJ texture is baked with a 1-texel transparent border (padded to a
-// multiple of 4 for RGB5A3's block size) so affine sampling that lands
-// outside the real sprite content clamps onto transparent border texels
-// instead of smearing the edge row/column -- see gx_gba_render.h. Non-affine
-// sprites never actually sample the border (their UV range is always exactly
-// [0,w]x[0,h] in source-texel space) but are baked the same way for one
-// code path.
-static const int kObjTexBufMaxPx = kObjTexMaxPx + 4;
-static u16 *s_objBakeScratch;
+// Every OBJ texture is baked with a 1-texel transparent border so affine
+// sampling that lands outside the real sprite content clamps onto
+// transparent border texels instead of smearing the edge row/column -- see
+// gx_gba_render.h. Non-affine sprites never actually sample the border
+// (their UV range is always exactly [0,w]x[0,h] in source-texel space) but
+// are baked the same way for one code path.
+//
+// gx-next-steps-log.md task 6: +8, not +4 -- same reasoning as
+// kAffineBgPlaneMaxPx above (CI4's block shape is 8x8 and CI8's is 8x4,
+// gx_texformat.h, both wider than RGB5A3's 4x4 that the old +4 padding was
+// sized for). The toEffectScratch RGB5A3 path still uses its own local
+// texW+4/texH+4 buffers (see gxBakeObjTexture), unaffected by this constant.
+static const int kObjTexBufMaxPx = kObjTexMaxPx + 8;
+static u16 *s_objBakeScratch; // toEffectScratch RGB5A3 path only
+static u8 *s_objBakeIdxScratch; // gx-next-steps-log.md task 6: persistent CI4/CI8 path
 
 struct GxObjDraw {
 	s16 x, y;             // on-screen top-left of the (possibly doubled) box
@@ -294,6 +342,19 @@ static int s_objDrawCount;
 static GXTexObj s_bmpTexObj;
 static void *s_bmpTexData;
 static bool s_bmpValid;
+// gx-next-steps-log.md task 6: mode 4 (8bpp palette-indexed bitmap) gets its
+// own CI8+TLUT texture object, kept separate from s_bmpTexObj/s_bmpTexData
+// (modes 3/5, direct 16bpp truecolor, stay RGB5A3 unchanged -- see
+// gx_gba_render.h). s_bmpValid/s_bmpValidCI are mutually exclusive in
+// practice (DISPCNT's mode field picks exactly one bitmap mode per frame)
+// but kept as separate flags rather than one shared bool + format tag, to
+// avoid touching the mode-3/5 code path's existing flag at all.
+static GXTexObj s_bmpTexObjCI;
+static void *s_bmpTexDataCI;
+static GXTlutObj s_bmpTlutObj;
+static void *s_bmpTlutData;
+static bool s_bmpValidCI;
+static u8 *s_bmpBakeIdxScratch;
 
 // 1x1 solid-color texture used for the backdrop fill (see gxGbaRenderFrame).
 static GXTexObj s_backdropTexObj;
@@ -331,6 +392,20 @@ static void gxUploadEffectTex(const u16 *linear, int w, int h, u8 wrapMode)
 	GX_InitTexObj(&s_effectTex.texObj, s_effectTex.texData, w, h, GX_TF_RGB5A3, wrapMode, wrapMode, GX_FALSE);
 }
 
+// ---------------------------------------------------------------------
+// gx-next-steps-log.md task 6: fixed GX_TLUTn name assignment for every
+// persistent CI4/CI8 texture this file bakes -- see gx_gba_render.h's
+// "Native CI4/CI8" section. Text BG and affine BG each get their OWN
+// dedicated slot (not shared between a BG index's text/affine variants)
+// specifically to avoid a cross-mode-clobber hazard: see GxBgPlaneCache's
+// comment above. 8 of the 16 available GX_TLUT0-15 names are used, well
+// within budget (GX_Init()'s default TMEM layout reserves all 16).
+// ---------------------------------------------------------------------
+static inline u8 gxBgTlutSlot(int bg) { return (u8)(GX_TLUT0 + bg); }              // BG0-3 text mode
+static const u8 kBmpTlutSlot = GX_TLUT4;                                          // bitmap mode 4
+static const u8 kObjTlutSlot = GX_TLUT5;                                          // OBJ, shared/reloaded per-draw
+static inline u8 gxAffineBgTlutSlot(int which) { return (u8)(GX_TLUT6 + which); }  // affine BG2/BG3
+
 // Copy-back scratch: GX_CopyTex's destination is real system memory, but in
 // GX's own block-tiled layout for the copy format (see gx_texformat.h) --
 // gxUnswizzle16bpp turns that back into a plain row-major buffer before the
@@ -360,33 +435,60 @@ bool gxGbaRenderInit()
 		s_bgPlane[i].texData = memalign(32, sz);
 		if (!s_bgPlane[i].texData) return false;
 		memset(s_bgPlane[i].texData, 0, sz);
+		s_bgPlane[i].tlutData = memalign(32, 256 * sizeof(u16));
+		if (!s_bgPlane[i].tlutData) return false;
+		memset(s_bgPlane[i].tlutData, 0, 256 * sizeof(u16));
 		s_bgPlane[i].valid = false;
 	}
 	s_bgBakeScratch = (u16 *)malloc(kBgPlaneMaxPx * kBgPlaneMaxPx * sizeof(u16));
 	if (!s_bgBakeScratch) return false;
+	s_bgBakeIdxScratch = (u8 *)malloc((u32)kBgPlaneMaxPx * kBgPlaneMaxPx);
+	if (!s_bgBakeIdxScratch) return false;
 
 	for (int i = 0; i < 2; ++i) {
 		s_affBgPlane[i].texData = nullptr;
 		s_affBgPlane[i].texDataCap = 0;
+		s_affBgPlane[i].tlutData = memalign(32, 256 * sizeof(u16));
+		if (!s_affBgPlane[i].tlutData) return false;
+		memset(s_affBgPlane[i].tlutData, 0, 256 * sizeof(u16));
 		s_affBgPlane[i].valid = false;
 	}
 	s_affBgBakeScratch = (u16 *)malloc((u32)kAffineBgPlaneMaxPx * kAffineBgPlaneMaxPx * sizeof(u16));
 	if (!s_affBgBakeScratch) return false;
+	s_affBgBakeIdxScratch = (u8 *)malloc((u32)kAffineBgPlaneMaxPx * kAffineBgPlaneMaxPx);
+	if (!s_affBgBakeIdxScratch) return false;
 
 	for (int i = 0; i < 128; ++i) {
 		u32 sz = kObjTexBufMaxPx * kObjTexBufMaxPx * sizeof(u16);
 		s_objTex[i].texData = memalign(32, sz);
 		if (!s_objTex[i].texData) return false;
 		memset(s_objTex[i].texData, 0, sz);
+		s_objTex[i].tlutData = memalign(32, 256 * sizeof(u16));
+		if (!s_objTex[i].tlutData) return false;
+		memset(s_objTex[i].tlutData, 0, 256 * sizeof(u16));
+		s_objTex[i].valid = false;
 	}
 	s_objBakeScratch = (u16 *)malloc(kObjTexBufMaxPx * kObjTexBufMaxPx * sizeof(u16));
 	if (!s_objBakeScratch) return false;
+	s_objBakeIdxScratch = (u8 *)malloc((u32)kObjTexBufMaxPx * kObjTexBufMaxPx);
+	if (!s_objBakeIdxScratch) return false;
 
 	u32 bmpSz = GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16);
 	s_bmpTexData = memalign(32, bmpSz);
 	if (!s_bmpTexData) return false;
 	memset(s_bmpTexData, 0, bmpSz);
 	s_bmpValid = false;
+
+	u32 bmpCiSz = GBA_SCREEN_W * GBA_SCREEN_H; // CI8: 1 byte/texel
+	s_bmpTexDataCI = memalign(32, bmpCiSz);
+	if (!s_bmpTexDataCI) return false;
+	memset(s_bmpTexDataCI, 0, bmpCiSz);
+	s_bmpTlutData = memalign(32, 256 * sizeof(u16));
+	if (!s_bmpTlutData) return false;
+	memset(s_bmpTlutData, 0, 256 * sizeof(u16));
+	s_bmpBakeIdxScratch = (u8 *)malloc(bmpCiSz);
+	if (!s_bmpBakeIdxScratch) return false;
+	s_bmpValidCI = false;
 
 	s_backdropTexData = memalign(32, 32); // GX's minimum texture alloc granularity
 	if (!s_backdropTexData) return false;
@@ -411,13 +513,19 @@ void gxGbaRenderShutdown()
 {
 	if (!s_initDone)
 		return;
-	for (int i = 0; i < 4; ++i) { free(s_bgPlane[i].texData); s_bgPlane[i].texData = nullptr; }
+	for (int i = 0; i < 4; ++i) { free(s_bgPlane[i].texData); s_bgPlane[i].texData = nullptr; free(s_bgPlane[i].tlutData); s_bgPlane[i].tlutData = nullptr; }
 	free(s_bgBakeScratch); s_bgBakeScratch = nullptr;
-	for (int i = 0; i < 2; ++i) { free(s_affBgPlane[i].texData); s_affBgPlane[i].texData = nullptr; s_affBgPlane[i].texDataCap = 0; }
+	free(s_bgBakeIdxScratch); s_bgBakeIdxScratch = nullptr;
+	for (int i = 0; i < 2; ++i) { free(s_affBgPlane[i].texData); s_affBgPlane[i].texData = nullptr; s_affBgPlane[i].texDataCap = 0; free(s_affBgPlane[i].tlutData); s_affBgPlane[i].tlutData = nullptr; }
 	free(s_affBgBakeScratch); s_affBgBakeScratch = nullptr;
-	for (int i = 0; i < 128; ++i) { free(s_objTex[i].texData); s_objTex[i].texData = nullptr; }
+	free(s_affBgBakeIdxScratch); s_affBgBakeIdxScratch = nullptr;
+	for (int i = 0; i < 128; ++i) { free(s_objTex[i].texData); s_objTex[i].texData = nullptr; free(s_objTex[i].tlutData); s_objTex[i].tlutData = nullptr; }
 	free(s_objBakeScratch); s_objBakeScratch = nullptr;
+	free(s_objBakeIdxScratch); s_objBakeIdxScratch = nullptr;
 	free(s_bmpTexData); s_bmpTexData = nullptr;
+	free(s_bmpTexDataCI); s_bmpTexDataCI = nullptr;
+	free(s_bmpTlutData); s_bmpTlutData = nullptr;
+	free(s_bmpBakeIdxScratch); s_bmpBakeIdxScratch = nullptr;
 	free(s_backdropTexData); s_backdropTexData = nullptr;
 	free(s_copyBackBuf); s_copyBackBuf = nullptr;
 	free(s_copyBackLinear); s_copyBackLinear = nullptr;
@@ -549,18 +657,27 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 				int srcY = vflip ? 7 - suby : suby;
 				for (int subx = 0; subx < 8; ++subx) {
 					int srcX = hflip ? 7 - subx : subx;
-					u16 texel;
+					int dstIdx = (ty * 8 + suby) * mapWpx + (tx * 8 + subx);
 					if (!li.colorMode) {
 						u32 tileAddr = li.charBase + tileNum * 32 + srcY * 4 + srcX / 2;
 						u8 byte = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
 						int idx = (srcX & 1) ? (byte >> 4) : (byte & 0xF);
-						texel = gxTexel(gxBgPalColor(palNum * 16 + idx), idx != 0, fx);
+						if (toEffectScratch)
+							s_bgBakeScratch[dstIdx] = gxTexel(gxBgPalColor(palNum * 16 + idx), idx != 0, fx);
+						else
+							// gx-next-steps-log.md task 6: combined 8-bit index
+							// (palNum*16+idx), not the raw 4-bit nibble -- see the
+							// CI8 comment block below for why 4bpp text BG can't
+							// use plain CI4.
+							s_bgBakeIdxScratch[dstIdx] = (u8)(palNum * 16 + idx);
 					} else {
 						u32 tileAddr = li.charBase + tileNum * 64 + srcY * 8 + srcX;
 						u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
-						texel = gxTexel(gxBgPalColor(idx), idx != 0, fx);
+						if (toEffectScratch)
+							s_bgBakeScratch[dstIdx] = gxTexel(gxBgPalColor(idx), idx != 0, fx);
+						else
+							s_bgBakeIdxScratch[dstIdx] = idx;
 					}
-					s_bgBakeScratch[(ty * 8 + suby) * mapWpx + (tx * 8 + subx)] = texel;
 				}
 			}
 		}
@@ -570,11 +687,52 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 		gxUploadEffectTex(s_bgBakeScratch, mapWpx, mapHpx, GX_REPEAT);
 		return;
 	}
+
+	// gx-next-steps-log.md task 6: CI8 raw-index bake, replacing the old
+	// pre-resolved RGB5A3 bake, for the persistent (non-effect) cache --
+	// see gx_gba_render.h's "Native CI4/CI8" section. Both 4bpp and 8bpp
+	// text BG content are baked into the SAME CI8 format (not CI4 for
+	// 4bpp, despite the task brief's literal wording) using an 8-bit
+	// COMBINED index (palNum*16+idx for 4bpp, idx directly for 8bpp) --
+	// a deliberate, documented deviation: a text BG map entry carries its
+	// OWN palNum per TILE (bits 12-15), so a single baked plane texture
+	// routinely spans multiple different 16-color sub-banks (palNum
+	// values) across its tiles, but GX binds exactly one TLUT per texture
+	// object per draw call -- a 16-entry CI4 TLUT could only ever
+	// correctly represent ONE of those sub-banks, silently corrupting
+	// every tile using a different one. The combined index already
+	// exactly matches gxBgPalColor()'s own existing palette-offset math
+	// (see the toEffectScratch branch above, unchanged), and a 256-entry
+	// CI8 TLUT spanning the *whole* BG palette bank makes every possible
+	// combined-index value resolve correctly regardless of which
+	// sub-banks this plane's tiles actually reference -- still a real,
+	// correct bandwidth/TMEM win over RGB5A3 (8 bits/texel instead of 16),
+	// just not the maximal 4-bit win a per-palette-group multi-draw
+	// scheme (nds-wii-texture-format-mapping.md's "Extended-palette 2D
+	// BGs" option) would have given for the 4bpp case -- that multi-draw
+	// scheme is a real, larger follow-up, not attempted this pass.
 	GxBgPlaneCache &pc = s_bgPlane[bg];
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(s_bgBakeScratch, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, mapWpx, mapHpx);
-	DCFlushRange(pc.texData, mapWpx * mapHpx * sizeof(u16));
-	GX_InitTexObj(&pc.texObj, pc.texData, mapWpx, mapHpx, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_CI8);
+	gxSwizzle8bpp(s_bgBakeIdxScratch, (u8 *)pc.texData, blk.texelsWide, blk.texelsTall, mapWpx, mapHpx);
+	DCFlushRange(pc.texData, (u32)mapWpx * mapHpx);
+
+	// Index-0 transparency (see gx_gba_render.h "Native CI4/CI8" and the
+	// two correctness subtleties in this task's log entry): GBA hardware
+	// treats palette index 0 WITHIN EACH 16-color sub-bank as transparent
+	// for 4bpp tile texels -- i.e. every combined index that's a multiple
+	// of 16 (palNum*16+0, for every palNum 0-15), not just combined index
+	// 0 itself. For 8bpp there's only one bank, so only combined index 0
+	// is transparent.
+	u16 *tlut = (u16 *)pc.tlutData;
+	for (int e = 0; e < 256; ++e) {
+		bool transparentEntry = li.colorMode ? (e == 0) : ((e & 0xF) == 0);
+		tlut[e] = transparentEntry ? kTransparentTexel : gxOpaqueTexel(gxBgPalColor(e));
+	}
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	u8 tlutSlot = gxBgTlutSlot(bg);
+	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
+	GX_LoadTlut(&pc.tlutObj, tlutSlot);
+	GX_InitTexObjCI(&pc.texObj, pc.texData, mapWpx, mapHpx, GX_TF_CI8, GX_REPEAT, GX_REPEAT, GX_FALSE, tlutSlot);
 	pc.mapWpx = (u16)mapWpx;
 	pc.mapHpx = (u16)mapHpx;
 	pc.cfgCharBase = li.charBase;
@@ -594,9 +752,62 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	int mapTiles = 16 << sizeSel; // 16/32/64/128
 	int mapPx = mapTiles * 8;
 	bool wrap = (cnt >> 13) & 1;
-	int bufPx = wrap ? mapPx : mapPx + 4;
-	int borderOff = wrap ? 0 : 1;
 
+	if (toEffectScratch) {
+		int bufPx = wrap ? mapPx : mapPx + 4;
+		int borderOff = wrap ? 0 : 1;
+		for (int ty = 0; ty < mapTiles; ++ty) {
+			for (int tx = 0; tx < mapTiles; ++tx) {
+				u32 entryAddr = mapBase + (ty * mapTiles + tx);
+				u8 tileNum = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(entryAddr));
+				for (int suby = 0; suby < 8; ++suby) {
+					for (int subx = 0; subx < 8; ++subx) {
+						u32 tileAddr = charBase + tileNum * 64 + suby * 8 + subx;
+						u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
+						u16 texel = gxTexel(gxBgPalColor(idx), idx != 0, fx);
+						int dstX = tx * 8 + subx + borderOff;
+						int dstY = ty * 8 + suby + borderOff;
+						s_affBgBakeScratch[dstY * bufPx + dstX] = texel;
+					}
+				}
+			}
+		}
+		if (!wrap) {
+			for (int x = 0; x < bufPx; ++x) {
+				s_affBgBakeScratch[x] = kTransparentTexel;
+				s_affBgBakeScratch[(bufPx - 1) * bufPx + x] = kTransparentTexel;
+			}
+			for (int y = 0; y < bufPx; ++y) {
+				s_affBgBakeScratch[y * bufPx] = kTransparentTexel;
+				s_affBgBakeScratch[y * bufPx + (bufPx - 1)] = kTransparentTexel;
+			}
+		}
+		gxUploadEffectTex(s_affBgBakeScratch, bufPx, bufPx, wrap ? GX_REPEAT : GX_CLAMP);
+		return;
+	}
+
+	// gx-next-steps-log.md task 6: CI8 raw-index bake for the persistent
+	// cache -- affine BG map entries are a full byte (0-255) indexing
+	// directly into an always-8bpp charset with NO per-tile palette
+	// selection (unlike text mode), so this is a clean, exact CI8
+	// conversion: one 256-entry TLUT covering the whole BG palette bank,
+	// no combined-index trick needed.
+	//
+	// Buffer padding: +8, not +4, when bordered (see kAffineBgPlaneMaxPx's
+	// comment) -- CI8's block shape is 8x4 (gx_texformat.h), and mapPx+4
+	// isn't guaranteed to be a multiple of 8 the way mapPx+8 is (mapPx
+	// itself always is). The wrap (unbordered) case needs no padding at
+	// all -- mapPx is already a multiple of 8.
+	int bufPx = wrap ? mapPx : mapPx + 8;
+	int borderOff = wrap ? 0 : 1;
+	// Zero the WHOLE buffer up front (index 0 == transparent via the TLUT
+	// built below) rather than writing an explicit 1-texel border loop
+	// afterward -- this also correctly zeros the extra unused padding
+	// columns/rows beyond the real 1-texel border (indices [mapPx+2,
+	// bufPx) when bordered), which a border-only loop would leave as
+	// stale scratch-buffer content; GX_CLAMP never samples out there, but
+	// zeroing is cheap and removes any doubt.
+	memset(s_affBgBakeIdxScratch, 0, (size_t)bufPx * bufPx);
 	for (int ty = 0; ty < mapTiles; ++ty) {
 		for (int tx = 0; tx < mapTiles; ++tx) {
 			u32 entryAddr = mapBase + (ty * mapTiles + tx);
@@ -605,31 +816,16 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 				for (int subx = 0; subx < 8; ++subx) {
 					u32 tileAddr = charBase + tileNum * 64 + suby * 8 + subx;
 					u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
-					u16 texel = gxTexel(gxBgPalColor(idx), idx != 0, fx);
 					int dstX = tx * 8 + subx + borderOff;
 					int dstY = ty * 8 + suby + borderOff;
-					s_affBgBakeScratch[dstY * bufPx + dstX] = texel;
+					s_affBgBakeIdxScratch[dstY * bufPx + dstX] = idx;
 				}
 			}
 		}
 	}
-	if (!wrap) {
-		for (int x = 0; x < bufPx; ++x) {
-			s_affBgBakeScratch[x] = kTransparentTexel;
-			s_affBgBakeScratch[(bufPx - 1) * bufPx + x] = kTransparentTexel;
-		}
-		for (int y = 0; y < bufPx; ++y) {
-			s_affBgBakeScratch[y * bufPx] = kTransparentTexel;
-			s_affBgBakeScratch[y * bufPx + (bufPx - 1)] = kTransparentTexel;
-		}
-	}
 
-	if (toEffectScratch) {
-		gxUploadEffectTex(s_affBgBakeScratch, bufPx, bufPx, wrap ? GX_REPEAT : GX_CLAMP);
-		return;
-	}
 	GxAffineBgPlaneCache &pc = s_affBgPlane[which];
-	u32 needed = (u32)bufPx * bufPx * sizeof(u16);
+	u32 needed = (u32)bufPx * bufPx; // CI8: 1 byte/texel
 	if (needed > pc.texDataCap) {
 		if (pc.texData) free(pc.texData);
 		pc.texData = memalign(32, needed);
@@ -637,11 +833,24 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	}
 	if (!pc.texData) { pc.valid = false; return; }
 
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(s_affBgBakeScratch, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, bufPx, bufPx);
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_CI8);
+	gxSwizzle8bpp(s_affBgBakeIdxScratch, (u8 *)pc.texData, blk.texelsWide, blk.texelsTall, bufPx, bufPx);
 	DCFlushRange(pc.texData, needed);
+
+	// Index-0 transparency: affine BG tile texels use idx!=0 as their
+	// opacity test (see the toEffectScratch branch above), so TLUT entry 0
+	// must be forced alpha=0 regardless of its real stored RGB -- this is
+	// also what makes the border-clamp technique (border/padding filled
+	// with raw index 0 above) keep working under CI8.
+	u16 *tlut = (u16 *)pc.tlutData;
+	for (int e = 0; e < 256; ++e)
+		tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxBgPalColor(e));
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	u8 tlutSlot = gxAffineBgTlutSlot(which);
+	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
+	GX_LoadTlut(&pc.tlutObj, tlutSlot);
 	u8 wm = wrap ? GX_REPEAT : GX_CLAMP;
-	GX_InitTexObj(&pc.texObj, pc.texData, bufPx, bufPx, GX_TF_RGB5A3, wm, wm, GX_FALSE);
+	GX_InitTexObjCI(&pc.texObj, pc.texData, bufPx, bufPx, GX_TF_CI8, wm, wm, GX_FALSE, tlutSlot);
 	pc.mapPx = (u16)mapPx;
 	pc.bufPx = (u16)bufPx;
 	pc.wrap = wrap;
@@ -984,8 +1193,69 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	int tileBytes = colorMode ? 64 : 32;
 	u32 charBase = 0x10000;
 	int w = d.texW, h = d.texH;
-	int bufW = w + 4, bufH = h + 4;
 
+	if (toEffectScratch) {
+		int bufW = w + 4, bufH = h + 4;
+		for (int texy = 0; texy < h; ++texy) {
+			int tileY = texy / 8, suby = texy % 8;
+			for (int texx = 0; texx < w; ++texx) {
+				int tileX = texx / 8, subx = texx % 8;
+				u32 addr;
+				if (oneDim) {
+					u32 tileIndex = tileNum + tileY * (w / 8) + tileX;
+					addr = charBase + tileIndex * tileBytes;
+				} else {
+					u32 slotX = tileX * (colorMode ? 2 : 1);
+					u32 slotIndex = tileNum + tileY * 32 + slotX;
+					addr = charBase + slotIndex * 32;
+				}
+				u16 texel;
+				if (!colorMode) {
+					u32 a = addr + suby * 4 + subx / 2;
+					u8 byte = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
+					int idx = (subx & 1) ? (byte >> 4) : (byte & 0xF);
+					texel = gxTexel(gxObjPalColor(palNum * 16 + idx), idx != 0, fx);
+				} else {
+					u32 a = addr + suby * 8 + subx;
+					u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
+					texel = gxTexel(gxObjPalColor(idx), idx != 0, fx);
+				}
+				s_objBakeScratch[(texy + 1) * bufW + (texx + 1)] = texel;
+			}
+		}
+		for (int x = 0; x < bufW; ++x) {
+			s_objBakeScratch[x] = kTransparentTexel;
+			s_objBakeScratch[(bufH - 1) * bufW + x] = kTransparentTexel;
+		}
+		for (int y = 0; y < bufH; ++y) {
+			s_objBakeScratch[y * bufW] = kTransparentTexel;
+			s_objBakeScratch[y * bufW + (bufW - 1)] = kTransparentTexel;
+		}
+		gxUploadEffectTex(s_objBakeScratch, bufW, bufH, GX_CLAMP);
+		return;
+	}
+
+	// gx-next-steps-log.md task 6: persistent (non-effect) OBJ bake now
+	// bakes raw palette-index texels (CI4 for 4bpp, CI8 for 8bpp) instead
+	// of pre-resolved RGB5A3 colors, uploaded via GX_InitTexObjCI with a
+	// TLUT built from this sprite's own live GBA OBJ-palette bytes -- see
+	// gx_gba_render.h's "Native CI4/CI8" section. Unlike text BG, a sprite
+	// has exactly ONE fixed palNum (an OAM field, not per-texel), so a
+	// plain CI4 TLUT (this sprite's own 16-color sub-bank) is exact here,
+	// no combined-index trick needed.
+	//
+	// Buffer padding: +8, not +4 -- CI4's block shape is 8x8 and CI8's is
+	// 8x4 (gx_texformat.h), both wider than RGB5A3's 4x4 that the old +4
+	// padding was sized for; w/h+4 isn't guaranteed to be a multiple of 8
+	// the way w/h+8 is (w/h themselves always are, being whole 8px OBJ
+	// tiles). One padding scheme covers both CI4 and CI8 uniformly.
+	int bufW = w + 8, bufH = h + 8;
+	// Zero the whole buffer first (index 0 == transparent via the TLUT
+	// below), same rationale as gxBakeAffineBgPlane's identical choice --
+	// covers the real 1-texel border AND the extra unused padding beyond
+	// it in one pass, rather than a border-only loop leaving the padding
+	// as stale scratch-buffer content.
+	memset(s_objBakeIdxScratch, 0, (size_t)bufW * bufH);
 	for (int texy = 0; texy < h; ++texy) {
 		int tileY = texy / 8, suby = texy % 8;
 		for (int texx = 0; texx < w; ++texx) {
@@ -999,41 +1269,57 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 				u32 slotIndex = tileNum + tileY * 32 + slotX;
 				addr = charBase + slotIndex * 32;
 			}
-			u16 texel;
+			u8 idx;
 			if (!colorMode) {
 				u32 a = addr + suby * 4 + subx / 2;
 				u8 byte = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
-				int idx = (subx & 1) ? (byte >> 4) : (byte & 0xF);
-				texel = gxTexel(gxObjPalColor(palNum * 16 + idx), idx != 0, fx);
+				idx = (subx & 1) ? (byte >> 4) : (byte & 0xF);
 			} else {
 				u32 a = addr + suby * 8 + subx;
-				u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
-				texel = gxTexel(gxObjPalColor(idx), idx != 0, fx);
+				idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
 			}
-			s_objBakeScratch[(texy + 1) * bufW + (texx + 1)] = texel;
+			s_objBakeIdxScratch[(texy + 1) * bufW + (texx + 1)] = idx;
 		}
 	}
-	for (int x = 0; x < bufW; ++x) {
-		s_objBakeScratch[x] = kTransparentTexel;
-		s_objBakeScratch[(bufH - 1) * bufW + x] = kTransparentTexel;
-	}
-	for (int y = 0; y < bufH; ++y) {
-		s_objBakeScratch[y * bufW] = kTransparentTexel;
-		s_objBakeScratch[y * bufW + (bufW - 1)] = kTransparentTexel;
-	}
 
-	if (toEffectScratch) {
-		gxUploadEffectTex(s_objBakeScratch, bufW, bufH, GX_CLAMP);
-		return;
-	}
 	GxObjTexSlot &slot = s_objTex[d.oamIndex];
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	// w/h are each a multiple of 8 (OBJ sizes are whole 8px tiles), so
-	// bufW/bufH (w/h + 4) are each a multiple of 4, satisfying
-	// gxSwizzle16bpp's RGB5A3 (4x4) block-multiple requirement.
-	gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
-	DCFlushRange(slot.texData, bufW * bufH * sizeof(u16));
-	GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GXTexFmt fmt = colorMode ? GXTEXFMT_CI8 : GXTEXFMT_CI4;
+	GXBlockShape blk = gxBlockShape(fmt);
+	if (colorMode)
+		gxSwizzle8bpp(s_objBakeIdxScratch, (u8 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+	else
+		gxSwizzle4bpp(s_objBakeIdxScratch, (u8 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+	u32 texBytes = colorMode ? (u32)bufW * bufH : (u32)(bufW * bufH) / 2;
+	DCFlushRange(slot.texData, texBytes);
+
+	// Index-0 transparency, and the sprite's own dedicated sub-palette for
+	// 4bpp (see gx_gba_render.h): a sprite's tile texels use idx!=0 as
+	// their opacity test, so TLUT entry 0 (this sprite's own palNum*16+0
+	// for 4bpp, or OBJ-palette-bank index 0 for 8bpp) must be forced
+	// alpha=0 regardless of its real stored RGB -- also what keeps the
+	// affine border-clamp technique (border/padding filled with raw index
+	// 0 above) working under CI4/CI8.
+	u16 *tlut = (u16 *)slot.tlutData;
+	int entries = colorMode ? 256 : 16;
+	if (colorMode) {
+		for (int e = 0; e < 256; ++e)
+			tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxObjPalColor(e));
+	} else {
+		for (int e = 0; e < 16; ++e)
+			tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxObjPalColor(palNum * 16 + e));
+	}
+	DCFlushRange(slot.tlutData, (u32)entries * sizeof(u16));
+	GX_InitTlutObj(&slot.tlutObj, slot.tlutData, GX_TL_RGB5A3, entries);
+	// Not loaded into TMEM here -- s_objTex[] slots all share ONE hardware
+	// TLUT name (kObjTlutSlot); the actual GX_LoadTlut() happens at DRAW
+	// time (gxDrawObjLayerWindowed), immediately before this slot's
+	// texture is bound, since another sprite's draw in between would
+	// otherwise have overwritten the shared slot's TMEM contents.
+	// NOTE: fmt (GXTexFmt, this file's own local block-shape enum) is NOT
+	// the same numbering as GX's own GX_TF_CI4/GX_TF_CI8 macros -- fmt is
+	// only ever used for gxBlockShape() above; the actual GX API call
+	// needs the real hardware format constant.
+	GX_InitTexObjCI(&slot.texObj, slot.texData, bufW, bufH, colorMode ? GX_TF_CI8 : GX_TF_CI4, GX_CLAMP, GX_CLAMP, GX_FALSE, kObjTlutSlot);
 
 	// Record the config this bake was built from (task 4's rebake-gate
 	// fingerprint -- see gxObjNeedsRebake above).
@@ -1044,6 +1330,8 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	slot.palNum = (u8)palNum;
 	slot.texW = d.texW;
 	slot.texH = d.texH;
+	slot.bufW = (u16)bufW;
+	slot.bufH = (u16)bufH;
 }
 
 // Bitmap-mode content is always opaque (no transparent texels -- every
@@ -1051,27 +1339,69 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 // rather than gated by an idx!=0 check the way tiled modes are.
 static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &fx = kTexelEffectNone, bool toEffectScratch = false)
 {
-	u16 *dst = toEffectScratch ? s_bgBakeScratch : (u16 *)s_bmpTexData;
 	u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
 
+	if (toEffectScratch) {
+		u16 *dst = s_bgBakeScratch;
+		if (mode == 3) {
+			for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i)
+				dst[i] = gxTexel(T1ReadWord(MMU.GBA_VRAM, i * 2), true, fx);
+		} else if (mode == 4) {
+			for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i) {
+				u8 idx = T1ReadByte(MMU.GBA_VRAM, page + i);
+				dst[i] = gxTexel(gxBgPalColor(idx), true, fx);
+			}
+		} else { // mode 5: 160x128, rest of the buffer stays whatever it last held
+			const int W = 160, H = 128;
+			for (int y = 0; y < H; ++y)
+				for (int x = 0; x < W; ++x)
+					dst[y * GBA_SCREEN_W + x] = gxTexel(T1ReadWord(MMU.GBA_VRAM, page + (y * W + x) * 2), true, fx);
+		}
+		gxUploadEffectTex(s_bgBakeScratch, GBA_SCREEN_W, GBA_SCREEN_H, GX_CLAMP);
+		return;
+	}
+
+	if (mode == 4) {
+		// gx-next-steps-log.md task 6: mode 4 (8bpp palette-indexed bitmap
+		// BG2, GBATEK) is a clean CI8 candidate -- direct idx 0-255 into
+		// the whole BG palette bank, same as affine BG, no per-tile
+		// palette indirection. Unlike tiled-mode BG/OBJ content, EVERY
+		// mode-4 pixel is always opaque (gxTexel's old call above always
+		// passed opaque=true, never gated by idx!=0) -- so, unlike every
+		// other TLUT this file builds, entry 0 here is NOT forced
+		// transparent; it keeps its real, opaque color. This is the
+		// deliberate distinction called out in this task's log entry
+		// ("bitmap mode 4... always opaque, unlike tile-indexed BG/OBJ").
+		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i)
+			s_bmpBakeIdxScratch[i] = T1ReadByte(MMU.GBA_VRAM, page + i);
+		GXBlockShape blk = gxBlockShape(GXTEXFMT_CI8);
+		gxSwizzle8bpp(s_bmpBakeIdxScratch, (u8 *)s_bmpTexDataCI, blk.texelsWide, blk.texelsTall, GBA_SCREEN_W, GBA_SCREEN_H);
+		DCFlushRange(s_bmpTexDataCI, GBA_SCREEN_W * GBA_SCREEN_H);
+
+		u16 *tlut = (u16 *)s_bmpTlutData;
+		for (int e = 0; e < 256; ++e)
+			tlut[e] = gxOpaqueTexel(gxBgPalColor(e)); // no transparency -- see comment above
+		DCFlushRange(s_bmpTlutData, 256 * sizeof(u16));
+		GX_InitTlutObj(&s_bmpTlutObj, s_bmpTlutData, GX_TL_RGB5A3, 256);
+		GX_LoadTlut(&s_bmpTlutObj, kBmpTlutSlot);
+		GX_InitTexObjCI(&s_bmpTexObjCI, s_bmpTexDataCI, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_CI8, GX_CLAMP, GX_CLAMP, GX_FALSE, kBmpTlutSlot);
+		s_bmpValidCI = true;
+		s_bmpValid = false; // stale/unused RGB5A3 buffer for this mode -- mode-exclusive, but keep the flags honest
+		return;
+	}
+
+	// Modes 3/5: direct 16bpp truecolor, unchanged RGB5A3 path -- see
+	// nds-wii-texture-format-mapping.md ("Bitmap-mode direct-color BG...
+	// no palette involved") and gx_gba_render.h.
+	u16 *dst = (u16 *)s_bmpTexData;
 	if (mode == 3) {
 		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i)
 			dst[i] = gxTexel(T1ReadWord(MMU.GBA_VRAM, i * 2), true, fx);
-	} else if (mode == 4) {
-		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i) {
-			u8 idx = T1ReadByte(MMU.GBA_VRAM, page + i);
-			dst[i] = gxTexel(gxBgPalColor(idx), true, fx);
-		}
 	} else { // mode 5: 160x128, rest of the buffer stays whatever it last held
 		const int W = 160, H = 128;
 		for (int y = 0; y < H; ++y)
 			for (int x = 0; x < W; ++x)
 				dst[y * GBA_SCREEN_W + x] = gxTexel(T1ReadWord(MMU.GBA_VRAM, page + (y * W + x) * 2), true, fx);
-	}
-
-	if (toEffectScratch) {
-		gxUploadEffectTex(s_bgBakeScratch, GBA_SCREEN_W, GBA_SCREEN_H, GX_CLAMP);
-		return;
 	}
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxSwizzle16bpp((u16 *)s_bmpTexData, s_bgBakeScratch, blk.texelsWide, blk.texelsTall, GBA_SCREEN_W, GBA_SCREEN_H);
@@ -1079,6 +1409,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 	DCFlushRange(s_bmpTexData, GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16));
 	GX_InitTexObj(&s_bmpTexObj, s_bmpTexData, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	s_bmpValid = true;
+	s_bmpValidCI = false;
 }
 
 // ---------------------------------------------------------------------
@@ -1101,11 +1432,15 @@ static void gxAffineObjTexCorner(const GxObjDraw &d, s32 col, s32 row, f32 *tx, 
 }
 
 // Single-sprite draw, shared by the windowed OBJ path (gxDrawObjLayerWindowed)
-// with an explicit texture (the sprite's own plain cache, or the shared
-// s_effectTex blend variant).
-static void gxDrawOneObj(const GxObjDraw &d, GXTexObj *tex)
+// with an explicit texture (the sprite's own persistent CI4/CI8 cache, or
+// the shared s_effectTex RGB5A3 blend variant) and that texture's actual
+// buffer size -- gx-next-steps-log.md task 6: these now differ (bufW/bufH
+// passed in, not always texW/texH+4) since the persistent cache uses a
+// wider CI4/CI8 block-alignment pad (+8) than the effect-scratch RGB5A3
+// texture still does (+4) -- see GxObjTexSlot::bufW/bufH and
+// gxBakeObjTexture's padding note.
+static void gxDrawOneObj(const GxObjDraw &d, GXTexObj *tex, f32 bufW, f32 bufH)
 {
-	f32 bufW = (f32)(d.texW + 4), bufH = (f32)(d.texH + 4);
 	if (d.affine) {
 		f32 tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3;
 		gxAffineObjTexCorner(d, 0, 0, &tx0, &ty0);
@@ -1326,25 +1661,25 @@ static void gxDrawAffineBgLayerWindowed(int which, int bgBit, const GxGbaBandReg
 // Bitmap-mode (3/4/5) BG2 layer -- same 3-pass precedence, but drawing the
 // single full-screen bitmap quad (clipped to 160x128 for mode 5) instead
 // of a tile-plane quad.
-static void gxDrawBitmapLayerWindowed(int mode, const GxWindowPlan &wp, GXTexObj *effTex)
+static void gxDrawBitmapLayerWindowed(int mode, const GxWindowPlan &wp, GXTexObj *baseTex, GXTexObj *effTex)
 {
 	int h = (mode == 5) ? 128 : GBA_SCREEN_H;
 	int w = (mode == 5) ? 160 : GBA_SCREEN_W;
 	f32 s1 = (f32)w / GBA_SCREEN_W, t1 = (f32)h / GBA_SCREEN_H;
 	auto draw = [&](GXTexObj *tex) { gxDrawQuad(tex, 0, 0, (f32)w, (f32)h, 0, 0, s1, t1); };
 	const int bgBit = 2; // bitmap-mode content is always "BG2" for BLDCNT/window purposes
-	if (!wp.active) { draw(effTex ? effTex : &s_bmpTexObj); return; }
+	if (!wp.active) { draw(effTex ? effTex : baseTex); return; }
 	if (wp.out.bg[bgBit]) {
 		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
-		draw(wp.out.effect && effTex ? effTex : &s_bmpTexObj);
+		draw(wp.out.effect && effTex ? effTex : baseTex);
 	}
 	if (wp.win1On && wp.win1.bg[bgBit] && wp.win1X1 > wp.win1X0) {
 		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
-		draw(wp.win1.effect && effTex ? effTex : &s_bmpTexObj);
+		draw(wp.win1.effect && effTex ? effTex : baseTex);
 	}
 	if (wp.win0On && wp.win0.bg[bgBit] && wp.win0X1 > wp.win0X0) {
 		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
-		draw(wp.win0.effect && effTex ? effTex : &s_bmpTexObj);
+		draw(wp.win0.effect && effTex ? effTex : baseTex);
 	}
 	GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 }
@@ -1363,14 +1698,22 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
 
 		bool blends = gxObjSpriteBlends(d, bp);
-		GXTexObj *plainTex = &s_objTex[d.oamIndex].texObj;
+		GxObjTexSlot &slot = s_objTex[d.oamIndex];
 		auto drawWith = [&](bool useEffect) {
 			if (useEffect && blends) {
 				GxTexelEffectParams fx = { GXTEXEFFECT_ALPHA, bp.eva, 0 };
 				gxBakeObjTexture(dispcnt, d, fx, true);
-				gxDrawOneObj(d, &s_effectTex.texObj);
+				gxDrawOneObj(d, &s_effectTex.texObj, (f32)(d.texW + 4), (f32)(d.texH + 4));
 			} else {
-				gxDrawOneObj(d, plainTex);
+				// gx-next-steps-log.md task 6: reload the shared OBJ TLUT
+				// slot from this sprite's own tlutData immediately before
+				// binding its texture -- every persistent-cache OBJ draw
+				// does this (not just on a rebake), since another sprite's
+				// draw in between may have overwritten kObjTlutSlot's TMEM
+				// contents with a different sprite's palette. See
+				// GxObjTexSlot's comment.
+				GX_LoadTlut(&slot.tlutObj, kObjTlutSlot);
+				gxDrawOneObj(d, &slot.texObj, (f32)slot.bufW, (f32)slot.bufH);
 			}
 		};
 
@@ -1552,14 +1895,19 @@ bool gxGbaRenderFrame()
 		GxWindowPlan wp = gxBuildWindowPlan(r, 0, GBA_SCREEN_H);
 		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 
-		if (s_bmpValid) {
+		if (s_bmpValid || s_bmpValidCI) {
 			GxTexelEffectParams fx = gxResolveLayerEffect(2, bp); // bitmap BG2 == layer bit 2
 			GXTexObj *effTex = nullptr;
 			if (fx.mode != GXTEXEFFECT_NONE) {
 				gxBakeBitmapMode(mode, dispcnt, fx, true);
 				effTex = &s_effectTex.texObj;
 			}
-			gxDrawBitmapLayerWindowed(mode, wp, effTex);
+			// gx-next-steps-log.md task 6: mode 4's CI8 texture object
+			// (s_bmpTexObjCI) already has its TLUT permanently dedicated
+			// (kBmpTlutSlot, reloaded only when gxBakeBitmapMode() actually
+			// rebakes it) -- no per-draw GX_LoadTlut needed here, unlike OBJ.
+			GXTexObj *baseTex = (mode == 4 && s_bmpValidCI) ? &s_bmpTexObjCI : &s_bmpTexObj;
+			gxDrawBitmapLayerWindowed(mode, wp, baseTex, effTex);
 		}
 		if ((dispcnt >> 12) & 1)
 			for (int prio = 3; prio >= 0; --prio)

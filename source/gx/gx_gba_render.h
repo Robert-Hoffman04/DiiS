@@ -111,13 +111,110 @@
     covered by the same precondition check, treating each such sprite as
     an implicit extra 1st-target layer for that computation.
 
+    ### Native CI4/CI8 (gx-next-steps-log.md task 6)
+
+    The BASE (non-effect, toEffectScratch==false) persistent-cache bake path
+    now uploads raw GBA palette-index texels via GX_InitTexObjCI + a TLUT
+    built from the live GBA palette bank at bake time, instead of resolving
+    each texel to RGB5A3 at bake time -- see nds-wii-texture-format-mapping.md
+    ("2D BG/OBJ 4bpp/8bpp tiles"). Converted:
+     - Affine BG planes (gxBakeAffineBgPlane): always CI8 -- affine map
+       entries are a full byte with no per-tile palette selection, direct
+       idx 0-255 into the whole 512-byte BG palette bank, exact.
+     - OBJ, regular and affine (gxBakeObjTexture): CI4 for 4bpp, CI8 for
+       8bpp -- a sprite has exactly one fixed OAM palNum field (not
+       per-texel), so CI4's 16-entry TLUT is exact for 4bpp.
+     - Text BG planes (gxBakeBgPlane): CI8 for BOTH 4bpp and 8bpp -- a
+       deliberate, documented deviation from the task brief's literal
+       "4bpp -> CI4" wording. A text BG map entry carries its OWN palNum
+       per TILE (bits 12-15), so a single baked plane texture routinely
+       spans multiple different 16-color sub-banks; GX binds exactly one
+       TLUT per texture object per draw call, so a 16-entry CI4 TLUT could
+       only ever represent ONE of those sub-banks correctly. 4bpp text BG
+       instead bakes an 8-bit COMBINED index (palNum*16+idx) into CI8 with
+       a 256-entry TLUT spanning the whole BG palette bank -- still a real,
+       correct bandwidth/TMEM win over RGB5A3 (8 bits/texel vs 16), just not
+       CI4's maximal 4-bit win. A per-palette-group multi-draw scheme (see
+       nds-wii-texture-format-mapping.md's "Extended-palette 2D BGs") would
+       get the maximal win but is a materially larger change, not attempted
+       this pass -- documented follow-up.
+     - Bitmap mode 4 (gxBakeBitmapMode, mode==4 only): CI8, direct idx 0-255
+       into the whole BG palette bank, same as affine BG. Unlike every tiled
+       format above, mode-4 pixels are ALWAYS opaque (no idx!=0 test), so
+       its TLUT does NOT force entry 0 transparent -- entry 0 keeps its real
+       color, same treatment as every other entry.
+
+    Left as RGB5A3, deliberately out of this task's scope:
+     - Bitmap modes 3/5: direct 16bpp truecolor, not palette-indexed at all
+       -- forcing them into a CI format would be a format-mismatch, not a
+       conversion.
+     - The backdrop (gxBakeBackdrop): a single 1x1 non-tile-indexed texel,
+       lowest priority per the task brief; converting a 1-texel texture to
+       CI+TLUT has no bandwidth benefit and adds a TLUT slot for no gain.
+     - The toEffectScratch==true bake-time-blend path (gxTexel's
+       GXTEXEFFECT_ALPHA/BRIGHTEN/DARKEN, see "Blend" above): completely
+       unchanged, still RGB5A3 -- explicit scope boundary per the task
+       brief, kept cleanly separable (every bake function's toEffectScratch
+       branch is untouched code, still calling gxTexel/gxUploadEffectTex
+       exactly as before task 6).
+
+    Two correctness subtleties, both load-bearing for this conversion:
+     - **Index-0 transparency**: GBA hardware treats palette index 0 WITHIN
+       EACH 16-color sub-bank as transparent for a 4bpp tile texel (i.e.
+       every combined index that's a multiple of 16, not just combined
+       index 0), and plain index 0 as transparent for 8bpp -- every TLUT
+       built for a BG/OBJ TILE texture (NOT the backdrop, and NOT mode 4's
+       bitmap TLUT -- see above) forces those specific entries' alpha to 0
+       regardless of the real RGB stored at that GBA palette slot, matching
+       the old `idx != 0` per-texel opacity test this file's gxTexel() call
+       sites already used.
+     - **Affine border-clamp technique**: affine BG planes and ALL OBJ
+       textures still pad a 1-texel transparent border around real content
+       (see this header's intro) so out-of-range affine UVs GX_CLAMP onto
+       transparency instead of smearing the edge -- under CI4/CI8 the
+       border/padding is filled with RAW INDEX 0, which the same TLUT
+       (index-0-transparent, see above) resolves to alpha=0, keeping the
+       technique exact. Buffer padding widened from the old RGB5A3 scheme's
+       +4 (a 1-texel real border rounded up to RGB5A3's 4x4 block multiple)
+       to +8 for the persistent CI4/CI8 caches specifically, since CI4's
+       block shape is 8x8 and CI8's is 8x4 (gx_texformat.h) -- both wider
+       than RGB5A3's 4x4, so +4 (only ever a multiple of 4) isn't guaranteed
+       to satisfy either format's alignment the way +8 is (the underlying
+       map/sprite dimension is always itself a multiple of 8). The
+       toEffectScratch RGB5A3 path is unaffected, still uses +4.
+
+    TLUT hardware-slot assignment (gxBgTlutSlot/kBmpTlutSlot/kObjTlutSlot/
+    gxAffineBgTlutSlot, gx_gba_render.cpp): text BG0-3 and affine BG2/BG3
+    each get their OWN permanently-dedicated GX_TLUTn name (GX_TLUT0-3 and
+    GX_TLUT6/7 respectively) rather than sharing one slot between a BG
+    index's text and affine bakes -- deliberately, so a mode switch (text
+    <-> affine) can never leave a cache's `valid` flag true while the TMEM
+    slot it references was silently overwritten by the other variant's bake
+    in between (each cache's own dirty-gate has no visibility into the
+    other cache's writes to a shared TMEM slot). Bitmap mode 4 gets its own
+    slot (GX_TLUT4). OBJ (128 possible sprites, only 16 GX_TLUTn names
+    exist) shares ONE slot (GX_TLUT5), reloaded via GX_LoadTlut immediately
+    before every persistent-cache OBJ draw (not just on a rebake) since a
+    different sprite's draw in between may have overwritten it -- the index
+    TEXTURE data is still cached/reused across frames exactly as task 4
+    already does; only the (cheap, 32-512 byte) TLUT reload happens every
+    draw. 8 of the 16 available slots are used, well within GX_Init()'s
+    default 16-slot TMEM TLUT budget.
+
+    Known limitation, not fixed this pass: a rebake gate (gxObjNeedsRebake/
+    gxBgPlaneNeedsRebake/gxAffineBgPlaneNeedsRebake, tasks 4-5) still
+    triggers a FULL re-bake (VRAM tile decode AND TLUT rebuild) whenever
+    EITHER the tile-index/config dependency OR the palette dependency is
+    dirty -- it doesn't distinguish a palette-only change (which, now that
+    index and color are decoupled, only needs a cheap TLUT rebuild, no VRAM
+    re-decode at all) from a VRAM/config change. This was a deliberate
+    choice to keep task 6 additive on top of tasks 4/5's existing
+    dirty-gating contract rather than restructuring it into two independent
+    triggers -- a real, cheap follow-up win (skip the VRAM decode on a
+    palette-only dirty), not attempted here.
+
     Design choices specific to this GX path (deviations/simplifications from
     an idealized Stage 1/4, documented rather than silent):
-     - BG/OBJ/bitmap textures are baked as already palette-resolved RGB5A3
-       (one CPU-side palette lookup per bake, the same lookup renderScanline()
-       does per-pixel today) rather than uploaded as native GX CI4/CI8+TLUT.
-       Simpler, and correct; revisit only if TMEM/upload bandwidth profiling
-       ever shows it matters.
      - Stage 1 dirty-gating: OBJ (task 4) and now the backdrop + all four
        BG planes (task 5) use per-target fine-grained gates built on
        gx_frameplan.h's GxDirtyBitmap::isPageDirty() -- see the next bullet
