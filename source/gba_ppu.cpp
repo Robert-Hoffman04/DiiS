@@ -572,7 +572,7 @@ void gbaPpuBeginFrame()
 void gbaPpuEndFrame()
 {
 	// Blit into GPU_screen (offset 0 = the "main screen" slot the DS side
-	// uses -- see GPU.cpp's `GXMerge_BeginFrame(MainScreen.offset == 0)`)
+	// uses -- see MainScreen.offset in GPU.cpp)
 	// so the existing screenshot/harness_frame.cpp capture path (which
 	// reads GPU_screen directly, expecting its native X-B5-G5-R5 layout)
 	// picks up GBA output with no changes of its own. GBA mode never

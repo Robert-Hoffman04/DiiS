@@ -45,7 +45,6 @@
 #include "matrix.h"
 #include "readwrite.h"
 #include "MMU_timing.h"
-#include "GXDirty.h"
 #ifdef DESMUME_JIT_ARM7
 #include "jit/jit.h"
 #endif
@@ -764,10 +763,6 @@ static inline void MMU_VRAMmapControl(u8 block, u8 VRAMBankCnt)
 	//printf(vramConfiguration.describe().c_str());
 	//printf("vram remapped at vcount=%d\n",nds.VCount);
 
-	//a bank remap breaks the guest-page <-> content association the GX 2D-BG
-	//cache relies on - every cached BG/ext-pal texture is now potentially stale.
-	GXDirty_FullInvalidate();
-
 	//if texInfo changed, trigger notifications
 	if(memcmp(&oldTexInfo,&MMU.texInfo,sizeof(MMU_struct::TextureInfo)))
 	{
@@ -1024,8 +1019,6 @@ void MMU_Reset()
 	memset(MMU.ARM9_REG,  0, 0x40000);
 	memset(MMU.ARM9_VMEM, 0, 0x800);
 	memset(MMU.MAIN_MEM,  0, 0x400000);
-
-	GXDirty_FullInvalidate();   // VRAM/pal/OAM bulk-cleared outside the write path
 
 	memset(MMU.blank_memory,  0, sizeof(MMU.blank_memory));
 	
@@ -2574,7 +2567,6 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM9][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]]=val;
-	GXDirty_NoteARM9(adr);
 }
 
 //================================================= MMU ARM9 write 16
@@ -3056,7 +3048,6 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);
-	GXDirty_NoteARM9(adr);
 }
 
 //================================================= MMU ARM9 write 32
@@ -3454,7 +3445,6 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);
-	GXDirty_NoteARM9(adr);
 }
 
 //================================================= MMU ARM9 read 08
@@ -3738,7 +3728,6 @@ void FASTCALL _MMU_ARM7_write08(u32 adr, u8 val)
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM7][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20]]=val;
-	GXDirty_NoteARM7VRAM(adr);
 #ifdef DESMUME_JIT_ARM7
 	// P4: catch-all SMC guard for every ARM7-sourced write this function's
 	// earlier special cases didn't already return out of (interpreter stores,
