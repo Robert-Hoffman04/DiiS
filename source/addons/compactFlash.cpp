@@ -525,6 +525,19 @@ static BOOL cflash_init()
 		cflashDeviceEnabled = FALSE;
 		currLBA = 0;
 
+		// PLAN.md §4.3 item 8 root cause: CFlash_Path is never assigned
+		// anywhere outside the interactive config UI, so the default
+		// ADDON_CFLASH_MODE_Path pak (addonsInit()'s default) starts with
+		// an empty sFlashPath. list_files("") below doesn't fail cleanly --
+		// it recursively scans whatever an empty path resolves to on the
+		// active filesystem device, which is what produced a boot hang for
+		// any automated single-ROM test build. Fail cleanly instead of
+		// scanning an unconfigured/empty path.
+		if (sFlashPath.empty()) {
+			CFLASHLOG("cflash_init: empty CFlash path, refusing to scan\n");
+			return FALSE;
+		}
+
 		if (activeDirEnt != -1)
 			fclose(hFile);
 		activeDirEnt = -1;

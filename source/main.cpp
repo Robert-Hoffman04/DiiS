@@ -50,6 +50,14 @@
 #include "fps_overlay.h"
 #include "harness/harness.h"
 
+#ifdef DESMUME_FORCE_ROM
+// Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
+// §4.3 item 8). Declared here, ahead of the more specific probe blocks
+// below, since DESMUME_FORCE_ROM alone (no other probe macro) is now a
+// valid, supported combination -- e.g. a plain single-ROM boot test.
+#include "addons.h"
+#endif
+
 #ifdef DESMUME_ARMWRESTLER_PROBE
 #include "addons.h"
 #if defined(DESMUME_JIT_ARM7)
@@ -312,48 +320,21 @@ int main(int argc, char **argv){
 
 	cflash_disk_image_file = NULL;
 
-#ifdef DESMUME_GBA_IRQ_SOAK
-	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.
-	// The default CFlash slot-2 passthrough (addonsInit()'s default pak)
-	// has a known, separately-documented boot hang when a GBA ROM is
-	// staged as sd:/DS/ROMS/test.nds under -DDESMUME_FORCE_ROM (see
-	// PLAN.md §4.3 item 8's "Dolphin/DeSmuME-side result" -- reproduced
-	// twice, console frozen at "Using CFlash directory:", not root-caused
-	// there). Sidestepped here the same way DESMUME_ARMWRESTLER_PROBE
-	// above sidesteps it for its own unrelated reason: switch slot-2 to
-	// NDS_ADDON_NONE before MMU_Init()/addonsInit() runs. This synthetic
-	// ROM never touches slot-2 either way, so the addon choice is inert
-	// to the test itself.
-	addonsChangePak(NDS_ADDON_NONE);
-#endif
-
-#ifdef DESMUME_GBA_APU_SOAK
-	// PLAN.md §4.3 item 3 (APU): same default-CFlash-slot-2 boot hang under
-	// -DDESMUME_FORCE_ROM documented above for DESMUME_GBA_IRQ_SOAK applies
-	// to any GBA ROM staged that way -- sidestep it the same way. The
-	// companion synthetic ROM (tools/gba-refcheck/dsound.s) never touches
-	// slot-2 either.
-	addonsChangePak(NDS_ADDON_NONE);
-#endif
-
-#ifdef DESMUME_GBA_WAITCNT_SOAK
-	// PLAN.md §4.3 item 4: same default-CFlash-slot-2 boot hang under
-	// -DDESMUME_FORCE_ROM sidestepped the same way. The companion synthetic
-	// ROM (tools/gba-refcheck/waitcnt.s) never touches slot-2 either.
-	addonsChangePak(NDS_ADDON_NONE);
-#endif
-
-#ifdef DESMUME_GBA_DMA_SOAK
-	// PLAN.md §4.3 item 2: same default-CFlash-slot-2 boot hang under
-	// -DDESMUME_FORCE_ROM sidestepped the same way. The companion synthetic
-	// ROM (tools/gba-refcheck/dmavcap.s) never touches slot-2 either.
-	addonsChangePak(NDS_ADDON_NONE);
-#endif
-
-#ifdef DESMUME_GBA_SAVESTATE_SOAK
-	// PLAN.md §4.3 item 7: same default-CFlash-slot-2 boot hang under
-	// -DDESMUME_FORCE_ROM sidestepped the same way -- this soak reuses
-	// irqsoak.gba, which never touches slot-2 either.
+#ifdef DESMUME_FORCE_ROM
+	// PLAN.md §4.3 item 8 root cause: the default CFlash slot-2 passthrough
+	// (addonsInit()'s default pak) defaults to ADDON_CFLASH_MODE_Path with
+	// an empty CFlash_Path (never assigned anywhere outside the interactive
+	// config UI). cflash_init() -> cflash_build_fat() -> list_files("")
+	// then recursively scans whatever the empty path resolves to on the
+	// active filesystem device instead of failing cleanly, which is what
+	// produced the "Using CFlash directory:"-then-frozen boot hang for any
+	// GBA ROM staged as sd:/DS/ROMS/test.nds under -DDESMUME_FORCE_ROM
+	// (reproduced twice, isolated as reachable from every -DDESMUME_FORCE_ROM
+	// single-ROM test build, GBA or DS, not merely the five GBA soaks below
+	// that each used to carry their own copy of this same sidestep). None
+	// of these automated single-ROM test/bench builds exercise slot-2 CFlash
+	// passthrough, so switch to NDS_ADDON_NONE unconditionally here, before
+	// MMU_Init()/addonsInit() runs, rather than gate it per soak macro.
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
@@ -1406,6 +1387,47 @@ static void gba_boot_probe_tick()
 }
 #endif // DESMUME_GBA_BOOT_PROBE
 
+#if !defined(DESMUME_HARNESS) && !defined(DESMUME_BENCH)
+// GX2DBG (DS) offloads the 2D compositor to the GX hardware, which made it
+// run many times faster than real hardware. DSExec()/NDS_exec() themselves
+// have no pacing at all (see the DESMUME_BENCH comment block above: "Nothing
+// here throttles"), so without this, gameplay -- physics, animation timers,
+// and audio pitch all derive from frame rate here -- simply runs at whatever
+// speed the Wii can push, not at the real console's fixed 59.8261 Hz. This
+// applies equally to DS and GBA-compat content since both are driven through
+// the same NDS_exec()/DSExec() frame cadence (see SPU.cpp's own single
+// 59.8261 Hz constant, used unconditionally for both).
+//
+// Deliberately compiled out under -DDESMUME_HARNESS/-DDESMUME_BENCH: those
+// builds exist specifically to measure that unthrottled speed (tools/
+// benchmark's "eff.fps"/"% realtime" columns), so pacing them to real time
+// would make the measurement meaningless.
+static void frameLimiterTick()
+{
+	static u64 nextDue = 0;
+
+	// SkipFrame > 0 is the existing turbo-speed feature (+/- on the Wiimote):
+	// the user has explicitly asked to run faster than real time by skipping
+	// draws, so don't fight that -- and keep the baseline cleared so releasing
+	// turbo doesn't try to "catch up" a backlog built up while it was held.
+	if (SkipFrame != 0) { nextDue = 0; return; }
+
+	const u64 now = gettime();
+	if (nextDue == 0) nextDue = now;
+
+	const u64 frameTicks = (u64)(secs_to_ticks(1) / 59.8261);
+	nextDue += frameTicks;
+
+	if ((s64)(nextDue - now) > 0) {
+		usleep((u32)ticks_to_microsecs(nextDue - now));
+	} else {
+		// Fell behind real time (a slow scene, a hitch, turbo just released) --
+		// resync rather than bursting frames back-to-back to "catch up".
+		nextDue = now;
+	}
+}
+#endif // !DESMUME_HARNESS && !DESMUME_BENCH
+
 void DSExec(){
 
 	PAD_ScanPads();
@@ -1832,6 +1854,10 @@ void DSExec(){
 #endif
 
 	if(showfps) ShowFPS();
+
+#if !defined(DESMUME_HARNESS) && !defined(DESMUME_BENCH)
+	frameLimiterTick();
+#endif
 }
 
 void Pause(){

@@ -31,6 +31,7 @@
 #include "armcpu.h"
 #include "debug.h"
 #include "readwrite.h"
+#include "perf_zones.h"
 
 enum { DMA_BASE = 0xB0, DMA_STRIDE = 0x0C };
 static inline u32 offSAD(int c)  { return DMA_BASE + c * DMA_STRIDE + 0x0; }
@@ -265,6 +266,9 @@ static void fireArmed(int wantTiming)
 
 void gbaDmaOnHblank(int vcount)
 {
+	// perf_zones: same PZ_DMA zone the DS side's DmaController::exec() uses
+	// (NDSSystem.cpp) -- previously unscoped here, so it fell into PZ_OTHER.
+	PZ_SCOPE(PZ_DMA);
 	fireArmed(2);
 
 	// DMA3 Video Capture (Special timing, channel 3 only -- see gba_dma.h's
@@ -285,7 +289,7 @@ void gbaDmaOnHblank(int vcount)
 		if (!d.repeat) { d.enabled = false; clearEnableInBuffer(3); }
 	}
 }
-void gbaDmaOnVblank() { fireArmed(1); }
+void gbaDmaOnVblank() { PZ_SCOPE(PZ_DMA); fireArmed(1); }
 
 void gbaDmaOnFifoTrigger(u32 fifoAddr)
 {

@@ -36,35 +36,12 @@
 #include "armcpu.h"
 #include "gba_irq.h"
 #include "readwrite.h"
+#include "perf_zones.h"
 #include <string.h>
 
 u16 GBA_screen[GBA_SCREEN_W * GBA_SCREEN_H];
 
-// ---------------------------------------------------------------------
-// I/O register offsets (within MMU.GBA_IOREG, i.e. relative to
-// 0x04000000). Matches GBATEK's documented GBA I/O map; only the video
-// registers are used by this file.
-// ---------------------------------------------------------------------
-enum
-{
-	IO_DISPCNT  = 0x000,
-	IO_DISPSTAT = 0x004,
-	IO_VCOUNT   = 0x006,
-	IO_BG0CNT   = 0x008,
-	IO_BG1CNT   = 0x00A,
-	IO_BG2CNT   = 0x00C,
-	IO_BG3CNT   = 0x00E,
-	IO_BG0HOFS  = 0x010,
-	IO_BG2PA    = 0x020,
-	IO_BG2X     = 0x028,
-	IO_BG2Y     = 0x02C,
-	IO_BG3PA    = 0x030,
-	IO_BG3X     = 0x038,
-	IO_BG3Y     = 0x03C,
-	IO_IE       = 0x200,
-	IO_IF       = 0x202,
-	IO_IME      = 0x208,
-};
+// I/O register offsets: see the enum in gba_ppu.h.
 
 static inline u16 io16(u32 off) { return T1ReadWord(MMU.GBA_IOREG, off); }
 static inline void io16w(u32 off, u16 v) { T1WriteWord(MMU.GBA_IOREG, off, v); }
@@ -550,7 +527,17 @@ void gbaPpuEndFrame()
 
 void gbaPpuHDrawEnd(int line)
 {
-	renderScanline(line);
+	// perf_zones: this software scanline compositor (BG sampling + OBJ line
+	// render, both per-pixel) is the GBA-mode counterpart of the DS side's
+	// GPU_RenderLine() call (NDSSystem.cpp, wrapped in the same PZ_GPU_2D
+	// zone) -- until this was added it had no zone of its own and fell into
+	// PZ_OTHER by default, which is what made an early perf-zones capture of
+	// Minish Cap misleadingly show ~95% "other" instead of naming this as
+	// the actual cost.
+	{
+		PZ_SCOPE(PZ_GPU_2D);
+		renderScanline(line);
+	}
 	setDispstatFlags(/*vblank*/ line >= GBA_SCREEN_H, /*hblank*/ true);
 	if (line < GBA_SCREEN_H) { advanceAffine(0); advanceAffine(1); }
 }

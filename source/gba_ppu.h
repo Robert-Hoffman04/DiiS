@@ -40,6 +40,32 @@
 
 class EMUFILE;
 
+// ---------------------------------------------------------------------
+// I/O register offsets (within MMU.GBA_IOREG, i.e. relative to
+// 0x04000000). Matches GBATEK's documented GBA I/O map; only the video
+// registers are listed.
+// ---------------------------------------------------------------------
+enum
+{
+	IO_DISPCNT  = 0x000,
+	IO_DISPSTAT = 0x004,
+	IO_VCOUNT   = 0x006,
+	IO_BG0CNT   = 0x008,
+	IO_BG1CNT   = 0x00A,
+	IO_BG2CNT   = 0x00C,
+	IO_BG3CNT   = 0x00E,
+	IO_BG0HOFS  = 0x010,
+	IO_BG2PA    = 0x020,
+	IO_BG2X     = 0x028,
+	IO_BG2Y     = 0x02C,
+	IO_BG3PA    = 0x030,
+	IO_BG3X     = 0x038,
+	IO_BG3Y     = 0x03C,
+	IO_IE       = 0x200,
+	IO_IF       = 0x202,
+	IO_IME      = 0x208,
+};
+
 // Composited output, one u16 per pixel, native GBA color layout
 // (bit15 unused, bits10-14 B, bits5-9 G, bits0-4 R) -- this is the exact
 // same X-B5-G5-R5 layout GPU_screen (GPU.h) already uses, so callers can
