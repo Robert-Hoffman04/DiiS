@@ -107,11 +107,22 @@ static bool gxIsLayoutRegister(u32 offset)
 	return false;
 }
 
+// GXHOT_OBJWIN now means specifically "OBJ window (DISPCNT's WINOBJ enable
+// bit) is active this frame", not "any window feature" as it did before
+// gx-next-steps-log.md's task 2: WIN0/WIN1 are implemented natively in
+// gx_gba_render.cpp now (rectangular GX scissor decomposition, exact), so
+// they no longer need to force a CPU-bail; OBJ window's sprite-shaped mask
+// still does, since it isn't expressible as a GX scissor rect -- see that
+// file's header comment. GXHOT_MOSAIC and GXHOT_BLEND keep their original
+// "any use of this register group" meaning: gx_gba_render.cpp still bails
+// the whole frame on any mosaic use (narrower reasoning documented in its
+// header), and refines blend down to a real per-frame precondition check
+// of its own (gxBlendPlanForFrame) rather than an unconditional bail.
 static void gxUpdateHotFlags()
 {
 	u16 dispcnt = io16(IO_DISPCNT);
-	bool win0 = (dispcnt >> 13) & 1, win1 = (dispcnt >> 14) & 1, winObj = (dispcnt >> 15) & 1;
-	g_gbaFramePlan.setHot(GXHOT_OBJWIN, win0 || win1 || winObj);
+	bool winObj = (dispcnt >> 15) & 1;
+	g_gbaFramePlan.setHot(GXHOT_OBJWIN, winObj);
 	g_gbaFramePlan.setHot(GXHOT_MOSAIC, io16(IO_MOSAIC) != 0);
 	g_gbaFramePlan.setHot(GXHOT_BLEND, (io16(IO_BLDCNT) & 0x3F3F) != 0);
 }
@@ -141,6 +152,15 @@ static void gxSnapshotBandRegs(GxGbaBandRegs *r)
 		r->affPC[w] = (s16)io16(base + 4);
 		r->affPD[w] = (s16)io16(base + 6);
 	}
+	r->win0h = io16(IO_WIN0H);
+	r->win1h = io16(IO_WIN1H);
+	r->win0v = io16(IO_WIN0V);
+	r->win1v = io16(IO_WIN1V);
+	r->winIn = io16(IO_WININ);
+	r->winOut = io16(IO_WINOUT);
+	r->bldcnt = io16(IO_BLDCNT);
+	r->bldalpha = io16(IO_BLDALPHA);
+	r->bldy = io16(IO_BLDY);
 }
 
 // Called from every generic (non DISPSTAT/VCOUNT/IF) register write below,

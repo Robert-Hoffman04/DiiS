@@ -16,21 +16,100 @@
     fall outside the real content clamps onto that transparent border
     instead of smearing the edge row/column.
 
+    gx-next-steps-log.md task 2: WIN0/WIN1 rectangular windows and
+    BLDCNT/BLDALPHA/BLDY blend (alpha-blend, brighten, darken) are now
+    implemented natively in this file -- see "Windows" and "Blend" below.
     gxGbaRenderFrame() still returns false (CPU fallback via
-    renderScanline(), untouched by this file) for anything genuinely
-    unhandled: the DISPCNT mode field's two prohibited encodings (6/7,
-    which shouldn't occur on real ROMs), and -- permanently, not a stub to
-    be removed later -- any frame with WIN0/WIN1/OBJ window, mosaic, or
-    BLDCNT/BLDALPHA/BLDY alpha-blend/brighten/darken active this frame
-    (g_gbaFramePlan.isHot(GXHOT_OBJWIN/GXHOT_MOSAIC/GXHOT_BLEND), checked
-    first thing in gxGbaRenderFrame() before any GX work). This GX path has
-    no window/mosaic/blend implementation of its own; those frames are left
-    entirely to the CPU reference compositor (gba_ppu.cpp's
-    renderScanline()), which does implement GBATEK-accurate window/mosaic/
-    blend semantics (see gx-next-steps-log.md, task 1). Porting the same
-    effects natively into this GX path so they no longer need the CPU-bail
-    fallback is a separate, later, purely-performance follow-up (task 2 in
-    that log) -- not started by this change.
+    renderScanline(), untouched by this file) for:
+     - the DISPCNT mode field's two prohibited encodings (6/7, which
+       shouldn't occur on real ROMs);
+     - OBJ window (g_gbaFramePlan.isHot(GXHOT_OBJWIN), now meaning
+       specifically DISPCNT's WINOBJ enable bit, not "any window feature"
+       -- see gba_ppu.cpp's gxUpdateHotFlags()). OBJ window's mask is
+       sprite-shaped, not a rectangle, so it isn't expressible as a GX
+       scissor the way WIN0/WIN1 are; reproducing it natively would need a
+       stencil-style sprite-mask render pass, a materially bigger and
+       separately-scoped piece of work than the rectangular-window case.
+       Narrow, permanent bail -- not started by this change.
+     - mosaic (g_gbaFramePlan.isHot(GXHOT_MOSAIC)), for all layer kinds
+       (text BG, affine BG, bitmap BG2, OBJ). Mosaic snaps the *screen*
+       sample coordinate to a coarser grid before the normal per-pixel
+       sample, which (unlike window/blend) changes what texture content a
+       layer even needs baked, not just how already-baked content is
+       composited -- and affine BG mosaic on top of that needs the
+       historical per-line reference-point substitution gba_ppu.cpp's
+       sampleAffineBg() implements (s_affXHistory/s_affYHistory, internal
+       to that file), while OBJ mosaic has its own documented sprite-edge
+       judgment call (see that file's renderObjLine()). A native GX
+       technique exists in principle (bake each mosaic'd band at reduced
+       resolution, matching CPU's block-start-snap sampling exactly, then
+       upsample with GX_NEAR/point-filtered magnification instead of
+       linear interpolation) but combining it correctly with the affine
+       history lookup and OBJ edge handling, on top of the window/blend
+       work already landed this task, was judged a separately-scoped
+       follow-up rather than something to force into this change --
+       narrower and more precisely bounded than task 1's original
+       blanket bail, but still a real remaining gap, not a convenience
+       shortcut. See gx-next-steps-log.md's task 2 section for the full
+       reasoning.
+     - alpha blend specifically (BLDCNT effect field == 1, including
+       semi-transparent OBJ's forced-1st-target case) when this frame's
+       blend configuration doesn't satisfy the precondition documented
+       below under "Blend". Brighten/darken (effect == 2/3) never bails on
+       this account -- they're always exactly reproducible natively.
+
+    ### Windows (WIN0/WIN1)
+
+    Implemented as GX scissor-rectangle decomposition, not a stencil
+    buffer: WININ/WINOUT's BG0-3/OBJ/effect enable bits and the WIN0 > WIN1
+    > outside precedence (gxGbaRenderFrame()'s window helpers,
+    GxWindowPlan/gxBuildWindowPlan) are static per band (WIN0H/V, WIN1H/V,
+    WININ, WINOUT are all layout registers -- gxIsLayoutRegister -- so a
+    write to any of them already forces a new GxGbaBandRegs snapshot, same
+    as BGxCNT/scroll), so each layer's draw for a given band is turned into
+    up to 3 scissored sub-draws in *precedence* order: WINOUT first (using
+    the full band's Y range -- window-disabled layers just don't get a
+    WINOUT pass at all, correctly leaving whatever's already in the
+    framebuffer there untouched, since these are the "layer that shouldn't
+    show here" case, same underlying trick this file already relies on for
+    ordinary per-pixel transparency), then WIN1 scissored to
+    [max(bandY0,win1Y0), min(bandY1,win1Y1)) x [win1X0,win1X1), then WIN0
+    the same way -- each later pass overwrites the earlier one only within
+    its own smaller rectangle, so precedence falls out of plain draw order,
+    no stencil/mask buffer needed. This is exact for WIN0/WIN1 (both are
+    genuinely axis-aligned rectangles in GBATEK), unlike OBJ window.
+
+    ### Blend (BLDCNT/BLDALPHA/BLDY)
+
+    Implemented as a *bake-time* texel transform, not per-frame TEV/blend
+    state: brighten/darken (BLDY, effect 2/3) recolor a target-1 layer's
+    opaque texels toward white/black at bake time (gxApplyTexelEffect,
+    reusing the same EVY/16 formula as gba_ppu.cpp's blendFade) -- exactly
+    reproducible with no precondition, since Y-effect only ever looks at
+    the topmost layer, never what's beneath it. Alpha blend (effect 1)
+    instead bakes the target-1 layer's opaque texels with alpha scaled by
+    EVA/16 (RGB5A3's alpha sub-format only has 3 bits, so this is a
+    documented near-match: EVA/16 is rounded to the nearest of 8 levels,
+    and RGB truncates 5->4 bits same as any other alpha-subformat texel --
+    see gx_color.h) and lets this file's existing GX_BM_BLEND/SRCALPHA/
+    INVSRCALPHA compositing (already used today so a transparent texel
+    leaves the destination pixel untouched) do the actual per-pixel blend
+    against whatever's already been painted there -- which is only
+    guaranteed to equal GBATEK's specific "2nd-target layer directly
+    beneath" when *every other active layer this frame (including the
+    backdrop) is itself flagged 2nd-target in BLDCNT*, since with a single
+    painter's-algorithm pass there's no way to make hardware blending
+    conditional on which specific layer produced the destination pixel.
+    gxGbaRenderFrame() computes this precondition once per frame
+    (gxBlendPlanForFrame) -- along with requiring EVA+EVB==16, the standard
+    translucency case that GX_BL_SRCALPHA/INVSRCALPHA's fixed dst factor
+    (1-EVA/16) can represent exactly; GBA content that deliberately uses
+    independent, non-complementary EVA/EVB coefficients is a rare, real,
+    but out-of-scope case -- and bails the whole frame to the CPU
+    compositor if it doesn't hold (rather than rendering some layers right
+    and others wrong). Semi-transparent OBJ's forced-alpha-blend case is
+    covered by the same precondition check, treating each such sprite as
+    an implicit extra 1st-target layer for that computation.
 
     Design choices specific to this GX path (deviations/simplifications from
     an idealized Stage 1/4, documented rather than silent):
@@ -101,6 +180,14 @@ struct GxGbaBandRegs {
 	// mid-frame BGxX/Y write.
 	s32 affX[2], affY[2];
 	s16 affPA[2], affPB[2], affPC[2], affPD[2];
+	// Window/blend registers, snapshotted for the same reason as the rest
+	// of this struct (Stage 4 runs at end-of-frame, after every register
+	// already holds its final value) -- WIN0H/WIN1H/WIN0V/WIN1V/WININ/
+	// WINOUT/BLDCNT/BLDALPHA/BLDY are all layout registers
+	// (gxIsLayoutRegister, gba_ppu.cpp) so a write to any of them already
+	// forces a new band boundary/snapshot, same as BGxCNT or scroll.
+	u16 win0h, win1h, win0v, win1v, winIn, winOut;
+	u16 bldcnt, bldalpha, bldy;
 };
 static const int GX_GBA_MAX_BAND_REGS = GxBandTracker::kMaxBands;
 extern GxGbaBandRegs g_gbaBandRegs[GX_GBA_MAX_BAND_REGS];

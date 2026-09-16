@@ -56,6 +56,137 @@ static inline u16 gxOpaqueTexel(u16 ndsColor) { return gxPackRGB5A3Opaque(gxExtr
 static const u16 kTransparentTexel = 0; // RGB5A3 alpha sub-format, alpha=0, top bit clear
 
 // ---------------------------------------------------------------------
+// Bake-time blend (BLDCNT/BLDALPHA/BLDY): see gx_gba_render.h's "Blend"
+// section. A target-1 layer's opaque texels are recolored/alpha-scaled at
+// bake time rather than via any per-frame TEV/blend state change; every
+// bake call site below routes its per-texel opaque-color choice through
+// gxTexel() with a GxTexelEffectParams that's GXTEXEFFECT_NONE for the
+// ordinary (unblended) case, so this is a strict superset of the existing
+// bake behavior, not a fork of it.
+// ---------------------------------------------------------------------
+enum GxTexelEffect { GXTEXEFFECT_NONE, GXTEXEFFECT_ALPHA, GXTEXEFFECT_BRIGHTEN, GXTEXEFFECT_DARKEN };
+struct GxTexelEffectParams { GxTexelEffect mode; int eva; int evy; };
+static const GxTexelEffectParams kTexelEffectNone = { GXTEXEFFECT_NONE, 0, 0 };
+
+// Local port of gba_ppu.cpp's blendFade() (brighten toward white / darken
+// toward black, EVY in 16ths) -- see that file for the reference formula.
+// Not shared via a header on purpose, same rationale as this file's other
+// small local duplicates (top of file).
+static inline u16 gxBlendFade(u16 ndsColor, int evy, bool toWhite)
+{
+	int r = ndsColor & 0x1F, g = (ndsColor >> 5) & 0x1F, b = (ndsColor >> 10) & 0x1F;
+	if (toWhite) { r += ((31 - r) * evy) / 16; g += ((31 - g) * evy) / 16; b += ((31 - b) * evy) / 16; }
+	else         { r -= (r * evy) / 16;        g -= (g * evy) / 16;        b -= (b * evy) / 16; }
+	if (r < 0) r = 0;
+	if (r > 31) r = 31;
+	if (g < 0) g = 0;
+	if (g > 31) g = 31;
+	if (b < 0) b = 0;
+	if (b > 31) b = 31;
+	return (u16)((b << 10) | (g << 5) | r);
+}
+
+// One opaque source texel (NDS BGR555, already palette-resolved), with
+// this layer's this-frame texel effect applied. `opaque` false always
+// yields fully transparent, regardless of fx -- effects never apply to a
+// texel that wouldn't have drawn at all.
+static inline u16 gxTexel(u16 ndsColor, bool opaque, const GxTexelEffectParams &fx)
+{
+	if (!opaque) return kTransparentTexel;
+	switch (fx.mode) {
+	case GXTEXEFFECT_ALPHA: {
+		// RGB5A3's alpha sub-format has only 3 bits of alpha (0-7) and
+		// 4 bits/channel of color (see gx_color.h) -- EVA/16 (17 possible
+		// levels) is rounded to the nearest of 8 representable levels,
+		// and color loses its LSB of precision. Documented near-match,
+		// not a bug: see gx_gba_render.h's "Blend" section.
+		u8 a3 = (u8)((fx.eva * 7 + 8) / 16);
+		return gxPackRGB5A3AlphaFull(a3, ndsColor);
+	}
+	case GXTEXEFFECT_BRIGHTEN: return gxOpaqueTexel(gxBlendFade(ndsColor, fx.evy, true));
+	case GXTEXEFFECT_DARKEN:   return gxOpaqueTexel(gxBlendFade(ndsColor, fx.evy, false));
+	default:                   return gxOpaqueTexel(ndsColor);
+	}
+}
+
+// ---------------------------------------------------------------------
+// Windows (WIN0/WIN1): see gx_gba_render.h's "Windows" section. Local
+// ports of gba_ppu.cpp's windowXRange/windowYRange/decodeWinByte (same
+// GBATEK rules -- garbage X2>240/Y2>160 or X1>X2/Y1>Y2 clamps to 240/160,
+// WININ/WINOUT bit layout), not shared via a header for the same reason
+// as this file's other CPU-reference duplicates.
+// ---------------------------------------------------------------------
+struct GxWinMasks { bool bg[4]; bool obj; bool effect; };
+
+static inline void gxWindowXRange(u16 winH, int &x1, int &x2)
+{
+	x1 = (winH >> 8) & 0xFF;
+	x2 = winH & 0xFF;
+	if (x2 > GBA_SCREEN_W || x1 > x2) x2 = GBA_SCREEN_W;
+}
+static inline void gxWindowYRange(u16 winV, int &y1, int &y2)
+{
+	y1 = (winV >> 8) & 0xFF;
+	y2 = winV & 0xFF;
+	if (y2 > GBA_SCREEN_H || y1 > y2) y2 = GBA_SCREEN_H;
+}
+static inline GxWinMasks gxDecodeWinByte(u16 v, int shift)
+{
+	u8 b = (u8)(v >> shift);
+	GxWinMasks m;
+	for (int i = 0; i < 4; i++) m.bg[i] = (b >> i) & 1;
+	m.obj = (b >> 4) & 1;
+	m.effect = (b >> 5) & 1;
+	return m;
+}
+
+// Precomputed per-band window decomposition: up to 3 scissor-rect passes
+// (WINOUT, WIN1, WIN0) in strict precedence order -- see gx_gba_render.h.
+// `active` is false whenever neither WIN0 nor WIN1 is enabled this band,
+// in which case callers must skip this machinery entirely and draw once,
+// unclipped, with effect always enabled (matching gba_ppu.cpp's
+// `!windowsActive` branch exactly).
+struct GxWindowPlan {
+	bool active;
+	GxWinMasks out;
+	bool win1On; int win1Y0, win1Y1, win1X0, win1X1; GxWinMasks win1;
+	bool win0On; int win0Y0, win0Y1, win0X0, win0X1; GxWinMasks win0;
+};
+
+static GxWindowPlan gxBuildWindowPlan(const GxGbaBandRegs &r, int bandY0, int bandY1)
+{
+	GxWindowPlan p;
+	bool win0Dc = (r.dispcnt >> 13) & 1, win1Dc = (r.dispcnt >> 14) & 1;
+	p.active = win0Dc || win1Dc;
+	p.out = gxDecodeWinByte(r.winOut, 0);
+	p.win1On = false;
+	p.win0On = false;
+	if (!p.active)
+		return p;
+	if (win1Dc) {
+		int y1, y2;
+		gxWindowYRange(r.win1v, y1, y2);
+		int oy0 = y1 > bandY0 ? y1 : bandY0, oy1 = y2 < bandY1 ? y2 : bandY1;
+		if (oy1 > oy0) {
+			p.win1On = true; p.win1Y0 = oy0; p.win1Y1 = oy1;
+			gxWindowXRange(r.win1h, p.win1X0, p.win1X1);
+			p.win1 = gxDecodeWinByte(r.winIn, 8);
+		}
+	}
+	if (win0Dc) {
+		int y1, y2;
+		gxWindowYRange(r.win0v, y1, y2);
+		int oy0 = y1 > bandY0 ? y1 : bandY0, oy1 = y2 < bandY1 ? y2 : bandY1;
+		if (oy1 > oy0) {
+			p.win0On = true; p.win0Y0 = oy0; p.win0Y1 = oy1;
+			gxWindowXRange(r.win0h, p.win0X0, p.win0X1);
+			p.win0 = gxDecodeWinByte(r.winIn, 0);
+		}
+	}
+	return p;
+}
+
+// ---------------------------------------------------------------------
 // BG plane cache: one baked RGB5A3 texture per BG (0-3), sized to that BG's
 // full tilemap extent (up to 64x64 tiles = 512x512px, text mode's max), so
 // a whole frame's worth of per-band scroll can be expressed as GX_REPEAT
@@ -126,6 +257,9 @@ struct GxObjDraw {
 	bool affine;
 	s16 pa, pb, pc, pd;    // meaningful only when affine, 8.8 fixed point
 	u8 oamIndex;
+	bool semiTransparent;  // attribute0 objMode==1 -- forces alpha-blend
+	                       // 1st-target behavior regardless of BLDCNT's OBJ
+	                       // bit, GBATEK; see gx_gba_render.h's "Blend".
 };
 static GxObjDraw s_objDraws[128];
 static int s_objDrawCount;
@@ -143,6 +277,37 @@ static bool s_bmpValid;
 // 1x1 solid-color texture used for the backdrop fill (see gxGbaRenderFrame).
 static GXTexObj s_backdropTexObj;
 static void *s_backdropTexData;
+
+// ---------------------------------------------------------------------
+// Shared scratch texture for the bake-time blend effect's "effected"
+// variant of whichever single layer currently needs one -- see
+// gx_gba_render.h's "Blend" section. A layer's ordinary (unblended) bake
+// stays in its own persistent cache above (s_bgPlane/s_affBgPlane/
+// s_objTex/s_bmpTexObj) exactly as before this task; this one extra slot
+// is re-baked transiently, immediately before whichever draw call needs
+// the blended version, and never cached across draws or frames. Sized for
+// the largest layer kind this file bakes (affine BG plane, up to
+// kAffineBgPlaneMaxPx^2); grown on demand like s_affBgPlane's cache.
+// ---------------------------------------------------------------------
+struct GxEffectScratch { GXTexObj texObj; void *texData; u32 cap; };
+static GxEffectScratch s_effectTex;
+
+// Swizzles `linear` (w x h RGB5A3 texels, w/h already multiples of 4) into
+// s_effectTex and initializes its GXTexObj with the given wrap mode.
+static void gxUploadEffectTex(const u16 *linear, int w, int h, u8 wrapMode)
+{
+	u32 needed = (u32)w * h * sizeof(u16);
+	if (needed > s_effectTex.cap) {
+		if (s_effectTex.texData) free(s_effectTex.texData);
+		s_effectTex.texData = memalign(32, needed);
+		s_effectTex.cap = s_effectTex.texData ? needed : 0;
+	}
+	if (!s_effectTex.texData) return;
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+	gxSwizzle16bpp(linear, (u16 *)s_effectTex.texData, blk.texelsWide, blk.texelsTall, w, h);
+	DCFlushRange(s_effectTex.texData, needed);
+	GX_InitTexObj(&s_effectTex.texObj, s_effectTex.texData, w, h, GX_TF_RGB5A3, wrapMode, wrapMode, GX_FALSE);
+}
 
 // Copy-back scratch: GX_CopyTex's destination is real system memory, but in
 // GX's own block-tiled layout for the copy format (see gx_texformat.h) --
@@ -202,6 +367,9 @@ bool gxGbaRenderInit()
 	s_copyBackLinear = (u16 *)malloc(GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16));
 	if (!s_copyBackLinear) return false;
 
+	s_effectTex.texData = nullptr;
+	s_effectTex.cap = 0;
+
 	s_initDone = true;
 	return true;
 }
@@ -220,6 +388,7 @@ void gxGbaRenderShutdown()
 	free(s_backdropTexData); s_backdropTexData = nullptr;
 	free(s_copyBackBuf); s_copyBackBuf = nullptr;
 	free(s_copyBackLinear); s_copyBackLinear = nullptr;
+	free(s_effectTex.texData); s_effectTex.texData = nullptr; s_effectTex.cap = 0;
 	s_initDone = false;
 }
 
@@ -320,7 +489,13 @@ static GxBgLayout gxBgLayoutFromCnt(u16 cnt)
 	return li;
 }
 
-static void gxBakeBgPlane(int bg)
+// `fx`/`toEffectScratch`: see gx_gba_render.h's "Blend" section. The
+// ordinary (unblended, GXTEXEFFECT_NONE) call sites behave exactly as
+// before this task; `toEffectScratch` bakes this BG's blended variant
+// into the shared transient s_effectTex scratch instead of its own
+// persistent cache, for use alongside a plain-cache draw of the same BG
+// within the same band (see gxDrawBgLayerWindowed).
+static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNone, bool toEffectScratch = false)
 {
 	u16 cnt = T1ReadWord(MMU.GBA_IOREG, IO_BG0CNT + bg * 2);
 	GxBgLayout li = gxBgLayoutFromCnt(cnt);
@@ -346,11 +521,11 @@ static void gxBakeBgPlane(int bg)
 						u32 tileAddr = li.charBase + tileNum * 32 + srcY * 4 + srcX / 2;
 						u8 byte = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
 						int idx = (srcX & 1) ? (byte >> 4) : (byte & 0xF);
-						texel = idx ? gxOpaqueTexel(gxBgPalColor(palNum * 16 + idx)) : kTransparentTexel;
+						texel = gxTexel(gxBgPalColor(palNum * 16 + idx), idx != 0, fx);
 					} else {
 						u32 tileAddr = li.charBase + tileNum * 64 + srcY * 8 + srcX;
 						u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
-						texel = idx ? gxOpaqueTexel(gxBgPalColor(idx)) : kTransparentTexel;
+						texel = gxTexel(gxBgPalColor(idx), idx != 0, fx);
 					}
 					s_bgBakeScratch[(ty * 8 + suby) * mapWpx + (tx * 8 + subx)] = texel;
 				}
@@ -358,6 +533,10 @@ static void gxBakeBgPlane(int bg)
 		}
 	}
 
+	if (toEffectScratch) {
+		gxUploadEffectTex(s_bgBakeScratch, mapWpx, mapHpx, GX_REPEAT);
+		return;
+	}
 	GxBgPlaneCache &pc = s_bgPlane[bg];
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxSwizzle16bpp(s_bgBakeScratch, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, mapWpx, mapHpx);
@@ -371,7 +550,7 @@ static void gxBakeBgPlane(int bg)
 // Affine BG map entries are 1 byte (tile index 0-255 into a fixed 8bpp
 // charset), no per-tile flip -- unlike text mode's 2-byte entries with
 // hflip/vflip/palette bits. which: 0=BG2, 1=BG3.
-static void gxBakeAffineBgPlane(int which, u16 cnt)
+static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &fx = kTexelEffectNone, bool toEffectScratch = false)
 {
 	u32 charBase = ((cnt >> 2) & 3) * 0x4000;
 	u32 mapBase = ((cnt >> 8) & 0x1F) * 0x800;
@@ -390,7 +569,7 @@ static void gxBakeAffineBgPlane(int which, u16 cnt)
 				for (int subx = 0; subx < 8; ++subx) {
 					u32 tileAddr = charBase + tileNum * 64 + suby * 8 + subx;
 					u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(tileAddr));
-					u16 texel = idx ? gxOpaqueTexel(gxBgPalColor(idx)) : kTransparentTexel;
+					u16 texel = gxTexel(gxBgPalColor(idx), idx != 0, fx);
 					int dstX = tx * 8 + subx + borderOff;
 					int dstY = ty * 8 + suby + borderOff;
 					s_affBgBakeScratch[dstY * bufPx + dstX] = texel;
@@ -409,6 +588,10 @@ static void gxBakeAffineBgPlane(int which, u16 cnt)
 		}
 	}
 
+	if (toEffectScratch) {
+		gxUploadEffectTex(s_affBgBakeScratch, bufPx, bufPx, wrap ? GX_REPEAT : GX_CLAMP);
+		return;
+	}
 	GxAffineBgPlaneCache &pc = s_affBgPlane[which];
 	u32 needed = (u32)bufPx * bufPx * sizeof(u16);
 	if (needed > pc.texDataCap) {
@@ -497,6 +680,7 @@ static bool gxCollectVisibleObj(u16 dispcnt)
 			d.vflip = (a1 >> 13) & 1;
 		}
 		d.oamIndex = (u8)i;
+		d.semiTransparent = (objMode == 1);
 	}
 	return true;
 }
@@ -505,7 +689,7 @@ static bool gxCollectVisibleObj(u16 dispcnt)
 // buffer with a 1-texel transparent border (see kObjTexBufMaxPx) -- baked
 // the same way regardless of d.affine so both draw paths share one bake
 // function; only affine sampling ever actually reaches the border.
-static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d)
+static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffectParams &fx = kTexelEffectNone, bool toEffectScratch = false)
 {
 	u32 oamOff = d.oamIndex * 8;
 	u16 a0 = T1ReadWord(MMU.GBA_OAM, oamOff);
@@ -538,11 +722,11 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d)
 				u32 a = addr + suby * 4 + subx / 2;
 				u8 byte = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
 				int idx = (subx & 1) ? (byte >> 4) : (byte & 0xF);
-				texel = idx ? gxOpaqueTexel(gxObjPalColor(palNum * 16 + idx)) : kTransparentTexel;
+				texel = gxTexel(gxObjPalColor(palNum * 16 + idx), idx != 0, fx);
 			} else {
 				u32 a = addr + suby * 8 + subx;
 				u8 idx = T1ReadByte(MMU.GBA_VRAM, gxVramAddr(a));
-				texel = idx ? gxOpaqueTexel(gxObjPalColor(idx)) : kTransparentTexel;
+				texel = gxTexel(gxObjPalColor(idx), idx != 0, fx);
 			}
 			s_objBakeScratch[(texy + 1) * bufW + (texx + 1)] = texel;
 		}
@@ -556,6 +740,10 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d)
 		s_objBakeScratch[y * bufW + (bufW - 1)] = kTransparentTexel;
 	}
 
+	if (toEffectScratch) {
+		gxUploadEffectTex(s_objBakeScratch, bufW, bufH, GX_CLAMP);
+		return;
+	}
 	GxObjTexSlot &slot = s_objTex[d.oamIndex];
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	// w/h are each a multiple of 8 (OBJ sizes are whole 8px tiles), so
@@ -566,26 +754,33 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d)
 	GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 }
 
-static void gxBakeBitmapMode(int mode, u16 dispcnt)
+// Bitmap-mode content is always opaque (no transparent texels -- every
+// mode 3/4/5 pixel is a real color), so `fx` is applied unconditionally
+// rather than gated by an idx!=0 check the way tiled modes are.
+static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &fx = kTexelEffectNone, bool toEffectScratch = false)
 {
-	u16 *dst = (u16 *)s_bmpTexData;
+	u16 *dst = toEffectScratch ? s_bgBakeScratch : (u16 *)s_bmpTexData;
 	u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
 
 	if (mode == 3) {
 		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i)
-			dst[i] = gxOpaqueTexel(T1ReadWord(MMU.GBA_VRAM, i * 2));
+			dst[i] = gxTexel(T1ReadWord(MMU.GBA_VRAM, i * 2), true, fx);
 	} else if (mode == 4) {
 		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i) {
 			u8 idx = T1ReadByte(MMU.GBA_VRAM, page + i);
-			dst[i] = gxOpaqueTexel(gxBgPalColor(idx));
+			dst[i] = gxTexel(gxBgPalColor(idx), true, fx);
 		}
 	} else { // mode 5: 160x128, rest of the buffer stays whatever it last held
 		const int W = 160, H = 128;
 		for (int y = 0; y < H; ++y)
 			for (int x = 0; x < W; ++x)
-				dst[y * GBA_SCREEN_W + x] = gxOpaqueTexel(T1ReadWord(MMU.GBA_VRAM, page + (y * W + x) * 2));
+				dst[y * GBA_SCREEN_W + x] = gxTexel(T1ReadWord(MMU.GBA_VRAM, page + (y * W + x) * 2), true, fx);
 	}
 
+	if (toEffectScratch) {
+		gxUploadEffectTex(s_bgBakeScratch, GBA_SCREEN_W, GBA_SCREEN_H, GX_CLAMP);
+		return;
+	}
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxSwizzle16bpp((u16 *)s_bmpTexData, s_bgBakeScratch, blk.texelsWide, blk.texelsTall, GBA_SCREEN_W, GBA_SCREEN_H);
 	memcpy(s_bmpTexData, s_bgBakeScratch, GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16));
@@ -613,36 +808,33 @@ static void gxAffineObjTexCorner(const GxObjDraw &d, s32 col, s32 row, f32 *tx, 
 	*ty = (f32)(origy + d.texH / 2);
 }
 
-static void gxDrawObjForPriorityBand(int prio, int y0, int y1)
+// Single-sprite draw, shared by the windowed OBJ path (gxDrawObjLayerWindowed)
+// with an explicit texture (the sprite's own plain cache, or the shared
+// s_effectTex blend variant).
+static void gxDrawOneObj(const GxObjDraw &d, GXTexObj *tex)
 {
-	for (int i = 0; i < s_objDrawCount; ++i) {
-		const GxObjDraw &d = s_objDraws[i];
-		if (d.priority != prio) continue;
-		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
-
-		f32 bufW = (f32)(d.texW + 4), bufH = (f32)(d.texH + 4);
-		if (d.affine) {
-			f32 tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3;
-			gxAffineObjTexCorner(d, 0, 0, &tx0, &ty0);
-			gxAffineObjTexCorner(d, d.boxW, 0, &tx1, &ty1);
-			gxAffineObjTexCorner(d, d.boxW, d.boxH, &tx2, &ty2);
-			gxAffineObjTexCorner(d, 0, d.boxH, &tx3, &ty3);
-			gxDrawQuadFree(&s_objTex[d.oamIndex].texObj, d.x, d.y, d.x + d.boxW, d.y + d.boxH,
-			               (tx0 + 1) / bufW, (ty0 + 1) / bufH,
-			               (tx1 + 1) / bufW, (ty1 + 1) / bufH,
-			               (tx2 + 1) / bufW, (ty2 + 1) / bufH,
-			               (tx3 + 1) / bufW, (ty3 + 1) / bufH);
-		} else {
-			f32 u0 = 1.0f / bufW, u1 = (f32)(d.texW + 1) / bufW;
-			f32 v0 = 1.0f / bufH, v1 = (f32)(d.texH + 1) / bufH;
-			f32 s0 = d.hflip ? u1 : u0, s1 = d.hflip ? u0 : u1;
-			f32 t0 = d.vflip ? v1 : v0, t1 = d.vflip ? v0 : v1;
-			gxDrawQuad(&s_objTex[d.oamIndex].texObj, d.x, d.y, d.x + d.boxW, d.y + d.boxH, s0, t0, s1, t1);
-		}
+	f32 bufW = (f32)(d.texW + 4), bufH = (f32)(d.texH + 4);
+	if (d.affine) {
+		f32 tx0, ty0, tx1, ty1, tx2, ty2, tx3, ty3;
+		gxAffineObjTexCorner(d, 0, 0, &tx0, &ty0);
+		gxAffineObjTexCorner(d, d.boxW, 0, &tx1, &ty1);
+		gxAffineObjTexCorner(d, d.boxW, d.boxH, &tx2, &ty2);
+		gxAffineObjTexCorner(d, 0, d.boxH, &tx3, &ty3);
+		gxDrawQuadFree(tex, d.x, d.y, d.x + d.boxW, d.y + d.boxH,
+		               (tx0 + 1) / bufW, (ty0 + 1) / bufH,
+		               (tx1 + 1) / bufW, (ty1 + 1) / bufH,
+		               (tx2 + 1) / bufW, (ty2 + 1) / bufH,
+		               (tx3 + 1) / bufW, (ty3 + 1) / bufH);
+	} else {
+		f32 u0 = 1.0f / bufW, u1 = (f32)(d.texW + 1) / bufW;
+		f32 v0 = 1.0f / bufH, v1 = (f32)(d.texH + 1) / bufH;
+		f32 s0 = d.hflip ? u1 : u0, s1 = d.hflip ? u0 : u1;
+		f32 t0 = d.vflip ? v1 : v0, t1 = d.vflip ? v0 : v1;
+		gxDrawQuad(tex, d.x, d.y, d.x + d.boxW, d.y + d.boxH, s0, t0, s1, t1);
 	}
 }
 
-static void gxDrawBgQuad(int bg, const GxGbaBandRegs &r, int y0, int y1)
+static void gxDrawBgQuad(int bg, const GxGbaBandRegs &r, int y0, int y1, GXTexObj *texOverride = nullptr)
 {
 	GxBgPlaneCache &pc = s_bgPlane[bg];
 	if (!pc.valid) return;
@@ -650,7 +842,7 @@ static void gxDrawBgQuad(int bg, const GxGbaBandRegs &r, int y0, int y1)
 	f32 s1 = s0 + (f32)GBA_SCREEN_W / pc.mapWpx;
 	f32 t0 = (f32)(r.vofs[bg] + y0) / pc.mapHpx;
 	f32 t1 = (f32)(r.vofs[bg] + y1) / pc.mapHpx;
-	gxDrawQuad(&pc.texObj, 0, (f32)y0, GBA_SCREEN_W, (f32)y1, s0, t0, s1, t1);
+	gxDrawQuad(texOverride ? texOverride : &pc.texObj, 0, (f32)y0, GBA_SCREEN_W, (f32)y1, s0, t0, s1, t1);
 }
 
 // which: 0=BG2, 1=BG3. Band's screen rect (0,y0)-(GBA_SCREEN_W,y1) maps
@@ -659,7 +851,7 @@ static void gxDrawBgQuad(int bg, const GxGbaBandRegs &r, int y0, int y1)
 // parallelogram in texture space; computing that mapping at the 4 rect
 // corners and letting GX interpolate reproduces sampleAffineBg()'s
 // per-pixel formula (gba_ppu.cpp) exactly, since it's linear in (x, y-y0).
-static void gxDrawAffineBgQuad(int which, const GxGbaBandRegs &r, int y0, int y1)
+static void gxDrawAffineBgQuad(int which, const GxGbaBandRegs &r, int y0, int y1, GXTexObj *texOverride = nullptr)
 {
 	GxAffineBgPlaneCache &pc = s_affBgPlane[which];
 	if (!pc.valid) return;
@@ -676,11 +868,236 @@ static void gxDrawAffineBgQuad(int which, const GxGbaBandRegs &r, int y0, int y1
 
 	f32 norm = (f32)pc.bufPx;
 	f32 off = pc.wrap ? 0.0f : 1.0f;
-	gxDrawQuadFree(&pc.texObj, 0, (f32)y0, GBA_SCREEN_W, (f32)y1,
+	gxDrawQuadFree(texOverride ? texOverride : &pc.texObj, 0, (f32)y0, GBA_SCREEN_W, (f32)y1,
 	               (tx0 + off) / norm, (ty0 + off) / norm,
 	               (tx1 + off) / norm, (ty1 + off) / norm,
 	               (tx2 + off) / norm, (ty2 + off) / norm,
 	               (tx3 + off) / norm, (ty3 + off) / norm);
+}
+
+// ---------------------------------------------------------------------
+// Blend classification (BLDCNT/BLDALPHA/BLDY): see gx_gba_render.h's
+// "Blend" section. Layer bit indices match gba_ppu.cpp's Layer/BLDCNT
+// convention: BG0=0, BG1=1, BG2=2, BG3=3, OBJ=4, backdrop=5 -- so a BG's
+// own loop index doubles as its bit here.
+// ---------------------------------------------------------------------
+struct GxBandBlendPlan {
+	int effect;            // BLDCNT bits 6-7: 0 none, 1 alpha, 2 brighten, 3 darken
+	int target1, target2;  // BLDCNT bits 0-5 / 8-13
+	int eva, evy;           // BLDALPHA EVA (evb is never needed -- see header), BLDY EVY, 16ths, clamped 0-16
+	bool alphaNativeOk;     // precondition holds for effect==1 this band (see header); irrelevant for effect!=1
+};
+
+// `mode`/`dispcnt` are the frame-global values (DISPCNT's mode field and
+// enable bits are treated as frame-static everywhere else in this file --
+// see gxGbaRenderFrame's `mode`/`dispcnt` locals and the per-band BG loop
+// that already reuses them instead of r.dispcnt's own mode bits); only the
+// blend registers themselves and the per-BG/OBJ *enable* bits are read
+// from the per-band snapshot `r`, consistent with how every other band
+// register is treated.
+static GxBandBlendPlan gxComputeBandBlendPlan(int mode, u16 dispcnt, const GxGbaBandRegs &r)
+{
+	GxBandBlendPlan p;
+	p.effect = (r.bldcnt >> 6) & 3;
+	p.target1 = r.bldcnt & 0x3F;
+	p.target2 = (r.bldcnt >> 8) & 0x3F;
+	int eva = r.bldalpha & 0x1F; if (eva > 16) eva = 16;
+	int evb = (r.bldalpha >> 8) & 0x1F; if (evb > 16) evb = 16;
+	p.eva = eva;
+	p.evy = r.bldy & 0x1F; if (p.evy > 16) p.evy = 16;
+	p.alphaNativeOk = true;
+	if (p.effect != 1)
+		return p; // brighten/darken/none never need the precondition
+
+	bool anySemiTransparent = false;
+	for (int i = 0; i < s_objDrawCount; ++i)
+		if (s_objDraws[i].semiTransparent) { anySemiTransparent = true; break; }
+
+	int activeMask = 0;
+	for (int bg = 0; bg < 4; ++bg) {
+		bool active;
+		if (mode >= 3) {
+			active = (bg == 2) && ((r.dispcnt >> 10) & 1);
+		} else {
+			active = (r.dispcnt >> (8 + bg)) & 1;
+			if (mode == 1 && bg == 3) active = false;
+			if (mode == 2 && (bg == 0 || bg == 1)) active = false;
+		}
+		if (active) activeMask |= (1 << bg);
+	}
+	if (((r.dispcnt >> 12) & 1) && s_objDrawCount > 0) activeMask |= (1 << 4);
+	activeMask |= (1 << 5); // backdrop is always present as the bottom layer
+
+	bool anyTarget1Active = (p.target1 & activeMask) != 0;
+	if (!anyTarget1Active && !anySemiTransparent)
+		return p; // nothing actually blends this band -- trivially fine
+
+	// GBATEK: "I = MIN(31, I1st*EVA + I2nd*EVB)" -- GX_BL_SRCALPHA/
+	// INVSRCALPHA's fixed dst factor (1-srcAlpha) only reproduces this
+	// when EVB == 16-EVA (the standard translucency case); independent,
+	// non-complementary coefficients are a real but rare, out-of-scope
+	// GBA usage (see header).
+	if (eva + evb != 16) { p.alphaNativeOk = false; return p; }
+
+	// Conservative-but-safe precondition (see header's "Blend" section):
+	// every layer that's active this band must be a BLDCNT 2nd-target,
+	// since with a single painter's-algorithm GX pass there's no way to
+	// make hardware blending conditional on which specific layer produced
+	// the destination pixel a target-1 draw blends against.
+	if ((activeMask & ~p.target2) != 0)
+		p.alphaNativeOk = false;
+	return p;
+}
+
+// Resolves layer `bit`'s bake-time texel effect from this band's blend
+// plan. Returns GXTEXEFFECT_NONE for a layer that isn't BLDCNT 1st-target
+// this band, or when effect==1 and the frame-level alpha-blend
+// precondition failed (gxGbaRenderFrame() already bails the whole frame
+// before this is ever reached in that case -- this branch is defensive,
+// not a real path).
+static GxTexelEffectParams gxResolveLayerEffect(int bit, const GxBandBlendPlan &bp)
+{
+	if (bp.effect == 0 || !((bp.target1 >> bit) & 1))
+		return kTexelEffectNone;
+	if (bp.effect == 1)
+		return bp.alphaNativeOk ? GxTexelEffectParams{ GXTEXEFFECT_ALPHA, bp.eva, 0 } : kTexelEffectNone;
+	return GxTexelEffectParams{ bp.effect == 2 ? GXTEXEFFECT_BRIGHTEN : GXTEXEFFECT_DARKEN, 0, bp.evy };
+}
+
+// Semi-transparent OBJ (GxObjDraw::semiTransparent) forces alpha-blend
+// 1st-target behavior for that individual sprite regardless of BLDCNT's
+// OBJ bit (GBATEK) -- but only when BLDCNT's effect field is actually 1
+// (gba_ppu.cpp's composePixel checks `effect == 0` before ever looking at
+// the forced-semi-transparent case, so effect 0/2/3 never force it).
+static inline bool gxObjSpriteBlends(const GxObjDraw &d, const GxBandBlendPlan &bp)
+{
+	if (bp.effect != 1 || !bp.alphaNativeOk)
+		return false;
+	return ((bp.target1 >> 4) & 1) || d.semiTransparent;
+}
+
+// ---------------------------------------------------------------------
+// Windows (WIN0/WIN1): draws one layer's slice of one band, decomposed
+// into up to 3 scissor-rect passes in WIN0 > WIN1 > outside precedence --
+// see gx_gba_render.h's "Windows" section for why this is exact for
+// rectangular windows and gx_gba_render.h's "Blend" section for why each
+// pass independently picks the plain or bake-time-effected texture based
+// on that specific window region's effect-enable bit. `drawFull`/`drawBg`/
+// `drawWin1`/`drawWin0` are avoided as a single functor parameter (no
+// std::function in this GX-only, allocation-averse file) -- callers
+// instead get a small dedicated wrapper per layer kind below.
+// ---------------------------------------------------------------------
+static void gxDrawBgLayerWindowed(int bg, const GxGbaBandRegs &r, int y0, int y1,
+                                   const GxWindowPlan &wp, GXTexObj *effTex)
+{
+	if (!wp.active) {
+		gxDrawBgQuad(bg, r, y0, y1, effTex);
+		return;
+	}
+	if (wp.out.bg[bg]) {
+		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
+		gxDrawBgQuad(bg, r, y0, y1, wp.out.effect ? effTex : nullptr);
+	}
+	if (wp.win1On && wp.win1.bg[bg] && wp.win1X1 > wp.win1X0) {
+		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
+		gxDrawBgQuad(bg, r, y0, y1, wp.win1.effect ? effTex : nullptr);
+	}
+	if (wp.win0On && wp.win0.bg[bg] && wp.win0X1 > wp.win0X0) {
+		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
+		gxDrawBgQuad(bg, r, y0, y1, wp.win0.effect ? effTex : nullptr);
+	}
+	GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0); // restore band scissor for later draws
+}
+
+static void gxDrawAffineBgLayerWindowed(int which, int bgBit, const GxGbaBandRegs &r, int y0, int y1,
+                                         const GxWindowPlan &wp, GXTexObj *effTex)
+{
+	if (!wp.active) {
+		gxDrawAffineBgQuad(which, r, y0, y1, effTex);
+		return;
+	}
+	if (wp.out.bg[bgBit]) {
+		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
+		gxDrawAffineBgQuad(which, r, y0, y1, wp.out.effect ? effTex : nullptr);
+	}
+	if (wp.win1On && wp.win1.bg[bgBit] && wp.win1X1 > wp.win1X0) {
+		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
+		gxDrawAffineBgQuad(which, r, y0, y1, wp.win1.effect ? effTex : nullptr);
+	}
+	if (wp.win0On && wp.win0.bg[bgBit] && wp.win0X1 > wp.win0X0) {
+		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
+		gxDrawAffineBgQuad(which, r, y0, y1, wp.win0.effect ? effTex : nullptr);
+	}
+	GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
+}
+
+// Bitmap-mode (3/4/5) BG2 layer -- same 3-pass precedence, but drawing the
+// single full-screen bitmap quad (clipped to 160x128 for mode 5) instead
+// of a tile-plane quad.
+static void gxDrawBitmapLayerWindowed(int mode, const GxWindowPlan &wp, GXTexObj *effTex)
+{
+	int h = (mode == 5) ? 128 : GBA_SCREEN_H;
+	int w = (mode == 5) ? 160 : GBA_SCREEN_W;
+	f32 s1 = (f32)w / GBA_SCREEN_W, t1 = (f32)h / GBA_SCREEN_H;
+	auto draw = [&](GXTexObj *tex) { gxDrawQuad(tex, 0, 0, (f32)w, (f32)h, 0, 0, s1, t1); };
+	const int bgBit = 2; // bitmap-mode content is always "BG2" for BLDCNT/window purposes
+	if (!wp.active) { draw(effTex ? effTex : &s_bmpTexObj); return; }
+	if (wp.out.bg[bgBit]) {
+		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
+		draw(wp.out.effect && effTex ? effTex : &s_bmpTexObj);
+	}
+	if (wp.win1On && wp.win1.bg[bgBit] && wp.win1X1 > wp.win1X0) {
+		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
+		draw(wp.win1.effect && effTex ? effTex : &s_bmpTexObj);
+	}
+	if (wp.win0On && wp.win0.bg[bgBit] && wp.win0X1 > wp.win0X0) {
+		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
+		draw(wp.win0.effect && effTex ? effTex : &s_bmpTexObj);
+	}
+	GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
+}
+
+// OBJ layer for one priority tier of one band. Unlike BG, the blend
+// effect choice is per-sprite (gxObjSpriteBlends), not per-layer, since
+// semi-transparent OBJ forces it for an individual sprite regardless of
+// BLDCNT's OBJ bit; a sprite that needs the effected texture gets one
+// freshly baked right before its draw (see gx_gba_render.h -- rare enough
+// combination that this isn't cached).
+static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan &wp, const GxBandBlendPlan &bp, u16 dispcnt)
+{
+	for (int i = 0; i < s_objDrawCount; ++i) {
+		const GxObjDraw &d = s_objDraws[i];
+		if (d.priority != prio) continue;
+		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
+
+		bool blends = gxObjSpriteBlends(d, bp);
+		GXTexObj *plainTex = &s_objTex[d.oamIndex].texObj;
+		auto drawWith = [&](bool useEffect) {
+			if (useEffect && blends) {
+				GxTexelEffectParams fx = { GXTEXEFFECT_ALPHA, bp.eva, 0 };
+				gxBakeObjTexture(dispcnt, d, fx, true);
+				gxDrawOneObj(d, &s_effectTex.texObj);
+			} else {
+				gxDrawOneObj(d, plainTex);
+			}
+		};
+
+		if (!wp.active) { drawWith(true); continue; }
+		if (wp.out.obj) {
+			GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
+			drawWith(wp.out.effect);
+		}
+		if (wp.win1On && wp.win1.obj && wp.win1X1 > wp.win1X0) {
+			GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
+			drawWith(wp.win1.effect);
+		}
+		if (wp.win0On && wp.win0.obj && wp.win0X1 > wp.win0X0) {
+			GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
+			drawWith(wp.win0.effect);
+		}
+	}
+	if (wp.active)
+		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
 }
 
 bool gxGbaRenderFrame()
@@ -688,15 +1105,16 @@ bool gxGbaRenderFrame()
 	if (!s_initDone)
 		return false;
 
-	// Permanent bail, not a temporary stub (see gx_gba_render.h's header
-	// comment): this GX path has no window/mosaic/blend implementation of
-	// its own, so any frame with one of those subsystems active this frame
-	// (per g_gbaFramePlan's Stage 0 hot-feature classification, gba_ppu.
-	// cpp's gxUpdateHotFlags()) is left entirely to the CPU reference
-	// compositor (renderScanline(), gba_ppu.cpp), which does implement
-	// them correctly. Checked before any GX work starts so a hot frame
-	// costs nothing here beyond these three flag reads.
-	if (g_gbaFramePlan.isHot(GXHOT_OBJWIN) || g_gbaFramePlan.isHot(GXHOT_MOSAIC) || g_gbaFramePlan.isHot(GXHOT_BLEND))
+	// OBJ window and mosaic remain permanent bails -- narrower than task
+	// 1's original blanket "any window/mosaic/blend" bail, but still real,
+	// documented remaining gaps, not stubs to be removed later. See
+	// gx_gba_render.h's header comment for exactly why each one still
+	// bails. WIN0/WIN1 and BLDCNT/BLDALPHA/BLDY are now implemented
+	// natively below (gxDraw*LayerWindowed / gxResolveLayerEffect), so
+	// GXHOT_BLEND no longer forces an unconditional bail here -- the
+	// per-band alpha-blend precondition check below decides that case by
+	// case, per frame.
+	if (g_gbaFramePlan.isHot(GXHOT_OBJWIN) || g_gbaFramePlan.isHot(GXHOT_MOSAIC))
 		return false;
 
 	u16 dispcnt = T1ReadWord(MMU.GBA_IOREG, IO_DISPCNT);
@@ -723,6 +1141,22 @@ bool gxGbaRenderFrame()
 		bandCount = 1;
 		outStarts[0] = 0;
 		outEnds[0] = GBA_SCREEN_H;
+	}
+
+	// Blend precondition (see gx_gba_render.h's "Blend" section /
+	// gxComputeBandBlendPlan): computed for every band up front, before
+	// any GX drawing happens, so an unsatisfiable band bails the *whole*
+	// frame to the CPU compositor cleanly -- nothing has been copied back
+	// into GBA_screen yet at this point (that only happens at the very
+	// end of this function), so an early return here is always safe,
+	// never a partially-drawn frame.
+	GxBandBlendPlan blendPlan[GxBandTracker::kMaxBands];
+	int blendBandCount = tiled ? bandCount : 1;
+	for (int b = 0; b < blendBandCount; ++b) {
+		const GxGbaBandRegs &r = tiled ? g_gbaBandRegs[b] : g_gbaBandRegs[0];
+		blendPlan[b] = gxComputeBandBlendPlan(mode, dispcnt, r);
+		if (blendPlan[b].effect == 1 && !blendPlan[b].alphaNativeOk)
+			return false;
 	}
 
 	bool dirty = g_gbaFramePlan.vram.anyDirty() || g_gbaFramePlan.palette.anyDirty();
@@ -758,6 +1192,8 @@ bool gxGbaRenderFrame()
 		}
 		for (int b = 0; b < bandCount; ++b) {
 			const GxGbaBandRegs &r = g_gbaBandRegs[b];
+			const GxBandBlendPlan &bp = blendPlan[b];
+			GxWindowPlan wp = gxBuildWindowPlan(r, outStarts[b], outEnds[b]);
 			GX_SetScissor(0, outStarts[b], GBA_SCREEN_W, outEnds[b] - outStarts[b]);
 			for (int prio = 3; prio >= 0; --prio) {
 				for (int bg = 3; bg >= 0; --bg) {
@@ -766,27 +1202,44 @@ bool gxGbaRenderFrame()
 					if (mode == 2 && (bg == 0 || bg == 1)) continue;
 					if ((r.bgcnt[bg] & 3) != prio) continue;
 					bool affineCapable = (mode == 2) ? (bg == 2 || bg == 3) : (mode == 1 ? bg == 2 : false);
+
+					GxTexelEffectParams fx = gxResolveLayerEffect(bg, bp);
+					GXTexObj *effTex = nullptr;
+					if (fx.mode != GXTEXEFFECT_NONE) {
+						if (affineCapable) gxBakeAffineBgPlane(bg - 2, r.bgcnt[bg], fx, true);
+						else gxBakeBgPlane(bg, fx, true);
+						effTex = &s_effectTex.texObj;
+					}
 					if (affineCapable)
-						gxDrawAffineBgQuad(bg - 2, r, outStarts[b], outEnds[b]);
+						gxDrawAffineBgLayerWindowed(bg - 2, bg, r, outStarts[b], outEnds[b], wp, effTex);
 					else
-						gxDrawBgQuad(bg, r, outStarts[b], outEnds[b]);
+						gxDrawBgLayerWindowed(bg, r, outStarts[b], outEnds[b], wp, effTex);
 				}
 				if ((r.dispcnt >> 12) & 1)
-					gxDrawObjForPriorityBand(prio, outStarts[b], outEnds[b]);
+					gxDrawObjLayerWindowed(prio, outStarts[b], outEnds[b], wp, bp, dispcnt);
 			}
 		}
 	} else {
 		if (dirty)
 			gxBakeBitmapMode(mode, dispcnt);
+
+		const GxGbaBandRegs &r = g_gbaBandRegs[0];
+		const GxBandBlendPlan &bp = blendPlan[0];
+		GxWindowPlan wp = gxBuildWindowPlan(r, 0, GBA_SCREEN_H);
+		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
+
 		if (s_bmpValid) {
-			int h = (mode == 5) ? 128 : GBA_SCREEN_H;
-			int w = (mode == 5) ? 160 : GBA_SCREEN_W;
-			f32 s1 = (f32)w / GBA_SCREEN_W, t1 = (f32)h / GBA_SCREEN_H;
-			gxDrawQuad(&s_bmpTexObj, 0, 0, (f32)w, (f32)h, 0, 0, s1, t1);
+			GxTexelEffectParams fx = gxResolveLayerEffect(2, bp); // bitmap BG2 == layer bit 2
+			GXTexObj *effTex = nullptr;
+			if (fx.mode != GXTEXEFFECT_NONE) {
+				gxBakeBitmapMode(mode, dispcnt, fx, true);
+				effTex = &s_effectTex.texObj;
+			}
+			gxDrawBitmapLayerWindowed(mode, wp, effTex);
 		}
 		if ((dispcnt >> 12) & 1)
 			for (int prio = 3; prio >= 0; --prio)
-				gxDrawObjForPriorityBand(prio, 0, GBA_SCREEN_H);
+				gxDrawObjLayerWindowed(prio, 0, GBA_SCREEN_H, wp, bp, dispcnt);
 	}
 
 	GX_DrawDone();
