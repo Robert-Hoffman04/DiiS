@@ -34,6 +34,7 @@
 #include "GPU.h"
 #include "gba_ppu.h"
 #include "gba_io.h"
+#include "gx/gx_frameplan.h"
 #include "gba_backup.h"
 #include "render3D.h"
 #include "gfx3d.h"
@@ -4482,6 +4483,23 @@ static u8* gbaWritableBuffer(GBAMemRegion region)
 	}
 }
 
+// Stage 0 dirty-range tagging (source/gx/gx_frameplan.h): VRAM/palette/OAM
+// writes all funnel through gbaWritableBuffer() below regardless of CPU
+// access width, so this is the single site that needs to call it - the
+// design doc's "tagged at the MMU write site, no separate dirty-flag
+// subsystem" decision, realized here as one switch on the already-decoded
+// region rather than duplicating it at every T1Write call site.
+static inline void gxMarkGbaDirty(GBAMemRegion region, u32 offset, u32 size)
+{
+	switch (region)
+	{
+		case GBA_REGION_VRAM:    g_gbaFramePlan.vram.markRange(offset, size); break;
+		case GBA_REGION_PALETTE: g_gbaFramePlan.palette.markRange(offset, size); break;
+		case GBA_REGION_OAM:     g_gbaFramePlan.oam.markRange(offset, size); break;
+		default: break;
+	}
+}
+
 // Cartridge ROM reads source MMU.CART_ROM/CART_ROM_MASK -- the same fields
 // NDS_LoadROM (NDSSystem.cpp) fills for a real .gba load, dual-purposed
 // from their usual DS card-controller role (see that function's comment).
@@ -4558,6 +4576,7 @@ void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val)
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteByte(buf, d.offset, val);
+	gxMarkGbaDirty(d.region, d.offset, 1);
 }
 
 void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
@@ -4569,6 +4588,7 @@ void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteWord_guaranteedAligned(buf, d.offset, val);
+	gxMarkGbaDirty(d.region, d.offset, 2);
 }
 
 void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val)
@@ -4580,6 +4600,7 @@ void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val)
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
 	T1WriteLong_guaranteedAligned(buf, d.offset, val);
+	gxMarkGbaDirty(d.region, d.offset, 4);
 }
 
 //=========================================================================================================

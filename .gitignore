@@ -51,6 +51,7 @@ bisect-log.csv
 
 # Host-built test binaries (see tools/*/build.sh)
 /tools/gx-texconv-test/gx_texconv_test
+/tools/gx-frameplan-test/gx_frameplan_test
 
 # Local analysis notes and planning docs (root and docs/ only; keep tools/**/README.md etc.)
 /*.md

@@ -37,6 +37,7 @@
 // bitmap-mode "always opaque") and BG/OBJ priority ordering are honored.
 
 #include "types.h"
+#include "gx/gx_frameplan.h"
 
 class EMUFILE;
 
@@ -61,10 +62,29 @@ enum
 	IO_BG3PA    = 0x030,
 	IO_BG3X     = 0x038,
 	IO_BG3Y     = 0x03C,
+	IO_WIN0H    = 0x040,
+	IO_WIN1H    = 0x042,
+	IO_WIN0V    = 0x044,
+	IO_WIN1V    = 0x046,
+	IO_WININ    = 0x048,
+	IO_WINOUT   = 0x04A,
+	IO_MOSAIC   = 0x04C,
+	IO_BLDCNT   = 0x050,
+	IO_BLDALPHA = 0x052,
+	IO_BLDY     = 0x054,
 	IO_IE       = 0x200,
 	IO_IF       = 0x202,
 	IO_IME      = 0x208,
 };
+
+// Stage 0 (see nds-wii-render-pipeline.md / source/gx/gx_frameplan.h) draw
+// plan for the GBA PPU - the first engine instance wired up, since it's the
+// narrowest of the three (no 3D layer, no capture unit). gbaPpuReset()
+// sizes the dirty bitmaps; gbaPpuBeginFrame() clears the accumulated trace
+// for the new frame; MMU.cpp's GBA VRAM/palette/OAM write funnel and this
+// file's I/O register write funnel populate it as the frame's CPU cycles
+// run.
+extern GxFramePlan g_gbaFramePlan;
 
 // Composited output, one u16 per pixel, native GBA color layout
 // (bit15 unused, bits10-14 B, bits5-9 G, bits0-4 R) -- this is the exact

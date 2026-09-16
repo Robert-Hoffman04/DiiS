@@ -41,6 +41,8 @@
 
 u16 GBA_screen[GBA_SCREEN_W * GBA_SCREEN_H];
 
+GxFramePlan g_gbaFramePlan;
+
 // I/O register offsets: see the enum in gba_ppu.h.
 
 static inline u16 io16(u32 off) { return T1ReadWord(MMU.GBA_IOREG, off); }
@@ -66,6 +68,44 @@ static void setDispstatFlags(bool vblank, bool hblank)
 	io16w(IO_DISPSTAT, v);
 }
 
+// ---------------------------------------------------------------------
+// Stage 0 register-write classification (see gx_frameplan.h / gba_ppu.h's
+// g_gbaFramePlan). Deliberately conservative: any write that lands inside
+// one of these ranges records a band boundary regardless of whether the
+// value actually changed (a same-value rewrite is rare and merely costs
+// one redundant band split, never a missed one) - see gxIsLayoutRegister's
+// range list, which is exactly Stage 4's 2D-compositor state: BG
+// mode/size/priority, per-scanline scroll/affine rewrites, windows,
+// blend, mosaic, and the master enable bits in DISPCNT.
+// ---------------------------------------------------------------------
+static bool gxIsLayoutRegister(u32 offset)
+{
+	if (offset <= 0x001) return true;             // DISPCNT
+	if (offset >= 0x008 && offset <= 0x03F) return true; // BG0-3 CNT/HOFS/VOFS/affine
+	if (offset >= 0x040 && offset <= 0x04D) return true; // WIN0/1 H/V, WININ/WINOUT, MOSAIC
+	if (offset >= 0x050 && offset <= 0x055) return true; // BLDCNT/BLDALPHA/BLDY
+	return false;
+}
+
+static void gxUpdateHotFlags()
+{
+	u16 dispcnt = io16(IO_DISPCNT);
+	bool win0 = (dispcnt >> 13) & 1, win1 = (dispcnt >> 14) & 1, winObj = (dispcnt >> 15) & 1;
+	g_gbaFramePlan.setHot(GXHOT_OBJWIN, win0 || win1 || winObj);
+	g_gbaFramePlan.setHot(GXHOT_MOSAIC, io16(IO_MOSAIC) != 0);
+	g_gbaFramePlan.setHot(GXHOT_BLEND, (io16(IO_BLDCNT) & 0x3F3F) != 0);
+}
+
+// Called from every generic (non DISPSTAT/VCOUNT/IF) register write below,
+// after the write has landed, so gxUpdateHotFlags() sees the new value.
+static void gxOnRegisterWritten(u32 offset)
+{
+	if (!gxIsLayoutRegister(offset))
+		return;
+	g_gbaFramePlan.bands.recordChangeAtLine(s_vcount);
+	gxUpdateHotFlags();
+}
+
 void gbaPpuIoWrite8(u32 offset, u8 val)
 {
 	// Byte-granular writes to DISPSTAT/VCOUNT are rare in practice (both
@@ -87,6 +127,7 @@ void gbaPpuIoWrite8(u32 offset, u8 val)
 		return;
 	}
 	T1WriteByte(MMU.GBA_IOREG, offset, val);
+	gxOnRegisterWritten(offset);
 }
 
 void gbaPpuIoWrite16(u32 offset, u16 val)
@@ -113,6 +154,7 @@ void gbaPpuIoWrite16(u32 offset, u16 val)
 		return;
 	}
 	io16w(offset, val);
+	gxOnRegisterWritten(offset);
 }
 
 void gbaPpuIoWrite32(u32 offset, u32 val)
@@ -135,12 +177,28 @@ void gbaPpuIoWrite32(u32 offset, u32 val)
 		return;
 	}
 	T1WriteLong(MMU.GBA_IOREG, offset, val);
+	gxOnRegisterWritten(offset);
+	gxOnRegisterWritten(offset + 2); // a 32-bit store spans two 16-bit registers
 }
 
 void gbaPpuReset()
 {
 	s_vcount = 0;
 	memset(GBA_screen, 0, sizeof(GBA_screen));
+
+	// Stage 0 dirty-bitmap sizing (once per GBA-mode boot, not per frame -
+	// see gx_frameplan.h). Palette/OAM are both a flat 1KB (MMU.h): 32-byte
+	// pages give 32 pages each, i.e. 16-color-palette-bank and
+	// 4-OAM-entry granularity - fine enough that one sprite's attribute
+	// write doesn't mark every sprite dirty. VRAM's 256-byte pages (96KB /
+	// 256 = 384 pages, comfortably under GxDirtyBitmap::kMaxPages) land
+	// mid-way between a single tile (32-64 bytes) and the DS bank
+	// granularity nds-wii-render-pipeline.md's Stage 0 describes (16KB) -
+	// proportional for VRAM two orders of magnitude smaller.
+	g_gbaFramePlan.vram.init(sizeof(MMU.GBA_VRAM), 256);
+	g_gbaFramePlan.palette.init(sizeof(MMU.GBA_PALETTE), 32);
+	g_gbaFramePlan.oam.init(sizeof(MMU.GBA_OAM), 32);
+	g_gbaFramePlan.beginFrame();
 }
 
 // ---------------------------------------------------------------------
@@ -508,6 +566,7 @@ void gbaPpuBeginFrame()
 {
 	latchAffine(0);
 	latchAffine(1);
+	g_gbaFramePlan.beginFrame();
 }
 
 void gbaPpuEndFrame()
