@@ -37,6 +37,7 @@
 #include "gba_irq.h"
 #include "readwrite.h"
 #include "perf_zones.h"
+#include "gx/gx_gba_render.h"
 #include <string.h>
 
 u16 GBA_screen[GBA_SCREEN_W * GBA_SCREEN_H];
@@ -96,6 +97,24 @@ static void gxUpdateHotFlags()
 	g_gbaFramePlan.setHot(GXHOT_BLEND, (io16(IO_BLDCNT) & 0x3F3F) != 0);
 }
 
+// Snapshots the per-band register state gx_gba_render.cpp's Stage 4 needs
+// (see gx_gba_render.h's GxGbaBandRegs comment) into g_gbaBandRegs[index].
+// Called once at frame start (index 0) and once per band boundary
+// thereafter (index == g_gbaFramePlan.bands.boundaryCount() right after
+// recordChangeAtLine() runs) -- relies on register writes landing in
+// non-decreasing scanline order within a frame, which is guaranteed here
+// since this is driven live by the scanline executor, never replayed
+// out of order.
+static void gxSnapshotBandRegs(GxGbaBandRegs *r)
+{
+	r->dispcnt = io16(IO_DISPCNT);
+	for (int i = 0; i < 4; ++i) {
+		r->bgcnt[i] = io16(IO_BG0CNT + i * 2);
+		r->hofs[i] = io16(IO_BG0HOFS + i * 4) & 0x1FF;
+		r->vofs[i] = io16(IO_BG0HOFS + i * 4 + 2) & 0x1FF;
+	}
+}
+
 // Called from every generic (non DISPSTAT/VCOUNT/IF) register write below,
 // after the write has landed, so gxUpdateHotFlags() sees the new value.
 static void gxOnRegisterWritten(u32 offset)
@@ -104,6 +123,9 @@ static void gxOnRegisterWritten(u32 offset)
 		return;
 	g_gbaFramePlan.bands.recordChangeAtLine(s_vcount);
 	gxUpdateHotFlags();
+	int bc = g_gbaFramePlan.bands.boundaryCount();
+	if (bc > 0 && bc < GX_GBA_MAX_BAND_REGS)
+		gxSnapshotBandRegs(&g_gbaBandRegs[bc]);
 }
 
 void gbaPpuIoWrite8(u32 offset, u8 val)
@@ -199,6 +221,8 @@ void gbaPpuReset()
 	g_gbaFramePlan.palette.init(sizeof(MMU.GBA_PALETTE), 32);
 	g_gbaFramePlan.oam.init(sizeof(MMU.GBA_OAM), 32);
 	g_gbaFramePlan.beginFrame();
+
+	gxGbaRenderInit();
 }
 
 // ---------------------------------------------------------------------
@@ -567,10 +591,21 @@ void gbaPpuBeginFrame()
 	latchAffine(0);
 	latchAffine(1);
 	g_gbaFramePlan.beginFrame();
+	gxSnapshotBandRegs(&g_gbaBandRegs[0]);
 }
 
 void gbaPpuEndFrame()
 {
+	// Stage 1+4 GX path (gx_gba_render.cpp): if it handles this frame's mode
+	// and content, it overwrites GBA_screen with its own result, superseding
+	// whatever gbaPpuHDrawEnd()'s per-scanline CPU compositor already wrote
+	// there this frame. If it bails (unsupported mode/feature -- see that
+	// file's header), GBA_screen already holds the correct CPU-rendered
+	// content and nothing further is needed. Either way this always runs:
+	// which path handled the frame is only knowable once all of the frame's
+	// register/OAM state is final, i.e. here, not per-scanline.
+	gxGbaRenderFrame();
+
 	// Blit into GPU_screen (offset 0 = the "main screen" slot the DS side
 	// uses -- see MainScreen.offset in GPU.cpp)
 	// so the existing screenshot/harness_frame.cpp capture path (which

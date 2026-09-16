@@ -19,7 +19,7 @@
 #ifndef GX_FRAMEPLAN_H
 #define GX_FRAMEPLAN_H
 
-#include "types.h"
+#include "../types.h"
 
 // ---------------------------------------------------------------------
 // Dirty-page bitmap: one bit per `pageSize`-byte page of a fixed-size

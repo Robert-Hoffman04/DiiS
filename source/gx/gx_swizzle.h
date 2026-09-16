@@ -21,7 +21,7 @@
 #ifndef GX_SWIZZLE_H
 #define GX_SWIZZLE_H
 
-#include "types.h"
+#include "../types.h"
 
 // 4 bits/texel (I4, CI4). Two texels per byte: even x in the high nibble,
 // odd x in the low nibble (matches GX/libogc I4/CI4 byte packing).

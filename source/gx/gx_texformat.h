@@ -12,7 +12,7 @@
 #ifndef GX_TEXFORMAT_H
 #define GX_TEXFORMAT_H
 
-#include "types.h"
+#include "../types.h"
 
 // Destination GX texture formats actually used by the NDS->GX mapping table.
 // (GX also defines C4/C8/C14X2/CMPR/RGBA8 variants not needed here - see

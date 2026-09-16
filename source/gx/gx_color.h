@@ -16,7 +16,7 @@
 #ifndef GX_COLOR_H
 #define GX_COLOR_H
 
-#include "types.h"
+#include "../types.h"
 
 struct GxRgb5 { u8 r, g, b; };
 

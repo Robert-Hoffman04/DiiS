@@ -23,7 +23,7 @@
 #define GX_MASK_H
 
 #include <gccore.h>
-#include "types.h"
+#include "../types.h"
 
 struct GXMaskTarget {
 	GXTexObj texObj;

@@ -21,7 +21,7 @@
 #ifndef GX_TEXCONV_H
 #define GX_TEXCONV_H
 
-#include "types.h"
+#include "../types.h"
 #include "gx_color.h"
 
 // ---- TEXMODE_A3I5 (3-bit alpha, 5-bit index, independent) -> CI8 ----
