@@ -60,6 +60,13 @@ static inline void io16w(u32 off, u16 v) { T1WriteWord(MMU.GBA_IOREG, off, v); }
 // ---------------------------------------------------------------------
 static u16 s_vcount = 0;
 
+// Affine BG (modes 1/2) reference-point accumulator -- declared here (ahead
+// of its home comment/functions near sampleAffineBg below) purely so
+// gxSnapshotBandRegs can read it; see that later comment for the
+// latch/advance semantics and the mid-frame-reload simplification this
+// implies for gx_gba_render.cpp's affine BG path too.
+static s32 s_affX[2], s_affY[2]; // index 0 = BG2, 1 = BG3, 20.8 fixed point
+
 static void setDispstatFlags(bool vblank, bool hblank)
 {
 	u16 v = io16(IO_DISPSTAT);
@@ -112,6 +119,15 @@ static void gxSnapshotBandRegs(GxGbaBandRegs *r)
 		r->bgcnt[i] = io16(IO_BG0CNT + i * 2);
 		r->hofs[i] = io16(IO_BG0HOFS + i * 4) & 0x1FF;
 		r->vofs[i] = io16(IO_BG0HOFS + i * 4 + 2) & 0x1FF;
+	}
+	for (int w = 0; w < 2; ++w) {
+		r->affX[w] = s_affX[w];
+		r->affY[w] = s_affY[w];
+		u32 base = w ? IO_BG3PA : IO_BG2PA;
+		r->affPA[w] = (s16)io16(base);
+		r->affPB[w] = (s16)io16(base + 2);
+		r->affPC[w] = (s16)io16(base + 4);
+		r->affPD[w] = (s16)io16(base + 6);
 	}
 }
 
@@ -311,8 +327,6 @@ static Pixel sampleTextBg(int bg, int line, int x)
 // hardware re-latches immediately on a mid-frame BGxX/Y write, which this
 // pass does not special-case.
 // ---------------------------------------------------------------------
-static s32 s_affX[2], s_affY[2]; // index 0 = BG2, 1 = BG3, 20.8 fixed point
-
 static void latchAffine(int which /*0=BG2,1=BG3*/)
 {
 	u32 base = which ? IO_BG3X : IO_BG2X;

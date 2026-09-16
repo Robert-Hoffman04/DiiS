@@ -2,13 +2,25 @@
     gx_gba_render.h - Stage 1 (Resource Sync) + Stage 4 (2D Compositing) GX
     implementation for the GBA PPU vertical slice (nds-wii-render-pipeline.md).
 
-    Scope for this pass: DISPCNT modes 0 (text-only, all four BGs) and 3/4/5
-    (bitmap), plus regular (non-affine) OBJ. gxGbaRenderFrame() bails out
-    (returns false) for anything it doesn't cover -- modes 1/2 (BG2/3 affine
-    text layers), or any affine OBJ present this frame -- and the caller
-    (gba_ppu.cpp's gbaPpuEndFrame) falls back to the existing per-pixel CPU
-    compositor (renderScanline()), which stays the sole reference
-    implementation for those cases. The CPU path is untouched by this file.
+    Scope: all DISPCNT display modes (0-5) and both regular and affine OBJ.
+    Affine BG (modes 1/2) and affine OBJ are drawn as a single textured quad
+    per band/sprite whose 4 corner UVs are computed from the same affine
+    formula the CPU reference (gba_ppu.cpp's sampleAffineBg/renderObjLine)
+    uses per-pixel -- valid because that formula is linear in screen (x,y),
+    so GX's per-pixel UV interpolation across a quad reproduces it exactly.
+    Pixels the affine transform maps outside the source texture (common with
+    rotation, and always possible with OBJ double-size) must read as fully
+    transparent rather than a clamped edge texel: every affine-sampled
+    texture (affine BG planes, all OBJ textures) is baked with a 1-texel
+    transparent border and addressed with GX_CLAMP, so any UV that would
+    fall outside the real content clamps onto that transparent border
+    instead of smearing the edge row/column.
+
+    gxGbaRenderFrame() still returns false (CPU fallback via
+    renderScanline(), untouched by this file) for anything genuinely
+    unhandled, but with modes 0-5 and both OBJ types covered, in practice
+    that's only the DISPCNT mode field's two prohibited encodings (6/7),
+    which shouldn't occur on real ROMs.
 
     Design choices specific to this GX path (deviations/simplifications from
     an idealized Stage 1/4, documented rather than silent):
@@ -32,6 +44,13 @@
        final value, not a crash.
      - OBJ textures are re-decoded every dirty frame for every visible
        sprite, not cached per-OAM-index. Same tradeoff as above.
+     - Affine BG's per-band reference point (GxGbaBandRegs::affX/affY)
+       inherits gba_ppu.cpp's own documented simplification: it's an
+       accumulator latched once at frame start and advanced by PB/PD per
+       scanline, not re-latched on a mid-frame BGxX/Y write. This GX path
+       matches whatever the CPU reference does here by construction (it
+       reads that same accumulator), so it can't diverge from it, but both
+       inherit the same inaccuracy against real hardware.
      - Output still round-trips through the CPU-side GBA_screen buffer (via
        GX_CopyTex) rather than presenting the EFB directly -- Stage 7 (final
        present) hasn't landed yet, so this keeps the existing harness/present
@@ -64,6 +83,14 @@ struct GxGbaBandRegs {
 	u16 bgcnt[4];
 	u16 hofs[4];
 	u16 vofs[4];
+	// Affine BG2/BG3 state (modes 1/2 only), index 0=BG2, 1=BG3. affX/affY
+	// are gba_ppu.cpp's already-accumulated internal reference point
+	// (s_affX/s_affY, 20.8 fixed point) at this band's starting scanline --
+	// not a fresh read of BG2X/Y -- so this snapshot inherits that file's
+	// documented simplification of not re-latching immediately on a
+	// mid-frame BGxX/Y write.
+	s32 affX[2], affY[2];
+	s16 affPA[2], affPB[2], affPC[2], affPD[2];
 };
 static const int GX_GBA_MAX_BAND_REGS = GxBandTracker::kMaxBands;
 extern GxGbaBandRegs g_gbaBandRegs[GX_GBA_MAX_BAND_REGS];

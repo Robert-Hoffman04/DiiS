@@ -25,9 +25,11 @@ build_one() {
 
 build_one gradient      "GRADIENT"   "AGRE"
 build_one checkerboard  "CHECKER"    "ACHE"
+build_one affinecheck   "AFFCHECK"   "AAFF"
+build_one objcheck      "OBJCHECK"   "AOBJ"
 build_one irqsoak       "IRQSOAK"    "AIRQ"
 build_one dsound        "DSOUND"     "ADSN"
 build_one waitcnt       "WAITCNT"    "AWAI"
 build_one dmavcap       "DMAVCAP"    "ADVC"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba"
