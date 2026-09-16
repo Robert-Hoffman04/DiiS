@@ -55,7 +55,7 @@ static const char* k_name[PZ_COUNT] = {
 	"arm7_interp", "arm7_jit", "arm7_build",
 	"gpu_ge", "gpu_render", "gpu_2d",
 	"spu", "draw",
-	"dma", "gx2dbg_bake", "draw_convert", "draw_present",
+	"dma", "draw_convert", "draw_present",
 };
 const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 

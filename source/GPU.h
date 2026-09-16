@@ -762,8 +762,8 @@ struct GPU{
 
 	// FUNCNUM >= 0 => blend mode resolved by the caller (compile-time dispatch);
 	// FUNCNUM < 0  => per-pixel switch on setFinalColorBck_funcNum (legacy path).
-	// The BG leaf renderers thread a hoisted FUNCNUM down from modeRender()
-	// (desmumewii-2d-compositor-plan.md Step 2); backdrop always passes 0..7.
+	// The BG leaf renderers thread a hoisted FUNCNUM down from modeRender();
+	// backdrop always passes 0..7.
 	template<bool BACKDROP, int FUNCNUM> void setFinalColorBG(u16 color, const u32 x);
 	template<bool MOSAIC, bool BACKDROP, int FUNCNUM = -1> FORCEINLINE void __setFinalColorBck(u16 color, const u32 x, const int opaque);
 	template<bool MOSAIC, bool BACKDROP, int FUNCNUM = -1> FORCEINLINE void ___setFinalColorBck(u16 color, const u32 x, const int opaque);
@@ -829,18 +829,6 @@ void sprite2D(GPU * gpu, u16 l, u8 * dst, u8 * dst_alpha, u8 * typeTab, u8 * pri
 void GPU_setVideoProp(GPU *, u32 p);
 void GPU_setBGProp(GPU *, u16 num, u16 p);
 
-// GX 2D-BG compositor (Step 5.1a): resolve one 8x8 tile cell of a MAIN text BG
-// plane to 64 GX RGB5A3 texels (0x0000 == transparent). See GPU.cpp.
-void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64]);
-bool GPU_ResolveAffineTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64]);
-
-// GX sprite compositor (Step 5.2): resolve a tiled OBJ (affine or not) into a
-// padded RGB5A3 texture + its on-screen field rect + 4 quad-corner UVs
-// (TL,BL,BR,TR). 0 = skip, 1 = baked, -1 = not GX-bakeable. See GPU.cpp.
-int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
-                         int *fx, int *fy, int *ox, int *oy,
-                         u8 *oprio, u8 *osemi, u32 *okey,
-                         float uv[8], int *texW, int *texH);
 void GPU_setBLDCNT(GPU *gpu, u16 v) ;
 void GPU_setBLDY(GPU *gpu, u16 v) ;
 void GPU_setMOSAIC(GPU *gpu, u16 v) ;

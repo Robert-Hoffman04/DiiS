@@ -45,8 +45,6 @@
 #include "readwrite.h"
 #include "GPU.h"
 #include "gfx3d.h"
-#include "GXDirty.h"
-#include "GXMerge.h"
 #include "movie.h"
 #include "mic.h"
 #include "MMU_timing.h"
@@ -1094,9 +1092,6 @@ bool savestate_save (const char *file_name)
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
-	// Hardware-merge mode de-swizzles the GX 3D scene lazily; the SF_GFX3D chunk
-	// (gfx3d_convertedScreen) needs it materialised now.  No-op when merge is off.
-	GXMerge_MaterializeConverted();
 	SF_MEM_rebind();   // heap MMU buffers -> SF_MEM[].v (see SF_MEM above)
 #ifdef DESMUME_SAVESTATE_DIAG
 	// ftell() delta around each chunk -- works uniformly for both
@@ -1227,10 +1222,6 @@ static void loadstate()
 	// perf), so just drop the whole cache -- both cores'.
 	jitFlushAllCaches();
 #endif
-
-	// A state load also overwrites VRAM / palette / OAM in bulk (ReadStateChunk
-	// SF_MEM), bypassing the GX dirty hooks -- drop the whole compositor cache.
-	GXDirty_FullInvalidate();
 
 	execute = 1;//!driver->EMU_IsEmulationPaused();
 }

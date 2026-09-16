@@ -103,15 +103,6 @@ void GPU_DispCapDumpRing()
 #include "NDSSystem.h"
 #include "readwrite.h"
 #include "guDesmume.h"
-#include "GXMerge.h"
-#include "GXDirty.h"
-#include "GX2DBG.h"
-
-// Per-scanline mergeability check (defined below, near GXMerge_FrameMergeable);
-// forward-declared so GPU_RenderLine_layer's 3D split point can call it.
-static bool GXMerge_LineMergeable(GPU * gpu, bool *outAlphaOver,
-                                  bool *outFrontAlphaOver, u8 *outFrontEva,
-                                  u8 *outBrightMode, u8 *outBrightFactor);
 
 #ifdef FASTBUILD
 	#undef FORCEINLINE
@@ -856,8 +847,8 @@ FORCEINLINE void GPU::setFinalColor3d(int dstX, int srcX)
 // setFinalColorSpr() used to live here: a per-sprite-pixel switch on
 // setFinalColorSpr_funcNum selecting one of 8 _master_setFinalOBJColor<>
 // instantiations. The sole caller (the sprite-composite loop in
-// GPU_RenderLine_layer) now hoists that switch out of the loop itself
-// (desmumewii-2d-compositor-plan.md Step 2), so this wrapper is gone.
+// GPU_RenderLine_layer) now hoists that switch out of the loop itself,
+// so this wrapper is gone.
 
 template<bool MOSAIC, bool BACKDROP, int FUNCNUM>
 FORCEINLINE void GPU::__setFinalColorBck(u16 color, const u32 x, const int opaque)
@@ -1120,311 +1111,6 @@ template<bool MOSAIC, int FUNCNUM> INLINE void renderline_textBG(GPU * gpu, u16 
 			line += line_dir;
 		}
 	}
-}
-
-//------------------------------------------------------------------------------
-// GX 2D-BG compositor (Step 5.1a) - resolve one 8x8 tile cell of a MAIN text BG
-// plane into 64 GX RGB5A3 texels (row-major, out[0] = top-left of the cell).
-// out == 0x0000 means transparent (BG colour index 0); every opaque texel gets
-// the RGB5A3 opaque bit via RGB15_REVERSE.  tx/ty are tile coords in the BG
-// plane; the caller need not pre-mask them.  This mirrors renderline_textBG()
-// exactly (screenblock wrap, H/V flip, 16- vs 256-colour, standard vs extended
-// palette); GX2DBG_VERIFY builds cross-check the two against each other.
-//------------------------------------------------------------------------------
-#ifndef RGB15_REVERSE
-#define RGB15_REVERSE(col) ( 0x8000 | (((col) & 0x001F) << 10) | ((col) & 0x03E0) | (((col) & 0x7C00) >> 10) )
-#endif
-
-void GPU_ResolveTextTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
-{
-	const struct _BGxCNT  *bgCnt   = &(gpu->dispx_st)->dispx_BGxCNT[num].bits;
-	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
-
-	const u32 lg  = gpu->BGSize[num][0];       // plane width  in px (pow2)
-	const u32 ht  = gpu->BGSize[num][1];       // plane height in px (pow2)
-	const u32 lgt = lg >> 3;                   // plane width  in tiles
-	const u32 htt = ht >> 3;                   // plane height in tiles
-
-	const u32 mrow = ty & (htt - 1);           // == (YBG & (ht-1)) >> 3
-	const u32 mcol = tx & (lgt - 1);
-
-	u32 rowbase = gpu->BG_map_ram[num] + (mrow & 31) * 64;
-	if (mrow > 31) rowbase += ADDRESS_STEP_512B << bgCnt->ScreenSize;
-
-	u32 mapinfo = rowbase + ((mcol & 31) << 1);
-	if (mcol > 31) mapinfo += 32 * 32 * 2;
-
-	TILEENTRY te;
-	te.val = T1ReadWord(MMU_gpu_map(mapinfo), 0);
-
-	const u32 tileBase = gpu->BG_tile_ram[num];
-
-	if (!bgCnt->Palette_256)
-	{
-		// 16-colour: 32 bytes/tile, low nibble = even pixel
-		u8 *pal = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
-		const u16 palOfs = (te.bits.Palette << 4);
-		for (u32 r = 0; r < 8; r++) {
-			const u32 sr = te.bits.VFlip ? (7 - r) : r;
-			const u8 *line = (const u8 *)MMU_gpu_map(tileBase + te.bits.TileNum * 0x20 + sr * 4);
-			for (u32 c = 0; c < 8; c++) {
-				const u32 sc = te.bits.HFlip ? (7 - c) : c;
-				u8 b = line[sc >> 1];
-				u8 idx = (sc & 1) ? (b >> 4) : (b & 0xF);
-				out[r * 8 + c] = idx ? RGB15_REVERSE(T1ReadWord(pal, (idx + palOfs) << 1)) : 0;
-			}
-		}
-		return;
-	}
-
-	// 256-colour: 64 bytes/tile, one byte per pixel
-	u8 *pal;
-	if (dispCnt->ExBGxPalette_Enable) {
-		pal = MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[num]];
-		if (!pal) { for (int i = 0; i < 64; i++) out[i] = 0; return; }
-		pal += (te.bits.Palette << 9);
-	} else {
-		pal = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
-	}
-	for (u32 r = 0; r < 8; r++) {
-		const u32 sr = te.bits.VFlip ? (7 - r) : r;
-		const u8 *line = (const u8 *)MMU_gpu_map(tileBase + te.bits.TileNum * 0x40 + sr * 8);
-		for (u32 c = 0; c < 8; c++) {
-			const u32 sc = te.bits.HFlip ? (7 - c) : c;
-			u8 idx = line[sc];
-			out[r * 8 + c] = idx ? RGB15_REVERSE(T1ReadWord(pal, idx << 1)) : 0;
-		}
-	}
-}
-
-// §5.4 affine: resolve one 8x8 cell of a rotscale background to RGB5A3, in the
-// BG's native plane space.  Mirrors extRotBG2 / rotBG2 for the tiled and
-// bitmap affine BG types.  Returns false for a type this path doesn't bake.
-bool GPU_ResolveAffineTile8x8(GPU *gpu, u8 num, u32 tx, u32 ty, u16 out[64])
-{
-	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
-	const u32 W = (u32)gpu->BGSize[num][0];
-	const u32 px0 = tx << 3, py0 = ty << 3;
-	u8 *palStd = MMU.ARM9_VMEM + gpu->core * ADDRESS_STEP_1KB;
-
-	switch (gpu->BGTypes[num]) {
-	case BGType_Affine: {
-		const u32 mapEnt = gpu->BG_map_ram[num] + ty * (W >> 3) + tx;
-		const u8  tile   = *(u8 *)MMU_gpu_map(mapEnt);
-		const u32 tbase  = gpu->BG_tile_ram[num] + ((u32)tile << 6);
-		for (u32 r = 0; r < 8; r++) {
-			const u8 *line = (const u8 *)MMU_gpu_map(tbase + r * 8);
-			for (u32 c = 0; c < 8; c++) {
-				u8 i = line[c];
-				out[r * 8 + c] = i ? RGB15_REVERSE(T1ReadWord(palStd, i << 1)) : 0;
-			}
-		}
-		return true;
-	}
-	case BGType_AffineExt_256x16: {
-		const bool ext = dispCnt->ExBGxPalette_Enable;
-		u8 *pal = ext ? MMU.ExtPal[gpu->core][gpu->BGExtPalSlot[num]] : palStd;
-		if (!pal) return false;
-		const u32 stride = W >> 3;
-		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
-			const u32 mx = (px0 + c) >> 3, my = (py0 + r) >> 3;
-			TILEENTRY te; te.val = T1ReadWord(MMU_gpu_map(gpu->BG_map_ram[num] + ((my * stride + mx) << 1)), 0);
-			const u32 fx = te.bits.HFlip ? 7 - c : c;
-			const u32 fy = te.bits.VFlip ? 7 - r : r;
-			u8 i = *(u8 *)MMU_gpu_map(gpu->BG_tile_ram[num] + (te.bits.TileNum << 6) + (fy << 3) + fx);
-			u16 col = T1ReadWord(pal, (i + (ext ? (te.bits.Palette << 8) : 0)) << 1);
-			out[r * 8 + c] = i ? RGB15_REVERSE(col) : 0;
-		}
-		return true;
-	}
-	case BGType_AffineExt_256x1:
-	case BGType_Large8bpp: {
-		const u32 base = (gpu->BGTypes[num] == BGType_Large8bpp)
-		                 ? gpu->BG_bmp_large_ram[num] : gpu->BG_bmp_ram[num];
-		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
-			u8 i = *(u8 *)MMU_gpu_map(base + (px0 + c) + (py0 + r) * W);
-			out[r * 8 + c] = i ? RGB15_REVERSE(T1ReadWord(palStd, i << 1)) : 0;
-		}
-		return true;
-	}
-	case BGType_AffineExt_Direct: {
-		for (u32 r = 0; r < 8; r++) for (u32 c = 0; c < 8; c++) {
-			u16 col = T1ReadWord(MMU_gpu_map(gpu->BG_bmp_ram[num] + (((px0 + c) + (py0 + r) * W) << 1)), 0);
-			out[r * 8 + c] = (col & 0x8000) ? RGB15_REVERSE(col) : 0;
-		}
-		return true;
-	}
-	default:
-		return false;
-	}
-}
-
-//------------------------------------------------------------------------------
-// GX sprite compositor (Step 5.2) - resolve one tiled, standard-palette OBJ
-// (non-affine OR affine) into a padded RGB5A3 texture (transparent GX2OBJ_MARGIN
-// border so GX_CLAMP outside the sprite reads as transparent) plus its on-screen
-// field rect and the 4 quad-corner UVs (TL,BL,BR,TR - into the *padded* texture,
-// 0..1).  Non-affine flips fold into the UVs; affine uses the OAM 2x2 matrix.
-// Returns 0 = skip, 1 = baked, -1 = not GX-bakeable (bitmap / OBJ-window /
-// ext-pal-256 / mosaic) - the frame then composites all its sprites on the CPU.
-//------------------------------------------------------------------------------
-#define GX2OBJ_MARGIN 2   // keeps padded dims a multiple of 4 (sprite dims are 8/16/32/64)
-
-int GPU_ResolveObjSprite(GPU *gpu, int oamIndex, u16 *out, int outCap,
-                         int *fx, int *fy, int *ox, int *oy,
-                         u8 *oprio, u8 *osemi, u32 *okey,
-                         float uv[8], int *texW, int *texH)
-{
-	const struct _DISPCNT *dispCnt = &(gpu->dispx_st)->dispx_DISPCNT.bits;
-
-	// local, endian-corrected copy of the 8-byte OAM entry (see _spriteRender)
-	OAM oe = gpu->oam[oamIndex];
-	{
-		u16 *w = (u16 *)&oe;
-#ifdef WORDS_BIGENDIAN
-		w[1] = (u16)((w[1] >> 1) | (w[1] << 15));
-		w[2] = (u16)((w[2] >> 2) | (w[2] << 14));
-#endif
-	}
-
-	if (oe.RotScale == 2)     return 0;    // disabled
-#ifdef DESMUME_BENCH
-	extern u32 g_gx2objRej[2][6];  // [eng][0 objwin 1 bitmap 2 mosaic 3 extpal256 4 size 5 cap]
-	u32 *rj = g_gx2objRej[gpu->core ? 1 : 0];
-#endif
-	if (oe.Mode == 2 || oe.Mode == 3) {
-#ifdef DESMUME_BENCH
-		rj[oe.Mode == 2 ? 0 : 1]++;
-#endif
-		return -1;   // OBJ window / bitmap
-	}
-	if (oe.Mosaic) {
-#ifdef DESMUME_BENCH
-		rj[2]++;
-#endif
-		return -1;
-	}
-	// ext-pal 256-colour sprite: bake against MMU.ObjExtPal (one 256-entry bank
-	// selected by PaletteIndex), mirroring _spriteRender.  If the bank isn't
-	// mapped, fall back.
-	const bool extPal256 = (oe.Depth && dispCnt->ExOBJPalette_Enable);
-	if (extPal256 && !MMU.ObjExtPal[gpu->core][0]) {
-#ifdef DESMUME_BENCH
-		rj[3]++;
-#endif
-		return -1;
-	}
-
-	const bool affine = (oe.RotScale & 1) != 0;
-	const size sz = sprSizeTab[oe.Size][oe.Shape];
-	const int W = sz.x, H = sz.y;
-	if (W <= 0 || H <= 0) {
-#ifdef DESMUME_BENCH
-		rj[4]++;
-#endif
-		return -1;
-	}
-
-	const int PW = W + 2 * GX2OBJ_MARGIN;
-	const int PH = H + 2 * GX2OBJ_MARGIN;
-	if (PW * PH > outCap) {
-#ifdef DESMUME_BENCH
-		rj[5]++;
-#endif
-		return -1;
-	}
-
-	// field (on-screen footprint): sprite size, doubled in double-size mode
-	int FX = W, FY = H;
-	if (affine && (oe.RotScale & 2)) { FX <<= 1; FY <<= 1; }
-
-	s32 sx = (oe.X << 23) >> 23;                 // sign-extend 9-bit X
-	s32 sy = oe.Y;
-	if (sy >= 192) sy = (s32)((s8)oe.Y);
-	// wrap: DS wraps sprites at 256/512; approximate with the closer copy
-	if (sx + FX <= 0)   sx += 512;
-	if (sx >= 256)      sx -= 512;
-	if (sx + FX <= 0 || sx >= 256 || sy + FY <= 0 || sy >= 192) return 0;   // off-screen
-
-	*ox = sx; *oy = sy;
-	*fx = FX; *fy = FY;
-	*oprio  = oe.Priority;
-	*osemi  = (oe.Mode == 1) ? 1 : 0;
-	*texW = PW; *texH = PH;
-	*okey = ((u32)oe.TileIndex) | ((u32)oe.PaletteIndex << 10) | ((u32)oe.Depth << 14)
-	      | ((u32)oe.Size << 15) | ((u32)oe.Shape << 17) | ((u32)oe.Mode << 19)
-	      | ((u32)(oe.RotScale & 1) << 21) | ((u32)extPal256 << 22);
-
-	// --- UVs -----------------------------------------------------------------
-	const float m = (float)GX2OBJ_MARGIN;
-	if (!affine) {
-		float u0 = m / PW,       u1 = (m + W) / PW;
-		float v0 = m / PH,       v1 = (m + H) / PH;
-		if (oe.HFlip) { float t = u0; u0 = u1; u1 = t; }
-		if (oe.VFlip) { float t = v0; v0 = v1; v1 = t; }
-		uv[0] = u0; uv[1] = v0;   // TL
-		uv[2] = u0; uv[3] = v1;   // BL
-		uv[4] = u1; uv[5] = v1;   // BR
-		uv[6] = u1; uv[7] = v0;   // TR
-	} else {
-		const int bp = (oe.RotScalIndex + (oe.HFlip << 3) + (oe.VFlip << 4)) * 4;
-		const s16 dx  = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 0])[3]);
-		const s16 dmx = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 1])[3]);
-		const s16 dy  = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 2])[3]);
-		const s16 dmy = (s16)LE_TO_LOCAL_16(((u16 *)&gpu->oam[bp + 3])[3]);
-		const float Cx = W * 128.0f, Cy = H * 128.0f;      // sprite centre, 8.8
-		const float hx = FX * 0.5f,  hy = FY * 0.5f;
-		// texX/texY at field-local (a,b): Cx + (a-hx)*dx + (b-hy)*dmx  (8.8)
-		const int cx[4] = { 0, 0, FX, FX };
-		const int cy[4] = { 0, FY, FY, 0 };
-		for (int k = 0; k < 4; k++) {
-			float tX = (Cx + (cx[k] - hx) * dx + (cy[k] - hy) * dmx) / 256.0f;
-			float tY = (Cy + (cx[k] - hx) * dy + (cy[k] - hy) * dmy) / 256.0f;
-			uv[k * 2 + 0] = (tX + m) / PW;
-			uv[k * 2 + 1] = (tY + m) / PH;
-		}
-	}
-
-	// --- bake the W*H sprite pixels into the padded buffer ------------------
-	for (int i = 0; i < PW * PH; i++) out[i] = 0;   // transparent border
-
-	const u32 base   = gpu->sprMem;
-	const u8  block  = gpu->sprBoundary;
-	const bool map2d = (gpu->spriteRenderMode == GPU::SPRITE_2D);
-	const bool d256  = oe.Depth;
-	const int  Wt    = W >> 3;
-	// tile-base shift: 2D mapping uses <<5, 1D uses <<sprBoundary - except the
-	// affine 256-colour path, which _spriteRender always addresses with <<block.
-	const u32 tbase  = (map2d && !(affine && d256))
-	                   ? (base + ((u32)oe.TileIndex << 5))
-	                   : (base + ((u32)oe.TileIndex << block));
-	u8 *palBase = MMU.ARM9_VMEM + 0x200 + gpu->core * ADDRESS_STEP_1KB;
-	u8 *pal16   = palBase + (oe.PaletteIndex << 5);
-	// d256 palette base: standard 256 bank, or the selected ObjExtPal bank.
-	u8 *pal256  = extPal256 ? (MMU.ObjExtPal[gpu->core][0] + (u32)oe.PaletteIndex * 0x200)
-	                        : palBase;
-
-	for (int py = 0; py < H; py++) {
-		const int ty = py >> 3, yin = py & 7;
-		u16 *dstrow = out + (py + GX2OBJ_MARGIN) * PW + GX2OBJ_MARGIN;
-		for (int px = 0; px < W; px++) {
-			const int tx = px >> 3, xin = px & 7;
-			u8 idx;
-			if (d256) {
-				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 64 + (u32)yin * 8 + xin
-				                : (u32)ty * (u32)Wt * 64 + (u32)tx * 64 + (u32)yin * 8 + xin;
-				idx = *(u8 *)MMU_gpu_map(tbase + ofs);
-				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(pal256, idx << 1)) : 0;
-			} else {
-				u32 ofs = map2d ? ((u32)ty << 10) + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1)
-				                : (u32)ty * (u32)Wt * 32 + (u32)tx * 32 + (u32)yin * 4 + (xin >> 1);
-				u8 b = *(u8 *)MMU_gpu_map(tbase + ofs);
-				idx = (xin & 1) ? (b >> 4) : (b & 0xF);
-				dstrow[px] = idx ? RGB15_REVERSE(T1ReadWord(pal16, idx << 1)) : 0;
-			}
-		}
-	}
-	return 1;
 }
 
 /*****************************************************************************/
@@ -2395,222 +2081,6 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 
 	u16 backdrop_color = LE_TO_LOCAL_16(T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF);
 
-	// Step 5.1a: if this whole scanline's 2D composite is GX-expressible - MAIN,
-	// every enabled BG a baked text layer, no sprites / window / mosaic / BLDCNT
-	// effect - record it for the GX band replay and skip the CPU walk.  A
-	// BG0-as-3D line is handled too when the existing GXMerge_LineMergeable
-	// accepts the 3D part (opaque, no front translucent BG): the resident 3D
-	// texture is drawn as a KIND_3D entry at BG0's priority slot.
-	{
-	const int gxeng = (gpu->core == GPU_MAIN) ? 0 : 1;
-	// BLDCNT colour-effect handling (§5.1a blend): a non-zero
-	// setFinalColorBck_funcNum only forces the CPU path when the effect actually
-	// changes a *recorded* pixel.  The per-pixel templates
-	// (GPU::_master_setFinalBGColor) are a straight passthrough for any BG whose
-	// 1st-target bit is clear, and a Blend on the backdrop is a no-op; the 3D
-	// layer's own blend is expressed by the KIND_3D sandwich path
-	// (GXMerge_LineMergeable) exactly as before.  So the recorder now accepts a
-	// blended line as long as no enabled BG is a blend 1st target, OBJ isn't in
-	// the blend while sprites are on, and (for Increase/Decrease) the backdrop
-	// tint is folded into the recorded backdrop colour here.  funcNum >= 4
-	// (a window in the DISPCNT config) still falls back.
-	const u8  s5_bm   = (gpu->BLDCNT >> 6) & 3;
-	const u16 s5_t1st = gpu->BLDCNT & 0x3F;              // BG0..3, OBJ(4), BD(5)
-	const u16 s5_t2nd = (gpu->BLDCNT >> 8) & 0x3F;       // 2nd-target mask
-	// OBJ as a blend 1st target while sprites are on: the sprite quad pass draws
-	// opaque, so a per-pixel blend against what's beneath is unreachable -> CPU.
-	const bool s5_objBlend = s5_bm != 0 && (s5_t1st & 0x10) && gpu->LayersEnable[4];
-	// §5.3: rectangular WIN0/WIN1 (no WINOBJ) are expressible as GX scissor
-	// segments.  funcNum >= 4 means "a window is in the DISPCNT config"; it is
-	// no longer a hard bail when only WIN0/WIN1 are active.
-	const bool s5_winRect = (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED) && !gpu->WINOBJ_ENABLED;
-#ifdef DESMUME_BENCH
-	// Step 5 diagnostic: per-scanline tally of why the 2D-BG recorder bails.
-	extern u32 g_gx2dbgBail[2][8];
-	if (!GXMerge_2DBGLineArmed(gxeng))                                  g_gx2dbgBail[gxeng & 1][1]++;
-	else if (gpu->WINOBJ_ENABLED)                                       g_gx2dbgBail[gxeng & 1][3]++;
-	else if (gpu->setFinalColorBck_funcNum >= 4 && !s5_winRect)         g_gx2dbgBail[gxeng & 1][4]++;  // window-in-config
-	else if (s5_objBlend)                                              g_gx2dbgBail[gxeng & 1][5]++;  // OBJ blend target
-	else if (gpu->LayersEnable[4] && !GX2DBG_ObjGXable(gxeng))          g_gx2dbgBail[gxeng & 1][2]++;
-	/* else: entered the gate - reason 0/6/7 tallied inside */
-#endif
-
-	if (GXMerge_2DBGLineArmed(gxeng)
-	    && (!gpu->LayersEnable[4] || GX2DBG_ObjGXable(gxeng))
-	    && !gpu->WINOBJ_ENABLED
-	    && (gpu->setFinalColorBck_funcNum < 4 || s5_winRect)
-	    && !s5_objBlend)
-	{
-		// Fold a backdrop brighten/darken (Increase/Decrease with BD as 1st
-		// target) into the recorded backdrop colour - GX draws the backdrop as a
-		// flat quad, so a pre-faded colour reproduces it exactly.  (Local copy:
-		// the CPU fall-through path must still see the raw backdrop.)
-		u16 s5_backdrop = backdrop_color & 0x7FFF;
-		if (s5_bm >= 2 && (s5_t1st & 0x20))
-			s5_backdrop = (s5_bm == 2) ? gpu->currentFadeInColors[s5_backdrop]
-			                           : gpu->currentFadeOutColors[s5_backdrop];
-		// This line cleared every frame-invariant gate; tell GX2DBG the BG-plane
-		// bake is worth doing (even if this particular line still bails below on
-		// an unbaked layer or a 3D-shape check).
-		GX2DBG_NoteWouldRecord(gxeng);
-		const bool has3d = (gxeng == 0) && dispCnt->BG0_3D && gpu->LayersEnable[0];
-		bool ao = false, fao = false; u8 feva = 0, bmode = 0, bfac = 0;
-		bool ok = true;
-
-		if (has3d) {
-			if (!GXMerge_LineMergeable(gpu, &ao, &fao, &feva, &bmode, &bfac) || fao)
-				ok = false;   // front translucent BG / other 3D disqualifier -> CPU path
-		} else if ((gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2)
-		           && gpu->MasterBrightFactor) {
-			bmode = gpu->MasterBrightMode;
-			bfac  = gpu->MasterBrightFactor > 16 ? 16 : gpu->MasterBrightFactor;
-		}
-
-		GX2DBGEntry ent[GX2DBG_MAX_LAYERS];
-		BGxPARMS   *entAff[GX2DBG_MAX_LAYERS] = { 0 };   // affine param blk to advance
-		memset(ent, 0, sizeof ent);
-		int gxn = 0;
-		int threeDAt = -1;
-		bool anyFx = false;
-		for (int prio = NB_PRIORITIES - 1; prio >= 0 && ok; prio--) {
-			itemsForPriority_t *it = &gpu->itemsForPriority[prio];
-			for (int i = 0; i < it->nbBGs; i++) {
-				const int bg = it->BGs[i];
-				if (!gpu->LayersEnable[bg]) continue;
-				if (gxn >= GX2DBG_MAX_LAYERS) { ok = false; break; }
-				GX2DBGEntry *E = &ent[gxn];
-				if (bg == 0 && has3d) {
-					E->kind = GX2DBG_KIND_3D;
-					E->layer = 0;
-					E->hofs = (u16)gpu->getHOFS(0);
-					threeDAt = gxn;
-					gxn++;
-					continue;
-				}
-				if (gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable ||
-				    !GX2DBG_LayerReady(gxeng, bg)) { ok = false; break; }
-
-				const bool is1st = s5_bm != 0 && (s5_t1st & (1 << bg));
-
-				const u8 bgt = gpu->BGTypes[bg];
-				const bool bgAffine = bgt == BGType_Affine || bgt == BGType_AffineExt_256x16 ||
-				                      bgt == BGType_AffineExt_256x1 || bgt == BGType_AffineExt_Direct ||
-				                      bgt == BGType_Large8bpp;
-				if (bgAffine) {
-					// affine/rotscale BG as a GX affine-mapped quad.  Blended
-					// affine BG -> CPU for now.
-					if (is1st) { ok = false; break; }
-					BGxPARMS *p = (bg == 2) ? &gpu->dispx_st->dispx_BG2PARMS
-					                        : &gpu->dispx_st->dispx_BG3PARMS;
-					E->kind  = GX2DBG_KIND_AFFINE;
-					E->layer = (u8)bg;
-					E->affX  = p->BGxX;
-					E->affY  = p->BGxY;
-					E->affPA = (s16)LE_TO_LOCAL_16(p->BGxPA);
-					E->affPB = (s16)LE_TO_LOCAL_16(p->BGxPB);
-					E->affPC = (s16)LE_TO_LOCAL_16(p->BGxPC);
-					E->affPD = (s16)LE_TO_LOCAL_16(p->BGxPD);
-					E->affWrap = gpu->dispx_st->dispx_BGxCNT[bg].bits.PaletteSet_Wrap;
-					entAff[gxn] = p;
-					gxn++;
-					continue;
-				}
-				if (gpu->BGTypes[bg] != BGType_Text) { ok = false; break; }
-
-				E->kind  = GX2DBG_KIND_BG;
-				E->layer = (u8)bg;
-				E->hofs  = (u16)gpu->getHOFS(bg);
-				E->vofs  = (u16)gpu->getVOFS(bg);
-
-				// per-entry BLDCNT colour effect (§5.1a-blend): only when this BG
-				// is a live 1st target.
-				if (is1st) {
-					if (s5_bm >= 2) {                       // Increase / Decrease
-						E->fx  = s5_bm;                     // 2 / 3
-						E->fxa = gpu->BLDY_EVY > 16 ? 16 : gpu->BLDY_EVY;
-					} else {                               // Blend (alpha)
-						// Only whole-quad-correct if everything this layer sits on
-						// (backdrop + every lower BG entry) is uniformly 2nd-target
-						// eligible, and nothing 3D is below it.
-						bool uniform = (s5_t2nd & 0x20) != 0;
-						for (int j = 0; j < gxn && uniform; j++) {
-							if (ent[j].kind == GX2DBG_KIND_3D) { uniform = false; break; }
-							if (ent[j].kind == GX2DBG_KIND_BG && !(s5_t2nd & (1 << ent[j].layer)))
-								uniform = false;
-						}
-						if (!uniform) { ok = false; break; }
-						E->fx  = 1;
-						E->fxa = gpu->BLDALPHA_EVA > 16 ? 16 : gpu->BLDALPHA_EVA;
-					}
-					if (E->fxa) anyFx = true;
-					else        E->fx = 0;                 // zero factor -> no effect
-				}
-				gxn++;
-			}
-		}
-		if (has3d && threeDAt < 0) ok = false;   // 3D expected but BG0 not in the walk
-		if (has3d && anyFx)        ok = false;   // blended BG + 3D sandwich: too tangled -> CPU
-
-		// §5.3: partition this scanline into rectangular WIN0/WIN1 x-segments,
-		// each with a constant (layer mask, colour-effect-enable).  The replay
-		// re-scissors to each and draws only the BG entries the mask keeps.
-		GX2DBGWinSeg wseg[GX2DBG_MAX_WSEG];
-		int nWSeg = 0;
-		if (ok && s5_winRect) {
-			const u8 *w0 = gpu->curr_win[0];
-			const u8 *w1 = gpu->curr_win[1];
-			const bool e0 = gpu->WIN0_ENABLED, e1 = gpu->WIN1_ENABLED;
-			const u8 mIn0 = gpu->WININ0 & 0x1F, mIn1 = gpu->WININ1 & 0x1F, mOut = gpu->WINOUT & 0x1F;
-			const u8 fIn0 = gpu->WININ0_SPECIAL, fIn1 = gpu->WININ1_SPECIAL, fOut = gpu->WINOUT_SPECIAL;
-			int segStart = 0; u8 curM = 0, curF = 0; bool have = false;
-			for (int x = 0; x <= 256 && ok; x++) {
-				u8 m, f;
-				if (x < 256) {
-					const bool in0 = e0 && w0[x];
-					const bool in1 = e1 && w1[x];
-					if (in0)      { m = mIn0; f = fIn0; }
-					else if (in1) { m = mIn1; f = fIn1; }
-					else          { m = mOut; f = fOut; }
-				} else { m = 0xFF; f = 0xFF; }   // sentinel: flush the final run
-				if (!have) { curM = m; curF = f; have = true; continue; }
-				if (m == curM && f == curF) continue;
-				if (nWSeg >= GX2DBG_MAX_WSEG) { ok = false; break; }
-				wseg[nWSeg].x0 = (u16)segStart; wseg[nWSeg].x1 = (u16)x;
-				wseg[nWSeg].mask = curM; wseg[nWSeg].fxOn = curF ? 1 : 0;
-				nWSeg++;
-				segStart = x; curM = m; curF = f;
-			}
-			// Any entry (text / affine / the 3D-fold slot) is skipped per-segment
-			// by the replay wherever the segment's mask clears its layer bit -
-			// no whole-line bail needed for a windowed layer.
-			// Collapse to the no-window fast path only when the window changes
-			// nothing on this line (one span, every layer visible, effects on).
-			if (nWSeg == 1 && wseg[0].mask == 0x1F && wseg[0].fxOn)
-				nWSeg = 0;
-		}
-
-		if (ok) {
-			const u8 behindContent = (threeDAt > 0) ? 1 : 0;
-			GXMerge_Record2DBGLine(gxeng, l, (u16)(s5_backdrop | 0x8000), bmode, bfac,
-			                       ao ? 1 : 0, behindContent, gxn, ent, nWSeg, wseg);
-			// advance each affine BG's param block by one scanline, exactly as
-			// lineRot would have if the CPU path had run this line.
-			for (int j = 0; j < gxn; j++)
-				if (entAff[j]) {
-					entAff[j]->BGxX += (s16)LE_TO_LOCAL_16(entAff[j]->BGxPB);
-					entAff[j]->BGxY += (s16)LE_TO_LOCAL_16(entAff[j]->BGxPD);
-				}
-#ifdef DESMUME_BENCH
-			g_gx2dbgBail[gxeng & 1][0]++;
-#endif
-			return;
-		}
-#ifdef DESMUME_BENCH
-		g_gx2dbgBail[gxeng & 1][(has3d && (threeDAt < 0 || !ok)) ? 6 : 7]++;
-#endif
-	}
-	}
-
 	//we need to write backdrop colors in the same way as we do BG pixels in order to do correct window processing
 	//this is currently eating up 2fps or so. it is a reasonable candidate for optimization. 
 	gpu->currBgNum = 5;
@@ -2649,7 +2119,6 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// sprAlpha/sprType/sprPrio are only ever read behind the LayersEnable[4]
 	// gate below (sprite bucketing + composite); sprWin only when the OBJ
 	// window is active. Skip ~1 KB of memsets per scanline when neither is on.
-	// (desmumewii-2d-compositor-plan.md Step 3.1)
 	if (gpu->LayersEnable[4])
 	{
 		memset(sprAlpha, 0, 256);
@@ -2723,59 +2192,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 						{
 							gpu->currBgNum = 0;
 
-							// Hardware-merge path: everything drawn so far this
-							// scanline is the "behind" bucket (already in
-							// GPU_screen); redirect the rest of the walk - the
-							// "front" bucket - into GXMerge's front line buffer
-							// and let the GX hardware sandwich the 3D layer in.
-							bool alphaOver = false;
-							bool frontAlphaOver = false;
-							u8   frontEva = 0;
-							u8   brightMode = 0;
-							u8   brightFactor = 0;
-#ifdef GXMERGE_FORCE
-							if (GXMerge_FrameArmed() && gpu->core == GPU_MAIN)
-#else
-							if (GXMerge_FrameArmed() && gpu->core == GPU_MAIN &&
-							    GXMerge_LineMergeable(gpu, &alphaOver, &frontAlphaOver, &frontEva,
-							                          &brightMode, &brightFactor))
-#endif
-							{
-								// Is there any 2D layer that can sit behind the 3D
-								// layer (>= BG0's priority), i.e. real content to
-								// reveal through transparent 3D?  Cheap register
-								// check - no per-pixel work.
-								const u32 p3d = gpu->dispx_st->dispx_BGxCNT[0].bits.Priority;
-								bool behindContent = gpu->LayersEnable[4];   // sprites: assume some behind
-								for (int bg = 1; bg <= 3 && !behindContent; bg++)
-									if (gpu->LayersEnable[bg] &&
-									    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority >= p3d)
-										behindContent = true;
-
-								GXMerge_RecordLine(l, behindContent, gpu->getHOFS(0), alphaOver,
-								                   frontAlphaOver, frontEva,
-								                   brightMode, brightFactor);
-								gpu->tempScanline = gpu->currDst = GXMerge_FrontLine(l);
-								memset(gpu->bgPixels, 0, 256);   // 3D (BG0) is now "below"
-								// The front line buffer never holds a 3D/behind pixel, so a
-								// CPU blend of a front layer against the bg_under==0 sentinel
-								// is always wrong - it would blend against the (empty) front
-								// buffer.  Clear BG0's 2nd-target bit for the rest of this
-								// line's walk; the GX front draw does that blend instead
-								// (frontAlphaOver band).  blend2[] is rebuilt from BLDCNT
-								// every line (see above), so this is scoped to this line.
-								gpu->blend2[0] = 0;
-								continue;
-							}
-
 							const u16 hofs = gpu->getHOFS(i16);
-
-							// Hardware-merge mode keeps the 3D scene only as a GX
-							// texture; de-swizzle it into gfx3d_convertedScreen now,
-							// on demand, for this fallback line's legacy per-pixel
-							// composite (idempotent within the frame).
-							if (GXMerge_Enabled())
-								GXMerge_MaterializeConverted();
 
 							gfx3d_GetLineData(l, &gpu->_3dColorLine);
 							u8* colorLine = gpu->_3dColorLine;
@@ -2822,7 +2239,6 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 			// switch inside setFinalColorSpr() would otherwise be an indirect
 			// jump-table dispatch on every sprite pixel. Hoist it: pick the
 			// blend-mode template once, run a straight-line loop.
-			// desmumewii-2d-compositor-plan.md Step 2.
 			const int nbPixelsX = item->nbPixelsX;
 			#define DESMUME_SPR_COMPOSITE(FUNC, WIN) \
 				for (int i=0; i < nbPixelsX; i++) { \
@@ -2891,9 +2307,6 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 		{
 			gpu->dispCapCnt.enabled = TRUE;
 			T1WriteLong(MMU.ARM9_REG, 0x64, gpu->dispCapCnt.val);
-			// capture writes go straight into MMU.ARM9_LCD, bypassing the GX
-			// dirty hooks in _MMU_write* - mark the destination 128 KB block.
-			GXDirty_MarkCaptureBlock(gpu->dispCapCnt.writeBlock);
 		}
 	}
 
@@ -3225,222 +2638,12 @@ void GPU::update_winh(int WIN_NUM)
 	}
 }
 
-// Whether the MAIN engine's frame can be handed to the hardware-merge path this
-// frame.  Two tiers:
-//  - Frame-level (GXMerge_FrameMergeable, checked once at line 0): things that
-//    don't vary per scanline and make the sandwich meaningless outright for the
-//    whole frame - a non-2D-compositor display mode, or display capture (which
-//    needs the legacy readback intact).
-//  - Line-level (GXMerge_LineMergeable, Phase 2: re-checked at every 3D split
-//    point): blend/window state that a game can rewrite mid-frame via HBlank IRQ
-//    raster effects. BG0 HOFS (see GXMerge_HofsSegment) and master-bright
-//    mode/factor (see GXMergeBand::brightMode, applied by GXMerge draw 4) are
-//    also read fresh per line but, unlike a window or a mixed blend target,
-//    don't disqualify the line - they just split the band.
-//    GPU_RenderLine_layer already
-//    re-reads all of these fresh every scanline for the legacy per-pixel path
-//    (see gpu->blend2[] just above), so checking them once at line 0 and freezing
-//    the decision for the whole frame was needlessly pessimistic: one scanline
-//    using a window or a blend effect used to fall the *entire screen* back to
-//    the legacy path. Now only the disqualified scanlines do - everything else
-//    still gets the hardware sandwich, coalesced into bands by GXMerge_EndFrame.
-// diagnostic: last reason a mergeability check returned false
-// 0 ok/armed  1 dispMode  2 capture
-// 3 blend2 - a cross-boundary blend GX fixed-function can't express as one
-//   whole-band operation: either the behind-bucket layers that could sit under
-//   3D don't share one blend2 eligibility, or BG0 is a blend 2nd target and the
-//   front bucket isn't the one clean shape the front-vs-beneath blend handles
-//   (a single blend1 BG, no front sprites - see GXMerge_LineMergeable).
-// 4 bright1st  5 window
-// 6 unused (was hofs - now handled per-band, see GXMerge_HofsSegment)
-// 7 unused (was masterbright - now handled per-band via GXMerge draw 4, see
-//   GXMergeBand::brightMode)
-int g_gxmergeFailReason = 0;
-
-#ifdef DESMUME_BENCH
-// Step 5 diagnostic: [engine][reason] scanline tally for the 2D-BG recorder.
-// reason: 0 recorded, 1 not-armed, 2 obj, 3 window, 4 funcNum, 5 blendmode,
-//         6 3D-line-not-mergeable, 7 layer-not-bakeable.
-u32 g_gx2dbgBail[2][8] = {{0}};
-u32 g_gx2objRej[2][6] = {{0}};
-u32 g_gx2objDis[2][4] = {{0}};   // ObjFrameUpdate disable cause: [0]bld [1]win [2]winobj [3]budget
-#endif
-
-static bool GXMerge_FrameMergeable(GPU * gpu)
-{
-	g_gxmergeFailReason = 0;
-
-	// dispMode != 1: the main engine is showing a VRAM framebuffer / FIFO / off,
-	// not the 2D compositor output, so there is nothing to sandwich into.
-	if (gpu->dispMode != 1)
-		{ g_gxmergeFailReason = 1; return false; }
-	// display capture reads the 3D / 2D-composite directly and needs the legacy
-	// readback intact this frame.
-	if (gpu->dispCapCnt.enabled || (gpu->dispCapCnt.val & 0x80000000))
-		{ g_gxmergeFailReason = 2; return false; }
-
-	return true;
-}
-
-// Per-scanline disqualifiers, checked fresh at the 3D split point for every line
-// that has BG0_3D active. A line that fails falls through to the legacy
-// per-pixel setFinalColor3d loop right below the caller's redirect - i.e. just
-// that scanline (and whichever band it ends up in) is composited the old way;
-// every other line's redirect is untouched.
-//
-// *outAlphaOver reports whether the hardware sandwich should draw this line's
-// 3D band with a real per-pixel alpha blend against the behind bucket
-// (GXMerge_HofsSegment's caller, GXMerge_DrawMainScreen, keys off this per
-// band) instead of the default opaque-and-alpha-keyed draw.
-static bool GXMerge_LineMergeable(GPU * gpu, bool *outAlphaOver,
-                                  bool *outFrontAlphaOver, u8 *outFrontEva,
-                                  u8 *outBrightMode, u8 *outBrightFactor)
-{
-	*outAlphaOver = false;
-	*outFrontAlphaOver = false;
-	*outFrontEva = 0;
-	*outBrightMode = 0;
-	*outBrightFactor = 0;
-	const u16 bld = gpu->BLDCNT;
-	const u32 p3d = gpu->dispx_st->dispx_BGxCNT[0].bits.Priority;
-	const u8  blendMode = (bld >> 6) & 3;
-
-	// --- front-bucket shape check (BG0/3D as a blend 2nd target) ----------
-	// BG0 selected as a blend 2nd target means a FRONT-bucket 2D layer above
-	// 3D blends against what is beneath it.  On real hardware
-	// (_master_setFinalBGColor case Blend) that is a constant-fraction blend
-	// by the global BLDALPHA EVA/EVB, so it maps onto one GX blend per band -
-	// but only when (a) the front bucket is a single blend1 BG in alpha-blend
-	// mode with nothing stacked on it (a stacked front layer or a front
-	// sprite would be wrongly translucified by a whole-band blend of the
-	// front composite), and (b) everything the front layer can sit on is
-	// uniformly blend2-eligible (checked with the behind-bucket uniformity
-	// below) - otherwise the DS draws it opaque over the non-eligible parts
-	// and a whole-band blend would over-blend those.
-	// GPU_RenderLine_layer's redirect clears blend2[0] for the front walk, so
-	// the front layer is composited opaque and the GX front draw
-	// (GXMergeBand::frontAlphaOver) does the EVA blend against the EFB.
-	bool wantFrontBlend = false;
-	if (bld & 0x0100)
-	{
-		int frontBG = -1, nFrontBG = 0;
-		for (int bg = 1; bg <= 3; bg++)
-			if (gpu->LayersEnable[bg] &&
-			    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority < p3d)
-				{ nFrontBG++; frontBG = bg; }
-
-		bool frontSprite = false;
-		if (gpu->LayersEnable[4])
-			for (u32 pr = 0; pr <= p3d; pr++)
-				if (gpu->itemsForPriority[pr].nbPixelsX) { frontSprite = true; break; }
-
-		if (nFrontBG == 0 && !frontSprite) {
-			// BG0 is a 2nd target but nothing in front actually blends against
-			// it this line - merge normally, no front blend.
-		} else if (nFrontBG == 1 && !frontSprite &&
-		           blendMode == 1 && (bld & (1 << frontBG))) {
-			wantFrontBlend = true;
-		} else {
-			g_gxmergeFailReason = 3; return false;
-		}
-	}
-
-	// The other five blend-2nd-target bits (BG1,BG2,BG3,OBJ,Backdrop) govern
-	// whether 3D blends against whatever is directly beneath it in the BEHIND
-	// bucket. Real hardware rule, already reproduced in this file's own
-	// _master_setFinal3dColor(): 3D blends with blend2[bg_under] using the 3D
-	// polygon's OWN per-pixel alpha - entirely independent of BLDCNT's blend
-	// mode bits or whether BG0 itself is selected as a 1st target. Which
-	// layer is "bg_under" varies per screen column (whichever behind-bucket
-	// layer happens to be topmost there), so a single GX draw for the whole
-	// band is only correct if every layer that could possibly be "under" 3D
-	// on this line shares the same blend2 eligibility - mixed eligibility is
-	// a genuinely per-pixel condition GX fixed-function can't express in one
-	// band, and falls back same as before.
-	bool underBlend2 = gpu->blend2[5];   // backdrop is always a potential "under"
-	{
-		bool uniform = true;
-		for (int bg = 1; bg <= 3 && uniform; bg++)
-			if (gpu->LayersEnable[bg] &&
-			    gpu->dispx_st->dispx_BGxCNT[bg].bits.Priority >= p3d &&
-			    gpu->blend2[bg] != underBlend2)
-				uniform = false;
-		if (uniform && gpu->LayersEnable[4] && gpu->blend2[4] != underBlend2)
-			uniform = false;   // sprites: conservatively assume some may be behind
-		if (!uniform)
-			{ g_gxmergeFailReason = 3; return false; }
-		*outAlphaOver = underBlend2;
-	}
-
-	// Front-vs-beneath blend is only whole-band-correct if the front layer
-	// sits on uniformly blend2-eligible content everywhere (backdrop + every
-	// behind layer, checked just above, plus BG0 itself which the 0x0100 test
-	// guarantees).  Otherwise the DS would draw it opaque over the parts that
-	// aren't 2nd targets - fall back for that line.
-	if (wantFrontBlend)
-	{
-		if (!underBlend2)
-			{ g_gxmergeFailReason = 3; return false; }
-		*outFrontAlphaOver = true;
-		*outFrontEva = gpu->BLDALPHA_EVA;   // pre-clamped 0..16
-	}
-
-	// brightness increase/decrease with BG0 as 1st target => 3D gets brightened
-	if ((bld & 0x0001) && (blendMode >= 2))
-		{ g_gxmergeFailReason = 4; return false; }
-	if (gpu->setFinalColor3d_funcNum >= 4)   // a window is active
-		{ g_gxmergeFailReason = 5; return false; }
-	// BG0 HOFS (3D layer horizontal scroll) no longer disqualifies a line: the
-	// hardware sandwich now reproduces it exactly by drawing each band's 3D quad
-	// from a sub-rect of the resident 3D texture (GXMerge_HofsSegment) instead of
-	// the full 256 columns - see GXMerge_RecordLine's hofs argument and
-	// GXMerge_EndFrame's band-split-on-hofs-change.
-	// MASTER_BRIGHT (mode 1 bright-up / mode 2 bright-down) no longer disqualifies
-	// a line: it applies to the *final* composited scanline, which for a merged
-	// line is the whole behind/3D/front sandwich, so the merge path reproduces it
-	// as a per-band full-width GX pass over the merged EFB (GXMerge draw 4) and
-	// GPU_RenderLine skips the CPU GPU_RenderLine_MasterBrightness pass for merged
-	// lines.  A mid-frame HBlank-IRQ rewrite of the factor/mode just splits the
-	// band (GXMerge_EndFrame), same as HOFS.
-	if (gpu->MasterBrightFactor != 0 &&
-	    (gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2)) {
-		*outBrightMode   = gpu->MasterBrightMode;
-		u32 f = gpu->MasterBrightFactor;
-		*outBrightFactor = (u8)(f > 16 ? 16 : f);
-	}
-
-	g_gxmergeFailReason = 0;
-	return true;
-}
-
 void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 {
 	GPU * gpu = screen->gpu;
 
 	//here is some setup which is only done on line 0
 	if(l == 0) {
-		if (gpu->core == GPU_MAIN && GXMerge_Enabled()) {
-			GXMerge_BeginFrame(MainScreen.offset == 0);
-#ifndef GXMERGE_FORCE
-			if (!GXMerge_FrameMergeable(gpu))
-				GXMerge_Disarm();
-#endif
-			// Step 5.1a: bake this frame's MAIN text BG planes now (before the
-			// per-line recorder can consult GX2DBG_LayerReady), on the core
-			// thread. GX_InitTexObj/DCFlushRange are thread-safe (no FIFO cmds).
-			if (GXMerge_2DBGEnabled()) {
-				PZ_SCOPE(PZ_GX2DBG_BAKE);
-				GX2DBG_FrameUpdate(gpu);
-				GX2DBG_ObjFrameUpdate(gpu);
-			}
-		}
-		// Step 5.1a: SUB engine (no 3D) - arm + bake its own 2D-BG record.
-		if (gpu->core == GPU_SUB && GXMerge_2DBGEnabled()) {
-			GXMerge_Begin2DBGSub(gpu->dispMode);
-			PZ_SCOPE(PZ_GX2DBG_BAKE);
-			GX2DBG_FrameUpdate(gpu);
-			GX2DBG_ObjFrameUpdate(gpu);
-		}
 		//this is speculative. the idea is as follows:
 		//whenever the user updates the affine start position regs, it goes into the active regs immediately
 		//(this is handled on the set event from MMU)
@@ -3521,11 +2724,7 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	if(gpu->MasterBrightFactor >= 16 && (gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2))
 	{
 		// except if it could cause any side effects (for example if we're capturing), then don't skip anything
-		// - and, in hardware-merge mode, the MAIN engine's line still has to run
-		//   the layer walk so GXMerge records the band; the full-white/black
-		//   result is produced by GXMerge draw 4 instead (factor 16 => alpha 255).
-		if(!(gpu->core == GPU_MAIN && (gpu->dispCapCnt.enabled || l == 0 || l == 191))
-		   && !(gpu->core == GPU_MAIN && GXMerge_FrameArmed()))
+		if(!(gpu->core == GPU_MAIN && (gpu->dispCapCnt.enabled || l == 0 || l == 191)))
 		{
 			gpu->currLine = l;
 			GPU_RenderLine_MasterBrightness(screen, l);
@@ -3602,15 +2801,6 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	//capture after displaying so that we can safely display vram before overwriting it here
 	if (gpu->core == GPU_MAIN)
 	{
-		// Hardware-merge mode: display capture of the 3D layer (srcA == 3D) reads
-		// gfx3d_convertedScreen via gfx3d_GetLineData15bpp. The layer walk above
-		// only materialises it when BG0/3D is actually composited; a capture with
-		// 3D off would otherwise read a stale buffer. (A capture frame is already
-		// whole-frame-disarmed by GXMerge_FrameMergeable, so this is a cheap
-		// belt-and-braces call - usually a no-op after the walk.)
-		if (GXMerge_Enabled() && gpu->dispCapCnt.enabled)
-			GXMerge_MaterializeConverted();
-
 		//BUG!!! if someone is capturing and displaying both from the fifo, then it will have been
 		//consumed above by the display before we get here
 		//(is that even legal? I think so)
@@ -3618,15 +2808,7 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 		if (l == 191) { disp_fifo.head = disp_fifo.tail = 0; }
 	}
 
-
-	// Hardware-merge mode: this scanline's behind bucket is only one third of the
-	// final composite (3D + front are added later by the GX sandwich), so
-	// MASTER_BRIGHT must be applied to the whole merged result, not just the
-	// behind bucket sitting in GPU_screen right now.  GXMerge draw 4 does that
-	// per band; skip the CPU pass here for merged lines or the behind bucket
-	// would be brightened twice.
-	if (!(gpu->core == GPU_MAIN && GXMerge_FrameArmed() && GXMerge_LineWasMerged(l)))
-		GPU_RenderLine_MasterBrightness(screen, l);
+	GPU_RenderLine_MasterBrightness(screen, l);
 }
 
 void gpu_savestate(EMUFILE* os)
@@ -3761,7 +2943,6 @@ template<bool MOSAIC> void GPU::modeRender(int layer)
 	// it once here and thread it into the BG renderers as a template constant,
 	// so the per-pixel switch in setFinalColorBG() collapses to one blend path
 	// instead of an indirect jump-table dispatch per pixel.
-	// desmumewii-2d-compositor-plan.md Step 2.
 	switch(setFinalColorBck_funcNum)
 	{
 		case 0x0: modeRenderT<MOSAIC,0x0>(this, layer); break;

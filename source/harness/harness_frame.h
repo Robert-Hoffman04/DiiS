@@ -8,8 +8,8 @@
       3. a host command        - PKT_CTRL "capture_frame [label]"
 
     Capture is opt-in and off by default even in a harness build (a runtime
-    toggle, like GXMerge_Enabled()): nothing is sent until frame_every is set
-    or a capture is explicitly requested.
+    toggle): nothing is sent until frame_every is set or a capture is
+    explicitly requested.
 
     Follows the perf_zones.h pattern: real bodies under DESMUME_HARNESS &&
     HARNESS_FRAME, static-inline no-ops otherwise.

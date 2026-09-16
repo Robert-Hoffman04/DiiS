@@ -41,9 +41,6 @@
 #include "FrontEnd.h"
 #include "version.h"
 #include "log_console.h"
-#include "GXRender.h"
-#include "GXMerge.h"
-#include "GX2DBG.h"
 #include "saves.h"
 #include "rasterize.h"
 #include "perf_zones.h"
@@ -105,11 +102,9 @@
 #include "addons.h"
 #endif
 
-// See GXRender.cpp - same SD-card diagnostic log, used here to confirm/deny
-// whether draw_thread keeps making progress while GXRender is on the core
-// thread (i.e. whether the mergerom GX-core stall is GXRender itself wedged,
-// starving draw_thread of vidmutex, vs. something in draw_thread). Throttled -
-// draw_thread runs every vsync and we only need the first handful of frames.
+// SD-card diagnostic log used to confirm/deny whether draw_thread keeps
+// making progress, vs. stalling waiting on vidmutex. Throttled - draw_thread
+// runs every vsync and we only need the first handful of frames.
 #ifdef GXRENDER_DEBUG_LOG
 #include <stdio.h>
 static void gxdbg_main(const char *msg)
@@ -171,7 +166,7 @@ static int SkipFrame = 0;
 static int SkipFrameTracker = 0;
 static u32 pad, wpad;
 
-// Which rendering core we are using (SoftRast or GX)
+// Which rendering core we are using (index into core3DList)
 u8 current3Dcore = 1;
 
 SoundInterface_struct *SNDCoreList[] = {
@@ -183,7 +178,6 @@ SoundInterface_struct *SNDCoreList[] = {
 
 GPU3DInterface *core3DList[] = {
 	&gpu3DNull,
-	&gpu3Dgx,
 	&gpu3DRasterize,
 	NULL
 };
@@ -411,19 +405,6 @@ int main(int argc, char **argv){
 
 	NDS_3D_ChangeCore(current3Dcore);
 
-	// Hardware 3D/2D compositing path (see GXMerge.h).  Mandatory for the GX
-	// core as of this branch, not opt-in: MAIN-screen visual A/B and the
-	// SUB-screen sprite-compositing fix (see BUGS.md "Graphics") are both
-	// verified, and the -61%/+45fps win means GX2DBG is the only 2D
-	// compositor the GX core runs - there is no build flag or runtime
-	// toggle to fall back to the CPU compositor while on the GX core (the
-	// old DESMUME_FORCE_GXCOMPOSITE/DESMUME_FORCE_GX2DBG bench flags no
-	// longer gate anything here; they're vestigial in the benchmark scripts
-	// that still pass them). One call, not two: GXMerge_Set2DBG(true) turns
-	// the base merge path on internally, there's nothing left to enable
-	// separately.
-	GXMerge_Set2DBG(current3Dcore == 1);
-
 	printf("Initialization successful!\n");
 
 	enable_sound = true;
@@ -465,16 +446,6 @@ void init(){
 	u32 xfbHeight;
 	f32 yscale;
 
-	// Alpha 0, not 0xFF: GXRender.cpp's legacy compositor path depends on the
-	// EFB clear alpha staying transparent for its entire life (see the long
-	// comment in ReadFramebuffer()) - an opaque clear here would make every
-	// pixel a 3D scene doesn't actually draw to read back as "3D content"
-	// anyway once the clear used by 3D frames round-trips through
-	// draw_thread's end-of-frame GX_CopyDisp(...,GX_TRUE), which re-clears
-	// the EFB with this same global colour for the next 3D frame to draw
-	// into. RGB is irrelevant to the final picture either way: the display
-	// copy that actually reaches the screen always runs before whichever
-	// clear prepares the EFB for next time.
 	GXColor background = {0, 0, 0, 0};
 	currfb = 0;
 
@@ -588,8 +559,6 @@ void init(){
 	if (vidmutex == LWP_MUTEX_NULL)
 		LWP_MutexInit(&vidmutex, false);
 
-	GXMerge_Init();
-
 	FPSOverlay_Init();
 
 	VIDEO_SetBlack(false);
@@ -628,11 +597,6 @@ static void Draw(void) {
 	DCFlushRange(TopScreen, 256*192*2);
 	DCFlushRange(BottomScreen, 256*192*2);
 	} // PZ_DRAW_CONVERT
-
-	if (GXMerge_Enabled()) {
-		PZ_SCOPE(PZ_DRAW_PRESENT);
-		GXMerge_Present();
-	}
 
 	LWP_MutexUnlock(vidmutex);
 
@@ -735,15 +699,6 @@ static void *draw_thread(void*){
 		LWP_MutexLock(vidmutex);
 		GXDBG_MAIN("draw_thread: vidmutex acquired");
 
-		// GXRender leaves the EFB in GX_PF_RGBA6_Z24 and never restores it; the
-		// hardware-merge sandwich wants a plain RGB8 EFB.  Only switch it for a
-		// present that actually runs the sandwich - otherwise match the legacy
-		// path, which presents through the RGBA6 EFB GXRender left behind.
-		if (GXMerge_HasPresentFrame()) {
-			GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
-			GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
-		}
-
 		// Transform for scaling and rotate
 
 		Mtx m, m1, m2, mv;
@@ -777,17 +732,6 @@ static void *draw_thread(void*){
 				GX_TexCoord2f32(1, 0);
 			GX_End();
 			GXDBG_MAIN("draw_thread: top screen quad end");
-
-			// TopTex is now the "behind" bucket in merge mode; overlay the 3D
-			// bands and the front bucket on top of it.
-			if (GXMerge_Enabled() && MainScreen.offset == 0) {
-				if (GXMerge_HasPresentFrame())
-					GXMerge_DrawMainScreen(topX, topY, width, height);
-				GXMerge_DrawStatusMarker(topX, topY, width, height);
-			}
-			// Step 5.1a: SUB engine on top (main on bottom) -> 2D-BG bands here
-			if (GXMerge_Enabled() && MainScreen.offset != 0)
-				GXMerge_DrawSubScreen(topX, topY, width, height);
 		}
 		// BOTTOM SCREEN
 		if (screen_layout != SCREEN_MAIN_NORMAL && (screen_layout != SCREEN_MAIN_STRETCH)){
@@ -804,15 +748,6 @@ static void *draw_thread(void*){
 				GX_TexCoord2f32(1, 0);
 			GX_End();
 			GXDBG_MAIN("draw_thread: bottom screen quad end");
-
-			if (GXMerge_Enabled() && MainScreen.offset != 0) {
-				if (GXMerge_HasPresentFrame())
-					GXMerge_DrawMainScreen(bottomX, bottomY, width, height);
-				GXMerge_DrawStatusMarker(bottomX, bottomY, width, height);
-			}
-			// Step 5.1a: SUB engine on bottom (main on top) -> 2D-BG bands here
-			if (GXMerge_Enabled() && MainScreen.offset == 0)
-				GXMerge_DrawSubScreen(bottomX, bottomY, width, height);
 
 			// CURSOR
 			if (drawcursor){
@@ -911,9 +846,6 @@ void Execute() {
 	LWP_JoinThread(vidthread, NULL);
 	vidthread = LWP_THREAD_NULL;
 
-	GX2DBG_Reset();
-	GXMerge_Deinit();
-
 	NDS_DeInit();
 
 	GX_AbortFrame();
@@ -995,8 +927,8 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 		t_block = now;
 		FILE *f = fopen("sd:/bench.log", "w");
 		if (f) {
-			fprintf(f, "# desmumewii bench  core=%d  gxmerge=%d  target_hz=59.8261\n",
-			        (int)current3Dcore, (int)GXMerge_Enabled());
+			fprintf(f, "# desmumewii bench  core=%d  target_hz=59.8261\n",
+			        (int)current3Dcore);
 			fprintf(f, "frame,wall_us,block_us,exec_us,draw_us\n");
 			fclose(f);
 		}
@@ -1388,10 +1320,9 @@ static void gba_boot_probe_tick()
 #endif // DESMUME_GBA_BOOT_PROBE
 
 #if !defined(DESMUME_HARNESS) && !defined(DESMUME_BENCH)
-// GX2DBG (DS) offloads the 2D compositor to the GX hardware, which made it
-// run many times faster than real hardware. DSExec()/NDS_exec() themselves
-// have no pacing at all (see the DESMUME_BENCH comment block above: "Nothing
-// here throttles"), so without this, gameplay -- physics, animation timers,
+// DSExec()/NDS_exec() themselves have no pacing at all (see the DESMUME_BENCH
+// comment block above: "Nothing here throttles"), so without this, gameplay
+// -- physics, animation timers,
 // and audio pitch all derive from frame rate here -- simply runs at whatever
 // speed the Wii can push, not at the real console's fixed 59.8261 Hz. This
 // applies equally to DS and GBA-compat content since both are driven through
@@ -1440,7 +1371,7 @@ void DSExec(){
 
 	// process_ctrls_event() has just polled the USB Gecko debug-serial channel;
 	// fold its edge events into `pad` too so the emulator-level controls below
-	// (console toggle, layout, GXMerge A/B toggle, ...) are drivable over it.
+	// (console toggle, layout, ...) are drivable over it.
 	pad |= GECKO_ButtonsDown();
 	// §3.5: same for the transport-agnostic remote-input core (network feed);
 	// process_ctrls_event() above already advanced it. Self-stubs to nothing
@@ -1870,12 +1801,11 @@ void Pause(){
 
 bool PickDevice(){
 	bool device = false;
-	bool useGX = false;
-	current3Dcore = 2; //Soft Raster
+	current3Dcore = 1; //Soft Raster (only 3D core; see core3DList)
 
 #ifdef DESMUME_FORCE_CORE
 	// Hardcoded selection for automated testing (see Makefile TESTDEFS).
-	// DESMUME_FORCE_CORE: 1 = GX, 2 = software raster
+	// DESMUME_FORCE_CORE: 1 = software raster (only option; see core3DList)
 	// DESMUME_FORCE_USB:  0 = SD, 1 = USB
 	current3Dcore = DESMUME_FORCE_CORE;
 #ifdef DESMUME_FORCE_USB
@@ -1894,41 +1824,19 @@ bool PickDevice(){
 		printf("Welcome to DeSmuME Wii!!!\n\n");
 		printf("Select Device: << ");
 		printf("%s", device ? "USB >>" : "SD >>");
-		printf("\nSelect Renderer \\/ ");
-		printf("%s", useGX ? " GX  /\\" : "Soft /\\");
 		printf("\n\nPress B to see the credits.");
 
-		//
-		//
-		//--DCN: This is so I don't have to do this every time I test
-		/*
-		{
-		current3Dcore = 1;
-		break;
-		}
-		//*/
-		//
-		//
-		//
-		
 		if(GetInput(LEFT, LEFT, LEFT) || GetInput(RIGHT, RIGHT, RIGHT)) {
 			device = !device;
 		}
 
-		if(GetInput(UP, UP, UP) || GetInput(DOWN, DOWN, DOWN)) {
-			useGX = !useGX;
-		}
-
 		if(GetInput(A, A, A)){
-			if(useGX){
-				current3Dcore = 1; // We want to use GX!
-			}
 			break;
 		}
-			
+
 		if(GetInput(B, B, B))
 		    ShowCredits();
-			
+
 		VIDEO_WaitVSync();
 	}
 
