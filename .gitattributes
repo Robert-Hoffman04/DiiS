@@ -1,0 +1,21 @@
+# gx-rewrite branch: these docs are full of pre-rewrite GX/GXMerge/GX2DBG
+# terminology that would otherwise pollute context while the 2D engine is
+# being rewritten from scratch. They are deleted on this branch (git rm) but
+# merge=ours here means a merge of gx-rewrite back into arm9-jit-infra (or
+# master) keeps the *target* branch's copy instead of applying the deletion,
+# so the docs come back intact once this branch lands.
+#
+# (docs/PLAN.md and docs/BUILD_FLAGS.md are NOT listed here -- they're
+# gitignored/untracked local files shared across the whole working tree, not
+# per-branch, so they were moved aside to docs/.arm9-jit-infra-*.md instead of
+# deleted; see that rename in the gx-rewrite branch history for why.)
+#
+# IMPORTANT: merge=ours requires a driver definition that git does not ship
+# by default and does NOT travel with the repo -- whoever performs that merge
+# must first run, once, in their local checkout:
+#   git config merge.ours.driver true
+# Without it, git falls back to a normal merge and these files WILL be
+# deleted on merge. (This has already been set in this repo's local config.)
+source/jit/NOTES.md merge=ours
+tools/benchmark/README.md merge=ours
+tools/vsd-testrom/README.md merge=ours
