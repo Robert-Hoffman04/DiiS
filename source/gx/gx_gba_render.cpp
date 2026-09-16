@@ -229,12 +229,22 @@ static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG
 
 // ---------------------------------------------------------------------
 // OBJ: one persistent texture slot per OAM index (128), sized to the max
-// regular-OBJ box (64x64), rewritten every dirty frame for whichever
-// sprites are visible. See header comment: not OAM-index dirty-cached yet.
+// regular-OBJ box (64x64). gx-next-steps-log.md task 4: each slot also
+// remembers the OAM fields + DISPCNT 1D/2D bit its *current* bake was
+// built from, so gxObjNeedsRebake() can skip re-decoding a sprite whose
+// own config and dependency bytes (VRAM tiles + palette entries) are both
+// unchanged since, instead of re-baking every visible sprite on any
+// VRAM/palette write anywhere.
 // ---------------------------------------------------------------------
 struct GxObjTexSlot {
 	GXTexObj texObj;
 	void *texData;
+	bool valid;       // false until this slot has been baked at least once
+	bool oneDim;       // DISPCNT bit6 at bake time
+	bool colorMode;    // attribute0 bit13 (4bpp/8bpp) at bake time
+	u16 tileNum;       // attribute2 bits0-9 at bake time
+	u8  palNum;        // attribute2 bits12-15 at bake time (4bpp only, harmless for 8bpp)
+	u16 texW, texH;    // resolved source pixel size at bake time (shape+size)
 };
 static GxObjTexSlot s_objTex[128];
 static const int kObjTexMaxPx = 64; // max regular-OBJ box (visibility/size gate)
@@ -695,6 +705,126 @@ static bool gxCollectVisibleObj(u16 dispcnt)
 	return true;
 }
 
+// ---------------------------------------------------------------------
+// gx-next-steps-log.md task 4: per-OAM-index re-bake gate. A baked OBJ
+// texture is a pure function of (DISPCNT's OBJ 1D/2D mapping bit, this
+// OAM entry's own color-mode/shape/size/tile-index/palette-index fields,
+// and the exact VRAM tile bytes + palette bytes that configuration reads)
+// -- nothing else. Screen position/priority/flip and the affine matrix
+// are read fresh every frame regardless (gxCollectVisibleObj/
+// gxAffineObjTexCorner) and never affect the baked pixels, so they are
+// deliberately NOT part of this dependency set -- including them would
+// only defeat the cache for ordinary moving/animating-via-matrix sprites
+// without buying any extra correctness.
+// ---------------------------------------------------------------------
+
+// Page-granularity range query built on top of GxDirtyBitmap's existing
+// isPageDirty() -- see gx_frameplan.h; no new dirty-tracking infrastructure,
+// just a range-shaped consumer of what's already there.
+static bool gxRangeDirty(const GxDirtyBitmap &bm, u32 offset, u32 size)
+{
+	if (size == 0) return false;
+	u32 pageSize = bm.pageSize();
+	if (pageSize == 0) return bm.anyDirty(); // untracked bitmap: conservative fallback
+	u32 first = offset / pageSize;
+	u32 last = (offset + size - 1) / pageSize;
+	for (u32 p = first; p <= last; ++p)
+		if (bm.isPageDirty(p)) return true;
+	return false;
+}
+
+// OBJ char-VRAM tile-grid byte range dirty check for a `tilesW`x`tilesH`
+// (in whole 8px tiles) sprite starting at `tileNum`, reusing exactly the
+// 1D/2D addressing math gxBakeObjTexture uses to decode it (see there)
+// rather than re-deriving it independently.
+static bool gxObjVramDepsDirty(bool oneDim, bool colorMode, int tileNum, int tilesW, int tilesH)
+{
+	const u32 charBase = 0x10000;
+	u32 tileBytes = colorMode ? 64 : 32;
+
+	// Mirrors gxVramAddr()'s own wrap (see its comment): a span landing
+	// entirely on one side of the 0x18000 mirror boundary just needs that
+	// one offset normalized; a span straddling it is checked as two
+	// sub-ranges. A span reaching past the 17-bit mask boundary gxVramAddr
+	// applies per-byte (addr & 0x1FFFF) is pathological (tileNum near its
+	// 10-bit max combined with a large sprite) and not worth reasoning
+	// about precisely -- bail conservative (treat as dirty) instead.
+	auto spanDirty = [](u32 rawAddr, u32 len) -> bool {
+		u32 end = rawAddr + len;
+		if (end > 0x20000) return true;
+		if (rawAddr < 0x18000 && end > 0x18000) {
+			return gxRangeDirty(g_gbaFramePlan.vram, rawAddr, 0x18000 - rawAddr) ||
+			       gxRangeDirty(g_gbaFramePlan.vram, 0x18000 - 0x8000, end - 0x18000);
+		}
+		u32 m = (rawAddr >= 0x18000) ? (rawAddr - 0x8000) : rawAddr;
+		return gxRangeDirty(g_gbaFramePlan.vram, m, len);
+	};
+
+	if (oneDim) {
+		// Contiguous: tileIndex = tileNum + tileY*tilesW + tileX enumerates
+		// [tileNum, tileNum + tilesW*tilesH) with no gaps.
+		u32 numTiles = (u32)tilesW * (u32)tilesH;
+		return spanDirty(charBase + (u32)tileNum * tileBytes, numTiles * tileBytes);
+	}
+	// 2D: each tile row is contiguous but rows are spaced by a fixed
+	// 32-tile-slot stride regardless of sprite width -- check per row,
+	// same slotIndex math as gxBakeObjTexture's 2D branch.
+	int rowSlots = tilesW * (colorMode ? 2 : 1);
+	for (int tileY = 0; tileY < tilesH; ++tileY) {
+		u32 slotIndex = (u32)tileNum + (u32)tileY * 32;
+		if (spanDirty(charBase + slotIndex * 32, (u32)rowSlots * 32))
+			return true;
+	}
+	return false;
+}
+
+// Palette dependency: a 4bpp sprite only ever reads its own 16-entry
+// sub-palette (palNum*16..+15); an 8bpp sprite reads the full 256-entry
+// OBJ palette bank (see gxBakeObjTexture's gxObjPalColor(idx) call, no
+// palNum offset at all in that branch) -- so, contrary to a naive
+// "whole OBJ palette bank is always a dependency" assumption, most
+// sprites (4bpp is the overwhelmingly common case) only actually care
+// about a 32-byte slice.
+static bool gxObjPaletteDepsDirty(bool colorMode, int palNum)
+{
+	if (colorMode) // 8bpp
+		return gxRangeDirty(g_gbaFramePlan.palette, 0x200, 512);
+	return gxRangeDirty(g_gbaFramePlan.palette, 0x200 + (u32)palNum * 32, 32);
+}
+
+// True if s_objTex[d.oamIndex] is stale and gxBakeObjTexture() needs to
+// run for it this frame -- either its own OAM fields changed since the
+// last bake into this slot (including a completely different sprite now
+// occupying this OAM index: its tile-index/shape/size/color-mode/
+// palette-index will essentially always differ, and even in the
+// coincidental case they don't, the resulting bake is provably identical
+// bytes since both bakes read the same VRAM/palette bytes under the same
+// field values), or its fields are unchanged but the exact VRAM/palette
+// bytes that configuration depends on were written since.
+static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
+{
+	const GxObjTexSlot &slot = s_objTex[d.oamIndex];
+
+	u32 oamOff = d.oamIndex * 8;
+	u16 a0 = T1ReadWord(MMU.GBA_OAM, oamOff);
+	u16 a2 = T1ReadWord(MMU.GBA_OAM, oamOff + 4);
+	bool colorMode = (a0 >> 13) & 1;
+	int tileNum = a2 & 0x3FF;
+	int palNum = (a2 >> 12) & 0xF;
+	bool oneDim = (dispcnt >> 6) & 1;
+
+	bool sameConfig = slot.valid &&
+		slot.oneDim == oneDim && slot.colorMode == colorMode &&
+		slot.tileNum == tileNum && slot.palNum == (u8)palNum &&
+		slot.texW == d.texW && slot.texH == d.texH;
+	if (!sameConfig)
+		return true;
+
+	if (gxObjVramDepsDirty(oneDim, colorMode, tileNum, d.texW / 8, d.texH / 8))
+		return true;
+	return gxObjPaletteDepsDirty(colorMode, palNum);
+}
+
 // Decodes one sprite's texW x texH source pixels into a (texW+4)x(texH+4)
 // buffer with a 1-texel transparent border (see kObjTexBufMaxPx) -- baked
 // the same way regardless of d.affine so both draw paths share one bake
@@ -762,6 +892,16 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
 	DCFlushRange(slot.texData, bufW * bufH * sizeof(u16));
 	GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+
+	// Record the config this bake was built from (task 4's rebake-gate
+	// fingerprint -- see gxObjNeedsRebake above).
+	slot.valid = true;
+	slot.oneDim = oneDim;
+	slot.colorMode = colorMode;
+	slot.tileNum = (u16)tileNum;
+	slot.palNum = (u8)palNum;
+	slot.texW = d.texW;
+	slot.texH = d.texH;
 }
 
 // Bitmap-mode content is always opaque (no transparent texels -- every
@@ -1186,9 +1326,19 @@ bool gxGbaRenderFrame()
 		gxBakeBackdrop();
 	gxDrawQuad(&s_backdropTexObj, 0, 0, GBA_SCREEN_W, GBA_SCREEN_H, 0, 0, 1, 1);
 
-	if (dirty) {
-		for (int i = 0; i < s_objDrawCount; ++i)
-			gxBakeObjTexture(dispcnt, s_objDraws[i]);
+	// Task 4 (gx-next-steps-log.md): per-sprite re-bake gate, deliberately
+	// NOT gated by the coarse `dirty` aggregate above -- a sprite is
+	// (re)baked exactly when gxObjNeedsRebake() says its own dependencies
+	// (OAM fields, or the VRAM/palette bytes they point at) actually
+	// changed, independent of whether some unrelated VRAM/palette byte
+	// changed elsewhere this frame. This also correctly picks up an
+	// OAM-only change (e.g. a reassigned tile index with no VRAM/palette
+	// write at all this frame) that the old `dirty`-gated loop would have
+	// missed entirely.
+	for (int i = 0; i < s_objDrawCount; ++i) {
+		const GxObjDraw &d = s_objDraws[i];
+		if (gxObjNeedsRebake(dispcnt, d))
+			gxBakeObjTexture(dispcnt, d);
 	}
 
 	if (tiled) {

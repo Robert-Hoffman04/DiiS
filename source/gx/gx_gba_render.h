@@ -131,8 +131,17 @@
        data layout. Mid-frame BGxCNT bank-switch tricks are rare and, if hit,
        degrade to slightly stale tile layout for the bands drawn before the
        final value, not a crash.
-     - OBJ textures are re-decoded every dirty frame for every visible
-       sprite, not cached per-OAM-index. Same tradeoff as above.
+     - OBJ textures: gx-next-steps-log.md task 4 closed this gap for OBJ
+       specifically -- each OAM index's baked texture (s_objTex[]) now
+       carries the OAM fields (tile-index/shape/size/color-mode/
+       palette-index) and DISPCNT 1D/2D bit it was baked from, and is only
+       re-decoded when gxObjNeedsRebake() finds either those fields
+       changed or the exact VRAM tile bytes/palette entries that
+       configuration depends on were written (via gx_frameplan.h's
+       GxDirtyBitmap::isPageDirty(), not just the coarse anyDirty() the
+       line above still describes for BG/bitmap planes). BG/bitmap
+       textures still use the coarse whole-VRAM-or-palette anyDirty() gate
+       above -- task 5 in that log is the follow-up for those.
      - Affine BG's per-band reference point (GxGbaBandRegs::affX/affY)
        inherits gba_ppu.cpp's own documented simplification: it's an
        accumulator latched once at frame start and advanced by PB/PD per
