@@ -595,6 +595,59 @@ void init(){
 	VIDEO_SetBlack(false);
 }
 
+// gx-next-steps-log.md task 7 (DS Engine B GX compositor): InitVideo()
+// above establishes the GX "present" state -- viewport, scissor, projection,
+// Z-mode, vertex format and, crucially, the EFB-copy source/destination
+// registers GX_CopyDisp() reads -- exactly ONCE, and neither Draw() nor
+// draw_thread re-applies any of it per frame. An engine-side GX compositor
+// (source/gx/gx_ds_engineb_render.cpp) has to repoint all of those at its
+// own 256x192 render+copy, so it calls this immediately afterwards, inside
+// the same vidmutex critical section, to hand the FIFO back in the state
+// draw_thread expects to find it in.
+//
+// Note GX_SetTexCopySrc/GX_SetTexCopyDst and GX_SetDispCopySrc/
+// GX_SetDispCopyDst write the SAME hardware EFB-copy registers in libogc --
+// re-issuing the display-copy pair here is not redundant with the viewport/
+// scissor restore, it is what keeps draw_thread's GX_CopyDisp() copying the
+// whole framebuffer instead of a 256x192 corner of it.
+void GxRestorePresentState(void)
+{
+	if (!rmode)
+		return;
+
+	GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+	GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+
+	f32 yscale = GX_GetYScaleFactor(rmode->efbHeight, rmode->xfbHeight);
+	u32 xfbHeight = GX_SetDispCopyYScale(yscale);
+	GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+	GX_SetDispCopyDst(rmode->fbWidth, xfbHeight);
+	GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+
+	GX_SetCullMode(GX_CULL_NONE);
+	GX_SetNumChans(1);
+	GX_SetNumTexGens(1);
+	GX_SetNumTevStages(1);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+
+	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	GX_SetAlphaUpdate(GX_TRUE);
+	GX_SetColorUpdate(GX_TRUE);
+
+	GX_LoadProjectionMtx(perspective, GX_ORTHOGRAPHIC);
+	GX_LoadPosMtxImm(GXmodelView2D, GX_PNMTX0);
+	GX_SetCurrentMtx(GX_PNMTX0);
+
+	GX_ClearVtxDesc();
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XY, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+}
+
 #define RGB15_REVERSE(col) ( 0x8000 | (((col) & 0x001F) << 10) | ((col) & 0x03E0)  | (((col) & 0x7C00) >> 10) )
 
 static void Draw(void) {

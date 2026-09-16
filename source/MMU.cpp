@@ -33,6 +33,7 @@
 #include "registers.h"
 #include "GPU.h"
 #include "gba_ppu.h"
+#include "gx/gx_ds_engineb_render.h"
 #include "gba_io.h"
 #include "gx/gx_frameplan.h"
 #include "gba_backup.h"
@@ -2561,6 +2562,18 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 		return;
 	}
 
+	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
+	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
+	// to palette RAM / VRAM / OAM funnels through regardless of access
+	// width (DmaController::doCopy() routes through _MMU_write16/32,
+	// which reach this same function), so tagging here is the
+	// design-doc's "tagged at the MMU write site, no separate
+	// dirty-flag subsystem" decision -- the same shape gxMarkGbaDirty()
+	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
+	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
+	// 0x07 region address.
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 1);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
@@ -3042,6 +3055,18 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	}
 
 
+	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
+	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
+	// to palette RAM / VRAM / OAM funnels through regardless of access
+	// width (DmaController::doCopy() routes through _MMU_write16/32,
+	// which reach this same function), so tagging here is the
+	// design-doc's "tagged at the MMU write site, no separate
+	// dirty-flag subsystem" decision -- the same shape gxMarkGbaDirty()
+	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
+	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
+	// 0x07 region address.
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 2);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
@@ -3439,6 +3464,18 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		return;
 	}
 
+	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
+	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
+	// to palette RAM / VRAM / OAM funnels through regardless of access
+	// width (DmaController::doCopy() routes through _MMU_write16/32,
+	// which reach this same function), so tagging here is the
+	// design-doc's "tagged at the MMU write site, no separate
+	// dirty-flag subsystem" decision -- the same shape gxMarkGbaDirty()
+	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
+	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
+	// 0x07 region address.
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 4);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;

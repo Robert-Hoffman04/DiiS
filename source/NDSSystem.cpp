@@ -46,6 +46,7 @@
 #include "Disassembler.h"
 #include "readwrite.h"
 #include "GPU.h"
+#include "gx/gx_ds_engineb_render.h"
 #include "firmware.h"
 #include "path.h"
 #ifdef DESMUME_JIT_ARM7
@@ -1392,8 +1393,26 @@ static void execHardware_hblank()
 		//taskSubGpu.execute(renderSubScreen,NULL);
 		{
 			PZ_SCOPE(PZ_GPU_2D);
-			GPU_RenderLine(&MainScreen, nds.VCount, frameSkipper.ShouldSkip2D());
-			GPU_RenderLine(&SubScreen, nds.VCount, frameSkipper.ShouldSkip2D());
+			const bool skip2d = frameSkipper.ShouldSkip2D();
+			GPU_RenderLine(&MainScreen, nds.VCount, skip2d);
+			// gx-next-steps-log.md task 7: Stage 0 for DS Engine B. Sampled
+			// here, immediately before this scanline's Engine-B CPU render,
+			// so the layout state it records is exactly the state that
+			// scanline was drawn with. A skipped 2D frame is deliberately
+			// NOT sampled: GPU_RenderLine() doesn't draw it either, and the
+			// end-of-frame call below then finds no line-0 snapshot and bails
+			// to the (equally skipped) CPU result.
+			if (!skip2d)
+				gxDsEngineBScanline(nds.VCount);
+			GPU_RenderLine(&SubScreen, nds.VCount, skip2d);
+			// The DS analogue of gbaPpuEndFrame()'s gxGbaRenderFrame() call:
+			// Engine B's frame is complete once its last visible scanline has
+			// been rendered, and every register/VRAM/OAM write this frame has
+			// landed. If it handles the frame it overwrites Engine B's 192
+			// scanlines in GPU_screen, superseding what GPU_RenderLine just
+			// wrote there; if it bails, that CPU result already stands.
+			if (nds.VCount == 191)
+				gxDsEngineBRenderFrame();
 		}
 		//taskSubGpu.finish();
 
