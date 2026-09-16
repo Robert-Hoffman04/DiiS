@@ -112,7 +112,6 @@ This addition was mostly for the sake of my own homebrew plans. It is an entirel
 
 ## License/Credations
  
-DiiS is free software, licensed under the GNU General Public License v2 or
-later - see `LICENSE.txt`. It builds on DeSmuME and DeSmuMEWii, and vendors a
+DiiS is free software, licensed under the GNU General Public License v2 - see `LICENSE.txt`. It builds on DeSmuME and DeSmuMEWii, and vendors a
 JIT derived from Visual Boy Advance GX (see
 `source/jit/upstream/PROVENANCE.md` for details and attribution).
