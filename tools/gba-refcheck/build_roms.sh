@@ -34,5 +34,6 @@ build_one dmavcap       "DMAVCAP"    "ADVC"
 build_one windowcheck   "WINCHECK"   "AWIN"
 build_one winblend      "WINBLEND"   "AWBL"
 build_one objcache      "OBJCACHE"   "AOCA"
+build_one bgcache       "BGCACHE"    "ABGC"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba $(pwd)/bgcache.gba"

@@ -118,11 +118,15 @@
        does per-pixel today) rather than uploaded as native GX CI4/CI8+TLUT.
        Simpler, and correct; revisit only if TMEM/upload bandwidth profiling
        ever shows it matters.
-     - Stage 1 dirty-gating is coarse: a whole-VRAM-or-palette anyDirty()
-       check gates re-baking every active layer, not per-layer/per-page
-       precision. Correct (never renders stale data) but leaves cheap wins on
-       the table; a follow-up can narrow this to gx_frameplan.h's actual
-       per-page bits.
+     - Stage 1 dirty-gating: OBJ (task 4) and now the backdrop + all four
+       BG planes (task 5) use per-target fine-grained gates built on
+       gx_frameplan.h's GxDirtyBitmap::isPageDirty() -- see the next bullet
+       and the "OBJ textures" bullet below. Bitmap-mode (DISPCNT mode 3/4/5)
+       textures are the one remaining consumer of the original coarse
+       whole-VRAM-or-palette anyDirty() gate; not narrowed by task 5 (out of
+       its BG/backdrop-specific scope) or task 4 (OBJ-specific scope) --
+       still correct (never renders stale data), just leaves a cheap win on
+       the table for a future task.
      - A BG plane's tile/map layout (char base, map base, size, color depth)
        is baked once per frame using the register value current at bake time
        (i.e. the frame's final value for that register) even though Stage 4
@@ -130,7 +134,11 @@
        only scroll is treated as varying per-band, not the underlying tile
        data layout. Mid-frame BGxCNT bank-switch tricks are rare and, if hit,
        degrade to slightly stale tile layout for the bands drawn before the
-       final value, not a crash.
+       final value, not a crash. Task 5's per-plane rebake gate
+       (gxBgPlaneNeedsRebake/gxAffineBgPlaneNeedsRebake) reads this same
+       frame-final register value to decide dirtiness, consistent with what
+       gxBakeBgPlane/gxBakeAffineBgPlane themselves bake from -- it inherits
+       this simplification rather than working around it.
      - OBJ textures: gx-next-steps-log.md task 4 closed this gap for OBJ
        specifically -- each OAM index's baked texture (s_objTex[]) now
        carries the OAM fields (tile-index/shape/size/color-mode/
@@ -139,9 +147,62 @@
        changed or the exact VRAM tile bytes/palette entries that
        configuration depends on were written (via gx_frameplan.h's
        GxDirtyBitmap::isPageDirty(), not just the coarse anyDirty() the
-       line above still describes for BG/bitmap planes). BG/bitmap
-       textures still use the coarse whole-VRAM-or-palette anyDirty() gate
-       above -- task 5 in that log is the follow-up for those.
+       bullet above still describes for bitmap-mode planes).
+     - BG textures: gx-next-steps-log.md task 5 closed this gap for the
+       backdrop and all four BG planes, replicating task 4's OBJ pattern.
+       The backdrop (gxBackdropNeedsRebake) gates on exactly its one
+       dependency, BG palette color 0 (2 bytes). Each BG plane
+       (gxBgPlaneNeedsRebake for text mode, gxAffineBgPlaneNeedsRebake for
+       affine) carries a last-baked fingerprint (char base, map base, color
+       depth / map size, and for affine, the overflow-wrap bit -- piggy-
+       backing on fields the cache already stored for drawing, e.g.
+       mapWpx/mapHpx/mapPx/wrap, rather than duplicating them) and is only
+       re-baked when that fingerprint changes or its dependency bytes were
+       written. Two deliberate precision/simplicity tradeoffs, both
+       documented in detail at gx_gba_render.cpp's gxBackdropNeedsRebake()
+       comment block (not repeated in full here):
+        - Text BG char-VRAM dependency is a conservative superset --
+          [charBase, charBase + 1024*tileBytes), the full range any of the
+          map's 10-bit tile indices could reach at the BG's current color
+          depth -- not a byte-exact "only the tiles this map actually
+          references" range (which would require walking the tilemap
+          before baking, at roughly the bake's own cost, just to decide
+          whether to bake). Map-VRAM dependency IS exact (gxBakeBgPlane's
+          own block addressing always produces one contiguous span).
+          Affine BG's dependency ranges are both exact (byte-per-tile map,
+          full-byte tile index into an always-8bpp charset).
+        - Every BG plane (4bpp text, 8bpp text, and affine) gates on the
+          whole 512-byte BG palette bank, not the tightest-possible
+          per-map-entry sub-palette -- unlike OBJ, a text BG map entry
+          carries its OWN palNum per tile (not one fixed OAM field), so a
+          byte-exact version has the same chicken-and-egg map-walk problem
+          as the char-VRAM case above. This means multiple BG planes that
+          use different sub-palettes still all re-bake together on any BG
+          palette write, even one none of them actually reads -- a
+          deliberate, documented conservative simplification, not an
+          oversight (see gx-next-steps-log.md task 5's own section for the
+          synthetic-ROM proof this surfaced during testing).
+       HOFS/VOFS (scroll) and, for affine, PA/PB/PC/PD/reference-point are
+       deliberately NOT part of any BG fingerprint, for the same reason
+       task 4 excludes OBJ's affine matrix: both are read fresh every frame
+       via UV/quad math and never affect the baked texture's pixels.
+       Per-frame dirty tracking's inherent limitation (both task 4's OBJ
+       gate and task 5's BG/backdrop gates share this): the dirty bitmaps
+       are cleared every frame (GxFramePlan::beginFrame()), so a plane/
+       sprite that goes temporarily invisible/disabled (and is therefore
+       skipped by the rebake check entirely while it stays that way) could
+       in principle miss a dependency write that happened only during that
+       invisible interval, then render stale once visible again with no
+       further writes to re-trigger it. The old coarse anyDirty() gate
+       accidentally avoided this in practice (virtually any VRAM/palette
+       write anywhere re-armed it), which the new fine-grained gates no
+       longer do by construction. Not fixed here -- doing so would mean
+       either accumulating dirty state across multiple frames (a bigger
+       change to gx_frameplan.h's contract) or force-rebaking on every
+       enable-after-disable transition (inconsistent with task 4's existing
+       OBJ design, which has the identical characteristic and was left
+       as-is) -- flagged as a known, shared limitation of this whole
+       per-frame dirty-tracking approach rather than silently assumed away.
      - Affine BG's per-band reference point (GxGbaBandRegs::affX/affY)
        inherits gba_ppu.cpp's own documented simplification: it's an
        accumulator latched once at frame start and advanced by PB/PD per

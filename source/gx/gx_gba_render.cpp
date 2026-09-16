@@ -197,6 +197,13 @@ struct GxBgPlaneCache {
 	void *texData;
 	u16 mapWpx, mapHpx;
 	bool valid;
+	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
+	// (mapWpx/mapHpx above double as the resolved map-size half of this
+	// fingerprint -- the four BGxCNT size selectors produce four distinct
+	// (mapWpx,mapHpx) pairs, so no separate size field is needed). See
+	// gxBgPlaneNeedsRebake().
+	u32 cfgCharBase, cfgMapBase;
+	bool cfgColorMode;
 };
 static GxBgPlaneCache s_bgPlane[4];
 static const int kBgPlaneMaxPx = 512;
@@ -222,6 +229,10 @@ struct GxAffineBgPlaneCache {
 	u16 bufPx;      // baked/allocated texture size (mapPx, or mapPx+4 if bordered)
 	bool wrap;
 	bool valid;
+	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
+	// (mapPx/wrap above already capture the size-selector and overflow-bit
+	// half of this fingerprint -- see gxAffineBgPlaneNeedsRebake()).
+	u32 cfgCharBase, cfgMapBase;
 };
 static GxAffineBgPlaneCache s_affBgPlane[2];
 static const int kAffineBgPlaneMaxPx = 1024 + 4;
@@ -287,6 +298,7 @@ static bool s_bmpValid;
 // 1x1 solid-color texture used for the backdrop fill (see gxGbaRenderFrame).
 static GXTexObj s_backdropTexObj;
 static void *s_backdropTexData;
+static bool s_backdropValid; // gx-next-steps-log.md task 5: false until first bake
 
 // ---------------------------------------------------------------------
 // Shared scratch texture for the bake-time blend effect's "effected"
@@ -380,6 +392,7 @@ bool gxGbaRenderInit()
 	if (!s_backdropTexData) return false;
 	memset(s_backdropTexData, 0, 32);
 	GX_InitTexObj(&s_backdropTexObj, s_backdropTexData, 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	s_backdropValid = false;
 
 	u32 copySz = GX_GetTexBufferSize(GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_FALSE, 0);
 	s_copyBackBuf = memalign(32, copySz);
@@ -564,6 +577,9 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 	GX_InitTexObj(&pc.texObj, pc.texData, mapWpx, mapHpx, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
 	pc.mapWpx = (u16)mapWpx;
 	pc.mapHpx = (u16)mapHpx;
+	pc.cfgCharBase = li.charBase;
+	pc.cfgMapBase = li.mapBase;
+	pc.cfgColorMode = li.colorMode;
 	pc.valid = true;
 }
 
@@ -629,6 +645,8 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	pc.mapPx = (u16)mapPx;
 	pc.bufPx = (u16)bufPx;
 	pc.wrap = wrap;
+	pc.cfgCharBase = charBase;
+	pc.cfgMapBase = mapBase;
 	pc.valid = true;
 }
 
@@ -637,6 +655,7 @@ static void gxBakeBackdrop()
 	u16 texel = gxOpaqueTexel(gxBgPalColor(0));
 	((u16 *)s_backdropTexData)[0] = texel;
 	DCFlushRange(s_backdropTexData, 32);
+	s_backdropValid = true;
 }
 
 static const u8 s_objSizeW[4][4] = { {8,16,32,64}, {16,32,32,64}, {8,8,16,32}, {0,0,0,0} };
@@ -733,6 +752,30 @@ static bool gxRangeDirty(const GxDirtyBitmap &bm, u32 offset, u32 size)
 	return false;
 }
 
+// Wraps a raw VRAM byte range [rawAddr, rawAddr+len) through gxVramAddr()'s
+// own mirror-wrap rule (see its comment) and queries dirty status for the
+// resulting real-VRAM sub-range(s). Shared by every VRAM dependency check in
+// this file (OBJ, task 4; BG/affine-BG, task 5) rather than duplicated per
+// caller. A span landing entirely on one side of the 0x18000 mirror boundary
+// just needs that one offset normalized; a span straddling it is checked as
+// two sub-ranges. A span reaching past the 17-bit mask boundary gxVramAddr
+// applies per-byte (addr & 0x1FFFF) is pathological (e.g. an OBJ tileNum near
+// its 10-bit max combined with a large sprite, or a BG char-base index 3
+// combined with 8bpp's full 1024-tile addressable range -- see
+// gxBgPlaneNeedsRebake) and not worth reasoning about precisely -- bail
+// conservative (treat as dirty) instead.
+static bool gxVramSpanDirty(u32 rawAddr, u32 len)
+{
+	u32 end = rawAddr + len;
+	if (end > 0x20000) return true;
+	if (rawAddr < 0x18000 && end > 0x18000) {
+		return gxRangeDirty(g_gbaFramePlan.vram, rawAddr, 0x18000 - rawAddr) ||
+		       gxRangeDirty(g_gbaFramePlan.vram, 0x18000 - 0x8000, end - 0x18000);
+	}
+	u32 m = (rawAddr >= 0x18000) ? (rawAddr - 0x8000) : rawAddr;
+	return gxRangeDirty(g_gbaFramePlan.vram, m, len);
+}
+
 // OBJ char-VRAM tile-grid byte range dirty check for a `tilesW`x`tilesH`
 // (in whole 8px tiles) sprite starting at `tileNum`, reusing exactly the
 // 1D/2D addressing math gxBakeObjTexture uses to decode it (see there)
@@ -742,29 +785,11 @@ static bool gxObjVramDepsDirty(bool oneDim, bool colorMode, int tileNum, int til
 	const u32 charBase = 0x10000;
 	u32 tileBytes = colorMode ? 64 : 32;
 
-	// Mirrors gxVramAddr()'s own wrap (see its comment): a span landing
-	// entirely on one side of the 0x18000 mirror boundary just needs that
-	// one offset normalized; a span straddling it is checked as two
-	// sub-ranges. A span reaching past the 17-bit mask boundary gxVramAddr
-	// applies per-byte (addr & 0x1FFFF) is pathological (tileNum near its
-	// 10-bit max combined with a large sprite) and not worth reasoning
-	// about precisely -- bail conservative (treat as dirty) instead.
-	auto spanDirty = [](u32 rawAddr, u32 len) -> bool {
-		u32 end = rawAddr + len;
-		if (end > 0x20000) return true;
-		if (rawAddr < 0x18000 && end > 0x18000) {
-			return gxRangeDirty(g_gbaFramePlan.vram, rawAddr, 0x18000 - rawAddr) ||
-			       gxRangeDirty(g_gbaFramePlan.vram, 0x18000 - 0x8000, end - 0x18000);
-		}
-		u32 m = (rawAddr >= 0x18000) ? (rawAddr - 0x8000) : rawAddr;
-		return gxRangeDirty(g_gbaFramePlan.vram, m, len);
-	};
-
 	if (oneDim) {
 		// Contiguous: tileIndex = tileNum + tileY*tilesW + tileX enumerates
 		// [tileNum, tileNum + tilesW*tilesH) with no gaps.
 		u32 numTiles = (u32)tilesW * (u32)tilesH;
-		return spanDirty(charBase + (u32)tileNum * tileBytes, numTiles * tileBytes);
+		return gxVramSpanDirty(charBase + (u32)tileNum * tileBytes, numTiles * tileBytes);
 	}
 	// 2D: each tile row is contiguous but rows are spaced by a fixed
 	// 32-tile-slot stride regardless of sprite width -- check per row,
@@ -772,7 +797,7 @@ static bool gxObjVramDepsDirty(bool oneDim, bool colorMode, int tileNum, int til
 	int rowSlots = tilesW * (colorMode ? 2 : 1);
 	for (int tileY = 0; tileY < tilesH; ++tileY) {
 		u32 slotIndex = (u32)tileNum + (u32)tileY * 32;
-		if (spanDirty(charBase + slotIndex * 32, (u32)rowSlots * 32))
+		if (gxVramSpanDirty(charBase + slotIndex * 32, (u32)rowSlots * 32))
 			return true;
 	}
 	return false;
@@ -823,6 +848,123 @@ static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
 	if (gxObjVramDepsDirty(oneDim, colorMode, tileNum, d.texW / 8, d.texH / 8))
 		return true;
 	return gxObjPaletteDepsDirty(colorMode, palNum);
+}
+
+// ---------------------------------------------------------------------
+// gx-next-steps-log.md task 5: backdrop + per-BG-plane re-bake gates, same
+// fingerprint + gxRangeDirty()/gxVramSpanDirty() pattern as task 4's OBJ
+// gate above -- replaces the single coarse `g_gbaFramePlan.vram.anyDirty()
+// || palette.anyDirty()` check that used to gate the backdrop and all four
+// BG planes together (see gxGbaRenderFrame).
+//
+// Dependency-range design (see this task's log section for the full
+// writeup):
+//  - Text BG char-VRAM range: this file's existing bake loop only ever
+//    reads tile indices actually present in the current tilemap, so a
+//    byte-exact dependency would need to walk the map first (same cost as
+//    the bake itself) just to decide whether to bake. Deliberately NOT
+//    done: instead this uses a conservative superset, [charBase, charBase +
+//    1024*tileBytes) -- the full range any of the map's 10-bit tile indices
+//    could possibly address at this BG's current color depth. Note this is
+//    wider than "one 16KB char-base block": a 10-bit tile index can reach
+//    up to 2 blocks (4bpp, 32KB) or 4 blocks (8bpp, 64KB) past the selected
+//    base, so a single-block range would have been an UNDER-count (a real
+//    correctness bug, not just an imprecision) -- widened here per this
+//    task's "when in doubt, widen" rule rather than trusting a single-block
+//    assumption that doesn't hold for every BGxCNT color-depth combination.
+//  - Text BG map-VRAM range: [mapBase, mapBase + mapWtiles*mapHtiles*2) --
+//    exact, not conservative: gxBakeBgPlane's own blockIdx addressing
+//    (blockIdx = blockX + blockY*(mapWtiles/32)) always produces a
+//    contiguous span of whole 0x800-byte blocks starting at mapBase for
+//    every one of the four BGxCNT size selectors, so this range is a
+//    precise description of what the bake loop reads, no map-walk needed.
+//  - Affine BG char-VRAM range: [charBase, charBase + 256*64) -- affine
+//    tile indices are a full byte (0-255) into an always-8bpp (64
+//    bytes/tile) charset, so this is the exact full addressable range, not
+//    an approximation.
+//  - Affine BG map-VRAM range: [mapBase, mapBase + mapTiles*mapTiles) --
+//    exact (1 byte per map entry, contiguous, no block-splitting like text
+//    mode).
+//  - Palette: every BG plane (4bpp text, 8bpp text, and affine, which is
+//    always 8bpp) gates on the *whole* 512-byte BG palette bank rather than
+//    the tightest-possible per-map-entry sub-palette. Unlike OBJ (task 4),
+//    a sprite has one fixed OAM palNum field, so tracking its exact
+//    16-color sub-palette is free; a text BG's map has a DIFFERENT palNum
+//    per tile entry, so computing the exact set of referenced sub-palettes
+//    would require the same full map walk the char-VRAM case above already
+//    declined for the same reason (chicken-and-egg with the bake itself).
+//    512 bytes is small next to the VRAM savings already made above, so
+//    this is a deliberately simple, safe choice, not an oversight.
+//
+// HOFS/VOFS (scroll) and, for affine, PA/PB/PC/PD/reference-point are
+// intentionally NOT part of any fingerprint here -- see gx_gba_render.h and
+// task 4's identical note for OBJ's affine matrix: those are read fresh
+// every frame via UV/quad math (gxDrawBgQuad/gxDrawAffineBgQuad) and never
+// affect the baked texture's pixels, so including them would only defeat
+// the cache for ordinary scrolling/rotation without buying correctness.
+// ---------------------------------------------------------------------
+
+static bool gxBackdropNeedsRebake()
+{
+	if (!s_backdropValid)
+		return true;
+	// gxBakeBackdrop() reads exactly gxBgPalColor(0) == palette offset 0,
+	// 2 bytes (T1ReadWord(MMU.GBA_PALETTE, 0*2)).
+	return gxRangeDirty(g_gbaFramePlan.palette, 0, 2);
+}
+
+// True if s_bgPlane[bg] is stale and gxBakeBgPlane(bg) needs to run for it
+// this frame -- either its own tile/map layout changed since the last bake
+// into this slot, or its fields are unchanged but the (conservative, see
+// above) VRAM char/map ranges or the BG palette bank were written since.
+static bool gxBgPlaneNeedsRebake(int bg, const GxBgLayout &li)
+{
+	const GxBgPlaneCache &pc = s_bgPlane[bg];
+	int mapWpx = li.mapWtiles * 8, mapHpx = li.mapHtiles * 8;
+
+	bool sameConfig = pc.valid &&
+		pc.cfgCharBase == li.charBase && pc.cfgMapBase == li.mapBase &&
+		pc.cfgColorMode == li.colorMode &&
+		pc.mapWpx == (u16)mapWpx && pc.mapHpx == (u16)mapHpx;
+	if (!sameConfig)
+		return true;
+
+	u32 tileBytes = li.colorMode ? 64 : 32;
+	if (gxVramSpanDirty(li.charBase, 1024u * tileBytes))
+		return true;
+	u32 mapRangeBytes = (u32)li.mapWtiles * (u32)li.mapHtiles * 2;
+	if (gxVramSpanDirty(li.mapBase, mapRangeBytes))
+		return true;
+	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
+}
+
+// True if s_affBgPlane[which] is stale and gxBakeAffineBgPlane(which, cnt)
+// needs to run for it this frame. `which`: 0=BG2, 1=BG3.
+static bool gxAffineBgPlaneNeedsRebake(int which, u16 cnt)
+{
+	const GxAffineBgPlaneCache &pc = s_affBgPlane[which];
+	u32 charBase = ((cnt >> 2) & 3) * 0x4000;
+	u32 mapBase = ((cnt >> 8) & 0x1F) * 0x800;
+	int sizeSel = (cnt >> 14) & 3;
+	int mapTiles = 16 << sizeSel;
+	int mapPx = mapTiles * 8;
+	bool wrap = (cnt >> 13) & 1;
+
+	// pc.wrap changing also changes the baked buffer's border layout (see
+	// gxBakeAffineBgPlane), not just which VRAM bytes it depends on, so it
+	// must be part of the config fingerprint too, same as pc.mapPx.
+	bool sameConfig = pc.valid &&
+		pc.cfgCharBase == charBase && pc.cfgMapBase == mapBase &&
+		pc.mapPx == (u16)mapPx && pc.wrap == wrap;
+	if (!sameConfig)
+		return true;
+
+	if (gxVramSpanDirty(charBase, 256u * 64))
+		return true;
+	u32 mapRangeBytes = (u32)mapTiles * (u32)mapTiles;
+	if (gxVramSpanDirty(mapBase, mapRangeBytes))
+		return true;
+	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
 }
 
 // Decodes one sprite's texW x texH source pixels into a (texW+4)x(texH+4)
@@ -1315,6 +1457,12 @@ bool gxGbaRenderFrame()
 			return false;
 	}
 
+	// `dirty`: still used below to gate bitmap-mode (DISPCNT mode 3/4/5)
+	// baking -- out of this task's scope (gx-next-steps-log.md task 5 is
+	// backdrop + BG-plane precision specifically; bitmap mode keeps the
+	// coarse gate, documented in gx_gba_render.h). Backdrop and the four
+	// tiled-mode BG planes below now use their own per-target fine-grained
+	// gates instead of this aggregate.
 	bool dirty = g_gbaFramePlan.vram.anyDirty() || g_gbaFramePlan.palette.anyDirty();
 
 	gxSetup2DState();
@@ -1322,7 +1470,7 @@ bool gxGbaRenderFrame()
 	GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 	GX_SetTexCopySrc(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 
-	if (dirty)
+	if (gxBackdropNeedsRebake())
 		gxBakeBackdrop();
 	gxDrawQuad(&s_backdropTexObj, 0, 0, GBA_SCREEN_W, GBA_SCREEN_H, 0, 0, 1, 1);
 
@@ -1342,18 +1490,28 @@ bool gxGbaRenderFrame()
 	}
 
 	if (tiled) {
-		if (dirty) {
-			for (int bg = 0; bg < 4; ++bg) {
-				if (!((dispcnt >> (8 + bg)) & 1)) continue;
-				if (mode == 1 && bg == 3) continue; // mode 1 has no BG3
-				if (mode == 2 && (bg == 0 || bg == 1)) continue; // mode 2 has no BG0/BG1
-				bool affineCapable = (mode == 2) ? (bg == 2 || bg == 3) : (mode == 1 ? bg == 2 : false);
-				if (affineCapable) {
-					u16 cnt = T1ReadWord(MMU.GBA_IOREG, IO_BG0CNT + bg * 2);
+		// gx-next-steps-log.md task 5: per-BG-plane re-bake gate, replacing
+		// the old `if (dirty) { bake all 4 enabled planes }` block -- each
+		// plane is now (re)baked exactly when its own gx{,Affine}BgPlane
+		// NeedsRebake() says its tile/map layout changed or its actual
+		// dependency bytes (VRAM char/map range, BG palette bank) were
+		// written, independent of unrelated VRAM/palette writes elsewhere
+		// (e.g. another BG's tiles, or OBJ VRAM/palette) this frame. See
+		// the comment block above gxBackdropNeedsRebake() for the exact
+		// per-plane dependency-range design.
+		for (int bg = 0; bg < 4; ++bg) {
+			if (!((dispcnt >> (8 + bg)) & 1)) continue;
+			if (mode == 1 && bg == 3) continue; // mode 1 has no BG3
+			if (mode == 2 && (bg == 0 || bg == 1)) continue; // mode 2 has no BG0/BG1
+			bool affineCapable = (mode == 2) ? (bg == 2 || bg == 3) : (mode == 1 ? bg == 2 : false);
+			u16 cnt = T1ReadWord(MMU.GBA_IOREG, IO_BG0CNT + bg * 2);
+			if (affineCapable) {
+				if (gxAffineBgPlaneNeedsRebake(bg - 2, cnt))
 					gxBakeAffineBgPlane(bg - 2, cnt);
-				} else {
+			} else {
+				GxBgLayout li = gxBgLayoutFromCnt(cnt);
+				if (gxBgPlaneNeedsRebake(bg, li))
 					gxBakeBgPlane(bg);
-				}
 			}
 		}
 		for (int b = 0; b < bandCount; ++b) {
