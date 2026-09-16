@@ -18,9 +18,19 @@
 
     gxGbaRenderFrame() still returns false (CPU fallback via
     renderScanline(), untouched by this file) for anything genuinely
-    unhandled, but with modes 0-5 and both OBJ types covered, in practice
-    that's only the DISPCNT mode field's two prohibited encodings (6/7),
-    which shouldn't occur on real ROMs.
+    unhandled: the DISPCNT mode field's two prohibited encodings (6/7,
+    which shouldn't occur on real ROMs), and -- permanently, not a stub to
+    be removed later -- any frame with WIN0/WIN1/OBJ window, mosaic, or
+    BLDCNT/BLDALPHA/BLDY alpha-blend/brighten/darken active this frame
+    (g_gbaFramePlan.isHot(GXHOT_OBJWIN/GXHOT_MOSAIC/GXHOT_BLEND), checked
+    first thing in gxGbaRenderFrame() before any GX work). This GX path has
+    no window/mosaic/blend implementation of its own; those frames are left
+    entirely to the CPU reference compositor (gba_ppu.cpp's
+    renderScanline()), which does implement GBATEK-accurate window/mosaic/
+    blend semantics (see gx-next-steps-log.md, task 1). Porting the same
+    effects natively into this GX path so they no longer need the CPU-bail
+    fallback is a separate, later, purely-performance follow-up (task 2 in
+    that log) -- not started by this change.
 
     Design choices specific to this GX path (deviations/simplifications from
     an idealized Stage 1/4, documented rather than silent):

@@ -29,12 +29,12 @@
 // scroll/affine warps, palette cycling) are honored, not just the register
 // state at frame start.
 //
-// Not implemented this pass (documented simplifications, not silently
-// dropped hardware behavior): alpha blending (BLDCNT/BLDALPHA/BLDY),
-// windows (WIN0/WIN1/WINOBJ, WININ/WINOUT), mosaic (MOSAIC), and the
-// green-swap/OBJ-semi-transparent-via-alpha modes. Every enabled layer is
-// treated as fully opaque; only per-pixel transparency (palette index 0 /
-// bitmap-mode "always opaque") and BG/OBJ priority ordering are honored.
+// Implements GBATEK-accurate windows (WIN0/WIN1/OBJ window, WININ/WINOUT),
+// mosaic (MOSAIC, BG and OBJ), and color special effects (BLDCNT/BLDALPHA/
+// BLDY alpha-blend/brighten/darken, including OBJ semi-transparent mode) --
+// see gba_ppu.cpp's renderScanline()/renderObjLine()/composePixel() and
+// gx-next-steps-log.md task 1. Not implemented: the green-swap mode (a
+// stereo/debug display curiosity, not used by real content).
 
 #include "types.h"
 #include "gx/gx_frameplan.h"

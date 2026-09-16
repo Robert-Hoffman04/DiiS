@@ -67,6 +67,18 @@ static u16 s_vcount = 0;
 // implies for gx_gba_render.cpp's affine BG path too.
 static s32 s_affX[2], s_affY[2]; // index 0 = BG2, 1 = BG3, 20.8 fixed point
 
+// Per-scanline history of the above, captured (gbaPpuHDrawEnd) just before
+// that line renders -- i.e. the exact reference-point value in effect for
+// that line, before advanceAffine()'s post-render PB/PD step. Needed only
+// for affine BG mosaic's V-snap (sampleAffineBg below): mosaic replaces the
+// current line's reference point with whatever was in effect at the
+// mosaic-block-aligned line above it, which (unlike text-mode mosaic's
+// plain coordinate snap) can't be recovered from the current line's
+// accumulator value alone since it's an iterative per-line accumulation,
+// not a pure function of the line number.
+static s32 s_affXHistory[GBA_SCREEN_H][2];
+static s32 s_affYHistory[GBA_SCREEN_H][2];
+
 static void setDispstatFlags(bool vblank, bool hblank)
 {
 	u16 v = io16(IO_DISPSTAT);
@@ -261,14 +273,18 @@ static inline u32 vramAddr(u32 addr)
 	return m;
 }
 
-struct Pixel { u16 color; bool opaque; int priority; };
+struct Pixel { u16 color; bool opaque; int priority; bool semiTransparent; };
+
+// Mosaic block size from a MOSAIC-register nibble field: field value is
+// "size - 1" (GBATEK), so a raw 0 means a 1-pixel block, i.e. no snapping.
+static inline int mosaicSize(u16 mosaicReg, int shift) { return ((mosaicReg >> shift) & 0xF) + 1; }
 
 // ---------------------------------------------------------------------
 // Text-mode background (modes 0/1/2's non-affine BGs).
 // ---------------------------------------------------------------------
 static Pixel sampleTextBg(int bg, int line, int x)
 {
-	Pixel out = { 0, false, 0 };
+	Pixel out = { 0, false, 0, false };
 	u16 cnt = io16(IO_BG0CNT + bg * 2);
 	int priority   = cnt & 3;
 	u32 charBase   = ((cnt >> 2) & 3) * 0x4000;
@@ -279,11 +295,23 @@ static Pixel sampleTextBg(int bg, int line, int x)
 	static const int mapHtiles[4] = { 32, 32, 64, 64 };
 	int mapWpx = mapWtiles[sizeSel] * 8, mapHpx = mapHtiles[sizeSel] * 8;
 
+	// Mosaic (BGxCNT bit6): snap the *screen* sample coordinate down to the
+	// mosaic-cell-aligned coordinate before doing anything else -- GBATEK:
+	// "a mosaic-pixel is colorized by the color of the upperleft covered
+	// pixel". x/line are always >= 0 here so plain '%' is safe.
+	int sx = x, sline = line;
+	if ((cnt >> 6) & 1) {
+		u16 mos = io16(IO_MOSAIC);
+		int hSize = mosaicSize(mos, 0), vSize = mosaicSize(mos, 4);
+		sx = x - (x % hSize);
+		sline = line - (line % vSize);
+	}
+
 	u16 hofs = io16(IO_BG0HOFS + bg * 4) & 0x1FF;
 	u16 vofs = io16(IO_BG0HOFS + bg * 4 + 2) & 0x1FF;
 
-	int px = (x + hofs) % mapWpx;
-	int py = (line + vofs) % mapHpx;
+	int px = (sx + hofs) % mapWpx;
+	int py = (sline + vofs) % mapHpx;
 	int tx = px / 8, ty = py / 8;
 
 	// Larger maps are laid out as 32x32-tile screen blocks (0x800 bytes
@@ -350,9 +378,9 @@ static void advanceAffine(int which)
 	s_affY[which] += pd;
 }
 
-static Pixel sampleAffineBg(int bg /*2 or 3*/, int x)
+static Pixel sampleAffineBg(int bg /*2 or 3*/, int line, int x)
 {
-	Pixel out = { 0, false, 0 };
+	Pixel out = { 0, false, 0, false };
 	int which = bg - 2;
 	u16 cnt = io16(IO_BG0CNT + bg * 2);
 	int priority = cnt & 3;
@@ -367,8 +395,25 @@ static Pixel sampleAffineBg(int bg /*2 or 3*/, int x)
 	s16 pa = (s16)io16(base);
 	s16 pc = (s16)io16(base + 4);
 
-	s32 srcX = s_affX[which] + x * pa;
-	s32 srcY = s_affY[which] + x * pc;
+	// Mosaic (BGxCNT bit6): H-snap is a plain coordinate snap of the
+	// screen column fed into the affine formula; V-snap has to substitute
+	// the reference-point value that was actually in effect at the
+	// mosaic-aligned line above this one (see s_affXHistory's comment) --
+	// unlike text-mode BGs, the affine reference point is an iterative
+	// per-line accumulator, not a pure function of (line, scroll).
+	s32 originX = s_affX[which], originY = s_affY[which];
+	int sx = x;
+	if ((cnt >> 6) & 1) {
+		u16 mos = io16(IO_MOSAIC);
+		int hSize = mosaicSize(mos, 0), vSize = mosaicSize(mos, 4);
+		sx = x - (x % hSize);
+		int sline = line - (line % vSize);
+		originX = s_affXHistory[sline][which];
+		originY = s_affYHistory[sline][which];
+	}
+
+	s32 srcX = originX + sx * pa;
+	s32 srcY = originY + sx * pc;
 	int px = srcX >> 8, py = srcY >> 8;
 
 	if (wrap) {
@@ -392,16 +437,61 @@ static Pixel sampleAffineBg(int bg /*2 or 3*/, int x)
 }
 
 // ---------------------------------------------------------------------
+// Bitmap-mode BG2 (modes 3/4/5) -- the only BG that exists in those modes.
+// Same mosaic treatment as the tiled BGs above: snap the screen coordinate
+// before indexing, so a mosaic'd bitmap frame still shows blocky-but-
+// correct content rather than being silently ignored.
+// ---------------------------------------------------------------------
+static Pixel sampleBitmapBg2(int mode, u16 dispcnt, int line, int x)
+{
+	Pixel out = { 0, false, 0, false };
+	u16 cnt = io16(IO_BG2CNT);
+	out.priority = cnt & 3;
+
+	int sx = x, sline = line;
+	if ((cnt >> 6) & 1) {
+		u16 mos = io16(IO_MOSAIC);
+		int hSize = mosaicSize(mos, 0), vSize = mosaicSize(mos, 4);
+		sx = x - (x % hSize);
+		sline = line - (line % vSize);
+	}
+
+	if (mode == 3) {
+		out.color = T1ReadWord(MMU.GBA_VRAM, (sline * GBA_SCREEN_W + sx) * 2);
+		out.opaque = true;
+	} else if (mode == 4) {
+		u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
+		u8 idx = T1ReadByte(MMU.GBA_VRAM, page + sline * GBA_SCREEN_W + sx);
+		if (idx) { out.color = bgPaletteColor(idx); out.opaque = true; }
+	} else { // mode 5
+		u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
+		const int W = 160, H = 128;
+		if (sx < W && sline < H) {
+			out.color = T1ReadWord(MMU.GBA_VRAM, page + (sline * W + sx) * 2);
+			out.opaque = true;
+		}
+	}
+	return out;
+}
+
+// ---------------------------------------------------------------------
 // OBJ (sprites)
 // ---------------------------------------------------------------------
 static const u8 s_objSizeW[4][4] = { {8,16,32,64}, {16,32,32,64}, {8,8,16,32}, {0,0,0,0} };
 static const u8 s_objSizeH[4][4] = { {8,16,32,64}, {8,8,16,32}, {16,32,32,64}, {0,0,0,0} };
 
-static void renderObjLine(int line, Pixel out[GBA_SCREEN_W])
+// `winMask`, if non-null, is filled in for OBJ-window (objMode==2) entries:
+// winMask[x] is set true wherever such a sprite's sampled texel is opaque.
+// Those entries never touch `out[]` -- they mask, they don't draw (GBATEK).
+// Passing null (windows inactive this frame, or DISPCNT's OBJ-window enable
+// bit is off) makes objMode==2 entries a no-op, same as before this change.
+static void renderObjLine(int line, Pixel out[GBA_SCREEN_W], bool *winMask)
 {
 	u16 dispcnt = io16(IO_DISPCNT);
 	if (!((dispcnt >> 12) & 1)) return; // OBJ disabled
 	bool oneDim = (dispcnt >> 6) & 1;
+	u16 mosaicReg = io16(IO_MOSAIC);
+	int objMosH = mosaicSize(mosaicReg, 8), objMosV = mosaicSize(mosaicReg, 12);
 
 	for (int i = 0; i < 128; i++) {
 		u32 oamOff = i * 8;
@@ -413,7 +503,10 @@ static void renderObjLine(int line, Pixel out[GBA_SCREEN_W])
 		bool doubleOrDisable = (a0 >> 9) & 1;
 		if (!affine && doubleOrDisable) continue; // OBJ disable bit
 		int objMode = (a0 >> 10) & 3;
-		if (objMode == 2) continue; // OBJ-window entries don't draw pixels themselves
+		bool isWindowObj = (objMode == 2);
+		if (isWindowObj && !winMask) continue; // OBJ-window feature inactive this frame
+		bool semiTransparent = (objMode == 1);
+		bool mosaicOn = (a0 >> 12) & 1;
 		int shape = (a0 >> 14) & 3;
 		if (shape == 3) continue; // prohibited
 
@@ -456,20 +549,41 @@ static void renderObjLine(int line, Pixel out[GBA_SCREEN_W])
 		for (int col = 0; col < boxW; col++) {
 			int sx = x + col;
 			if (sx < 0 || sx >= GBA_SCREEN_W) continue;
-			if (out[sx].opaque && out[sx].priority <= priority) continue;
+			if (!isWindowObj && out[sx].opaque && out[sx].priority <= priority) continue;
+
+			// OBJ mosaic (attribute0 bit12): like BG mosaic, blocks are
+			// aligned to the top-left of the *screen*, not the sprite -- so
+			// snap the screen coordinate (sx, line), then re-derive which
+			// sprite-local column/row that corresponds to. A block can
+			// straddle the sprite's own edge (its top-left isn't
+			// necessarily mosaic-aligned); real hardware's exact behavior
+			// there is underdocumented, so this clamps into the sprite's
+			// own bounds rather than reading outside it -- a reasonable,
+			// documented simplification, not a guess at exact edge pixels.
+			int sampleCol = col, sampleRow = rowInBox;
+			if (mosaicOn) {
+				int snappedSx = sx - (sx % objMosH);
+				int snappedLine = line - (line % objMosV);
+				sampleCol = snappedSx - x;
+				if (sampleCol < 0) sampleCol = 0;
+				if (sampleCol >= boxW) sampleCol = boxW - 1;
+				sampleRow = snappedLine - y;
+				if (sampleRow < 0) sampleRow = 0;
+				if (sampleRow >= boxH) sampleRow = boxH - 1;
+			}
 
 			int texx, texy;
 			if (affine) {
 				s32 cx = boxW / 2, cy = boxH / 2;
-				s32 relx = col - cx, rely = rowInBox - cy;
+				s32 relx = sampleCol - cx, rely = sampleRow - cy;
 				s32 origx = (relx * pa + rely * pb) >> 8;
 				s32 origy = (relx * pc + rely * pd) >> 8;
 				texx = origx + w / 2;
 				texy = origy + h / 2;
 				if (texx < 0 || texy < 0 || texx >= w || texy >= h) continue;
 			} else {
-				texx = hflip ? (w - 1 - col) : col;
-				texy = vflip ? (h - 1 - rowInBox) : rowInBox;
+				texx = hflip ? (w - 1 - sampleCol) : sampleCol;
+				texy = vflip ? (h - 1 - sampleRow) : sampleRow;
 			}
 
 			int tileX = texx / 8, tileY = texy / 8;
@@ -490,22 +604,144 @@ static void renderObjLine(int line, Pixel out[GBA_SCREEN_W])
 			}
 
 			int colorIdx;
+			u16 color = 0;
 			if (!colorMode) {
 				u32 a = addr + suby * 4 + subx / 2;
 				u8 byte = T1ReadByte(MMU.GBA_VRAM, vramAddr(a));
 				colorIdx = (subx & 1) ? (byte >> 4) : (byte & 0xF);
 				if (colorIdx == 0) continue;
-				out[sx].color = objPaletteColor(palNum * 16 + colorIdx);
+				color = objPaletteColor(palNum * 16 + colorIdx);
 			} else {
 				u32 a = addr + suby * 8 + subx;
 				colorIdx = T1ReadByte(MMU.GBA_VRAM, vramAddr(a));
 				if (colorIdx == 0) continue;
-				out[sx].color = objPaletteColor(colorIdx);
+				color = objPaletteColor(colorIdx);
 			}
+
+			if (isWindowObj) { winMask[sx] = true; continue; }
+			out[sx].color = color;
 			out[sx].opaque = true;
 			out[sx].priority = priority;
+			out[sx].semiTransparent = semiTransparent;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------
+// Windows (WIN0/WIN1/OBJ window) + color special effects (BLDCNT/
+// BLDALPHA/BLDY). GBATEK-accurate semantics:
+//  - Precedence WIN0 > WIN1 > OBJ window > outside (GBATEK: "Window 0 is
+//    having highest priority, Window 1 medium, and Obj Window lowest
+//    priority. Outside of Window is having zero priority.").
+//  - Windows are entirely inactive (every BG/OBJ layer and effects always
+//    enabled, WININ/WINOUT ignored) unless at least one of DISPCNT's
+//    WIN0/WIN1/OBJWIN enable bits is set -- exactly gxUpdateHotFlags()'s
+//    GXHOT_OBJWIN condition, so a frame with that flag clear provably hits
+//    the plain/no-window path below.
+//  - Special effects blend the frontmost visible pixel (if it's a BLDCNT
+//    1st-target layer, or an OBJ drawn in semi-transparent mode -- which
+//    forces alpha-blend behavior for that OBJ regardless of BLDCNT's OBJ
+//    1st-target bit, per GBATEK) against the next visible layer down (for
+//    alpha blend, only if that layer is a 2nd-target; brighten/darken
+//    don't consult a 2nd layer at all -- they fade toward white/black).
+// ---------------------------------------------------------------------
+struct WindowMasks { bool bg[4]; bool obj; bool effect; };
+
+// WIN0H/WIN1H, WIN0V/WIN1V: GBATEK - "Garbage values of X2>240 (Y2>160) or
+// X1>X2 (Y1>Y2) are interpreted as X2=240 (Y2=160)."
+static inline void windowXRange(u16 winH, int &x1, int &x2)
+{
+	x1 = (winH >> 8) & 0xFF;
+	x2 = winH & 0xFF;
+	if (x2 > GBA_SCREEN_W || x1 > x2) x2 = GBA_SCREEN_W;
+}
+static inline void windowYRange(u16 winV, int &y1, int &y2)
+{
+	y1 = (winV >> 8) & 0xFF;
+	y2 = winV & 0xFF;
+	if (y2 > GBA_SCREEN_H || y1 > y2) y2 = GBA_SCREEN_H;
+}
+
+// WININ/WINOUT: bits0-3 BG0-3 enable, bit4 OBJ enable, bit5 effect enable,
+// for the low byte; WININ's high byte is WIN1's copy of the same layout,
+// WINOUT's high byte is OBJ-window's copy.
+static inline WindowMasks decodeWinByte(u16 v, int shift)
+{
+	u8 b = (u8)(v >> shift);
+	WindowMasks m;
+	for (int i = 0; i < 4; i++) m.bg[i] = (b >> i) & 1;
+	m.obj = (b >> 4) & 1;
+	m.effect = (b >> 5) & 1;
+	return m;
+}
+
+static WindowMasks getPixelWindowMasks(int x,
+	bool win0On, int w0x1, int w0x2, bool win0YIn,
+	bool win1On, int w1x1, int w1x2, bool win1YIn,
+	bool winObjOn, const bool *objWinMask, u16 winIn, u16 winOut)
+{
+	if (win0On && win0YIn && x >= w0x1 && x < w0x2) return decodeWinByte(winIn, 0);
+	if (win1On && win1YIn && x >= w1x1 && x < w1x2) return decodeWinByte(winIn, 8);
+	if (winObjOn && objWinMask && objWinMask[x]) return decodeWinByte(winOut, 8);
+	return decodeWinByte(winOut, 0);
+}
+
+static inline u16 packColor(int r, int g, int b) { return (u16)((b << 10) | (g << 5) | r); }
+static inline void unpackColor(u16 c, int &r, int &g, int &b) { r = c & 0x1F; g = (c >> 5) & 0x1F; b = (c >> 10) & 0x1F; }
+
+// BLDALPHA: "I = MIN(31, I1st*EVA + I2nd*EVB)" per-channel, EVA/EVB in 16ths.
+static u16 blendAlpha(u16 c1, u16 c2, int eva, int evb)
+{
+	int r1, g1, b1, r2, g2, b2;
+	unpackColor(c1, r1, g1, b1);
+	unpackColor(c2, r2, g2, b2);
+	int r = (r1 * eva + r2 * evb) / 16; if (r > 31) r = 31;
+	int g = (g1 * eva + g2 * evb) / 16; if (g > 31) g = 31;
+	int b = (b1 * eva + b2 * evb) / 16; if (b > 31) b = 31;
+	return packColor(r, g, b);
+}
+// BLDY: brighten "I = I1st + (31-I1st)*EVY", darken "I = I1st - I1st*EVY".
+static u16 blendFade(u16 c, int evy, bool toWhite)
+{
+	int r, g, b;
+	unpackColor(c, r, g, b);
+	if (toWhite) { r += ((31 - r) * evy) / 16; g += ((31 - g) * evy) / 16; b += ((31 - b) * evy) / 16; }
+	else         { r -= (r * evy) / 16;        g -= (g * evy) / 16;        b -= (b * evy) / 16; }
+	if (r < 0) r = 0;
+	if (r > 31) r = 31;
+	if (g < 0) g = 0;
+	if (g > 31) g = 31;
+	if (b < 0) b = 0;
+	if (b > 31) b = 31;
+	return packColor(r, g, b);
+}
+
+// Layer bit indices, matching BLDCNT's target1/target2 field layout:
+// BG0=0, BG1=1, BG2=2, BG3=3, OBJ=4, backdrop=5.
+struct Layer { u16 color; int priority; int bit; bool isObj; bool semiTransparent; };
+
+// Composes the final color for one pixel from its front-to-back visible
+// layer list (list[0] is frontmost; callers only push layers that already
+// passed that pixel's window BG/OBJ enable check) plus this frame's blend
+// config. `count` is always >= 1 -- every caller pushes the backdrop last.
+static u16 composePixel(const Layer *list, int count, bool effectEnabled, int effect,
+                         int target1, int target2, int eva, int evb, int evy)
+{
+	const Layer &top = list[0];
+	if (!effectEnabled || effect == 0) return top.color;
+	bool bldTarget1 = (target1 >> top.bit) & 1;
+	if (effect == 1) { // alpha blend
+		bool forced = top.isObj && top.semiTransparent; // GBATEK: semi-transparent OBJ acts as 1st target regardless of BLDCNT's OBJ bit
+		if (!(bldTarget1 || forced) || count < 2) return top.color;
+		const Layer &sec = list[1];
+		if (!((target2 >> sec.bit) & 1)) return top.color; // no valid 2nd target below -> draws normally
+		return blendAlpha(top.color, sec.color, eva, evb);
+	}
+	// effect 2 = brighten, 3 = darken -- top layer only, no 2nd-target
+	// lookup, and semi-transparent OBJ status does NOT force these (only
+	// alpha-blend gets that GBATEK special case).
+	if (!bldTarget1) return top.color;
+	return blendFade(top.color, evy, effect == 2);
 }
 
 // ---------------------------------------------------------------------
@@ -524,76 +760,100 @@ static void renderScanline(int line)
 
 	int mode = dispcnt & 7;
 	u16 backdrop = bgPaletteColor(0);
-	for (int x = 0; x < GBA_SCREEN_W; x++) dst[x] = backdrop;
+
+	bool win0Dc = (dispcnt >> 13) & 1, win1Dc = (dispcnt >> 14) & 1, winObjDc = (dispcnt >> 15) & 1;
+	bool windowsActive = win0Dc || win1Dc || winObjDc; // == GXHOT_OBJWIN's condition
+
+	int w0x1 = 0, w0x2 = GBA_SCREEN_W, w1x1 = 0, w1x2 = GBA_SCREEN_W;
+	bool win0YIn = false, win1YIn = false;
+	u16 winIn = 0, winOut = 0;
+	if (windowsActive) {
+		windowXRange(io16(IO_WIN0H), w0x1, w0x2);
+		windowXRange(io16(IO_WIN1H), w1x1, w1x2);
+		int y1, y2;
+		windowYRange(io16(IO_WIN0V), y1, y2); win0YIn = win0Dc && line >= y1 && line < y2;
+		windowYRange(io16(IO_WIN1V), y1, y2); win1YIn = win1Dc && line >= y1 && line < y2;
+		winIn = io16(IO_WININ);
+		winOut = io16(IO_WINOUT);
+	}
+
+	bool haveObjWinMask = windowsActive && winObjDc;
+	bool objWinMaskArr[GBA_SCREEN_W];
+	if (haveObjWinMask) memset(objWinMaskArr, 0, sizeof(objWinMaskArr));
 
 	Pixel obj[GBA_SCREEN_W];
-	for (int x = 0; x < GBA_SCREEN_W; x++) obj[x] = Pixel{ 0, false, 0 };
-	renderObjLine(line, obj);
+	for (int x = 0; x < GBA_SCREEN_W; x++) obj[x] = Pixel{ 0, false, 0, false };
+	renderObjLine(line, obj, haveObjWinMask ? objWinMaskArr : nullptr);
 
-	if (mode == 3) {
-		bool bg2on = (dispcnt >> 10) & 1;
-		for (int x = 0; x < GBA_SCREEN_W; x++) {
-			u16 c = backdrop;
-			bool haveBg = false;
-			if (bg2on) { c = T1ReadWord(MMU.GBA_VRAM, (line * GBA_SCREEN_W + x) * 2); haveBg = true; }
-			int bgPriority = io16(IO_BG2CNT) & 3;
-			if (obj[x].opaque && (!haveBg || obj[x].priority <= bgPriority)) c = obj[x].color;
-			dst[x] = c;
+	u16 bldcnt = io16(IO_BLDCNT);
+	int effect = (bldcnt >> 6) & 3;
+	int target1 = bldcnt & 0x3F, target2 = (bldcnt >> 8) & 0x3F;
+	u16 bldalpha = io16(IO_BLDALPHA);
+	int eva = bldalpha & 0x1F; if (eva > 16) eva = 16;
+	int evb = (bldalpha >> 8) & 0x1F; if (evb > 16) evb = 16;
+	int evy = io16(IO_BLDY) & 0x1F; if (evy > 16) evy = 16;
+
+	// Per-BG sample cache: filled for whichever BGs this mode actually has
+	// active, using the bitmap sampler for modes 3-5's single BG2 layer and
+	// the tiled/affine samplers for modes 0-2 -- this lets the priority-
+	// sorted composite loop below treat every mode identically instead of
+	// special-casing bitmap modes as a separate, narrower path (which is
+	// how this looked before window/blend support: three near-duplicate
+	// mode3/4/5 blocks each re-deriving the same obj-vs-bg priority rule).
+	static Pixel bgLine[4][GBA_SCREEN_W];
+	bool bgActive[4] = { false, false, false, false };
+	for (int bg = 0; bg < 4; bg++) {
+		bool active;
+		if (mode >= 3) {
+			active = (bg == 2) && ((dispcnt >> 10) & 1);
+		} else {
+			active = (dispcnt >> (8 + bg)) & 1;
+			if (mode == 1 && bg == 3) active = false; // mode 1 has no BG3
+			if (mode == 2 && (bg == 0 || bg == 1)) active = false; // mode 2 has no BG0/BG1
 		}
-		return;
-	}
-	if (mode == 4) {
-		bool bg2on = (dispcnt >> 10) & 1;
-		u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
-		for (int x = 0; x < GBA_SCREEN_W; x++) {
-			u16 c = backdrop;
-			bool haveBg = false;
-			if (bg2on) {
-				u8 idx = T1ReadByte(MMU.GBA_VRAM, page + line * GBA_SCREEN_W + x);
-				if (idx) { c = bgPaletteColor(idx); haveBg = true; }
-			}
-			int bgPriority = io16(IO_BG2CNT) & 3;
-			if (obj[x].opaque && (!haveBg || obj[x].priority <= bgPriority)) c = obj[x].color;
-			dst[x] = c;
+		bgActive[bg] = active;
+		if (!active) continue;
+		if (mode >= 3) {
+			for (int x = 0; x < GBA_SCREEN_W; x++) bgLine[bg][x] = sampleBitmapBg2(mode, dispcnt, line, x);
+		} else {
+			bool affineCapable = (mode == 2) ? (bg == 2 || bg == 3) : (mode == 1 ? bg == 2 : false);
+			for (int x = 0; x < GBA_SCREEN_W; x++)
+				bgLine[bg][x] = affineCapable ? sampleAffineBg(bg, line, x) : sampleTextBg(bg, line, x);
 		}
-		return;
-	}
-	if (mode == 5) {
-		bool bg2on = (dispcnt >> 10) & 1;
-		u32 page = ((dispcnt >> 4) & 1) ? 0xA000 : 0;
-		const int W = 160, H = 128;
-		for (int x = 0; x < GBA_SCREEN_W; x++) {
-			u16 c = backdrop;
-			bool haveBg = false;
-			if (bg2on && x < W && line < H) {
-				c = T1ReadWord(MMU.GBA_VRAM, page + (line * W + x) * 2);
-				haveBg = true;
-			}
-			int bgPriority = io16(IO_BG2CNT) & 3;
-			if (obj[x].opaque && (!haveBg || obj[x].priority <= bgPriority)) c = obj[x].color;
-			dst[x] = c;
-		}
-		return;
 	}
 
-	// Modes 0/1/2: tiled BGs, composited back-to-front by priority
-	// (3 = furthest back, 0 = frontmost); OBJ of a given priority draws
-	// over BG of the same priority.
-	for (int prio = 3; prio >= 0; prio--) {
-		for (int bg = 3; bg >= 0; bg--) {
-			if (!((dispcnt >> (8 + bg)) & 1)) continue;
-			bool bgIsAffineCapable = (mode == 2) ? (bg == 2 || bg == 3) : (mode == 1 ? bg == 2 : false);
-			if (mode == 1 && bg == 3) continue; // mode 1 has no BG3
-			if (mode == 2 && (bg == 0 || bg == 1)) continue; // mode 2 has no BG0/BG1
-			u16 cnt = io16(IO_BG0CNT + bg * 2);
-			if ((cnt & 3) != prio) continue;
-			for (int x = 0; x < GBA_SCREEN_W; x++) {
-				Pixel p = bgIsAffineCapable ? sampleAffineBg(bg, x) : sampleTextBg(bg, line, x);
-				if (p.opaque) dst[x] = p.color;
+	// Composite: for each pixel, build the front-to-back visible layer
+	// list (OBJ then BG0..BG3 within each priority tier, matching the
+	// original last-write-wins draw order this replaces -- OBJ wins ties
+	// against a same-priority BG, and lower-indexed BGs win ties against
+	// higher-indexed ones), append the backdrop as the always-present
+	// bottom layer, then resolve special effects against the top 1-2.
+	for (int x = 0; x < GBA_SCREEN_W; x++) {
+		WindowMasks wm;
+		if (!windowsActive) {
+			wm.bg[0] = wm.bg[1] = wm.bg[2] = wm.bg[3] = true;
+			wm.obj = true;
+			wm.effect = true;
+		} else {
+			wm = getPixelWindowMasks(x, win0Dc, w0x1, w0x2, win0YIn, win1Dc, w1x1, w1x2, win1YIn,
+			                          winObjDc, haveObjWinMask ? objWinMaskArr : nullptr, winIn, winOut);
+		}
+
+		Layer list[6];
+		int n = 0;
+		for (int prio = 0; prio <= 3; prio++) {
+			if (wm.obj && obj[x].opaque && obj[x].priority == prio)
+				list[n++] = Layer{ obj[x].color, prio, 4, true, obj[x].semiTransparent };
+			for (int bg = 0; bg < 4; bg++) {
+				if (!bgActive[bg] || !wm.bg[bg]) continue;
+				const Pixel &p = bgLine[bg][x];
+				if (p.opaque && p.priority == prio)
+					list[n++] = Layer{ p.color, prio, bg, false, false };
 			}
 		}
-		for (int x = 0; x < GBA_SCREEN_W; x++)
-			if (obj[x].opaque && obj[x].priority == prio) dst[x] = obj[x].color;
+		list[n++] = Layer{ backdrop, 4, 5, false, false };
+
+		dst[x] = composePixel(list, n, wm.effect, effect, target1, target2, eva, evb, evy);
 	}
 }
 
@@ -604,7 +864,18 @@ void gbaPpuBeginFrame()
 {
 	latchAffine(0);
 	latchAffine(1);
-	g_gbaFramePlan.beginFrame();
+	g_gbaFramePlan.beginFrame(); // clears all hot flags to false
+	// Re-derive the hot flags from the register state already in effect at
+	// frame start, rather than leaving them false until (if ever) a layout
+	// register happens to be rewritten this frame. gxOnRegisterWritten()
+	// alone only *updates* the flags on a write; without this, a frame with
+	// no window/mosaic/blend register writes at all -- the common case
+	// once a game has set them up and stops touching them -- would report
+	// every hot flag false regardless of whether the feature is still
+	// genuinely active, silently letting gxGbaRenderFrame() render (and
+	// get it wrong) instead of bailing to the CPU compositor. Mid-frame
+	// toggles are still caught live by gxOnRegisterWritten()'s own call.
+	gxUpdateHotFlags();
 	gxSnapshotBandRegs(&g_gbaBandRegs[0]);
 }
 
@@ -642,6 +913,14 @@ void gbaPpuHDrawEnd(int line)
 	// PZ_OTHER by default, which is what made an early perf-zones capture of
 	// Minish Cap misleadingly show ~95% "other" instead of naming this as
 	// the actual cost.
+	// Capture this line's affine reference point before it renders (and
+	// before advanceAffine() below moves it on to the next line) -- see
+	// s_affXHistory's comment: affine BG mosaic needs to look this back up
+	// for whatever earlier line a mosaic block aligns to.
+	if (line >= 0 && line < GBA_SCREEN_H) {
+		s_affXHistory[line][0] = s_affX[0]; s_affXHistory[line][1] = s_affX[1];
+		s_affYHistory[line][0] = s_affY[0]; s_affYHistory[line][1] = s_affY[1];
+	}
 	{
 		PZ_SCOPE(PZ_GPU_2D);
 		renderScanline(line);

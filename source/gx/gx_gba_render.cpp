@@ -688,6 +688,17 @@ bool gxGbaRenderFrame()
 	if (!s_initDone)
 		return false;
 
+	// Permanent bail, not a temporary stub (see gx_gba_render.h's header
+	// comment): this GX path has no window/mosaic/blend implementation of
+	// its own, so any frame with one of those subsystems active this frame
+	// (per g_gbaFramePlan's Stage 0 hot-feature classification, gba_ppu.
+	// cpp's gxUpdateHotFlags()) is left entirely to the CPU reference
+	// compositor (renderScanline(), gba_ppu.cpp), which does implement
+	// them correctly. Checked before any GX work starts so a hot frame
+	// costs nothing here beyond these three flag reads.
+	if (g_gbaFramePlan.isHot(GXHOT_OBJWIN) || g_gbaFramePlan.isHot(GXHOT_MOSAIC) || g_gbaFramePlan.isHot(GXHOT_BLEND))
+		return false;
+
 	u16 dispcnt = T1ReadWord(MMU.GBA_IOREG, IO_DISPCNT);
 	int mode = dispcnt & 7;
 	if (mode > 5)

@@ -31,5 +31,6 @@ build_one irqsoak       "IRQSOAK"    "AIRQ"
 build_one dsound        "DSOUND"     "ADSN"
 build_one waitcnt       "WAITCNT"    "AWAI"
 build_one dmavcap       "DMAVCAP"    "ADVC"
+build_one windowcheck   "WINCHECK"   "AWIN"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba"
