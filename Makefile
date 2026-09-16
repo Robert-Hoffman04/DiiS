@@ -19,7 +19,7 @@ TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source source/metaspu \
 				source/addons source/utils source/gekko_utils \
-				source/jit source/harness
+				source/jit source/harness source/gx
 DATA		:=	data  
 INCLUDES	:=
 
@@ -36,7 +36,7 @@ INCLUDES	:=
 OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations -flto=auto -funroll-loops
 
 # TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
-#   make TESTDEFS="-DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM"
+#   make TESTDEFS="-DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM"
 # to skip the on-screen device/renderer picker and file browser and boot
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 
