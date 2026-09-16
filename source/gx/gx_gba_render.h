@@ -144,7 +144,52 @@
        GX_CopyTex) rather than presenting the EFB directly -- Stage 7 (final
        present) hasn't landed yet, so this keeps the existing harness/present
        code (which expects GBA_screen as a plain RGB565-family buffer)
-       working unchanged. Goes away once Stage 7 lands.
+       working unchanged.
+
+       gx-next-steps-log.md task 3 narrowed, rather than removed, this gap:
+       a genuinely direct EFB->XFB present (skipping GBA_screen entirely)
+       was ruled out as unsafe for this task -- gxGbaRenderFrame() runs on
+       the emulation thread (called from gbaPpuEndFrame(), itself called
+       from DSExec()), while the actual EFB->XFB copy (GX_CopyDisp) and the
+       cursor/FPS overlay draws happen on main.cpp's separate draw_thread
+       LWP, synchronized only at frame granularity via vidmutex. Two
+       independently-configured GX state setups (this file's
+       gxSetup2DState() vs. draw_thread's own matrix/TEV/Z state) would
+       have to agree on EFB ownership and draw ordering with the cursor/FPS
+       overlay layered on top, entirely across that thread boundary, to
+       make a same-EFB same-copy scheme safe -- judged too large a
+       restructuring (a real frame-boundary handshake between the
+       emulation thread and draw_thread doesn't exist today) to fold into
+       this task safely. See "Future follow-up" below.
+
+       What task 3 *did* land, still GBA_screen/GPU_screen-preserving (so
+       harness_frame.cpp capture and GPU_screen-based savestate blobs are
+       unaffected) but removing the double-conversion penalty from the
+       actual on-screen present: gxGbaRenderFrame() keeps this frame's
+       still-swizzled RGB5A3 GX_CopyTex output around
+       (gxGbaBlitNativeTop()); main.cpp's Draw() uses that directly for the
+       top-screen present via a block-aligned memcpy instead of re-driving
+       it through GBA_screen's BGR555 downconvert + Draw()'s own
+       RGB15_REVERSE per-pixel reconversion back up to RGB5A3. GBA_screen
+       and GPU_screen are still populated exactly as before, unconditionally,
+       every frame -- this is strictly additive, not a replacement of that
+       path. See gxGbaBlitNativeTop()'s own comment below and
+       gx-next-steps-log.md's task 3 section for the full reasoning,
+       including why draw_thread and Draw() being already serialized by
+       vidmutex is what makes even this narrower change safe.
+
+       Future follow-up (not started): give draw_thread and the emulation
+       thread a real per-frame handshake (e.g. draw_thread waits on a
+       frame-ready condvar/semaphore posted at the end of
+       gbaPpuEndFrame()/GPU_RenderLine(), instead of the current
+       free-running "draw_thread renders whatever's currently in
+       TopScreen/BottomScreen, whenever vidmutex is free" model) so that a
+       true direct-EFB present (this file draws straight into the frame
+       draw_thread is about to copy out, cursor/FPS overlay drawn on top of
+       it in the same pass, no separate GX_CopyTex/CPU round trip at all)
+       becomes safe to build. That's a cross-cutting change to main.cpp's
+       threading model, not scoped to this file, and affects DS-mode
+       present too -- a separate task.
 
     GX-only (libogc), like gx_mask.* -- verified by cross-compilation only,
     not a host-side unit test.
@@ -203,5 +248,29 @@ void gxGbaRenderShutdown();
 // isn't handled yet, in which case GBA_screen is left untouched and the
 // caller must run its CPU fallback for the whole frame.
 bool gxGbaRenderFrame();
+
+// gx-next-steps-log.md task 3 (Stage 7 partial present win): when the most
+// recent gxGbaRenderFrame() call rendered this frame via the real GX
+// draw+GX_CopyTex path (not a CPU-bail return, and not the forced-blank
+// early return -- see gxGbaRenderFrame()'s header comment), that call's
+// GX_CopyTex output is still sitting in this file's internal scratch
+// buffer, already in RGB5A3-swizzled (4x4 texel block) form -- the exact
+// format a GX texture object needs, no per-pixel conversion required.
+//
+// dst256x192Rgb5a3 must point at a 256*192 u16 buffer already holding a
+// GX_TF_RGB5A3-swizzled, cleared/transparent (all-zero) border -- this
+// function only ever overwrites the top-left [0,240)x[0,160) texel region
+// (block-row-aligned memcpy, 4-texel-aligned since GBA_SCREEN_W/H are both
+// multiples of 4) to match the same top-left placement
+// gbaPpuEndFrame()'s GPU_screen blit already uses, leaving the right
+// 16-texel and bottom 32-texel border untouched. Caller (main.cpp's
+// InitVideo/Draw()) is responsible for that one-time clear; this function
+// never clears anything itself, so it stays a cheap block memcpy with no
+// per-frame memset.
+//
+// Returns false (does nothing to dst) if the last gxGbaRenderFrame() call
+// did not render natively this frame -- caller must fall back to its
+// regular GPU_screen-based top-screen conversion in that case.
+bool gxGbaBlitNativeTop(void *dst256x192Rgb5a3);
 
 #endif // GX_GBA_RENDER_H

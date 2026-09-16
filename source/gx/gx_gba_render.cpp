@@ -316,6 +316,16 @@ static void gxUploadEffectTex(const u16 *linear, int w, int h, u8 wrapMode)
 static void *s_copyBackBuf;
 static u16 *s_copyBackLinear;
 
+// gx-next-steps-log.md task 3: true only while s_copyBackBuf holds *this*
+// frame's real GX_CopyTex output (the actual draw+copy path just below,
+// not the forced-blank or CPU-bail early returns in gxGbaRenderFrame()) --
+// set true right before that function's final `return true`, and false at
+// its very first line every call, so every other return path (there are
+// several bail points) leaves it false with no need to touch each one.
+// Consumed by gxGbaBlitNativeTop(), main.cpp's Draw() direct-present fast
+// path -- see that function's comment and gx_gba_render.h's header.
+static bool s_lastFrameNative = false;
+
 static bool s_initDone = false;
 
 bool gxGbaRenderInit()
@@ -1102,6 +1112,12 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 
 bool gxGbaRenderFrame()
 {
+	// See s_lastFrameNative's comment: reset unconditionally here, only
+	// set true right before the real draw path's final `return true` below,
+	// so every bail (including the forced-blank early return, which never
+	// touches s_copyBackBuf) leaves it correctly false.
+	s_lastFrameNative = false;
+
 	if (!s_initDone)
 		return false;
 
@@ -1253,5 +1269,43 @@ bool gxGbaRenderFrame()
 	for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i)
 		GBA_screen[i] = gxRgb5a3ToGbaBgr555(s_copyBackLinear[i]);
 
+	// s_copyBackBuf (still RGB5A3-swizzled, pre-unswizzle) stays valid for
+	// gxGbaBlitNativeTop() until the next gxGbaRenderFrame() call overwrites
+	// it next frame -- main.cpp's Draw() (same thread, called immediately
+	// after gbaPpuEndFrame() within DSExec()) consumes it before that
+	// happens, so there's no lifetime hazard here.
+	s_lastFrameNative = true;
+
+	return true;
+}
+
+bool gxGbaBlitNativeTop(void *dst256x192Rgb5a3)
+{
+	if (!s_lastFrameNative || !s_copyBackBuf)
+		return false;
+
+	// Block-row memcpy, not a per-pixel loop: both GBA_SCREEN_W (240) and
+	// GBA_SCREEN_H (160) are multiples of the RGB5A3 block shape (4x4), so
+	// each 4x4 texel block is self-contained in both the 240-wide source
+	// and 256-wide destination block-tiled layouts (gx_swizzle.cpp's
+	// gxBlockAddress: blockIndex = blockY*(width/blockW) + blockX, blocks
+	// stored contiguously within a block-row) -- copying whole block-rows
+	// reproduces the swizzled data exactly with no unswizzle/reswizzle
+	// needed. Destination block-columns 60-63 (texels 240-255) and
+	// block-rows 40-47 (texels 160-191) are never written here, by design
+	// -- see this function's header comment.
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+	const int bytesPerBlock = blk.texelsWide * blk.texelsTall * (int)sizeof(u16);
+	const int blocksPerRowSrc = GBA_SCREEN_W / blk.texelsWide;
+	const int blocksPerRowDst = 256 / blk.texelsWide;
+	const int blockRows = GBA_SCREEN_H / blk.texelsTall;
+	const u8 *src = (const u8 *)s_copyBackBuf;
+	u8 *dst = (u8 *)dst256x192Rgb5a3;
+	const size_t rowBytes = (size_t)blocksPerRowSrc * bytesPerBlock;
+	for (int by = 0; by < blockRows; ++by) {
+		memcpy(dst + (size_t)by * blocksPerRowDst * bytesPerBlock,
+		       src + (size_t)by * rowBytes,
+		       rowBytes);
+	}
 	return true;
 }

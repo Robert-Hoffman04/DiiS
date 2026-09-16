@@ -46,6 +46,7 @@
 #include "perf_zones.h"
 #include "fps_overlay.h"
 #include "harness/harness.h"
+#include "gx/gx_gba_render.h"
 
 #ifdef DESMUME_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
@@ -141,9 +142,33 @@ static u8 gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 static u16 TopScreen[256*192] __attribute__((aligned(32)));
 static u16 BottomScreen[256*192] __attribute__((aligned(32)));
 
+// gx-next-steps-log.md task 3: direct-present fast path for GBA mode. Same
+// 256x192 RGB5A3-swizzled layout as TopScreen/TopTex (so it drops straight
+// into draw_thread's existing top-screen quad with no geometry changes),
+// but its top-left [0,240)x[0,160) region is filled by a block-aligned
+// memcpy straight out of gx_gba_render.cpp's own GX_CopyTex output
+// (gxGbaBlitNativeTop()) instead of Draw()'s normal GPU_screen-sourced
+// per-pixel RGB15_REVERSE conversion -- see Draw()'s and draw_thread's own
+// comments below, and gx_gba_render.h's header comment, for the full
+// reasoning. The border (right 16 / bottom 32 texels) is cleared once in
+// init() and never touched again, matching TopScreen's own border which is
+// likewise only ever cleared once and never repainted in GBA mode.
+static u16 GbaTopScreen[256*192] __attribute__((aligned(32)));
+
 static GXTexObj TopTex;
 static GXTexObj BottomTex;
 static GXTexObj CursorTex;
+static GXTexObj GbaTopTex;
+
+// Set by Draw() (under vidmutex) each frame that GBA mode's GX path
+// rendered natively this frame -- i.e. GbaTopScreen (not TopScreen) holds
+// the current top-screen content and draw_thread should bind GbaTopTex
+// instead of TopTex. Read by draw_thread under the same vidmutex critical
+// section it already uses for its whole per-frame draw, so this is exactly
+// as safe as TopScreen/BottomScreen's existing cross-thread protection --
+// no new lock, no new race, just one more mutex-protected word alongside
+// data that mutex was already guarding.
+static bool GbaUseDirectTopTex = false;
 
 // TODO: Make this fancier
 static u16 CursorData[16] __attribute__((aligned(32))) = {
@@ -552,9 +577,15 @@ void init(){
 	GX_InitTexObj(&TopTex, TopScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObj(&BottomTex, BottomScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObj(&CursorTex, CursorData, 4, 4, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&GbaTopTex, GbaTopScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 
 	memset(TopScreen, 0, 256*192*sizeof(*TopScreen));
 	memset(BottomScreen, 0, 256*192*sizeof(*BottomScreen));
+	// gx-next-steps-log.md task 3: cleared once, here, and never touched
+	// again outside the top-left [0,240)x[0,160) region gxGbaBlitNativeTop()
+	// overwrites each frame -- see GbaTopScreen's own comment above.
+	memset(GbaTopScreen, 0, sizeof(GbaTopScreen));
+	DCFlushRange(GbaTopScreen, sizeof(GbaTopScreen));
 
 	if (vidmutex == LWP_MUTEX_NULL)
 		LWP_MutexInit(&vidmutex, false);
@@ -570,32 +601,61 @@ static void Draw(void) {
 	// convert to 4x4 textels for GX
 	u16 *sTop = (u16*)&GPU_screen;
 	u16 *sBottom = sTop+256*192;
-	u16 *dTop = TopScreen;
 	u16 *dBottom = BottomScreen;
 	LWP_MutexLock(vidmutex);
 
 	{ PZ_SCOPE(PZ_DRAW_CONVERT);
+
+	// gx-next-steps-log.md task 3: GBA-mode direct-present fast path.
+	// gxGbaRenderFrame() already ran this frame (called from
+	// gbaPpuEndFrame(), itself called from DSExec() on this same thread,
+	// strictly before Draw() -- see NDSSystem.cpp's gbaExecFrame() call
+	// site). If it rendered natively, its GX_CopyTex output is still
+	// sitting in gx_gba_render.cpp's scratch buffer, already in the exact
+	// RGB5A3-swizzled layout GbaTopTex needs -- gxGbaBlitNativeTop() block-
+	// copies it straight into GbaTopScreen (no per-pixel unswizzle/
+	// reconvert), which replaces the entire top-screen conversion loop
+	// below for this frame. GPU_screen/GBA_screen are still populated
+	// exactly as before by gbaPpuEndFrame() regardless of this flag, so
+	// harness_frame.cpp capture and GPU_screen-based savestate blobs are
+	// completely unaffected -- this only changes which buffer supplies the
+	// on-screen top-screen texture. draw_thread reads this same
+	// vidmutex-protected flag to choose GbaTopTex over TopTex.
+	GbaUseDirectTopTex = gameInfo.isGBA && gxGbaBlitNativeTop(GbaTopScreen);
+
+	if (!GbaUseDirectTopTex) {
+		u16 *dTop = TopScreen;
+		for (int y = 0; y < 48; y++) {
+			for (int h = 0; h < 4; h++) {
+				for (int x = 0; x < 64; x++) {
+					for (int w = 0; w < 4; w++)
+						*dTop++ = RGB15_REVERSE(sTop[w]);
+					dTop+=12;     // next tile
+					sTop+=4;
+				}
+				dTop-=1020;     // next line
+			}
+			dTop+=1008;       // next row
+		}
+		DCFlushRange(TopScreen, 256*192*2);
+	}
+
 	for (int y = 0; y < 48; y++) {
 		for (int h = 0; h < 4; h++) {
 			for (int x = 0; x < 64; x++) {
-				for (int w = 0; w < 4; w++) {
-					*dTop++ = RGB15_REVERSE(sTop[w]);
+				for (int w = 0; w < 4; w++)
 					*dBottom++ = RGB15_REVERSE(sBottom[w]);
-				}
-				dTop+=12;     // next tile
-				dBottom+=12;
-				sTop+=4;
+				dBottom+=12;     // next tile
 				sBottom+=4;
 			}
-			dTop-=1020;     // next line
-			dBottom-=1020;
+			dBottom-=1020;     // next line
 		}
-		dTop+=1008;       // next row
-		dBottom+=1008;
+		dBottom+=1008;       // next row
 	}
-
-	DCFlushRange(TopScreen, 256*192*2);
 	DCFlushRange(BottomScreen, 256*192*2);
+
+	if (GbaUseDirectTopTex)
+		DCFlushRange(GbaTopScreen, 256*192*2);
 	} // PZ_DRAW_CONVERT
 
 	LWP_MutexUnlock(vidmutex);
@@ -720,7 +780,12 @@ static void *draw_thread(void*){
 		// TOP SCREEN
 		if ((screen_layout != SCREEN_SUB_NORMAL) && (screen_layout != SCREEN_SUB_STRETCH)){
 			GXDBG_MAIN("draw_thread: top screen quad start");
-			GX_LoadTexObj(&TopTex, GX_TEXMAP0);
+			// gx-next-steps-log.md task 3: GbaUseDirectTopTex was set by
+			// Draw() under this same vidmutex critical section, strictly
+			// before draw_thread could observe it (Draw() runs on the
+			// emulation thread and always unlocks vidmutex before
+			// draw_thread's next lock can succeed) -- see Draw()'s comment.
+			GX_LoadTexObj(GbaUseDirectTopTex ? &GbaTopTex : &TopTex, GX_TEXMAP0);
 			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 				GX_Position2f32(topX, topY);
 				GX_TexCoord2f32(0, 0);
