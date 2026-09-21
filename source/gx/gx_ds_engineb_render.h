@@ -379,6 +379,14 @@
        the final frame's data applied to the whole frame. This is an
        inherited simplification of the GBA slice's design, not a new one,
        and is documented here rather than assumed away.
+       **Task 13j update:** a VRAM / palette / OAM write this engine can SEE
+       (its BG/OBJ VRAM windows and extended-palette slots, its half of
+       palette RAM / OAM) that lands while a visible frame is in flight now
+       makes the frame bail (`midframewrite`) instead of engaging with
+       frame-final data, so the CPU compositor (which saw the write from
+       the next line on) is the answer: the transient bad frames that limitation
+       used to produce are gone, at the price of the frames that really write
+       mid-frame no longer engaging. Test hook -DDSLZ_NODATABAIL restores the old behaviour.
      - **Per-band replay covers the layout registers Stage 4 actually
        consumes** -- per-BG enable, per-BG priority, per-BG type, per-BG
        HOFS/VOFS (text) or reference point + PA..PD (affine), OBJ
@@ -392,6 +400,35 @@
        switch, ...) is detected by the same
        per-scanline hook and bails the whole frame, so it degrades to the
        CPU compositor rather than rendering something wrong.
+     - **Task 13j (skip the CPU compositor on engaged frames): DEFERRED CPU
+       LINES.** GPU_RenderLine() no longer runs at each line's hblank for a
+       frame that might be GX's. gxDsEngine{A,B}Scanline() returns true when
+       it defers the line (NDSSystem.cpp then skips the call). The deferred
+       lines [rendered, seen) are rendered late by the CPU only if (a) a write
+       that could change what they render is about to land (BARRIER: any write
+       to this engine's registers, its palette/OAM half, a VRAM page it can
+       see, a VRAMCNT / POWCNT1 remap -- MMU.cpp's ARM9 write funnel calls
+       gxDsLazyIoWriteSlow / gxDsMarkWrite / gxDsMarkVram BEFORE the write
+       lands), (b) the per-line trace latches an out-of-scope state (the rest
+       of the frame is then eager, exactly as before), or (c) the frame-end GX
+       pass bails. Between two barriers no state the CPU pass reads changes,
+       so a late render is byte-identical to an on-time one. If GX handles
+       the frame the pending lines are never rendered and
+       GPU_DiscardDeferredLines() (GPU.cpp) replays the persistent side
+       effects of a CPU line pass (affine reference-point latch + advance,
+       the `blend1`/`currBgNum` leftovers the CPU's stale-state windowed
+       backdrop path reads on the next CPU frame, disp FIFO reset,
+       currLine). Lines the CPU pass cannot be skipped for stay eager: MOSAIC
+       register != 0 (per-pixel state carried across lines and frames) and a
+       saturated MASTER_BRIGHT (GPU_RenderLine skips the render, and its
+       parms advance). Engine A / B are independent (their own pending sets
+       and visibility maps). Measured on SM64DS: zero barriers per frame,
+       so engaged frames cost no CPU compositor time at all
+       (gx-next-steps-log.md task 13j). Test hooks: -DDS2D_NOLAZY (pre-13j
+       eager behaviour), -DDSLZ_FORCE_LAZY (with -DDSA/DSB_FORCE_CPU: defer
+       every frame and always flush -- a pure replay-exactness build),
+       -DDSLZ_STATS, -DDSLZ_FRAMECRC (per-frame output hash),
+       -DDSLZ_MUTATE_NOBARRIER / -DDSLZ_MUTATE_IGNOREOOS (mutation checks).
      - **Sub-screen-only.** Stage 6 ("Engine B + display composition") is
        not addressed here: Engine B's finished frame is written back into
        GPU_screen at SubScreen.offset in the same native X-B5-G5-R5 layout
@@ -478,7 +515,11 @@ void gxDsEngineBRenderShutdown();
 // it changed since the previous line, and latches an "out of scope this
 // frame" flag if any scanline's configuration falls outside this file's
 // documented scope (see the header comment above).
-void gxDsEngineBScanline(int line);
+//
+// Queue item 13j: returns true when this line's CPU compositor pass is DEFERRED -- the caller
+// must then NOT call GPU_RenderLine for this line (it is rendered later, by the CPU, only if a
+// barrier / a bail needs it, or replaced by the GX result). false = render it now, as before.
+bool gxDsEngineBScanline(int line);
 
 // Stage 1 + Stage 4, called once per frame from the same site right after
 // the last visible scanline (191) has been rendered -- the DS analogue of
@@ -515,5 +556,22 @@ void gxDsEngineBInvalidateAll();
 void gxDsMarkWrite(u32 adr, u32 size);
 void gxDsMarkVram(u32 lcdcOffset, u32 size);
 void gxDsInvalidateAll();
+
+// Queue item 13j: deferred CPU line rendering. See gx_ds_engine_impl.inc's "DEFERRED CPU
+// compositing" block for the design. Barriers: any write that can change what a deferred line
+// would render flushes the pending lines first. The MMU write funnel calls the io form for
+// register writes (inline pre-check on g_gxDsLazyOn), and the existing dirty-tag entry points
+// (gxDsMarkWrite / gxDsMarkVram) call the data form internally.
+extern u32 g_gxDsLazyPend;   // bit 0 = Engine A has deferred lines, bit 1 = Engine B
+extern u32 g_gxDsLazyOn;     // bit n = engine n is inside a lazy frame (data writes bail its GX pass)
+void gxDsLazyIoWriteSlow(u32 adr);
+void gxDsLazyVramRemapped();   // MMU_VRAMmapControl: a bank was (re)mapped, recompute which LCDC pages each engine sees
+void gxDsEngineALazyBarrier(int data);
+void gxDsEngineBLazyBarrier(int data);
+bool gxDsEngineALazyPending();
+bool gxDsEngineBLazyPending();
+void gxDsLazyFlushAll();
+// Call at the top of the IO branch of every ARM9 write function (adr already & 0x0FFFFFFF).
+#define GXDS_LAZY_IO_BARRIER(adr_) do { if (g_gxDsLazyOn && ((adr_) >> 24) == 4) gxDsLazyIoWriteSlow(adr_); } while (0)
 
 #endif // GX_DS_ENGINEB_RENDER_H

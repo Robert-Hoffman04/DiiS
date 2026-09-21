@@ -373,6 +373,26 @@
        threading model, not scoped to this file, and affects DS-mode
        present too -- a separate task.
 
+    Deferred CPU scanlines + GX decision point (gx-next-steps-log.md queue item
+    13j): gba_ppu.cpp no longer runs renderScanline() at every visible line's
+    HDraw end. The lines are DEFERRED and rendered late, by the CPU, only if a
+    barrier (a write to a video register / VRAM / palette / OAM, flushed BEFORE
+    the write lands), an out-of-scope line (mosaic, OBJ window, forced blank,
+    prohibited or changed mode) or a bail of this file's gxGbaRenderFrame()
+    needs them; when this file handles the frame they are simply dropped. To
+    make that exact the frame decision moved from gbaPpuEndFrame() (after the 68
+    VBlank lines) to gbaPpuHDrawEnd(159) (end of the visible lines, like the DS
+    engines): it used to bake VBlank-period VRAM/OAM/register writes -- the NEXT
+    frame's -- into THIS frame, one frame early relative to the CPU compositor
+    (the bgcache "1px scroll phase" fixture caveat). The dirty bitmaps are
+    consequently cleared at the end of gxGbaRenderFrame() instead of
+    gbaPpuBeginFrame(). A VRAM/palette/OAM write while a lazy frame is in
+    flight, or an out-of-scope line, makes gxGbaRenderFrame() bail
+    (gbaPpuLazyForceBail()) so the CPU result -- exact -- stands; before, GX
+    engaged with frame-final data / frame-end hot flags. Test hooks:
+    -DGBA_FORCE_CPU (always bail), -DGBA_NOLAZY, -DDSLZ_FORCE_LAZY (with
+    GBA_FORCE_CPU: always defer + flush), -DDSLZ_STATS, -DDSLZ_FRAMECRC.
+
     Present-state hygiene (gx-next-steps-log.md task 12): gxGbaRenderFrame()
     holds vidmutex (non-recursive; never called with it held) across its whole
     GX sequence, calls main.cpp's GxRestorePresentState() before unlock, and
@@ -438,6 +458,9 @@ void gxGbaRenderShutdown();
 // isn't handled yet, in which case GBA_screen is left untouched and the
 // caller must run its CPU fallback for the whole frame.
 bool gxGbaRenderFrame();
+// Queue item 13j: true once gxGbaRenderInit() succeeded and the present mutex exists, i.e. when
+// gxGbaRenderFrame() could handle a frame at all (gates deferred CPU line rendering).
+bool gxGbaRenderReady();
 
 // gx-next-steps-log.md task 3 (Stage 7 partial present win): when the most
 // recent gxGbaRenderFrame() call rendered this frame via the real GX

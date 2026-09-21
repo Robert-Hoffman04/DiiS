@@ -837,6 +837,13 @@ void GPU_addBack(GPU *, u8 num);
 int  GPU_ChangeGraphicsCore(int coreid);
 void GPU_set_DISPCAPCNT(u32 val) ;
 void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip = false) ;
+// Queue item 13j: the GX compositor handled a frame whose CPU lines [first, last] were never
+// rendered (deferred). Replays the state a GPU_RenderLine pass leaves behind (affine
+// reference-point latch/advance, blend1/currBgNum leftovers, disp FIFO reset, currLine) so the
+// emulation state is identical to having rendered them. The state read is the current one, which
+// is the state those lines would have used (deferral is only legal across a stretch with no
+// register/VRAM/palette/OAM write, see gx_ds_engine_impl.inc).
+void GPU_DiscardDeferredLines(NDS_Screen * screen, int first, int last);
 #ifdef GPU_DISPCAP_DEBUG_LOG
 // Dumps the last ~1024 frames' worth of DISPCAPCNT/offset ring-buffer history
 // to sd:/dispring.log. Cheap to keep recording every frame (RAM only, no

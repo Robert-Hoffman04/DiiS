@@ -2826,6 +2826,76 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	GPU_RenderLine_MasterBrightness(screen, l);
 }
 
+void GPU_DiscardDeferredLines(NDS_Screen * screen, int first, int last)
+{
+	if (last < first)
+		return;
+	GPU * gpu = screen->gpu;
+	const s32 n = last - first + 1;
+
+	//GPU_RenderLine(l == 0): the affine start registers are re-latched into the running parms
+	if (first == 0)
+		gpu->refreshAffineStartRegs(-1,-1);
+
+	gpu->currLine = (u16)last;
+	gpu->currentFadeInColors = &fadeInColors[gpu->BLDY_EVY][0];
+	gpu->currentFadeOutColors = &fadeOutColors[gpu->BLDY_EVY][0];
+	for(int j=0;j<8;j++)
+		gpu->blend2[j] = (gpu->BLDCNT & (0x100 << j))!=0;
+
+	//lineRot/lineExtRot advance the running reference point after every line they render a BG2/BG3 on
+	for (int layer = 2; layer < 4; layer++)
+	{
+		if (!gpu->LayersEnable[layer]) continue;
+		switch (GPU_mode2type[gpu->dispCnt().BG_Mode][layer])
+		{
+			case BGType_Affine:
+			case BGType_AffineExt:
+			case BGType_Large8bpp:
+			{
+				BGxPARMS * parms = (layer == 2) ? &(gpu->dispx_st)->dispx_BG2PARMS : &(gpu->dispx_st)->dispx_BG3PARMS;
+				parms->BGxX = (s32)((u32)parms->BGxX + (u32)n * (u32)(s32)(s16)LE_TO_LOCAL_16(parms->BGxPB));
+				parms->BGxY = (s32)((u32)parms->BGxY + (u32)n * (u32)(s32)(s16)LE_TO_LOCAL_16(parms->BGxPD));
+				break;
+			}
+			default: break;
+		}
+	}
+
+	//what GPU_RenderLine_layer leaves in gpu->blend1 / currBgNum / curr_mosaic_enabled: the values set by the
+	//last layer it processes (BGs then OBJ, priority 3 down to 0), retained from earlier lines if none is enabled
+	{
+		const bool bgEn = gpu->LayersEnable[0] || gpu->LayersEnable[1] || gpu->LayersEnable[2] || gpu->LayersEnable[3];
+		u8 cur = 5;
+		for (int prio = NB_PRIORITIES; prio > 0; )
+		{
+			prio--;
+			itemsForPriority_t * item = &(gpu->itemsForPriority[prio]);
+			if (bgEn)
+			{
+				for (int i = 0; i < item->nbBGs; i++)
+				{
+					const u16 bg = item->BGs[i];
+					if (!gpu->LayersEnable[bg]) continue;
+					cur = (u8)bg;
+					gpu->blend1 = (gpu->BLDCNT & (1 << bg)) != 0;
+					gpu->curr_mosaic_enabled = (gpu->dispx_st)->dispx_BGxCNT[bg].bits.Mosaic_Enable;
+				}
+			}
+			if (gpu->LayersEnable[4])
+			{
+				cur = 4;
+				gpu->blend1 = (gpu->BLDCNT & (1 << 4)) != 0;
+			}
+		}
+		gpu->currBgNum = cur;
+	}
+
+	//GPU_RenderLine's tail for the last visible line
+	if (last == 191 && gpu->core == GPU_MAIN)
+		disp_fifo.head = disp_fifo.tail = 0;
+}
+
 void gpu_savestate(EMUFILE* os)
 {
 	//version

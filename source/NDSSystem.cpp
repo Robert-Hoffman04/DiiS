@@ -54,6 +54,9 @@
 #include "jit/jit.h"
 #endif
 #include "perf_zones.h"   // no-op macros unless -DDESMUME_PERFZONES
+#ifdef DSLZ_FRAMECRC
+#include "harness/harness_profile.h"
+#endif
 #ifdef DESMUME_ARM_TIME_SPLIT
 #include <ogc/lwp_watchdog.h>
 #include <stdio.h>
@@ -1399,9 +1402,14 @@ static void execHardware_hblank()
 			// this scanline's Engine-A CPU render (unlike Engine B's, which follows
 			// Engine A's line), so the affine reference point it reads at line 0 is
 			// still the pre-latch value, exactly like Engine B's hook sees it.
-			if (!skip2d)
-				gxDsEngineAScanline(nds.VCount);
-			GPU_RenderLine(&MainScreen, nds.VCount, skip2d);
+			// Queue item 13j: the hook returns true when this line's CPU pass is DEFERRED
+			// (rendered later only if a register/data write barrier, an out-of-scope state or a
+			// frame-end GX bail needs it; otherwise the GX result replaces it and the CPU never
+			// runs). Every state the pass would have read is protected by a barrier (see
+			// gx_ds_engine_impl.inc), so the late render is byte-identical to this one.
+			const bool deferA = !skip2d && gxDsEngineAScanline(nds.VCount);
+			if (!deferA)
+				GPU_RenderLine(&MainScreen, nds.VCount, skip2d);
 			// gx-next-steps-log.md task 7: Stage 0 for DS Engine B. Sampled
 			// here, immediately before this scanline's Engine-B CPU render,
 			// so the layout state it records is exactly the state that
@@ -1409,9 +1417,9 @@ static void execHardware_hblank()
 			// NOT sampled: GPU_RenderLine() doesn't draw it either, and the
 			// end-of-frame call below then finds no line-0 snapshot and bails
 			// to the (equally skipped) CPU result.
-			if (!skip2d)
-				gxDsEngineBScanline(nds.VCount);
-			GPU_RenderLine(&SubScreen, nds.VCount, skip2d);
+			const bool deferB = !skip2d && gxDsEngineBScanline(nds.VCount);
+			if (!deferB)
+				GPU_RenderLine(&SubScreen, nds.VCount, skip2d);
 			// The DS analogue of gbaPpuEndFrame()'s gxGbaRenderFrame() call:
 			// Engine B's frame is complete once its last visible scanline has
 			// been rendered, and every register/VRAM/OAM write this frame has
@@ -1424,6 +1432,17 @@ static void execHardware_hblank()
 			if (nds.VCount == 191) {
 				gxDsEngineARenderFrame();
 				gxDsEngineBRenderFrame();
+#ifdef DSLZ_FRAMECRC
+				// Test hook (13j): per-frame hash of the finished frame, both screens, with bit 15 (the CPU
+				// compositor's "written" flag) masked, for frame-by-frame A/B between builds/paths.
+				{
+					static u32 s_fcrcFrame;
+					u32 h = 2166136261u;
+					const u16 *px = (const u16 *)GPU_screen;
+					for (u32 i = 0; i < sizeof(GPU_screen) / 2; ++i) h = (h ^ (u32)(px[i] & 0x7FFF)) * 16777619u;
+					harness_profile_emitf("fcrc %u %08x", (unsigned)s_fcrcFrame++, (unsigned)h);
+				}
+#endif
 			}
 		}
 		//taskSubGpu.finish();

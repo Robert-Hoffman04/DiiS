@@ -1883,6 +1883,15 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
 }
 
+bool gxGbaRenderReady()
+{
+#if defined(GBA_FORCE_CPU) && !defined(DSLZ_FORCE_LAZY)
+	return false;
+#else
+	return s_initDone && vidmutex != LWP_MUTEX_NULL;
+#endif
+}
+
 bool gxGbaRenderFrame()
 {
 	// See s_lastFrameNative's comment: reset unconditionally here, only
@@ -1897,6 +1906,20 @@ bool gxGbaRenderFrame()
 	// Queue item 21: must precede every bail / early return below, since the
 	// dirty bitmaps are cleared next frame whether or not this one rendered.
 	gxInvalidateStaleCaches();
+	// Item 13j: the dirty bitmaps are cleared here, once this frame has consumed them (they used to
+	// be cleared by gbaPpuBeginFrame(); this call now runs at the end of the VISIBLE lines, so the
+	// VBlank period's writes must survive into the next frame's trace).
+	struct DirtyClear {
+		~DirtyClear() { g_gbaFramePlan.vram.clear(); g_gbaFramePlan.palette.clear(); g_gbaFramePlan.oam.clear(); }
+	} dirtyClear;
+
+#ifdef GBA_FORCE_CPU
+	return false;   // test hook: the CPU compositor renders every frame (reference build)
+#endif
+	// Queue item 13j: an exactness bail latched by gba_ppu.cpp's per-line hook (out-of-scope state
+	// seen mid-frame, or a VRAM / palette / OAM write while the frame was in flight).
+	if (gbaPpuLazyForceBail())
+		return false;
 
 	// OBJ window and mosaic remain permanent bails -- narrower than task
 	// 1's original blanket "any window/mosaic/blend" bail, but still real,

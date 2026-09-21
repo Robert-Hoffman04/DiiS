@@ -30,13 +30,14 @@
 #include "../gfx3d.h"    // gfx3d_convertedScreen / g_gfx3dRenderSeq (Engine A's 3D layer input)
 #endif
 #include "../NDSSystem.h"
+#include "../perf_zones.h"
 #include <gccore.h>
 #include <ogc/lwp_watchdog.h>
 #include <malloc.h>
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
-#if defined(DSB_STATS) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if (defined(DSB_STATS) || defined(DSLZ_STATS)) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 #include "../harness/harness_profile.h"
 #endif
 
@@ -228,6 +229,42 @@ static bool s_frameBaseBlocksKnown = false;
 // Task 9: per-scanline MASTER_BRIGHT mode (0 none, 1 up, 2 down) and factor (0..16).
 static u8 s_mbMode[192], s_mbFac[192];
 
+// ---------------------------------------------------------------------
+// Queue item 13j: DEFERRED CPU compositing ("lazy lines").
+// ---------------------------------------------------------------------
+// The CPU compositor (GPU_RenderLine) used to run for every visible line at its hblank
+// because whether GX handles the frame is only known at the end of the frame. It is now
+// DEFERRED: the per-line hook (GXDS_API(Scanline)) says "this line's CPU render is deferred"
+// (returns true) and NDSSystem.cpp skips GPU_RenderLine for it. The deferred lines are
+// [s_lzRendered, s_lzSeen). They are rendered later, by the CPU, only if something needs them:
+//  - a BARRIER: any write that could change what a pending line would render (an engine
+//    register, palette / OAM of this engine, a VRAM page this engine can see, a VRAMCNT / POWCNT
+//    remap) flushes the pending lines BEFORE the write lands, so they are rendered with exactly
+//    the state they would have had at their own hblank (gxDsLazy*Barrier, called from MMU.cpp /
+//    the shared write funnel). Between two barriers the state is constant, so a deferred line
+//    rendered late is byte-identical to one rendered at its own hblank;
+//  - the trace says the frame can no longer be handled by GX (out-of-scope state seen at line
+//    L): the pending lines are flushed and lines L.. render eagerly;
+//  - the frame-end GX decision bails: the pending lines are flushed (frame-end state == pending
+//    range state, by the barrier rule) and the CPU result stands.
+// If GX handles the frame the pending lines are DISCARDED (never rendered) after replaying the
+// few persistent side effects a CPU line pass has (GPU_DiscardDeferredLines: affine reference
+// point latch/advance, `blend1` leftover, disp FIFO reset, currLine).
+// Lines that cannot be deferred exactly (MOSAIC register != 0: it carries per-pixel state across
+// lines/frames; MASTER_BRIGHT saturated: GPU_RenderLine skips the render and its parms advance)
+// are rendered eagerly, in order, after flushing whatever is pending.
+static bool s_lzOn = false;       // this frame defers its CPU lines
+static int s_lzRendered = 0;      // lines [0, s_lzRendered) are CPU-rendered (eager or flushed) this frame
+static int s_lzSeen = 0;          // lines [0, s_lzSeen) have passed the hook; pending = [s_lzRendered, s_lzSeen)
+static bool s_lzFlushing = false; // re-entrancy guard (a flushed line's capture write hits the barrier again)
+static bool s_lzDataHit = false;  // a data write (VRAM/palette/OAM) hit this engine's read set during the frame
+extern u32 g_gxDsLazyPend;        // gx_ds_engineb_render.cpp: bit `core` = this engine has pending lines
+extern u32 g_gxDsLazyOn;          // bit `core` = this engine is inside a lazy frame (data-write bail window)
+#ifdef DSLZ_STATS
+static u32 s_lzStFrames, s_lzStDeferredLines, s_lzStFlushRegLines, s_lzStFlushDataLines, s_lzStFlushBailLines,
+           s_lzStFlushOosLines, s_lzStDiscardFrames, s_lzStEagerLines, s_lzStBarrierIo, s_lzStBarrierData, s_lzStDataBail;
+#endif
+
 // vram_arm9_map (MMU.h) page ranges that back Engine B's BG and OBJ
 // windows. VRAM_ARM9_PAGES is 512 16KB pages covering 0x06000000-0x067FFFFF,
 // split by MMU.h's VRAM_PAGE_* constants into ABG[0,128) BBG[128,256)
@@ -328,9 +365,11 @@ void GXDS_API(MarkVram)(u32 off, u32 size)
 
 // Reset / savestate load rewrite VRAM/palette/OAM without a single MMU write.
 static bool s_forceRebakeAll = true;
+static void gxDsLzReset();
 void GXDS_API(InvalidateAll)()
 {
 	s_forceRebakeAll = true;
+	gxDsLzReset();   // task 13j: a reset / savestate load abandons whatever the frame in flight had pending
 #if GXDS_CORE == 0
 	s_3dScanValid = false; s_3d.valid = false; s_3dFx.valid = false;   // task 13: reset / savestate load rewrite gfx3d_convertedScreen
 #endif
@@ -750,15 +789,26 @@ static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r, int line, bool *af
 			continue;
 		}
 		const BGxPARMS *p = (bg == 2) ? &gpu->dispx_st->dispx_BG2PARMS : &gpu->dispx_st->dispx_BG3PARMS;
-		// Line 0: the CPU re-latches BGxX/BGxY from affineInfo[] inside
-		// GPU_RenderLine(l==0), which runs AFTER this hook, so the live
-		// parms->BGxX still holds last frame's accumulated value here.
-		s32 x = (line == 0) ? (s32)gpu->affineInfo[w].x : p->BGxX;
-		s32 y = (line == 0) ? (s32)gpu->affineInfo[w].y : p->BGxY;
 		// GPU.cpp reads the matrix through LE_TO_LOCAL_16 (host-endian fixup);
 		// BGxX/BGxY are plain host s32 and are read unswapped, as it does.
 		s16 pa = (s16)LE_TO_LOCAL_16(p->BGxPA), pb = (s16)LE_TO_LOCAL_16(p->BGxPB);
 		s16 pc = (s16)LE_TO_LOCAL_16(p->BGxPC), pd = (s16)LE_TO_LOCAL_16(p->BGxPD);
+		// Line 0: the CPU re-latches BGxX/BGxY from affineInfo[] inside
+		// GPU_RenderLine(l==0), which runs AFTER this hook, so the live
+		// parms->BGxX still holds last frame's accumulated value here.
+		// Task 13j: with deferred CPU lines parms only advance when a line is really rendered
+		// (s_lzRendered lines so far; s_lzRendered == 0 means not even the line-0 latch has run),
+		// so the value in effect at `line` is the parms value as of line s_lzRendered plus
+		// (line - s_lzRendered) steps of PB/PD (PB/PD/enable state are constant across the pending
+		// range: any write flushes it). With eager rendering line == s_lzRendered, i.e. the old code.
+		const bool fromInfo = (line == 0) || (s_lzRendered == 0);
+		const u32 steps = (u32)(line - s_lzRendered);
+		s32 x = fromInfo ? (s32)gpu->affineInfo[w].x : p->BGxX;
+		s32 y = fromInfo ? (s32)gpu->affineInfo[w].y : p->BGxY;
+		if (line != 0) {
+			x = (s32)((u32)x + steps * (u32)(s32)pb);
+			y = (s32)((u32)y + steps * (u32)(s32)pd);
+		}
 		r->affX[w] = x; r->affY[w] = y;
 		r->affPA[w] = pa; r->affPB[w] = pb; r->affPC[w] = pc; r->affPD[w] = pd;
 		if (line != 0 && (!pr.valid || pr.x != x || pr.y != y || pr.pa != pa || pr.pb != pb || pr.pc != pc || pr.pd != pd))
@@ -859,7 +909,7 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 	return false;
 }
 
-void GXDS_API(Scanline)(int line)
+static void gxDsBScanlineTrace(int line)
 {
 	if (line < 0 || line >= kDsBScreenH)
 		return;
@@ -930,6 +980,148 @@ void GXDS_API(Scanline)(int line)
 	if (bc > 0 && bc < GX_DSB_MAX_BAND_REGS)
 		GXDS_REGS[bc] = cur;
 	s_lastBandRegs = cur;
+}
+
+// ---------------------------------------------------------------------
+// Queue item 13j: deferred CPU compositing -- flush / discard / per-line decision.
+// (State variables are declared with the other Stage 0 state above.)
+// ---------------------------------------------------------------------
+#if defined(DS2D_NOLAZY)
+#define GXDS_LAZY_COMPILED 0
+#else
+#define GXDS_LAZY_COMPILED 1
+#endif
+
+// Lazy lines only make sense while this engine's GX path could handle the frame at all.
+static inline bool gxDsLzAllowed()
+{
+#if defined(GXDS_FORCE_CPU) && !defined(DSLZ_FORCE_LAZY)
+	return false;   // forced-CPU reference builds keep the eager pre-13j behaviour
+#else
+	return !gameInfo.isGBA && s_initDone && GXDS_SCREEN.gpu && vidmutex != LWP_MUTEX_NULL;
+#endif
+}
+
+// Renders every pending line on the CPU, in order (exactly the GPU_RenderLine call the eager path
+// would have made at that line's hblank, with the state constant since then: see the header
+// comment on s_lzOn). `why`: 0 register write, 1 data write, 2 frame-end bail, 3 out-of-scope line.
+static void gxDsLzFlush(int why)
+{
+	if (s_lzFlushing || s_lzSeen <= s_lzRendered)
+		return;
+	s_lzFlushing = true;
+	{
+		PZ_SCOPE(PZ_GPU_2D);
+		const int n = s_lzSeen - s_lzRendered;
+#ifdef DSLZ_STATS
+		if (why == 0) s_lzStFlushRegLines += n; else if (why == 1) s_lzStFlushDataLines += n;
+		else if (why == 2) s_lzStFlushBailLines += n; else s_lzStFlushOosLines += n;
+#endif
+		(void)why; (void)n;
+		while (s_lzRendered < s_lzSeen) {
+			GPU_RenderLine(&GXDS_SCREEN, (u16)s_lzRendered, false);
+			++s_lzRendered;
+		}
+	}
+	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
+	s_lzFlushing = false;
+}
+
+// Barrier entry points (called through gx_ds_engineb_render.cpp's dispatchers, BEFORE the write lands).
+void GXDS_API(LazyBarrier)(int data)
+{
+#if GXDS_LAZY_COMPILED && !defined(DSLZ_MUTATE_NOBARRIER)
+	if (s_lzFlushing)
+		return;
+#ifdef DSLZ_STATS
+	if (s_lzSeen > s_lzRendered) { if (data) ++s_lzStBarrierData; else ++s_lzStBarrierIo; }
+#endif
+#ifndef DSLZ_NODATABAIL
+	if (data && s_lzOn)
+		s_lzDataHit = true;   // the frame-end GX pass would bake frame-final data: bail (exact CPU result instead)
+#endif
+	gxDsLzFlush(data ? 1 : 0);
+#else
+	(void)data;
+#endif
+}
+
+bool GXDS_API(LazyPending)()
+{
+	return s_lzSeen > s_lzRendered;
+}
+
+static void gxDsLzReset()
+{
+	s_lzOn = false; s_lzRendered = 0; s_lzSeen = 0; s_lzFlushing = false; s_lzDataHit = false;
+	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
+	g_gxDsLazyOn &= ~(1u << GXDS_CORE);
+}
+
+// Frame ended with GX handling it: the pending lines are never rendered; replay the persistent side
+// effects the CPU line pass would have had (see GPU_DiscardDeferredLines).
+static void gxDsLzDiscard()
+{
+	if (s_lzSeen <= s_lzRendered)
+		return;
+#ifdef DSLZ_STATS
+	++s_lzStDiscardFrames;
+#endif
+#ifndef DSLZ_MUTATE_NODISCARD   // mutation check: skip the side-effect replay (lz_c24 must then differ)
+	GPU_DiscardDeferredLines(&GXDS_SCREEN, s_lzRendered, s_lzSeen - 1);
+#endif
+}
+
+// Returns true when this line's CPU render is deferred (NDSSystem.cpp then skips GPU_RenderLine for
+// it); false = the caller renders it now, exactly like before task 13j.
+bool GXDS_API(Scanline)(int line)
+{
+	if (line == 0)
+		gxDsLzReset();
+	gxDsBScanlineTrace(line);
+	if (line < 0 || line >= kDsBScreenH)
+		return false;
+#if GXDS_LAZY_COMPILED
+	if (line == 0) {
+		s_lzOn = gxDsLzAllowed();
+		if (s_lzOn) g_gxDsLazyOn |= (1u << GXDS_CORE);
+	}
+	if (s_lzOn && line != s_lzSeen) {
+		// Lost sync (a hook was skipped): never defer again this frame; whatever is pending stays exact.
+		gxDsLzFlush(3);
+		s_lzOn = false;
+		g_gxDsLazyOn &= ~(1u << GXDS_CORE);
+	}
+	bool defer = s_lzOn && s_frameSawLine0;
+#ifndef DSLZ_MUTATE_IGNOREOOS
+	if (s_frameOutOfScope)
+		defer = false;   // GX cannot handle this frame any more: the rest is CPU work, done now
+#endif
+	if (defer) {
+		GPU *gpu = GXDS_SCREEN.gpu;
+		// Lines whose CPU pass has state that outlives it and cannot be replayed cheaply stay eager.
+		const u16 mosaic = T1ReadWord((u8 *)&gpu->dispx_st->dispx_MISC.MOSAIC, 0);
+		const bool brightSat = gpu->MasterBrightFactor >= 16 && (gpu->MasterBrightMode == 1 || gpu->MasterBrightMode == 2);
+		if (mosaic != 0 || brightSat)
+			defer = false;
+	}
+	if (defer) {
+		++s_lzSeen;
+		g_gxDsLazyPend |= (1u << GXDS_CORE);
+#ifdef DSLZ_STATS
+		++s_lzStDeferredLines;
+#endif
+		return true;
+	}
+	gxDsLzFlush(3);
+#ifdef DSLZ_STATS
+	++s_lzStEagerLines;
+#endif
+	s_lzRendered = s_lzSeen = line + 1;   // the caller renders `line` right after this returns
+#else
+	(void)line;
+#endif
+	return false;
 }
 
 // ---------------------------------------------------------------------
@@ -2443,7 +2635,7 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 }
 
-bool GXDS_API(RenderFrame)()
+static bool gxDsBRenderFrameImpl()
 {
 	// Whatever happens below, this frame's band trace is finished with here;
 	// the next frame re-arms it from its own scanline 0.
@@ -2542,6 +2734,20 @@ bool GXDS_API(RenderFrame)()
 #endif
 	if (!s_frameSawLine0 || s_frameOutOfScope)
 		return false;
+#if GXDS_LAZY_COMPILED && !defined(DSLZ_NODATABAIL)
+	// Task 13j: a VRAM / palette / OAM write this engine can see landed while the visible frame was
+	// in flight. The eager CPU compositor saw it only on the lines drawn after it; GX bakes the
+	// frame-final data for the whole frame. That is the "inherited mid-frame VRAM write limitation"
+	// (transient bad frames); the barrier already rendered the earlier lines with the old data, so
+	// the exact answer is simply the CPU result.
+	if (s_lzDataHit) {
+#ifdef DSLZ_STATS
+		++s_lzStDataBail;
+#endif
+		DSB_WHY("midframewrite");
+		return false;
+	}
+#endif
 	if (!GXDS_SCREEN.gpu)
 		return false;
 	if (!GXDS_API(RenderInit)())
@@ -2860,4 +3066,34 @@ bool GXDS_API(RenderFrame)()
 #endif
 	(void)anyMb;
 	return true;
+}
+
+bool GXDS_API(RenderFrame)()
+{
+#if GXDS_LAZY_COMPILED
+#ifdef DSB_ABCMP
+	// The in-process A/B compare needs the CPU compositor's result in GPU_screen before the GX pass
+	// overwrites it: replay the pending lines first (this also exercises the deferred-render path
+	// on every frame). The discard path is then a no-op, so ABCMP validates GX-vs-CPU, and the
+	// forced-lazy replay build (see DSLZ_FORCE_LAZY) validates the deferral itself.
+	gxDsLzFlush(2);
+#endif
+	const bool handled = gxDsBRenderFrameImpl();
+	if (handled) gxDsLzDiscard(); else gxDsLzFlush(2);
+#ifdef DSLZ_STATS
+	++s_lzStFrames;
+	if ((s_lzStFrames % 30) == 0) {
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+		harness_profile_emitf(GXDS_TAG "lz n=%u defer=%u eager=%u disc=%u flushreg=%u flushdata=%u flushbail=%u flushoos=%u barrio=%u barrdata=%u databail=%u",
+		                      (unsigned)s_lzStFrames, (unsigned)s_lzStDeferredLines, (unsigned)s_lzStEagerLines, (unsigned)s_lzStDiscardFrames,
+		                      (unsigned)s_lzStFlushRegLines, (unsigned)s_lzStFlushDataLines, (unsigned)s_lzStFlushBailLines, (unsigned)s_lzStFlushOosLines,
+		                      (unsigned)s_lzStBarrierIo, (unsigned)s_lzStBarrierData, (unsigned)s_lzStDataBail);
+#endif
+	}
+#endif
+	gxDsLzReset();
+	return handled;
+#else
+	return gxDsBRenderFrameImpl();
+#endif
 }

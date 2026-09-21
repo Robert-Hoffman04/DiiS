@@ -724,6 +724,7 @@ void MMU_VRAM_unmap_all()
 
 static inline void MMU_VRAMmapControl(u8 block, u8 VRAMBankCnt)
 {
+	gxDsLazyVramRemapped();   // item 13j: the 2D engines' VRAM visibility map (deferred-line barriers) must be recomputed
 	//dont handle wram mappings in here
 	if(block == 7) {
 		//wram
@@ -2374,6 +2375,10 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 
 	adr &= 0x0FFFFFFF;
 
+	// gx-next-steps-log.md item 13j: flush deferred 2D CPU lines before a register write can
+	// change what they would have rendered (no-op unless a lazy frame has pending lines).
+	GXDS_LAZY_IO_BARRIER(adr);
+
 	if (adr >> 24 == 4)
 	{
 		if(MMU_new.is_dma(adr)) { MMU_new.write_dma(ARMCPU_ARM9,8,adr,val); return; }
@@ -2610,6 +2615,8 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	}
 
 	adr &= 0x0FFFFFFF;
+
+	GXDS_LAZY_IO_BARRIER(adr);   // item 13j, see _MMU_ARM9_write08
 
 	if((adr >> 24) == 4)
 	{
@@ -3120,6 +3127,8 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		return ;
 	}
 #endif
+
+	GXDS_LAZY_IO_BARRIER(adr);   // item 13j, see _MMU_ARM9_write08
 
 	if((adr>>24)==4)
 	{
@@ -4530,6 +4539,13 @@ static u8* gbaWritableBuffer(GBAMemRegion region)
 // design doc's "tagged at the MMU write site, no separate dirty-flag
 // subsystem" decision, realized here as one switch on the already-decoded
 // region rather than duplicating it at every T1Write call site.
+// Queue item 13j: deferred GBA scanlines must be rendered BEFORE a VRAM / palette / OAM write lands.
+static inline void gxLazyGbaData(GBAMemRegion region)
+{
+	if (region == GBA_REGION_VRAM || region == GBA_REGION_PALETTE || region == GBA_REGION_OAM)
+		GBA_LAZY_DATA_BARRIER();
+}
+
 static inline void gxMarkGbaDirty(GBAMemRegion region, u32 offset, u32 size)
 {
 	switch (region)
@@ -4616,6 +4632,7 @@ void FASTCALL _MMU_ARM7GBA_write08(u32 adr, u8 val)
 	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
+	gxLazyGbaData(d.region);
 	T1WriteByte(buf, d.offset, val);
 	gxMarkGbaDirty(d.region, d.offset, 1);
 }
@@ -4628,6 +4645,7 @@ void FASTCALL _MMU_ARM7GBA_write16(u32 adr, u16 val)
 	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
+	gxLazyGbaData(d.region);
 	T1WriteWord_guaranteedAligned(buf, d.offset, val);
 	gxMarkGbaDirty(d.region, d.offset, 2);
 }
@@ -4640,6 +4658,7 @@ void FASTCALL _MMU_ARM7GBA_write32(u32 adr, u32 val)
 	if (d.region == GBA_REGION_SRAM) { gbaSramWrite8(d.offset, (u8)val); return; }
 	u8* buf = gbaWritableBuffer(d.region);
 	if (!buf) return;
+	gxLazyGbaData(d.region);
 	T1WriteLong_guaranteedAligned(buf, d.offset, val);
 	gxMarkGbaDirty(d.region, d.offset, 4);
 }

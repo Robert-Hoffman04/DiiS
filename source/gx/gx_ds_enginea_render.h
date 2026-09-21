@@ -8,6 +8,13 @@
     gating, CI4/CI8+TLUT, windows / effects / MASTER_BRIGHT, the exact-vs-near-exact
     rules) is gx_ds_engineb_render.h and applies to Engine A verbatim; this header
     documents only what is different for Engine A.
+
+    Queue item 13j: Engine A's CPU lines are deferred exactly like Engine B's (see the
+    "Task 13j" bullet in gx_ds_engineb_render.h). Engine-A-specific parts: a capture armed at
+    a line's hook (or the DISPCAPCNT enable bit set) is an out-of-scope state, so the line
+    renders eagerly and the capture unit runs on real composited lines; a DISPCAPCNT /
+    DISPCNT / MASTER_BRIGHT / BLDCNT ... write is a register barrier; the 3D layer input
+    (gfx3d_convertedScreen) only changes at VBlank end, so it needs no barrier.
 */
 #ifndef GX_DS_ENGINEA_RENDER_H
 #define GX_DS_ENGINEA_RENDER_H
@@ -21,7 +28,7 @@ extern GxDsBBandRegs g_dsABandRegs[GX_DSB_MAX_BAND_REGS];
 
 bool gxDsEngineARenderInit();
 void gxDsEngineARenderShutdown();
-void gxDsEngineAScanline(int line);
+bool gxDsEngineAScanline(int line);   // true = CPU pass for this line deferred (queue item 13j)
 bool gxDsEngineARenderFrame();
 void gxDsEngineAMarkWrite(u32 adr, u32 size);
 void gxDsEngineAMarkVram(u32 lcdcOffset, u32 size);

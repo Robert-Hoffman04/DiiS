@@ -13,3 +13,7 @@
 /.gen/
 /a3drom/build/
 /a3drom/*.nds
+/lzrom/build/
+/lzrom/*.nds
+/lzrom/*.elf
+/lzrom/*.map

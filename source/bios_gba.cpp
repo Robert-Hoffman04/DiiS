@@ -48,6 +48,7 @@
 #include "armcpu.h"
 #include "bios_gba.h"
 #include "MMU.h"
+#include "gba_ppu.h"
 #include "debug.h"
 #include "NDSSystem.h"
 
@@ -126,6 +127,7 @@ static u32 gba_RegisterRamReset()
 	// matches real hardware's RegisterRamReset, which spares exactly what
 	// SoftReset itself would clear/re-read.
 	if (flags & 0x02) memset(MMU.GBA_IWRAM,   0, sizeof(MMU.GBA_IWRAM) - 0x200);
+	if (flags & 0x1C) GBA_LAZY_DATA_BARRIER();   // item 13j: deferred scanlines render before the wipe
 	if (flags & 0x04) memset(MMU.GBA_PALETTE, 0, sizeof(MMU.GBA_PALETTE));
 	if (flags & 0x08) memset(MMU.GBA_VRAM,    0, sizeof(MMU.GBA_VRAM));
 	if (flags & 0x10) memset(MMU.GBA_OAM,     0, sizeof(MMU.GBA_OAM));

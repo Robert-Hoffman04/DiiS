@@ -97,6 +97,20 @@ extern u16 GBA_screen[GBA_SCREEN_W * GBA_SCREEN_H];
 
 void gbaPpuReset();
 
+// Queue item 13j: DEFERRED CPU scanline compositing (see gba_ppu.cpp's block comment). A visible
+// line's renderScanline() is not run at its HDraw end; it is rendered later, on the CPU, only if
+// a barrier (a write to a compositor register, VRAM, palette or OAM), an out-of-scope line, or a
+// frame-end GX bail needs it. When gxGbaRenderFrame() handles the frame the pending lines are
+// simply dropped (renderScanline has no side effect outside GBA_screen; the affine reference
+// point is advanced by gbaPpuHDrawEnd independently). MMU.cpp calls the barrier BEFORE a
+// VRAM / palette / OAM write lands, and gbaPpuIoWrite*() before a video register write.
+extern bool g_gbaLazyPend;   // some lines are deferred and not yet rendered
+extern bool g_gbaLazyOn;     // the current frame defers its lines (data writes then force a GX bail)
+void gbaPpuLazyBarrier(int data);
+bool gbaPpuLazyForceBail();  // gx_gba_render.cpp: this frame's GX pass must not run (exactness)
+#define GBA_LAZY_IO_BARRIER() do { if (g_gbaLazyPend) gbaPpuLazyBarrier(0); } while (0)
+#define GBA_LAZY_DATA_BARRIER() do { if (g_gbaLazyOn) gbaPpuLazyBarrier(1); } while (0)
+
 // Frame-boundary hooks, called once per GBA video frame by NDSSystem.cpp's
 // gbaExecFrame().
 void gbaPpuBeginFrame();

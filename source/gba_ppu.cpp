@@ -38,6 +38,9 @@
 #include "readwrite.h"
 #include "perf_zones.h"
 #include "gx/gx_gba_render.h"
+#if defined(DSLZ_STATS) || defined(DSLZ_FRAMECRC)
+#include "harness/harness_profile.h"
+#endif
 #include <string.h>
 
 u16 GBA_screen[GBA_SCREEN_W * GBA_SCREEN_H];
@@ -78,6 +81,44 @@ static s32 s_affX[2], s_affY[2]; // index 0 = BG2, 1 = BG3, 20.8 fixed point
 // not a pure function of the line number.
 static s32 s_affXHistory[GBA_SCREEN_H][2];
 static s32 s_affYHistory[GBA_SCREEN_H][2];
+
+// ---------------------------------------------------------------------
+// Queue item 13j: DEFERRED CPU scanline compositing.
+// ---------------------------------------------------------------------
+// renderScanline() used to run for every visible line at its HDraw end because whether the GX path
+// (gx_gba_render.cpp) handles the frame is only known at frame end. It is now deferred: a visible
+// line is only recorded (s_lzSeen), and the lines [s_lzRendered, s_lzSeen) are rendered later by the
+// CPU iff needed:
+//  - a BARRIER: any write that can change what a pending line renders (a video register, VRAM,
+//    palette, OAM: see MMU.cpp / gbaPpuIoWrite*) flushes the pending lines BEFORE it lands, so they
+//    are rendered with the state they would have had at their own HDraw end. Between two barriers
+//    the state is constant, so a late render is byte-identical to an on-time one;
+//  - an out-of-scope line (mosaic / OBJ window / prohibited mode / forced blank / a DISPCNT mode
+//    change mid-frame, or any DISPCNT bit other than the BG / WIN enables changing): the frame can no longer be GX's, the rest renders eagerly and gxGbaRenderFrame
+//    is forced to bail (this also closes an inherited hole: hot flags were frame-end state, so a
+//    mid-frame toggle could engage GX on a frame the CPU renders differently);
+//  - the frame-end GX pass bails: flush (frame-end state == pending-range state).
+// If GX handles the frame the pending lines are dropped. renderScanline() has no state outside
+// GBA_screen (the affine reference point advances in gbaPpuHDrawEnd, and the per-line history
+// s_affXHistory is captured there for every line, so a late render swaps it in).
+// A VRAM / palette / OAM write while a lazy frame is in flight also forces the frame's GX pass to
+// bail: GX bakes frame-final data whereas the eager compositor saw each write only from the next
+// line on (the "mid-frame VRAM write" limitation); the CPU result is the exact one.
+#ifdef GBA_NOLAZY
+#define GBA_LAZY_COMPILED 0
+#else
+#define GBA_LAZY_COMPILED 1
+#endif
+bool g_gbaLazyPend = false;
+bool g_gbaLazyOn = false;
+static bool s_lzOn = false, s_lzOos = false, s_lzFlushing = false, s_lzDataHit = false;
+static int s_lzRendered = 0, s_lzSeen = 0;
+static int s_lzMode = -1;
+static u16 s_lzDc0 = 0;   // DISPCNT as seen on the frame's first hooked line
+static void gbaLzReset();
+#ifdef DSLZ_STATS
+static u32 s_lzStFrames, s_lzStDeferred, s_lzStEager, s_lzStDiscard, s_lzStFlushReg, s_lzStFlushData, s_lzStFlushBail, s_lzStBarrIo, s_lzStBarrData, s_lzStDataBail, s_lzStOos, s_lzStHandled;
+#endif
 
 static void setDispstatFlags(bool vblank, bool hblank)
 {
@@ -165,11 +206,25 @@ static void gxSnapshotBandRegs(GxGbaBandRegs *r)
 
 // Called from every generic (non DISPSTAT/VCOUNT/IF) register write below,
 // after the write has landed, so gxUpdateHotFlags() sees the new value.
+static bool s_inHblank = false;   // between gbaPpuHDrawEnd(L) and gbaPpuHBlankEnd(L): line L has already been drawn
+
 static void gxOnRegisterWritten(u32 offset)
 {
 	if (!gxIsLayoutRegister(offset))
 		return;
-	g_gbaFramePlan.bands.recordChangeAtLine(s_vcount);
+	// Item 13j (exactness of the GX path against the CPU compositor): the first line a write can
+	// affect is s_vcount while the line is still in HDraw, but s_vcount + 1 once its HDraw end has
+	// rendered it (a write in HBlank -- HBlank DMA / IRQ raster effects -- applies from the NEXT line;
+	// recording the boundary at s_vcount, as this used to, applied it one line early). A write before
+	// line 0 has been drawn (frame start) is not a band boundary at all (bands never split at line
+	// 0): it IS the frame's band-0 state, which gbaPpuBeginFrame() had snapshotted before the write.
+	const int line = s_vcount + (s_inHblank ? 1 : 0);
+	if (line == 0) {
+		gxUpdateHotFlags();
+		gxSnapshotBandRegs(&g_gbaBandRegs[0]);
+		return;
+	}
+	g_gbaFramePlan.bands.recordChangeAtLine(line);
 	gxUpdateHotFlags();
 	int bc = g_gbaFramePlan.bands.boundaryCount();
 	if (bc > 0 && bc < GX_GBA_MAX_BAND_REGS)
@@ -196,6 +251,7 @@ void gbaPpuIoWrite8(u32 offset, u8 val)
 		io16w(IO_IF, (u16)(cur & ~bit)); // write-1-to-clear, see gbaPpuIoWrite16
 		return;
 	}
+	if (gxIsLayoutRegister(offset)) GBA_LAZY_IO_BARRIER();   // item 13j: flush deferred lines before the write lands
 	T1WriteByte(MMU.GBA_IOREG, offset, val);
 	gxOnRegisterWritten(offset);
 }
@@ -223,6 +279,7 @@ void gbaPpuIoWrite16(u32 offset, u16 val)
 		io16w(IO_IF, (u16)(io16(IO_IF) & ~val));
 		return;
 	}
+	if (gxIsLayoutRegister(offset)) GBA_LAZY_IO_BARRIER();   // item 13j
 	io16w(offset, val);
 	gxOnRegisterWritten(offset);
 }
@@ -246,6 +303,7 @@ void gbaPpuIoWrite32(u32 offset, u32 val)
 		gbaPpuIoWrite16(IO_IF, (u16)(val >> 16));
 		return;
 	}
+	if (gxIsLayoutRegister(offset) || gxIsLayoutRegister(offset + 2)) GBA_LAZY_IO_BARRIER();   // item 13j
 	T1WriteLong(MMU.GBA_IOREG, offset, val);
 	gxOnRegisterWritten(offset);
 	gxOnRegisterWritten(offset + 2); // a 32-bit store spans two 16-bit registers
@@ -253,6 +311,8 @@ void gbaPpuIoWrite32(u32 offset, u32 val)
 
 void gbaPpuReset()
 {
+	gbaLzReset();
+	s_inHblank = false;
 	s_vcount = 0;
 	memset(GBA_screen, 0, sizeof(GBA_screen));
 
@@ -878,13 +938,87 @@ static void renderScanline(int line)
 }
 
 // ---------------------------------------------------------------------
+// Deferred-line machinery (see the block comment near the top of the file)
+// ---------------------------------------------------------------------
+static void gbaLzFlush(int why /*0 reg, 1 data, 2 bail, 3 oos*/)
+{
+	if (s_lzFlushing || s_lzSeen <= s_lzRendered)
+		return;
+	s_lzFlushing = true;
+	{
+		PZ_SCOPE(PZ_GPU_2D);
+#ifdef DSLZ_STATS
+		{ const int n = s_lzSeen - s_lzRendered; if (why == 0) s_lzStFlushReg += n; else if (why == 1) s_lzStFlushData += n; else if (why == 2) s_lzStFlushBail += n; }
+#endif
+		(void)why;
+		const s32 sx0 = s_affX[0], sx1 = s_affX[1], sy0 = s_affY[0], sy1 = s_affY[1];
+		while (s_lzRendered < s_lzSeen) {
+			const int l = s_lzRendered++;
+			// the reference point in effect for that line (captured in gbaPpuHDrawEnd before its render)
+			s_affX[0] = s_affXHistory[l][0]; s_affX[1] = s_affXHistory[l][1];
+			s_affY[0] = s_affYHistory[l][0]; s_affY[1] = s_affYHistory[l][1];
+			renderScanline(l);
+		}
+		s_affX[0] = sx0; s_affX[1] = sx1; s_affY[0] = sy0; s_affY[1] = sy1;
+	}
+	g_gbaLazyPend = false;
+	s_lzFlushing = false;
+}
+
+void gbaPpuLazyBarrier(int data)
+{
+#if GBA_LAZY_COMPILED && !defined(DSLZ_MUTATE_NOBARRIER)
+	if (s_lzFlushing)
+		return;
+#ifdef DSLZ_STATS
+	if (s_lzSeen > s_lzRendered) { if (data) ++s_lzStBarrData; else ++s_lzStBarrIo; }
+#endif
+#ifndef DSLZ_NODATABAIL
+	if (data && s_lzOn)
+		s_lzDataHit = true;
+#endif
+	gbaLzFlush(data ? 1 : 0);
+#else
+	(void)data;
+#endif
+}
+
+bool gbaPpuLazyForceBail()
+{
+#if GBA_LAZY_COMPILED
+	return s_lzOos || s_lzDataHit;
+#else
+	return false;
+#endif
+}
+
+static void gbaLzReset()
+{
+	s_lzOn = false; s_lzOos = false; s_lzFlushing = false; s_lzDataHit = false;
+	s_lzRendered = 0; s_lzSeen = 0; s_lzMode = -1;
+	g_gbaLazyPend = false; g_gbaLazyOn = false;
+}
+
+// ---------------------------------------------------------------------
 // Frame/scanline sequencing hooks (called by NDSSystem.cpp's gbaExecFrame)
 // ---------------------------------------------------------------------
 void gbaPpuBeginFrame()
 {
+	gbaLzReset();
+#if GBA_LAZY_COMPILED
+	s_lzOn = gxGbaRenderReady();
+	g_gbaLazyOn = s_lzOn;
+#endif
 	latchAffine(0);
 	latchAffine(1);
-	g_gbaFramePlan.beginFrame(); // clears all hot flags to false
+	// Item 13j: the frame's GX decision now runs at the END OF THE VISIBLE LINES (gbaPpuFrameDecision,
+	// called from gbaPpuHDrawEnd(159)), exactly like the DS engines at line 191, so the VRAM / palette /
+	// OAM writes of the VBlank period that follows belong to the NEXT frame's trace. The dirty bitmaps
+	// are therefore no longer cleared here; gxGbaRenderFrame() clears them once it has consumed them.
+	g_gbaFramePlan.bands.beginFrame();
+	g_gbaFramePlan.setHot(GXHOT_OBJWIN, false);
+	g_gbaFramePlan.setHot(GXHOT_MOSAIC, false);
+	g_gbaFramePlan.setHot(GXHOT_BLEND, false);
 	// Re-derive the hot flags from the register state already in effect at
 	// frame start, rather than leaving them false until (if ever) a layout
 	// register happens to be rewritten this frame. gxOnRegisterWritten()
@@ -901,15 +1035,10 @@ void gbaPpuBeginFrame()
 
 void gbaPpuEndFrame()
 {
-	// Stage 1+4 GX path (gx_gba_render.cpp): if it handles this frame's mode
-	// and content, it overwrites GBA_screen with its own result, superseding
-	// whatever gbaPpuHDrawEnd()'s per-scanline CPU compositor already wrote
-	// there this frame. If it bails (unsupported mode/feature -- see that
-	// file's header), GBA_screen already holds the correct CPU-rendered
-	// content and nothing further is needed. Either way this always runs:
-	// which path handled the frame is only knowable once all of the frame's
-	// register/OAM state is final, i.e. here, not per-scanline.
-	gxGbaRenderFrame();
+	// Stage 1+4 GX path (gx_gba_render.cpp): the frame's GX decision already ran at the end of the
+	// visible lines (gbaPpuFrameDecision, item 13j): if GX handled the frame it overwrote GBA_screen
+	// with its own result, superseding what the per-scanline CPU compositor would have written; if it
+	// bailed, the (deferred, then flushed) CPU-rendered lines already stand. Either way GBA_screen is final here.
 
 	// Blit into GPU_screen (offset 0 = the "main screen" slot the DS side
 	// uses -- see MainScreen.offset in GPU.cpp)
@@ -922,6 +1051,49 @@ void gbaPpuEndFrame()
 	u16 *dst = (u16 *)GPU_screen;
 	for (int y = 0; y < GBA_SCREEN_H; y++)
 		memcpy(dst + y * 256, GBA_screen + y * GBA_SCREEN_W, GBA_SCREEN_W * sizeof(u16));
+#ifdef DSLZ_FRAMECRC
+	{
+		static u32 s_fcrcFrame;
+		u32 h = 2166136261u;
+		for (int i = 0; i < GBA_SCREEN_W * GBA_SCREEN_H; ++i) h = (h ^ (u32)(GBA_screen[i] & 0x7FFF)) * 16777619u;
+		harness_profile_emitf("fcrc %u %08x", (unsigned)s_fcrcFrame++, (unsigned)h);
+	}
+#endif
+}
+
+// The frame's GX decision, run once the last visible line (159) has passed the hook, i.e. with every
+// register / VRAM / palette / OAM write of the visible frame in and none of the VBlank period's yet.
+// (It used to run at gbaPpuEndFrame(), after the 68 VBlank lines: a game that updates VRAM/OAM/registers
+// in its VBlank handler then had those NEXT-frame writes baked into THIS frame's GX output, one frame
+// early relative to the CPU compositor.) See the deferred-lines block comment near the top of the file.
+static void gbaPpuFrameDecision()
+{
+	// GX pass first: the deferred CPU lines it may supersede are only rendered if it bails.
+	const bool handled = gxGbaRenderFrame();
+#if GBA_LAZY_COMPILED
+	// Item 13j: GX handled the frame -> the deferred lines are dropped; it bailed -> render them now.
+#ifdef DSLZ_STATS
+	if (s_lzOos) ++s_lzStOos;
+	if (s_lzDataHit) ++s_lzStDataBail;
+	if (handled && s_lzSeen > s_lzRendered) ++s_lzStDiscard;
+#endif
+	if (!handled)
+		gbaLzFlush(2);
+#ifdef DSLZ_STATS
+	++s_lzStFrames;
+	if ((s_lzStFrames % 30) == 0)
+		harness_profile_emitf("gbalz n=%u handled=%u defer=%u eager=%u disc=%u flushreg=%u flushdata=%u flushbail=%u barrio=%u barrdata=%u databail=%u oos=%u",
+		                      (unsigned)s_lzStFrames, (unsigned)s_lzStHandled, (unsigned)s_lzStDeferred, (unsigned)s_lzStEager, (unsigned)s_lzStDiscard,
+		                      (unsigned)s_lzStFlushReg, (unsigned)s_lzStFlushData, (unsigned)s_lzStFlushBail,
+		                      (unsigned)s_lzStBarrIo, (unsigned)s_lzStBarrData, (unsigned)s_lzStDataBail, (unsigned)s_lzStOos);
+#endif
+	gbaLzReset();
+#else
+	(void)handled;
+#endif
+#ifdef DSLZ_STATS
+	if (handled) ++s_lzStHandled;
+#endif
 }
 
 void gbaPpuHDrawEnd(int line)
@@ -941,10 +1113,57 @@ void gbaPpuHDrawEnd(int line)
 		s_affXHistory[line][0] = s_affX[0]; s_affXHistory[line][1] = s_affX[1];
 		s_affYHistory[line][0] = s_affY[0]; s_affYHistory[line][1] = s_affY[1];
 	}
+#if GBA_LAZY_COMPILED
+	if (line >= 0 && line < GBA_SCREEN_H) {
+		bool defer = false;
+		if (s_lzOn && line != s_lzSeen) {
+			// lost sync: never defer again this frame (whatever is pending stays exact)
+			gbaLzFlush(3);
+			s_lzOn = false; g_gbaLazyOn = false;
+		}
+		if (s_lzOn) {
+			// Hook-time out-of-scope detection: state the GX path cannot reproduce (or reproduces from
+			// frame-end state only) on this line. Latched; the rest of the frame renders eagerly and GX
+			// is forced to bail so the CPU result stands.
+			const u16 dc = io16(IO_DISPCNT);
+			const int md = dc & 7;
+			if (s_lzMode < 0) { s_lzMode = md; s_lzDc0 = dc; }
+			// Only the BG enables (bits 8-11) and the WIN0/WIN1 enables (13/14) are replayed per band by the
+			// GX path; every other DISPCNT bit (mode, frame select, OBJ mapping, OBJ enable, forced blank,
+			// OBJ window) is read once from the frame-final value, so a mid-frame change of any of them
+			// cannot be reproduced.
+			if (md > 5 || ((dc ^ s_lzDc0) & 0x90FF) || ((dc >> 15) & 1) || ((dc >> 7) & 1) || io16(IO_MOSAIC) != 0)
+				s_lzOos = true;
+			defer = !s_lzOos;
+#ifdef DSLZ_MUTATE_IGNOREOOS
+			defer = true;
+#endif
+		}
+		if (defer) {
+			++s_lzSeen;
+			g_gbaLazyPend = true;
+#ifdef DSLZ_STATS
+			++s_lzStDeferred;
+#endif
+		} else {
+			PZ_SCOPE(PZ_GPU_2D);
+			gbaLzFlush(3);
+#ifdef DSLZ_STATS
+			++s_lzStEager;
+#endif
+			renderScanline(line);
+			s_lzRendered = s_lzSeen = line + 1;
+		}
+	}
+#else
 	{
 		PZ_SCOPE(PZ_GPU_2D);
 		renderScanline(line);
 	}
+#endif
+	if (line == GBA_SCREEN_H - 1)
+		gbaPpuFrameDecision();
+	s_inHblank = true;
 	setDispstatFlags(/*vblank*/ line >= GBA_SCREEN_H, /*hblank*/ true);
 	if (line < GBA_SCREEN_H) { advanceAffine(0); advanceAffine(1); }
 }
@@ -965,6 +1184,7 @@ static void gbaFireVBlankIrqIfNeeded()
 
 void gbaPpuHBlankEnd(int line)
 {
+	s_inHblank = false;
 	s_vcount = (u16)((line + 1) % 228);
 	io16w(IO_VCOUNT, s_vcount);
 	setDispstatFlags(/*vblank*/ s_vcount >= GBA_SCREEN_H, /*hblank*/ false);
@@ -982,6 +1202,7 @@ void gbaPpuSaveState(EMUFILE* os)
 
 bool gbaPpuLoadState(EMUFILE* is, int size)
 {
+	gbaLzReset();   // item 13j: a loaded state abandons any deferred lines
 	u32 version;
 	if (!read32le(&version, is)) return false;
 	if (version != 1) return false;

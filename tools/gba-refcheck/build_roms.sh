@@ -44,5 +44,6 @@ build_one affineshrink  "AFFSHRINK"  "AASH"
 build_one affinenowrap  "AFFNOWRAP"  "AANW"
 build_one dirtygate     "DIRTYGATE"  "ADGT"
 build_one dirtybmp      "DIRTYBMP"   "ADGB"
+build_one lztrans       "LZTRANS"    "ALZT"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba $(pwd)/bgcache.gba $(pwd)/ci8check.gba $(pwd)/bmp4check.gba $(pwd)/winlayeroff.gba $(pwd)/affinezoom.gba $(pwd)/affinemag.gba $(pwd)/affineshrink.gba $(pwd)/affinenowrap.gba $(pwd)/dirtygate.gba $(pwd)/dirtybmp.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba $(pwd)/bgcache.gba $(pwd)/ci8check.gba $(pwd)/bmp4check.gba $(pwd)/winlayeroff.gba $(pwd)/affinezoom.gba $(pwd)/affinemag.gba $(pwd)/affineshrink.gba $(pwd)/affinenowrap.gba $(pwd)/dirtygate.gba $(pwd)/dirtybmp.gba $(pwd)/lztrans.gba"
