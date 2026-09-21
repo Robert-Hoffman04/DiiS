@@ -8,3 +8,5 @@
 /fxrom/*.nds
 /dirtyrom/build/
 /dirtyrom/*.nds
+/cirom/build/
+/cirom/*.nds

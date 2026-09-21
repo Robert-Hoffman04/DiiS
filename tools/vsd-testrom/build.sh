@@ -120,6 +120,15 @@ docker run --rm -v "$HERE/dirtyrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/dirtyrom/dr_c$c.nds "$OUT"/; done
 
+# --- cirom (gx-next-steps-log.md task 11) --------------------------------------
+# DS Engine B native CI4/CI8+TLUT fixtures for source/gx/gx_ds_engineb_render.cpp:
+# ci_c0 .. ci_c8 (see the header of cirom/source/main.c for the case list).
+docker run --rm -v "$HERE/cirom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
+docker run --rm -v "$HERE/cirom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
+	for c in 0 1 2 3 4 5 6 7 8; do build ci_c$c "-DCI_CASE=$c"; done
+'
+for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/cirom/ci_c$c.nds "$OUT"/; done
+
 echo
 echo "ROMs in $OUT :"
 ls -la "$OUT"/*.nds

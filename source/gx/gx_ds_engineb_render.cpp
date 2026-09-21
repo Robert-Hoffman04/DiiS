@@ -6,6 +6,7 @@
 #include "../MMU.h"
 #include "../NDSSystem.h"
 #include <gccore.h>
+#include <ogc/lwp_watchdog.h>
 #include <malloc.h>
 #include <string.h>
 #include <stddef.h>
@@ -17,6 +18,15 @@
 //  -DDSB_FORCE_CPU : gxDsEngineBRenderFrame() always bails, so the CPU
 //                    compositor renders every frame. The A/B reference for
 //                    byte-comparing the GX path against GPU.cpp.
+//  -DDSB_NOCI      : (task 11) every bake uses the pre-task-11 pre-resolved RGB5A3
+//                    format instead of native CI4/CI8+TLUT (the always-available
+//                    fallback path for multi-slice extended-palette planes), the A/B
+//                    reference for the CI conversion and the memory-saving baseline.
+//  -DDSB_MUTATE_TLUTSHARE / -DDSB_MUTATE_TLUTNOBIND : (task 11) mutation checks for
+//                    the TLUT-clobber hazard. SHARE: every plane and sprite uses ONE
+//                    hardware TLUT slot, loaded at bake time only; NOBIND: per-BG /
+//                    shared-OBJ slots but loaded at bake time only (no per-draw
+//                    ownership check). The clobber fixture must FAIL under both.
 //  -DDSB_STATS     : (needs the harness profile sink) counts engaged vs.
 //                    bailed frames, the last bail reason and the BG-type mix
 //                    of engaged frames, and emits one line per 30 frames.
@@ -34,6 +44,10 @@ static bool s_dsbFrWin, s_dsbFrFade, s_dsbFrAlpha, s_dsbFrSemi, s_dsbFrMb;
 static u32 s_dsbBgBake[4], s_dsbBgFxBake[4], s_dsbObjBake[128], s_dsbObjFxBake[128];
 static u32 s_dsbOldBg, s_dsbOldObj, s_dsbStale; // s_dsbStale: -DDSB_VERIFY only (cached texture != fresh bake)
 static bool s_dsbOldVramArm; // the old whole-region VRAM flag (BBG/BOBJ page writes + bank H LCDC window)
+// task 11: texture memory / format accounting (cumulative bakes, live gauge is computed at emit time)
+static u32 s_dsbBakeCi, s_dsbBakeRgb, s_dsbBakeFallback, s_dsbTlutLoads;
+static u64 s_dsbBakedBytes, s_dsbBakedBytesRgbEquiv;
+static u64 s_dsbBakeTicks;   // emulated-timebase ticks spent inside bakes (Dolphin's PPC timing is approximate: indicative only)
 #define DSB_WHY(s_) do { s_dsbWhy = (s_); } while (0)
 #else
 #define DSB_WHY(s_) do { } while (0)
@@ -145,6 +159,7 @@ static GxDsBBandRegs s_lastBandRegs;
 // DISPCNT.ExBGxPalette_Enable as seen on this frame's line 0 (see
 // gxDsBScanlineOutOfScope); reset at every line 0.
 static u8 s_frameExtBgPal = 0;
+static u8 s_frameExtObjPal = 0;   // task 11: same, for DISPCNT.ExOBJPalette_Enable
 static bool s_frameExtBgPalKnown = false;
 // Task 9: per-scanline MASTER_BRIGHT mode (0 none, 1 up, 2 down) and factor (0..16).
 static u8 s_mbMode[192], s_mbFac[192];
@@ -169,6 +184,10 @@ static bool gxDsBBankMapChanged()
 	bool extChanged = false;
 	for (int i = 0; i < 4; ++i)
 		if (s_extPalCopy[i] != MMU.ExtPal[1][i]) { extChanged = true; s_extPalCopy[i] = MMU.ExtPal[1][i]; }
+	// Task 11: the extended OBJ palette pointer (VRAMCNT_I). Only slot [0] is ever read
+	// (PaletteIndex*0x200 <= 0x1E00+0x200 < 8KB).
+	static u8 *s_extObjPalCopy;
+	if (s_extObjPalCopy != MMU.ObjExtPal[1][0]) { extChanged = true; s_extObjPalCopy = MMU.ObjExtPal[1][0]; }
 	if (s_bankMapCopyValid && !extChanged && memcmp(cur, s_bankMapCopy, sizeof(cur)) == 0)
 		return false;
 	memcpy(s_bankMapCopy, cur, sizeof(cur));
@@ -310,9 +329,10 @@ static bool gxDsBDepsDirty(const GxDsBDeps &d)
 #endif
 
 // ---------------------------------------------------------------------
-// Caches (Stage 1). Every texture here is plain RGB5A3 with the palette
-// already resolved -- this phase deliberately does NOT use native
-// CI4/CI8+TLUT (see the header). Buffers are grown on demand rather than
+// Caches (Stage 1). Since task 11 a texture is native CI4/CI8 + TLUT (`ci`), or
+// RGB5A3 with the palette already resolved where a TLUT cannot express the content
+// (direct-colour bitmaps, multi-slice extended-palette planes; see the header's
+// "Native CI4/CI8 + TLUT"). Buffers are grown on demand rather than
 // allocated at their theoretical maximum, since a DS sub screen very
 // commonly uses only 256x256 text BGs and a handful of small sprites.
 // ---------------------------------------------------------------------
@@ -339,6 +359,13 @@ struct GxDsBBgPlaneCache {
 	const u8 *cfgExtPal; // extended-palette slot pointer baked in, NULL if the regular palette was used
 	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
 	GxDsBDeps deps;    // task 10: the VRAM / palette bytes the last bake read
+	// task 11: native CI8 + TLUT. ci == false is the RGB5A3 (pre-resolved) form, used for
+	// direct-colour planes, multi-slice extended-palette planes and -DDSB_NOCI builds.
+	bool ci;
+	u32 texBytes;      // bytes of texData actually used by the current bake
+	GXTlutObj tlutObj;
+	void *tlutData;    // 256 RGB5A3 entries (512B), owned by this cache, rebuilt by every bake
+	u16 tlutEntries;
 };
 static GxDsBBgPlaneCache s_bgPlane[4];
 static GxDsBBgPlaneCache s_bgPlaneFx[4]; // task 9: brighten/darken variant of each plane (lazily baked)
@@ -379,6 +406,13 @@ struct GxDsBObjTexSlot {
 	u8 cfgBordered;
 	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
 	GxDsBDeps deps;    // task 10: the VRAM / palette bytes the last bake read
+	// task 11: native CI4 (16-colour) / CI8 (256-colour) + TLUT. ci == false only under -DDSB_NOCI.
+	bool ci;
+	u32 texBytes;
+	const u8 *cfgExtPal; // extended OBJ palette slice baked in (256-colour sprite under ExOBJPalette_Enable), else NULL
+	GXTlutObj tlutObj;
+	void *tlutData;    // 16 or 256 RGB5A3 entries, owned by this slot
+	u16 tlutEntries;
 };
 static GxDsBObjTexSlot s_objTex[128];
 static GxDsBObjTexSlot s_objTexFx[128]; // task 9: brighten/darken variant of each sprite (lazily baked)
@@ -393,6 +427,60 @@ static void *s_backdropTexData;
 
 static void *s_copyBackBuf;
 static u16 *s_copyBackLinear;
+
+// ---------------------------------------------------------------------
+// Task 11: TLUT hardware-slot budget and clobber protection
+// ---------------------------------------------------------------------
+// GX has 16 normal TLUT names (GX_TLUT0..15, 256 entries each) shared by every user, and
+// binds exactly ONE TLUT per texture object, resolved by *name* when the texture is
+// loaded. Engine B reserves FIVE names and no more:
+//   GX_TLUT12..GX_TLUT15  BG0..BG3 (a plane's plain and brighten/darken variants share
+//                         their BG's name; they are never simultaneously "the" texture)
+//   GX_TLUT11             every sprite (128 x plain/fade textures -> one shared name)
+// leaving GX_TLUT0..10 for Engine A / the 3D path (the GBA slice uses 0..7 but GBA and DS
+// are mutually exclusive). Sharing a name is only safe if the TLUT is (re)loaded whenever
+// the draw's owner differs from whoever loaded the name last, so every draw goes through
+// gxDsBBindTlut(), which tracks the owner of each name and issues GX_LoadTlut on a change.
+// The tracking is reset at the start of every Engine B GX sequence, so nothing assumes a
+// TLUT survived from an earlier frame (another engine may have loaded the same name in
+// between). A TLUT is 512B / 32B, so a reload is cheap; the ownership check keeps the
+// common case (one plane drawn several times, one sprite over several window runs)
+// down to a single load.
+static const u8 kDsBTlutObjSlot = GX_TLUT11;
+static inline u8 gxDsBBgTlutSlot(int bg) { return (u8)(GX_TLUT12 + bg); }
+static const GXTlutObj *s_tlutOwner[20];
+static inline void gxDsBTlutReset() { memset(s_tlutOwner, 0, sizeof(s_tlutOwner)); }
+static inline void gxDsBBindTlut(GXTlutObj *obj, u8 slot)
+{
+#if defined(DSB_MUTATE_TLUTSHARE) || defined(DSB_MUTATE_TLUTNOBIND)
+	(void)obj; (void)slot;   // mutation: the TLUT was loaded at bake time only, no per-draw ownership check
+#else
+	if (s_tlutOwner[slot] == obj) return;
+	GX_LoadTlut(obj, slot);
+	s_tlutOwner[slot] = obj;
+#ifdef DSB_STATS
+	++s_dsbTlutLoads;
+#endif
+#endif
+}
+// The slot a texture bakes its TLUT name for (the mutation builds collapse it to one).
+static inline u8 gxDsBBgSlotFor(int bg)
+{
+#ifdef DSB_MUTATE_TLUTSHARE
+	(void)bg; return kDsBTlutObjSlot;
+#else
+	return gxDsBBgTlutSlot(bg);
+#endif
+}
+static inline u8 gxDsBObjSlotFor() { return kDsBTlutObjSlot; }
+static inline void gxDsBMutantLoad(GXTlutObj *obj, u8 slot)
+{
+#if defined(DSB_MUTATE_TLUTSHARE) || defined(DSB_MUTATE_TLUTNOBIND)
+	GX_LoadTlut(obj, slot);   // careless: TMEM at `slot` now holds THIS texture's TLUT until the next bake overwrites it
+#else
+	(void)obj; (void)slot;
+#endif
+}
 
 static bool s_initDone = false;
 
@@ -422,17 +510,21 @@ bool gxDsEngineBRenderInit()
 		s_bgPlane[i].texData = NULL;
 		s_bgPlane[i].texDataCap = 0;
 		s_bgPlane[i].valid = false;
+		s_bgPlane[i].tlutData = NULL;
 		s_bgPlaneFx[i].texData = NULL;
 		s_bgPlaneFx[i].texDataCap = 0;
 		s_bgPlaneFx[i].valid = false;
+		s_bgPlaneFx[i].tlutData = NULL;
 	}
 	for (int i = 0; i < 128; ++i) {
 		s_objTex[i].texData = NULL;
 		s_objTex[i].texDataCap = 0;
 		s_objTex[i].valid = false;
+		s_objTex[i].tlutData = NULL;
 		s_objTexFx[i].texData = NULL;
 		s_objTexFx[i].texDataCap = 0;
 		s_objTexFx[i].valid = false;
+		s_objTexFx[i].tlutData = NULL;
 	}
 
 	s_backdropTexData = memalign(32, 32 * GX_DSB_MAX_BAND_REGS); // 32B = GX minimum texture allocation granularity
@@ -461,10 +553,14 @@ void gxDsEngineBRenderShutdown()
 	for (int i = 0; i < 4; ++i) {
 		free(s_bgPlane[i].texData); s_bgPlane[i].texData = NULL; s_bgPlane[i].texDataCap = 0; s_bgPlane[i].valid = false;
 		free(s_bgPlaneFx[i].texData); s_bgPlaneFx[i].texData = NULL; s_bgPlaneFx[i].texDataCap = 0; s_bgPlaneFx[i].valid = false;
+		free(s_bgPlane[i].tlutData); s_bgPlane[i].tlutData = NULL;
+		free(s_bgPlaneFx[i].tlutData); s_bgPlaneFx[i].tlutData = NULL;
 	}
 	for (int i = 0; i < 128; ++i) {
 		free(s_objTex[i].texData); s_objTex[i].texData = NULL; s_objTex[i].texDataCap = 0; s_objTex[i].valid = false;
 		free(s_objTexFx[i].texData); s_objTexFx[i].texData = NULL; s_objTexFx[i].texDataCap = 0; s_objTexFx[i].valid = false;
+		free(s_objTex[i].tlutData); s_objTex[i].tlutData = NULL;
+		free(s_objTexFx[i].tlutData); s_objTexFx[i].tlutData = NULL;
 	}
 	free(s_bgBakeScratch); s_bgBakeScratch = NULL; s_bgBakeScratchCap = 0;
 	free(s_objBakeScratch); s_objBakeScratch = NULL;
@@ -579,13 +675,13 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 
 	if (gpu->dispMode != 1) { DSB_WHY("dispmode"); return true; }   // 0 = white; 2/3 are Engine-A-only
 	if (d.ForceBlank) { DSB_WHY("forceblank"); return true; }
-	// Extended OBJ palettes stay out of scope. Extended BG palettes are IN scope
-	// (task 8 -- SM64DS's in-game sub screen needs them; see gxDsBExtPalFor()),
-	// but the flag is baked once from the frame-final state, so a mid-frame
-	// toggle can't be replayed.
-	if (d.ExOBJPalette_Enable) { DSB_WHY("objextpal"); return true; }
-	if (s_frameExtBgPalKnown && d.ExBGxPalette_Enable != s_frameExtBgPal) { DSB_WHY("extpalchange"); return true; }
+	// Extended BG palettes are IN scope (task 8 -- SM64DS's in-game sub screen needs
+	// them; see gxDsBExtPalFor()) and, since task 11, so are extended OBJ palettes
+	// (gxDsBObjExtPalFor()). Both flags are baked once from the frame-final state, so a
+	// mid-frame toggle can't be replayed.
+	if (s_frameExtBgPalKnown && (d.ExBGxPalette_Enable != s_frameExtBgPal || d.ExOBJPalette_Enable != s_frameExtObjPal)) { DSB_WHY("extpalchange"); return true; }
 	s_frameExtBgPal = d.ExBGxPalette_Enable;
+	s_frameExtObjPal = d.ExOBJPalette_Enable;
 	s_frameExtBgPalKnown = true;
 	// Task 9: WIN0/WIN1, BLDCNT effects, semi-transparent OBJ and MASTER_BRIGHT are
 	// now in scope. Still out: the OBJ window (a sprite-shaped mask), and a
@@ -814,6 +910,7 @@ static inline f32 gxDsBAffineCorner(s32 num, s32 dA, s32 dB)
 // flips lattice-edge texels), whereas the identical UVs on a 32/64/256-wide
 // texture were byte-exact. Exactness of the sample is the whole point of this
 // path, so the (transparent) padding is worth the memory.
+static inline int gxDsBPopcount(u32 v) { return __builtin_popcount(v); }
 static inline int gxDsBPow2Ge(int n)
 {
 	int p = 1;
@@ -843,6 +940,75 @@ static bool gxDsBEnsureCap(void **buf, u32 *cap, u32 needed)
 // 7-y, HFlip source column 7-x; the CPU expresses both as reversed
 // traversal, which is the same mapping). Every VRAM access goes through
 // MMU_gpu_map() so bank mapping/unmapped pages behave identically.
+// ---------------------------------------------------------------------
+// Task 11: native CI helpers
+// ---------------------------------------------------------------------
+// Every bake below first writes a linear u16 "palette index" scratch: 0 = transparent
+// (palette index 0 of the tile / sprite, or the affine border / padding), otherwise the
+// index the CPU reference would look up in the palette it selected (4bpp text:
+// palNum*16+idx; 8bpp: idx; extended palette: (palNum<<8)+idx). That one representation
+// is then either compacted to CI8/CI4 texels + a TLUT (the normal case) or resolved to
+// RGB5A3 through the same palette (the fallback: direct-colour planes never come here;
+// multi-slice extended-palette planes and -DDSB_NOCI builds do).
+static bool gxDsBEnsureTlut(void **data)
+{
+	if (!*data) *data = memalign(32, 256 * sizeof(u16));
+	return *data != NULL;
+}
+// tlut[0] transparent; tlut[e] (1 <= e < n) = opaque colour of the palette entry at base+e*2.
+static void gxDsBTlutFromPal(u16 *tlut, const u8 *base, int n)
+{
+	tlut[0] = kDsBTransparentTexel;
+	for (int e = 1; e < n; ++e)
+		tlut[e] = gxDsBOpaqueTexel(T1ReadWord((void *)base, (u32)e * 2));
+}
+// In-place u16 -> u8 compaction (write index i lands at or before read index i).
+static void gxDsBCompact8(u16 *buf, u32 n)
+{
+	u8 *p8 = (u8 *)buf;
+	for (u32 i = 0; i < n; ++i) p8[i] = (u8)buf[i];
+}
+// In-place resolve of an index scratch to RGB5A3 (the fallback / -DDSB_NOCI form).
+static void gxDsBResolveScratch(u16 *buf, u32 n, const u8 *pal)
+{
+	for (u32 i = 0; i < n; ++i) {
+		const u16 v = buf[i];
+		buf[i] = v ? gxDsBOpaqueTexel(T1ReadWord((void *)pal, (u32)v * 2)) : kDsBTransparentTexel;
+	}
+}
+// Upload `scratch` (w x h palette indices, values < 256 after the caller's slice
+// selection) as a CI8 texture object bound to TLUT name `slot`; `tlutData` (256 RGB5A3
+// entries) is already filled.
+static bool gxDsBUploadCI8(void **texData, u32 *cap, u32 *texBytes, u16 *scratch, int w, int h,
+                           GXTexObj *tex, u8 wm, GXTlutObj *tlutObj, void *tlutData, u8 slot)
+{
+	const u32 needed = (u32)w * h;
+	if (!gxDsBEnsureCap(texData, cap, needed))
+		return false;
+	gxDsBCompact8(scratch, needed);
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_CI8);
+	gxSwizzle8bpp((const u8 *)scratch, (u8 *)*texData, blk.texelsWide, blk.texelsTall, w, h);
+	DCFlushRange(*texData, needed);
+	DCFlushRange(tlutData, 256 * sizeof(u16));
+	GX_InitTlutObj(tlutObj, tlutData, GX_TL_RGB5A3, 256);
+	GX_InitTexObjCI(tex, *texData, w, h, GX_TF_CI8, wm, wm, GX_FALSE, slot);
+	GX_InitTexObjFilterMode(tex, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	gxDsBMutantLoad(tlutObj, slot);
+	*texBytes = needed;
+	return true;
+}
+#ifdef DSB_STATS
+static inline void gxDsBStatBake(bool ci, u32 bytes, u32 rgbEquiv, bool fallback)
+{
+	if (ci) ++s_dsbBakeCi; else ++s_dsbBakeRgb;
+	if (fallback) ++s_dsbBakeFallback;
+	s_dsbBakedBytes += bytes;
+	s_dsbBakedBytesRgbEquiv += rgbEquiv;
+}
+#else
+#define gxDsBStatBake(a, b, c, d) do { } while (0)
+#endif
+
 // The extended BG palette slot a plane samples, or NULL when it uses the
 // regular BG palette. Mirrors GPU.cpp exactly: the ext palette only applies
 // when DISPCNT.ExBGxPalette_Enable is set AND the plane is a 256-colour text
@@ -891,6 +1057,7 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	GxDsBRecGuard recGuard;
 	u32 seenTile[32] = { 0 };
 	u32 seenPal = 0;
+	u32 usedPal = 0;   // task 11: palNums with at least one opaque texel (bit palNum)
 	if (c256 && !extPal)
 		gxDsBRecPal(kDsBBgPalOff, 512);
 
@@ -919,6 +1086,7 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 				else if (!c256) gxDsBRecPal(kDsBBgPalOff + (u32)palNum * 32, 32); // 4bpp: its own 16-colour sub-palette
 			}
 
+			bool anyOpaque = false;
 			for (int sy = 0; sy < 8; ++sy) {
 				int srcY = vflip ? 7 - sy : sy;
 				const u8 *line = (const u8 *)MMU_gpu_map(tileBase + (u32)tileNum * tileBytes + (u32)srcY * rowBytes);
@@ -933,32 +1101,70 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 						idx = (srcX & 1) ? (b >> 4) : (b & 0xF);
 					}
 					if (!idx) {
-						out[sx] = kDsBTransparentTexel;
+						out[sx] = 0;
 					} else {
-						int palIdx = c256 ? (extPal ? (palNum << 8) + idx : idx) : (palNum * 16 + idx);
-						out[sx] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)palIdx * 2));
+						anyOpaque = true;
+						// palette index the CPU reference would look up (== the CI8 combined index for 4bpp)
+						out[sx] = (u16)(c256 ? (extPal ? (palNum << 8) + idx : idx) : (palNum * 16 + idx));
 					}
 				}
 			}
+			if (anyOpaque) usedPal |= 1u << palNum;
 		}
 	}
 
-	u32 needed = (u32)lg * ht * sizeof(u16);
-	if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, needed))
-		return;
-
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(s_bgBakeScratch, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, lg, ht);
-	DCFlushRange(pc.texData, needed);
-	GX_InitTexObj(&pc.texObj, pc.texData, lg, ht, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
-	// GX_NEAR, not GX_InitTexObj's default GX_LINEAR: this is an emulated
-	// 2D framebuffer sampled 1:1, so any bilinear tap mixes a texel with
-	// its neighbours instead of reproducing it. Found by A/B rather than
-	// by inspection -- see the copy-filter comment in
-	// gxDsEngineBRenderFrame() for the measurement that exposed it.
-	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR);
+	// Task 11: format decision. 4bpp text (combined index) and 8bpp text on the regular
+	// palette are always CI8; 8bpp text on an extended palette is CI8 only if the plane
+	// uses a single 256-colour slice (a tile's palNum picks the slice and GX binds one
+	// TLUT per texture -- a multi-slice plane falls back to pre-resolved RGB5A3).
+	bool ci = true;
+	if (extPal && gxDsBPopcount(usedPal) > 1) ci = false;
+#ifdef DSB_NOCI
+	ci = false;
+#endif
+	const u32 texels = (u32)lg * ht;
 	pc.wpx = (u16)lg;
 	pc.hpx = (u16)ht;
+	if (ci) {
+		if (!gxDsBEnsureTlut(&pc.tlutData))
+			return;
+		u16 *tlut = (u16 *)pc.tlutData;
+		memset(tlut, 0, 256 * sizeof(u16));
+		if (!c256) {
+			// 4bpp: TLUT entry palNum*16+e for every sub-bank with an opaque texel (the rest are
+			// never sampled and stay 0, which keeps the TLUT a pure function of the recorded read-set).
+			for (int pn = 0; pn < 16; ++pn)
+				if ((usedPal >> pn) & 1)
+					for (int e = 1; e < 16; ++e)
+						tlut[pn * 16 + e] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)(pn * 16 + e) * 2));
+		} else if (!extPal) {
+			gxDsBTlutFromPal(tlut, pal, 256);
+		} else if (usedPal) {
+			gxDsBTlutFromPal(tlut, extPal + (u32)__builtin_ctz(usedPal) * 512, 256);
+		}
+		pc.tlutEntries = 256;
+		if (!gxDsBUploadCI8(&pc.texData, &pc.texDataCap, &pc.texBytes, s_bgBakeScratch, lg, ht,
+		                    &pc.texObj, GX_REPEAT, &pc.tlutObj, pc.tlutData, gxDsBBgSlotFor(bg)))
+			return;
+	} else {
+		gxDsBResolveScratch(s_bgBakeScratch, texels, pal);
+		u32 needed = texels * sizeof(u16);
+		if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, needed))
+			return;
+		GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+		gxSwizzle16bpp(s_bgBakeScratch, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, lg, ht);
+		DCFlushRange(pc.texData, needed);
+		GX_InitTexObj(&pc.texObj, pc.texData, lg, ht, GX_TF_RGB5A3, GX_REPEAT, GX_REPEAT, GX_FALSE);
+		// GX_NEAR, not GX_InitTexObj's default GX_LINEAR: this is an emulated
+		// 2D framebuffer sampled 1:1, so any bilinear tap mixes a texel with
+		// its neighbours instead of reproducing it. Found by A/B rather than
+		// by inspection -- see the copy-filter comment in
+		// gxDsEngineBRenderFrame() for the measurement that exposed it.
+		GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR);
+		pc.texBytes = needed;
+	}
+	pc.ci = ci;
+	gxDsBStatBake(ci, pc.texBytes, texels * 2, extPal && !ci);
 	pc.bufW = (u16)lg;
 	pc.bufH = (u16)ht;
 	pc.cfgTileBase = tileBase;
@@ -1025,27 +1231,27 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	GxDsBRecGuard recGuard;
 	u16 *const buf = s_bgBakeScratch;
 	if (!wrap)
-		memset(buf, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent RGB5A3
+		memset(buf, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent (index 0 / RGB5A3 alpha 0)
 
-	// Index -> RGB5A3 lookup for the 8bpp flavours; index 0 is transparent.
-	u16 lut[256];
-	lut[0] = kDsBTransparentTexel;
-	for (int i = 1; i < 256; ++i)
-		lut[i] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)i * 2));
 	// BGType_AffineExt_256x16 with DISPCNT.ExBGxPalette_Enable: the tile's
 	// 4-bit palette number selects one of 16 256-entry palettes in the ext
 	// slot (rot_tiled_16bit_entry<extPal=true>: `pal[(entry + (Palette<<8))<<1]`).
 	const u8 *extPal = gxDsBExtPalFor(bg);
-	// The 256-entry regular palette is read (lut) by every flavour except a
-	// direct-colour bitmap and an extended-palette 256x16 (which never uses lut).
+	// The 256-entry regular palette is read by every indexed flavour except an
+	// extended-palette 256x16 (and a direct-colour bitmap never touches a palette).
 	if (type != BGType_AffineExt_Direct && !(type == BGType_AffineExt_256x16 && extPal))
 		gxDsBRecPal(kDsBBgPalOff, 512);
 	u32 seenExtPal = 0;
+	u32 usedPal = 0;   // task 11: ext-palette slices with an opaque texel
 
 	const u32 tileBase = gpu->BG_tile_ram[bg];
 	const u32 mapBase = gpu->BG_map_ram[bg];
 	u32 auxBase = 0;
+	const bool indexed = (type != BGType_AffineExt_Direct);
 
+	// Task 11: every indexed flavour writes its palette index (0 = transparent) into the
+	// scratch; format selection / TLUT / RGB5A3 resolve happen after the walk. (The
+	// direct-colour bitmap writes RGB5A3 texels straight away and stays RGB5A3.)
 	if (type == BGType_Affine || type == BGType_AffineExt_256x16) {
 		const int tw = lg >> 3, th = ht >> 3;
 		for (int ty = 0; ty < th; ++ty) {
@@ -1071,20 +1277,18 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 					seenExtPal |= 1u << palNum;
 					gxDsBRecVram(extPal + (u32)palNum * 512, 512);
 				}
+				const u16 base = (u16)(extPal ? (palNum << 8) : 0);
+				bool anyOpaque = false;
 				for (int sy = 0; sy < 8; ++sy) {
 					const u8 *row = tile + (vflip ? 7 - sy : sy) * 8;
 					u16 *out = buf + (u32)(ty * 8 + sy + border) * bufW + tx * 8 + border;
-					if (extPal) {
-						for (int sx = 0; sx < 8; ++sx) {
-							int idx = row[hflip ? 7 - sx : sx];
-							out[sx] = idx ? gxDsBOpaqueTexel(T1ReadWord((void *)extPal, (u32)((palNum << 8) + idx) * 2))
-							              : kDsBTransparentTexel;
-						}
-					} else {
-						for (int sx = 0; sx < 8; ++sx)
-							out[sx] = lut[row[hflip ? 7 - sx : sx]];
+					for (int sx = 0; sx < 8; ++sx) {
+						int idx = row[hflip ? 7 - sx : sx];
+						out[sx] = idx ? (u16)(base + idx) : 0;
+						anyOpaque |= (idx != 0);
 					}
 				}
+				if (anyOpaque && extPal) usedPal |= 1u << palNum;
 			}
 		}
 	} else if (type == BGType_AffineExt_256x1 || type == BGType_Large8bpp) {
@@ -1094,7 +1298,7 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 			gxDsBRecVram(row, (u32)lg);
 			u16 *out = buf + (u32)(y + border) * bufW + border;
 			for (int x = 0; x < lg; ++x)
-				out[x] = lut[row[x]];
+				out[x] = row[x];
 		}
 	} else if (type == BGType_AffineExt_Direct) {
 		auxBase = gpu->BG_bmp_ram[bg];
@@ -1111,15 +1315,42 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 		return;
 	}
 
-	u32 needed = (u32)bufW * bufH * sizeof(u16);
-	if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, needed))
-		return;
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(buf, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
-	DCFlushRange(pc.texData, needed);
+	const bool sliceOk = !(extPal && type == BGType_AffineExt_256x16 && gxDsBPopcount(usedPal) > 1);
+	bool ci = indexed && sliceOk;
+#ifdef DSB_NOCI
+	ci = false;
+#endif
+	const u32 texels = (u32)bufW * bufH;
 	const u8 wm = wrap ? GX_REPEAT : GX_CLAMP;
-	GX_InitTexObj(&pc.texObj, pc.texData, bufW, bufH, GX_TF_RGB5A3, wm, wm, GX_FALSE);
-	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	if (ci) {
+		if (!gxDsBEnsureTlut(&pc.tlutData))
+			return;
+		u16 *tlut = (u16 *)pc.tlutData;
+		memset(tlut, 0, 256 * sizeof(u16));
+		if (type == BGType_AffineExt_256x16 && extPal) {
+			if (usedPal) gxDsBTlutFromPal(tlut, extPal + (u32)__builtin_ctz(usedPal) * 512, 256);
+		} else {
+			gxDsBTlutFromPal(tlut, pal, 256);   // index 0 transparent, 1..255 from the regular BG palette bank
+		}
+		pc.tlutEntries = 256;
+		if (!gxDsBUploadCI8(&pc.texData, &pc.texDataCap, &pc.texBytes, buf, bufW, bufH,
+		                    &pc.texObj, wm, &pc.tlutObj, pc.tlutData, gxDsBBgSlotFor(bg)))
+			return;
+	} else {
+		if (indexed)
+			gxDsBResolveScratch(buf, texels, (type == BGType_AffineExt_256x16 && extPal) ? extPal : pal);
+		u32 needed = texels * sizeof(u16);
+		if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, needed))
+			return;
+		GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+		gxSwizzle16bpp(buf, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+		DCFlushRange(pc.texData, needed);
+		GX_InitTexObj(&pc.texObj, pc.texData, bufW, bufH, GX_TF_RGB5A3, wm, wm, GX_FALSE);
+		GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+		pc.texBytes = needed;
+	}
+	pc.ci = ci;
+	gxDsBStatBake(ci, pc.texBytes, texels * 2, indexed && !ci && !sliceOk);
 	pc.wpx = (u16)lg;
 	pc.hpx = (u16)ht;
 	pc.bufW = (u16)bufW;
@@ -1269,34 +1500,50 @@ static bool gxDsBCollectVisibleObj()
 	return true;
 }
 
-// One sprite -> one w x h RGB5A3 texture, unflipped (H/V flip is applied at
-// draw time by swapping the quad's UVs, which is exactly the reversed
-// traversal compute_sprite_vars() performs). Address arithmetic transcribed
-// from GPU.cpp's _spriteRender() non-rotozoomed 16/256-colour branches for
-// both SPRITE_1D and SPRITE_2D mapping, including the per-row
-// MMU_gpu_map() call the CPU makes (so a row that straddles a 16KB VRAM
-// page behaves identically to the reference).
+// Task 11: the extended OBJ palette slice a sprite samples, or NULL for the regular OBJ
+// palette. Mirrors GPU.cpp exactly: `if (dispCnt->ExOBJPalette_Enable) pal =
+// MMU.ObjExtPal[core][0] + PaletteIndex*0x200` in BOTH the rot/scale and the plain
+// 256-colour branches of _spriteRender; the 16-colour branch never looks at the flag
+// (it always indexes the regular OBJ palette by `PaletteIndex<<4`). A sprite has ONE
+// fixed PaletteIndex, so its slice is a fixed 256-entry palette: no per-tile selection
+// problem, unlike an extended BG palette.
+static const u8 *gxDsBObjExtPalFor(const GxDsBObjDraw &d)
+{
+	if (!d.depth || !SubScreen.gpu->dispx_st->dispx_DISPCNT.bits.ExOBJPalette_Enable)
+		return NULL;
+	return MMU.ObjExtPal[1][0] + (u32)d.palIndex * 0x200;
+}
+
+// One sprite -> one w x h texture, unflipped (H/V flip is applied at draw time by
+// swapping the quad's UVs, which is exactly the reversed traversal
+// compute_sprite_vars() performs). Since task 11 it is native CI4 (16-colour, the
+// sprite's own sub-palette as a 16-entry TLUT) / CI8 (256-colour, a 256-entry TLUT of the
+// regular or extended OBJ palette). Address arithmetic transcribed from GPU.cpp's
+// _spriteRender() non-rotozoomed 16/256-colour branches for both SPRITE_1D and
+// SPRITE_2D mapping, including the per-row MMU_gpu_map() call the CPU makes (so a row
+// that straddles a 16KB VRAM page behaves identically to the reference).
 static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 {
 	GPU *gpu = SubScreen.gpu;
 	const bool oneDim = (gpu->spriteRenderMode == GPU::SPRITE_1D);
 	const int rowBytes = d.depth ? 8 : 4;
 	u8 *const pal = MMU.ARM9_VMEM + kDsBObjPalOff;
+	const u8 *const extPal = gxDsBObjExtPalFor(d);
 
 	slot.valid = false;
 
 	// Task 8: an affine sprite is sampled through an arbitrary matrix, so any
 	// sample landing outside the w x h image must read transparent (the CPU
 	// simply doesn't draw it). Same trick as the affine BG planes: bake inside
-	// a 1-texel transparent border and sample GX_CLAMP. The border is padded to
-	// the RGB5A3 4x4 block size; a plain sprite keeps its exact-size,
-	// borderless bake so task 7's output is untouched.
+	// a 1-texel transparent border (index 0) and sample GX_CLAMP. The border is padded to
+	// a power of two; a plain sprite keeps its exact-size, borderless bake so
+	// task 7's output is untouched.
 	const bool bordered = d.affine;
 	const int off = bordered ? 1 : 0;
 	const int bufW = bordered ? gxDsBPow2Ge(d.w + 2) : d.w;
 	const int bufH = bordered ? gxDsBPow2Ge(d.h + 2) : d.h;
 	if (bordered)
-		memset(s_objBakeScratch, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent
+		memset(s_objBakeScratch, 0, (size_t)bufW * bufH * sizeof(u16)); // index 0 == transparent
 
 	// Plain sprites: GPU.cpp resolves MMU_gpu_map() once per ROW (compute_
 	// sprite_vars/_spriteRender's per-line `src = MMU_gpu_map(...)`), affine
@@ -1319,8 +1566,10 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 		if (d.depth) rowSpan = (u32)((xm & 7) + ((xm & 0xFFF8) << 3) + 1);
 		else { const int x1 = xm >> 1; rowSpan = (u32)((x1 & 3) + ((x1 & 0xFFFC) << 3) + 1); }
 	}
-	if (d.depth) gxDsBRecPal(kDsBObjPalOff, 512);                       // 256-colour: the whole OBJ palette
-	else gxDsBRecPal(kDsBObjPalOff + (u32)d.palIndex * 32, 32);         // 16-colour: its own sub-palette
+	if (d.depth) {
+		if (extPal) gxDsBRecVram(extPal, 512);                          // task 11: the extended-palette slice
+		else gxDsBRecPal(kDsBObjPalOff, 512);                           // 256-colour: the whole OBJ palette
+	} else gxDsBRecPal(kDsBObjPalOff + (u32)d.palIndex * 32, 32);       // 16-colour: its own sub-palette
 
 	for (int y = 0; y < d.h; ++y) {
 		const u8 *src;
@@ -1344,26 +1593,60 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 				u8 b = src[(x1 & 3) + ((x1 & 0xFFFC) << 3)];
 				idx = (x & 1) ? (b >> 4) : (b & 0xF);
 			}
-			if (!idx) {
-				out[x] = kDsBTransparentTexel;
-			} else {
-				int palIdx = d.depth ? idx : (d.palIndex * 16 + idx);
-				out[x] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)palIdx * 2));
-			}
+			out[x] = (u16)idx;   // 0 = transparent; else the index into this sprite's own (sub-)palette
 		}
 	}
 
-	u32 needed = (u32)bufW * bufH * sizeof(u16);
-	if (!gxDsBEnsureCap(&slot.texData, &slot.texDataCap, needed))
-		return;
-
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
-	DCFlushRange(slot.texData, needed);
-	GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjFilterMode(&slot.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	const u32 texels = (u32)bufW * bufH;
+	bool ci = true;
+#ifdef DSB_NOCI
+	ci = false;
+#endif
 	slot.w = d.w;
 	slot.h = d.h;
+	if (ci) {
+		if (!gxDsBEnsureTlut(&slot.tlutData))
+			return;
+		u16 *tlut = (u16 *)slot.tlutData;
+		const int entries = d.depth ? 256 : 16;
+		// Index-0 transparency, as the CPU tests `color != 0` per texel, is TLUT entry 0; the
+		// affine border / padding is raw index 0 and so is transparent through the same entry.
+		if (d.depth) gxDsBTlutFromPal(tlut, extPal ? extPal : pal, 256);
+		else gxDsBTlutFromPal(tlut, pal + (u32)d.palIndex * 32, 16);
+		DCFlushRange(slot.tlutData, (u32)entries * sizeof(u16));
+		GX_InitTlutObj(&slot.tlutObj, slot.tlutData, GX_TL_RGB5A3, entries);
+		slot.tlutEntries = (u16)entries;
+		if (d.depth) {
+			if (!gxDsBUploadCI8(&slot.texData, &slot.texDataCap, &slot.texBytes, s_objBakeScratch, bufW, bufH,
+			                    &slot.texObj, GX_CLAMP, &slot.tlutObj, slot.tlutData, gxDsBObjSlotFor()))
+				return;
+		} else {
+			const u32 needed = texels / 2;
+			if (!gxDsBEnsureCap(&slot.texData, &slot.texDataCap, needed))
+				return;
+			gxDsBCompact8(s_objBakeScratch, texels);
+			GXBlockShape blk = gxBlockShape(GXTEXFMT_CI4);
+			gxSwizzle4bpp((const u8 *)s_objBakeScratch, (u8 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+			DCFlushRange(slot.texData, needed);
+			GX_InitTexObjCI(&slot.texObj, slot.texData, bufW, bufH, GX_TF_CI4, GX_CLAMP, GX_CLAMP, GX_FALSE, gxDsBObjSlotFor());
+			GX_InitTexObjFilterMode(&slot.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+			gxDsBMutantLoad(&slot.tlutObj, gxDsBObjSlotFor());
+			slot.texBytes = needed;
+		}
+	} else {
+		gxDsBResolveScratch(s_objBakeScratch, texels, d.depth ? (extPal ? extPal : pal) : pal + (u32)d.palIndex * 32);
+		u32 needed = texels * sizeof(u16);
+		if (!gxDsBEnsureCap(&slot.texData, &slot.texDataCap, needed))
+			return;
+		GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+		gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+		DCFlushRange(slot.texData, needed);
+		GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&slot.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+		slot.texBytes = needed;
+	}
+	slot.ci = ci;
+	gxDsBStatBake(ci, slot.texBytes, texels * 2, false);
 	slot.bufW = (u16)bufW;
 	slot.bufH = (u16)bufH;
 	slot.cfgBordered = (u8)(bordered ? 1 : 0);
@@ -1372,6 +1655,7 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 	slot.cfgDepth = (u8)(d.depth ? 1 : 0);
 	slot.cfgOneDim = (u8)(oneDim ? 1 : 0);
 	slot.cfgBoundary = gpu->sprBoundary;
+	slot.cfgExtPal = extPal;
 	slot.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
 	slot.valid = true;
 }
@@ -1725,6 +2009,7 @@ static void gxDsBDrawBgLayer(int bg, const GxDsBBandRegs &r, const GxDsBBandPlan
 			const GxDsBBgPlaneCache &pc = fade ? s_bgPlaneFx[bg] : s_bgPlane[bg];
 			if (!pc.valid) continue;
 			if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+			if (pc.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&pc.tlutObj), gxDsBBgSlotFor(bg));
 			GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
 			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
@@ -1756,6 +2041,7 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 				const GxDsBObjTexSlot &slot = fade ? s_objTexFx[d.oamIndex] : s_objTex[d.oamIndex];
 				if (!slot.valid) continue;
 				if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+				if (slot.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&slot.tlutObj), gxDsBObjSlotFor());
 				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 				if (d.affine) {
 					gxDsBDrawAffineObj(d, slot);
@@ -1800,10 +2086,11 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 		s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
 		if (affine) gxDsBBakeAffineBgPlane(bg, tmp); else gxDsBBakeBgPlane(bg, tmp);
 		s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
-		u32 sz = (u32)tmp.bufW * tmp.bufH * 2;
-		if (tmp.valid && (tmp.bufW != pc.bufW || tmp.bufH != pc.bufH || memcmp(tmp.texData, pc.texData, sz) != 0))
+		if (tmp.valid && (tmp.bufW != pc.bufW || tmp.bufH != pc.bufH || tmp.ci != pc.ci || tmp.texBytes != pc.texBytes ||
+		                  memcmp(tmp.texData, pc.texData, tmp.texBytes) != 0 ||
+		                  (tmp.ci && memcmp(tmp.tlutData, pc.tlutData, 256 * sizeof(u16)) != 0)))
 			++s_dsbStale;
-		free(tmp.texData);
+		free(tmp.texData); free(tmp.tlutData);
 	}
 #endif
 	if (!needBake) return;
@@ -1811,8 +2098,14 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 	if (fadeMode) ++s_dsbBgFxBake[bg]; else ++s_dsbBgBake[bg];
 #endif
 	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+#ifdef DSB_STATS
+	const u64 t0 = gettime();
+#endif
 	if (affine) gxDsBBakeAffineBgPlane(bg, pc);
 	else gxDsBBakeBgPlane(bg, pc);
+#ifdef DSB_STATS
+	s_dsbBakeTicks += gettime() - t0;
+#endif
 	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 }
 
@@ -1829,6 +2122,7 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	                slot.cfgDepth != (u8)(d.depth ? 1 : 0) ||
 	                slot.cfgOneDim != oneDim ||
 	                slot.cfgBoundary != gpu->sprBoundary ||
+	                slot.cfgExtPal != gxDsBObjExtPalFor(d) ||
 	                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
 	if (!needBake && gxDsBDepsDirty(slot.deps)) needBake = true;
 #ifdef DSB_VERIFY
@@ -1837,10 +2131,11 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 		s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
 		gxDsBBakeObjTexture(d, tmp);
 		s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
-		u32 sz = (u32)tmp.bufW * tmp.bufH * 2;
-		if (tmp.valid && (tmp.bufW != slot.bufW || tmp.bufH != slot.bufH || memcmp(tmp.texData, slot.texData, sz) != 0))
+		if (tmp.valid && (tmp.bufW != slot.bufW || tmp.bufH != slot.bufH || tmp.ci != slot.ci || tmp.texBytes != slot.texBytes ||
+		                  memcmp(tmp.texData, slot.texData, tmp.texBytes) != 0 ||
+		                  (tmp.ci && memcmp(tmp.tlutData, slot.tlutData, (u32)tmp.tlutEntries * sizeof(u16)) != 0)))
 			++s_dsbStale;
-		free(tmp.texData);
+		free(tmp.texData); free(tmp.tlutData);
 	}
 #endif
 	if (!needBake) return;
@@ -1848,7 +2143,13 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	if (fadeMode) ++s_dsbObjFxBake[d.oamIndex]; else ++s_dsbObjBake[d.oamIndex];
 #endif
 	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+#ifdef DSB_STATS
+	const u64 t0 = gettime();
+#endif
 	gxDsBBakeObjTexture(d, slot);
+#ifdef DSB_STATS
+	s_dsbBakeTicks += gettime() - t0;
+#endif
 	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 }
 
@@ -1907,6 +2208,24 @@ bool gxDsEngineBRenderFrame()
 				                      (unsigned)s_dsbObjBake[0], (unsigned)s_dsbObjBake[1], (unsigned)s_dsbObjBake[2], (unsigned)s_dsbObjBake[3],
 				                      (unsigned)s_dsbObjBake[4], (unsigned)s_dsbObjBake[5], (unsigned)s_dsbObjBake[6], (unsigned)s_dsbObjBake[7],
 				                      (unsigned)s_dsbOldBg, (unsigned)s_dsbOldObj, (unsigned)s_dsbStale);
+				{
+					// task 11: texture memory. live = every cached texture currently valid, `rgb` = what the
+					// same textures would occupy as pre-resolved RGB5A3 (the pre-task-11 form).
+					u32 live = 0, rgb = 0, nci = 0, ntex = 0;
+					for (int i = 0; i < 4; ++i) {
+						const GxDsBBgPlaneCache *c[2] = { &s_bgPlane[i], &s_bgPlaneFx[i] };
+						for (int k = 0; k < 2; ++k) if (c[k]->valid) { live += c[k]->texBytes; rgb += (u32)c[k]->bufW * c[k]->bufH * 2; nci += c[k]->ci; ++ntex; }
+					}
+					for (int i = 0; i < 128; ++i) {
+						const GxDsBObjTexSlot *c[2] = { &s_objTex[i], &s_objTexFx[i] };
+						for (int k = 0; k < 2; ++k) if (c[k]->valid) { live += c[k]->texBytes; rgb += (u32)c[k]->bufW * c[k]->bufH * 2; nci += c[k]->ci; ++ntex; }
+					}
+					harness_profile_emitf("dsbm tex=%u ci=%u live=%u rgb5a3equiv=%u bakes_ci=%u bakes_rgb=%u fallback=%u baked_bytes=%u baked_equiv=%u tlutloads=%u bake_us=%u",
+					                      (unsigned)ntex, (unsigned)nci, (unsigned)live, (unsigned)rgb,
+					                      (unsigned)s_dsbBakeCi, (unsigned)s_dsbBakeRgb, (unsigned)s_dsbBakeFallback,
+					                      (unsigned)s_dsbBakedBytes, (unsigned)s_dsbBakedBytesRgbEquiv, (unsigned)s_dsbTlutLoads,
+					                      (unsigned)ticks_to_microsecs(s_dsbBakeTicks));
+				}
 #endif
 			}
 		}
@@ -2040,6 +2359,7 @@ bool gxDsEngineBRenderFrame()
 	LWP_MutexLock(vidmutex);
 
 	gxDsBSetup2DState();
+	gxDsBTlutReset();   // task 11: assume nothing about TMEM's TLUT contents from an earlier frame / another engine
 	s_tevK = -1;
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);

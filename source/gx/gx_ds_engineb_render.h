@@ -127,10 +127,11 @@
        wave effects) exceeds the band budget and bails.
      - Every drawn sprite is a regular OBJ or (task 8) an affine one
        (OAM RotScale 1 = normal box, 3 = double-size box), both in Mode 0.
-     - No mosaic on any enabled BG or any drawn sprite, no extended OBJ
-       palettes, no forced blank, no OBJ window (DISPCNT WinOBJ_Enable). (Extended
-       BG palettes ARE handled since task 8: 256-colour text BGs and the 256x16
-       extended-affine flavour, nothing else -- see "Extended BG palettes" below.)
+     - No mosaic on any enabled BG or any drawn sprite, no forced blank, no OBJ
+       window (DISPCNT WinOBJ_Enable). (Extended BG palettes ARE handled since
+       task 8: 256-colour text BGs and the 256x16 extended-affine flavour, nothing
+       else -- see "Extended BG palettes" below; extended OBJ palettes since task
+       11, see "Native CI4/CI8 + TLUT".)
        TASK 9 brought WIN0/WIN1 windows, all BLDCNT effects, semi-transparent
        OBJ and MASTER_BRIGHT IN scope -- see "Windows / colour effects /
        MASTER_BRIGHT (task 9)" below for exactly what is exact, what is
@@ -161,7 +162,8 @@
        one quad per band (BG) / per sprite (OBJ) whose 4 corner UVs are the
        texture coordinates the CPU's per-pixel `X += PA / Y += PC` walk
        reaches at those corners, so GX's linear interpolation reproduces the
-       whole walk. Baked RGB5A3 (native CI is queue item 11), GX_NEAR.
+       whole walk. Baked as native CI8 + TLUT since task 11 (RGB5A3 for the direct-colour
+       bitmap and multi-slice extended-palette planes), GX_NEAR.
        Out-of-map / out-of-sprite samples read TRANSPARENT via a 1-texel
        transparent border + GX_CLAMP; a wrapping BG plane is baked at its
        own size and sampled GX_REPEAT (== the CPU's `& (size-1)`).
@@ -254,7 +256,60 @@
      LCDC window (0x06898000-0x0689FFFF) arm the whole-region VRAM flag, and
      the four MMU.ExtPal[1][] slot pointers are part of the bank-map
      fingerprint (a VRAMCNT_H remap re-bakes). Extended OBJ palettes
-     (MMU.ObjExtPal) still bail.
+     (MMU.ObjExtPal) bailed until task 11, which handles them (below).
+
+    ------------------------------------------------------------------
+    Native CI4/CI8 + TLUT (task 11)
+    ------------------------------------------------------------------
+     Every base bake (plain and brighten/darken fade variant) is now a palette-INDEX
+     texture + a TLUT instead of pre-resolved RGB5A3. The bake first writes a u16
+     scratch of "palette indices" (0 = transparent: index 0 of the tile/sprite, the
+     affine border and pow2 padding; else the index the CPU would look up), then
+     either compacts it to CI8/CI4 and builds a TLUT (RGB5A3 entries, entry 0 = alpha
+     0, so transparency and the clamp-border technique are unchanged) or resolves it
+     through the same palette to RGB5A3 (the fallback). Formats:
+       - text BG 4bpp: CI8 with the COMBINED index palNum*16+idx (a plane spans
+         several 16-colour sub-banks; GX binds one TLUT per texture, and a CI4 TLUT
+         could only be one sub-bank), TLUT = the sub-banks that have an opaque texel
+         (the rest are 0, keeping the TLUT a pure function of the recorded read-set).
+         Same answer task 6 gave the GBA.
+       - text BG 8bpp / affine / 256x1 / Large8bpp on the regular palette: CI8,
+         256-entry TLUT of the BG palette bank (entry 0 transparent).
+       - extended-palette BG (256-colour text, AffineExt_256x16): the per-TILE palNum
+         picks one of 16 256-colour slices, i.e. a 12-bit index. CI8 only if the plane
+         uses a SINGLE slice (blank tiles' palNum is ignored: only slices with an
+         opaque texel count); a multi-slice plane falls back to RGB5A3 (exact, 2x
+         the bytes). A CI14X2 / per-slice multi-draw scheme was not attempted.
+       - AffineExt_Direct (15-bit colour bitmap): RGB5A3, not palette-indexed.
+       - OBJ 4bpp: CI4 with the sprite's own 16-entry TLUT (one palIndex per sprite).
+         OBJ 8bpp: CI8, 256-entry TLUT of the OBJ palette, or (DISPCNT
+         ExOBJPalette_Enable) of the sprite's own extended slice
+         MMU.ObjExtPal[1][0] + palIndex*0x200 -- exactly GPU.cpp's rule, in both
+         its plain and rot/scale 256-colour branches; a 16-colour sprite ignores the
+         flag. A sprite has one fixed palIndex, so unlike an extended BG palette
+         there is no per-tile problem and the conversion is always exact.
+       - brighten/darken: NOT a separate texture design -- the same CI bake with the
+         fade applied to the TLUT entries (gxDsBOpaqueTexel), byte-identical to the
+         RGB5A3 fade bake by construction. Alpha / semi-transparent OBJ never bake
+         colour (constant-alpha TEV compare on the texel alpha, which the TLUT
+         supplies), so they are format-independent.
+     TLUT hardware-slot budget (documented in the code, gxDsBBindTlut): Engine B
+     reserves FIVE of the 16 names -- GX_TLUT12..15 for BG0..3 (a plane's plain and
+     fade variants share their BG's name) and GX_TLUT11 for every sprite -- leaving
+     GX_TLUT0..10 for Engine A / 3D. Sharing a name is only safe if the TLUT is
+     (re)loaded whenever the drawer differs from the last loader, so every draw calls
+     gxDsBBindTlut(), which tracks the owner of each name and issues GX_LoadTlut on a
+     change; the tracking is reset at the start of every Engine B GX sequence, so
+     nothing assumes a TLUT survived from an earlier frame or another engine.
+     Dirty gating is UNCHANGED (task 10): the read-set recorded for the RGB5A3 bake is
+     exactly what the CI bake reads, so a palette write still invalidates exactly the
+     textures that read it; a palette-only change re-bakes the index texture too
+     (correct, ~free at these sizes; a TLUT-only rebuild is a possible refinement).
+     Extended OBJ palettes: DISPCNT.ExOBJPalette_Enable no longer bails; toggling it
+     (or ExBGxPalette_Enable) mid-frame bails (`extpalchange`); the VRAMCNT_I pointer
+     MMU.ObjExtPal[1][0] joined the bank-map fingerprint; the slice a sprite read is
+     in its read-set as an LCDC range, so a bank-I LCD-window fill is caught.
+     Memory: ~50% of the RGB5A3 bytes (CI8), ~25% for 4bpp sprites (CI4).
 
     ------------------------------------------------------------------
     Test hooks (compile-time, zero cost when undefined)
@@ -273,6 +328,15 @@
      -DDSB_VERIFY     (with DSB_STATS) every cached texture the gate calls
                       fresh is re-baked into scratch and byte-compared; the
                       `stale=` counter of the `dsbk` line must stay 0.
+     -DDSB_NOCI       (task 11) every bake uses the old pre-resolved RGB5A3 form
+                      (the always-present fallback path): the A/B reference for
+                      the CI conversion and the memory-saving baseline. -DDSB_STATS
+                      adds a `dsbm` line (live/baked texture bytes CI vs the RGB5A3
+                      equivalent, fallback count, TLUT loads, bake time).
+     -DDSB_MUTATE_TLUTSHARE / _TLUTNOBIND   (task 11) TLUT-clobber mutations for
+                      tools/vsd-testrom/cirom: every texture shares ONE TLUT name /
+                      per-BG names + one OBJ name but loaded at bake time only.
+                      The fixtures must FAIL (they do; see the task 11 log section).
      -DDSB_MUTATE_NOINVAL / _NODEPS / _NOBANK
                       mutation tests for the tools/vsd-testrom/dirtyrom fixtures: drop the
                       not-drawn-texture invalidation / make the dependency gate
@@ -282,13 +346,10 @@
     ------------------------------------------------------------------
     Deliberate deviations from the pipeline doc's ideal Stage 0/1/4
     ------------------------------------------------------------------
-     - **RGB5A3 baking, not native CI4/CI8+TLUT.** Every BG plane and OBJ
-       texture is baked with the palette already resolved on the CPU, one
-       16-bit texel per pixel -- the GBA slice's original approach, before
-       gx-next-steps-log.md task 6 converted it. The native-CI conversion
-       for Engine B (including the per-BG-plane dedicated-TLUT-slot hazard
-       task 6 documents, which would be *worse* here since Engine B's text
-       BGs have the same per-tile palNum problem) is queued as a follow-up.
+     - **Native CI4/CI8+TLUT: RESOLVED by task 11** (see "Native CI4/CI8 + TLUT"
+       above). Remaining RGB5A3 bakes: the direct-colour bitmap plane, multi-slice
+       extended-palette planes (per-tile slice selection cannot be one TLUT), the
+       1x1 backdrop (as in the GBA slice), and -DDSB_NOCI builds.
      - **Dirty gating: RESOLVED by task 10** (see "Dirty gating" above; this used
        to be a single whole-region VRAM flag). Deviations from the GBA pattern it
        was modelled on: dependencies are recorded during the bake (a read-set)
