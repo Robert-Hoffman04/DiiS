@@ -2573,7 +2573,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 1);
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 1);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
@@ -2581,7 +2581,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
-	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 1);
+	if(adr - 0x06000000u < 0xA4000u) gxDsMarkVram(adr - 0x06000000u, 1);
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM9][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]]=val;
@@ -3071,7 +3071,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 2);
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 2);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
@@ -3079,7 +3079,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
-	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 2);
+	if(adr - 0x06000000u < 0xA4000u) gxDsMarkVram(adr - 0x06000000u, 2);
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);
@@ -3485,7 +3485,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsEngineBMarkWrite(adr, 4);
+	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 4);
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
@@ -3493,7 +3493,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
-	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 4);
+	if(adr - 0x06000000u < 0xA4000u) gxDsMarkVram(adr - 0x06000000u, 4);
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);

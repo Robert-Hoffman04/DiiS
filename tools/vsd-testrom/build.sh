@@ -129,6 +129,9 @@ docker run --rm -v "$HERE/cirom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/cirom/ci_c$c.nds "$OUT"/; done
 
+# --- Engine A fixtures (gx-next-steps-log.md task 13) --------------------------
+bash "$HERE/build_enga.sh"
+
 echo
 echo "ROMs in $OUT :"
 ls -la "$OUT"/*.nds

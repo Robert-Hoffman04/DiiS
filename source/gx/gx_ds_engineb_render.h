@@ -312,6 +312,18 @@
      Memory: ~50% of the RGB5A3 bytes (CI8), ~25% for 4bpp sprites (CI4).
 
     ------------------------------------------------------------------
+    TASK 13 (Engine A): this body is now compiled twice
+    ------------------------------------------------------------------
+     source/gx/gx_ds_engine_impl.inc is this file's implementation, compiled as Engine B
+     (gx_ds_engineb_render.cpp) and as Engine A (gx_ds_enginea_render.cpp, see
+     gx_ds_enginea_render.h). Everything above applies to both. Deviations: Engine A adds
+     the 3D layer (a 256x256 RGB5A3 input texture from gfx3d_convertedScreen, exact-or-bail),
+     bails on capture armed / display mode != 1 / mid-frame DISPCNT base-block change; both
+     engines bail on a mid-frame screen swap (`screenswap`); Engine A TLUT names are
+     GX_TLUT6-10; GxDsBBandRegs has a `bg3d` field (always 0 for B); test hooks:
+     -DDSA_FORCE_CPU, -DDSB_ABCMP. See gx-next-steps-log.md "Task 13".
+
+    ------------------------------------------------------------------
     Test hooks (compile-time, zero cost when undefined)
     ------------------------------------------------------------------
      -DDSB_FORCE_CPU  gxDsEngineBRenderFrame() always bails -> the CPU
@@ -439,6 +451,7 @@ struct GxDsBBandRegs {
 	u8  win1h0, win1h1, win1v0, win1v1;
 	u8  winIn0, winIn1, winOut;           // 5-bit layer-enable masks (BG0-3, OBJ)
 	u8  winSp;        // bit0 WININ0 effect, bit1 WININ1 effect, bit2 WINOUT effect
+	u8  bg3d;         // task 13: Engine A only -- DISPCNT.BG0_3D (BG0 is the 3D layer this band); always 0 for Engine B
 	u8  eva, evb;     // BLDALPHA EVA/EVB (already clamped to 16 by GPU.h)
 	u8  evy;          // BLDY EVY (already clamped to 16); 0 unless the effect is brighten/darken
 	// --- NOT memcmp'd: task 8 affine state for BG2 (index 0) / BG3 (index 1).
@@ -494,5 +507,13 @@ void gxDsEngineBMarkVram(u32 lcdcOffset, u32 size);
 // Task 10: force every cached Engine B texture to re-bake on the next frame
 // (NDS_Reset(), hence savestate load: VRAM/palette/OAM are rewritten wholesale).
 void gxDsEngineBInvalidateAll();
+
+// Task 13: both DS engines track dirtiness from the same write funnels, so the MMU /
+// capture call sites use these, which tag Engine A's and Engine B's plans (each engine
+// only ever records reads inside its own palette/OAM half and its own VRAM windows, so
+// the other engine's traffic never dirties it -- see gx_ds_enginea_render.h).
+void gxDsMarkWrite(u32 adr, u32 size);
+void gxDsMarkVram(u32 lcdcOffset, u32 size);
+void gxDsInvalidateAll();
 
 #endif // GX_DS_ENGINEB_RENDER_H

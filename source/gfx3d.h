@@ -369,6 +369,8 @@ extern CACHE_ALIGN const u8 material_3bit_to_8bit[8];
 //these contain the 3d framebuffer converted into the most useful format
 //they are stored here instead of in the renderers in order to consolidate the buffers
 extern CACHE_ALIGN u8 gfx3d_convertedScreen[256*192*4];
+// Bumped every time gfx3d_convertedScreen is (re)written (gfx3d_VBlankEndSignal); GX Engine A's 3D-layer bake gate.
+extern u32 g_gfx3dRenderSeq;
 extern CACHE_ALIGN u8 gfx3d_convertedAlpha[256*192*2]; //see cpp for explanation of illogical *2
 
 extern BOOL isSwapBuffers;

@@ -1863,11 +1863,17 @@ void gfx3d_VBlankSignal(){
 	}
 }
 
+u32 g_gfx3dRenderSeq = 0;
+
 void gfx3d_VBlankEndSignal(bool skipFrame){
 	if (!drawPending) return;
 	if(skipFrame) return;
 
 	drawPending = FALSE;
+	// gx-next-steps-log.md task 13: the GX Engine A compositor re-bakes its 3D-layer texture
+	// from gfx3d_convertedScreen only when this counter moved (both writers below/in the
+	// rasterizer run only after this point).
+	++g_gfx3dRenderSeq;
 
 	//if the null 3d core is chosen, then we need to clear out the 3d buffers to keep old data from being rendered
 	if(gpu3D == &gpu3DNull || !CommonSettings.showGpu.main)

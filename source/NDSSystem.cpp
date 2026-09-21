@@ -47,6 +47,7 @@
 #include "readwrite.h"
 #include "GPU.h"
 #include "gx/gx_ds_engineb_render.h"
+#include "gx/gx_ds_enginea_render.h"
 #include "firmware.h"
 #include "path.h"
 #ifdef DESMUME_JIT_ARM7
@@ -1394,6 +1395,12 @@ static void execHardware_hblank()
 		{
 			PZ_SCOPE(PZ_GPU_2D);
 			const bool skip2d = frameSkipper.ShouldSkip2D();
+			// gx-next-steps-log.md task 13: Stage 0 for DS Engine A. Sampled BEFORE
+			// this scanline's Engine-A CPU render (unlike Engine B's, which follows
+			// Engine A's line), so the affine reference point it reads at line 0 is
+			// still the pre-latch value, exactly like Engine B's hook sees it.
+			if (!skip2d)
+				gxDsEngineAScanline(nds.VCount);
 			GPU_RenderLine(&MainScreen, nds.VCount, skip2d);
 			// gx-next-steps-log.md task 7: Stage 0 for DS Engine B. Sampled
 			// here, immediately before this scanline's Engine-B CPU render,
@@ -1411,8 +1418,13 @@ static void execHardware_hblank()
 			// landed. If it handles the frame it overwrites Engine B's 192
 			// scanlines in GPU_screen, superseding what GPU_RenderLine just
 			// wrote there; if it bails, that CPU result already stands.
-			if (nds.VCount == 191)
+			// Task 13: Engine A first (its own GX sequence + EFB readback under
+			// vidmutex, ending with the EFB clear + GxRestorePresentState()), then
+			// Engine B's; the two never overlap in the FIFO.
+			if (nds.VCount == 191) {
+				gxDsEngineARenderFrame();
 				gxDsEngineBRenderFrame();
+			}
 		}
 		//taskSubGpu.finish();
 
@@ -2208,7 +2220,7 @@ void NDS_Reset()
 	// gx-next-steps-log.md task 10: a reset / savestate load (which calls this) rewrites VRAM,
 	// palette and OAM without going through the MMU write funnel, so every dirty-gated
 	// Engine B cache is stale by construction.
-	gxDsEngineBInvalidateAll();
+	gxDsInvalidateAll();
 
 	if (!header) return ;
 

@@ -10,3 +10,6 @@
 /dirtyrom/*.nds
 /cirom/build/
 /cirom/*.nds
+/.gen/
+/a3drom/build/
+/a3drom/*.nds
