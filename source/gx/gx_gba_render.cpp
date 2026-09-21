@@ -8,6 +8,13 @@
 #include <gccore.h>
 #include <malloc.h>
 #include <string.h>
+#include <ogc/lwp.h>
+#include <ogc/mutex.h>
+
+// gx-next-steps-log.md task 12: same present-state discipline as
+// gx_ds_engineb_render.cpp (task 7). See gxGbaRenderFrame()'s GX section.
+extern void GxRestorePresentState(void);
+extern mutex_t vidmutex;
 
 GxGbaBandRegs g_gbaBandRegs[GX_GBA_MAX_BAND_REGS];
 
@@ -1882,6 +1889,21 @@ bool gxGbaRenderFrame()
 	// gates instead of this aggregate.
 	bool dirty = g_gbaFramePlan.vram.anyDirty() || g_gbaFramePlan.palette.anyDirty();
 
+	// ---- GX sequence, under vidmutex (task 12) --------------------------
+	// draw_thread (main.cpp) shares this GX FIFO from another LWP thread and
+	// only re-loads its position matrix per frame; viewport/scissor/projection/
+	// Z-mode/EFB-copy registers are set once by InitVideo(). So this whole
+	// sequence (state setup -> draws -> GX_DrawDone -> GX_CopyTex) is held
+	// under vidmutex, and GxRestorePresentState() hands the FIFO back in
+	// draw_thread's expected state before unlock. vidmutex is NOT recursive
+	// (LWP_MutexInit(&m,false)); this function is never called with it held
+	// (gbaPpuEndFrame() runs before Draw() takes it, same thread), and every
+	// bail `return` in this function is above this lock -- there is no return
+	// between here and the unlock at the end.
+	if (vidmutex == LWP_MUTEX_NULL)
+		return false;
+	LWP_MutexLock(vidmutex);
+
 	gxSetup2DState();
 	GX_SetViewport(0, 0, GBA_SCREEN_W, GBA_SCREEN_H, 0, 1);
 	GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
@@ -1990,9 +2012,19 @@ bool gxGbaRenderFrame()
 
 	GX_DrawDone();
 	GX_SetTexCopyDst(GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_FALSE);
-	GX_CopyTex(s_copyBackBuf, GX_FALSE);
+	// clear=GX_TRUE: wipe the 240x160 EFB corner this pass just drew into
+	// (using InitVideo()'s GX_SetCopyClear colour) after the readback. The
+	// EFB is otherwise never cleared between this pass and draw_thread's
+	// present, so without it the raw GBA image ghosts in the EFB's top-left
+	// corner underneath the presented screens (seen in the live window).
+	GX_CopyTex(s_copyBackBuf, GX_TRUE);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
+
+	// Undo gxSetup2DState() + the copy src/dst above before draw_thread's
+	// next present pass can observe them.
+	GxRestorePresentState();
+	LWP_MutexUnlock(vidmutex);
 
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, GBA_SCREEN_W, GBA_SCREEN_H);

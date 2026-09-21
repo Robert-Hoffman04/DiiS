@@ -372,6 +372,14 @@
        threading model, not scoped to this file, and affects DS-mode
        present too -- a separate task.
 
+    Present-state hygiene (gx-next-steps-log.md task 12): gxGbaRenderFrame()
+    holds vidmutex (non-recursive; never called with it held) across its whole
+    GX sequence, calls main.cpp's GxRestorePresentState() before unlock, and
+    does its EFB->texture copy with clear=GX_TRUE so the raw 240x160 draw does
+    not ghost in the EFB corner under draw_thread's present. Without this the
+    live window showed only a clipped corner (see the log). Same clear fix
+    applied to gx_ds_engineb_render.cpp (deviation from task scope).
+
     GX-only (libogc), like gx_mask.* -- verified by cross-compilation only,
     not a host-side unit test.
 */

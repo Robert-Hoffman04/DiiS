@@ -1866,7 +1866,9 @@ bool gxDsEngineBRenderFrame()
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
-	GX_CopyTex(s_copyBackBuf, GX_FALSE);
+	// clear=GX_TRUE (task 12): wipe the 256x192 EFB corner just drawn into so it
+	// does not ghost under draw_thread's present (visible in the live window).
+	GX_CopyTex(s_copyBackBuf, GX_TRUE);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
 
