@@ -26,6 +26,14 @@ static u32 s_dsbOk = 0, s_dsbBail = 0, s_dsbAffOk = 0, s_dsbAffObjOk = 0, s_dsbD
 // task 9: engaged-frame counts per feature (window / fade / alpha / semi-transparent OBJ / master brightness)
 static u32 s_dsbWinOk = 0, s_dsbFadeOk = 0, s_dsbAlphaOk = 0, s_dsbSemiOk = 0, s_dsbMbOk = 0;
 static bool s_dsbFrWin, s_dsbFrFade, s_dsbFrAlpha, s_dsbFrSemi, s_dsbFrMb;
+// task 10: bake counters (every real texture bake, per BG plane / per OAM index; the
+// *Fx counters are the brighten/darken variants) and, from the SAME run, how many bakes
+// the pre-task-10 coarse gate (any Engine-B-visible VRAM write / any palette write /
+// any OAM write / bank remap => re-bake every enabled plane and visible sprite) WOULD
+// have done, so before/after is measured on identical inputs.
+static u32 s_dsbBgBake[4], s_dsbBgFxBake[4], s_dsbObjBake[128], s_dsbObjFxBake[128];
+static u32 s_dsbOldBg, s_dsbOldObj, s_dsbStale; // s_dsbStale: -DDSB_VERIFY only (cached texture != fresh bake)
+static bool s_dsbOldVramArm; // the old whole-region VRAM flag (BBG/BOBJ page writes + bank H LCDC window)
 #define DSB_WHY(s_) do { s_dsbWhy = (s_); } while (0)
 #else
 #define DSB_WHY(s_) do { } while (0)
@@ -168,33 +176,28 @@ static bool gxDsBBankMapChanged()
 	return true;
 }
 
+// Palette RAM and OAM are tracked here (pre-MMU_LCDmap address; they are not remapped).
+// VRAM is NOT: it is tracked in LCDC space by gxDsEngineBMarkVram() below, fed by
+// MMU.cpp AFTER MMU_LCDmap() resolved the write. Under -DDSB_STATS this still
+// evaluates the pre-task-10 whole-region VRAM flag so the log can report what the
+// coarse gate would have re-baked on identical inputs.
 void gxDsEngineBMarkWrite(u32 adr, u32 size)
 {
 	switch ((adr >> 24) & 0xF) {
 	case 5: // palette RAM, 2KB (Engine A 0x000-0x3FF, Engine B 0x400-0x7FF)
 		g_dsBFramePlan.palette.markRange(adr & 0x7FF, size);
 		break;
+#ifdef DSB_STATS
 	case 6: {
-		// Coarse by design (see the header's dirty-gating deviation note):
-		// one whole-region flag, but only armed by writes that can actually
-		// reach Engine B's own BG/OBJ windows. vram_arm9_map's page index is
-		// exactly how MMU_gpu_map() resolves an access, so using the same
-		// index here means "could this write be visible to Engine B" is
-		// answered with the same arithmetic the reader uses.
 		u32 page = (adr >> 14) & (VRAM_ARM9_PAGES - 1);
 		if ((page >= VRAM_PAGE_BBG && page < VRAM_PAGE_BBG + 128) ||
 		    (page >= VRAM_PAGE_BOBJ && page < VRAM_PAGE_BOBJ + 128))
-			g_dsBFramePlan.vram.markRange(0, 1);
-		// Engine B's extended BG palette lives in VRAM bank H, which a game
-		// fills through H's LCDC window (0x06898000-0x0689FFFF) while H is
-		// in LCDC mode and only then remaps to "BG ext palette" -- so the
-		// write carries a BBG/BOBJ-free address and the page test above
-		// can't see it. (A later remap that repoints MMU.ExtPal[1][] is
-		// caught separately by gxDsBBankMapChanged.)
+			s_dsbOldVramArm = true;
 		else if ((adr & 0x00FFFFFF) >= 0x898000 && (adr & 0x00FFFFFF) < 0x8A0000)
-			g_dsBFramePlan.vram.markRange(0, 1);
+			s_dsbOldVramArm = true;
 		break;
 	}
+#endif
 	case 7: // OAM, 2KB (Engine A 0x000-0x3FF, Engine B 0x400-0x7FF)
 		g_dsBFramePlan.oam.markRange(adr & 0x7FF, size);
 		break;
@@ -202,6 +205,109 @@ void gxDsEngineBMarkWrite(u32 adr, u32 size)
 		break;
 	}
 }
+
+// Task 10: VRAM dirtiness in LCDC space. `off` is a byte offset into MMU.ARM9_LCD
+// (== the address MMU_LCDmap() returned minus 0x06000000), 1KB pages, 656 of them
+// (0xA4000 bytes, inside GxDirtyBitmap::kMaxPages). Every Engine-B bake read goes
+// through MMU_gpu_map(), whose result is a pointer into that same array, so a
+// dependency recorded as an LCDC range and a write tagged as an LCDC range meet on
+// the same bytes regardless of which ARM9 page / mirror / bank remap either used.
+void gxDsEngineBMarkVram(u32 off, u32 size)
+{
+	g_dsBFramePlan.vram.markRange(off, size);
+}
+
+// Reset / savestate load rewrite VRAM/palette/OAM without a single MMU write.
+static bool s_forceRebakeAll = true;
+void gxDsEngineBInvalidateAll()
+{
+	s_forceRebakeAll = true;
+}
+
+// ---------------------------------------------------------------------
+// Task 10: bake read-set recording ("what did this texture actually read?")
+// ---------------------------------------------------------------------
+// The GBA slice derives each plane's/sprite's dependency ranges from its config
+// (charBase + 1024 tiles worst case, whole palette bank, ...). Engine B instead
+// RECORDS them while it bakes: every VRAM read the bake makes through
+// MMU_gpu_map() is a host pointer into MMU.ARM9_LCD, so the bytes it touched are
+// marked in a per-texture LCDC-space page bitmap (same 1KB pages as the write-side
+// tracker), and every palette-RAM read is marked in a 32-byte-page palette bitmap.
+// A texture is stale iff any recorded page was written since -- exact by
+// construction (the tiles the tilemap really references, the 16-colour sub-palettes
+// really used, the extended-palette slices really used, the physical bytes a sprite
+// row really spans even where it runs off the end of a 16KB page), so nothing has to
+// be re-derived and cannot drift from the bake. The config fingerprints (BGxCNT /
+// OAM fields / VRAMCNT map) still cover everything that is not a memory byte; the
+// tilemap bytes themselves are IN the read-set, so a tilemap edit re-bakes.
+static const u32 kDsBLcdcBytes = 0xA4000;                       // sizeof(MMU.ARM9_LCD)
+static const u32 kDsBVramPages = kDsBLcdcBytes >> 10;           // 656
+static const u32 kDsBVramWords = (kDsBVramPages + 31) / 32;     // 21
+struct GxDsBDeps {
+	u32 vram[kDsBVramWords];  // LCDC 1KB pages read
+	u32 pal[2];               // palette RAM 32B pages read (0x800 bytes = 64 pages; Engine B is 0x400-0x7FF)
+};
+static GxDsBDeps *s_rec;
+static u32 s_recLastPage;
+static inline void gxDsBRecBegin(GxDsBDeps *d)
+{
+	memset(d, 0, sizeof(*d));
+	s_rec = d;
+	s_recLastPage = ~0u;
+}
+struct GxDsBRecGuard { ~GxDsBRecGuard() { s_rec = NULL; } };
+// Record a read of [host, host+len) where host is an MMU_gpu_map()-derived pointer.
+// The read may run past the end of the 16KB page host lies in (a sprite row / an
+// affine flat offset continues into the PHYSICALLY next LCDC page, exactly as the
+// bake's own pointer arithmetic does), so the span is recorded linearly in LCDC space.
+static inline void gxDsBRecVram(const void *host, u32 len)
+{
+	if (!s_rec || !len) return;
+	const u32 off = (u32)((const u8 *)host - (const u8 *)MMU.ARM9_LCD);
+	if (off >= kDsBLcdcBytes) return;   // blank page past the end: nothing can ever write it
+	u32 last = off + len - 1;
+	if (last >= kDsBLcdcBytes) last = kDsBLcdcBytes - 1;
+	const u32 p0 = off >> 10, p1 = last >> 10;
+	if (p0 == p1 && p0 == s_recLastPage) return;
+	for (u32 p = p0; p <= p1; ++p)
+		s_rec->vram[p >> 5] |= 1u << (p & 31);
+	s_recLastPage = p1;
+}
+static inline void gxDsBRecPal(u32 off, u32 len)
+{
+	if (!s_rec || !len) return;
+	const u32 p0 = off >> 5, p1 = (off + len - 1) >> 5;
+	for (u32 p = p0; p <= p1 && p < 64; ++p)
+		s_rec->pal[p >> 5] |= 1u << (p & 31);
+}
+static bool gxDsBDepsDirty(const GxDsBDeps &d)
+{
+#ifdef DSB_MUTATE_NODEPS
+	(void)d; return false;   // mutation test: a dependency gate that never fires (fixtures must FAIL)
+#endif
+	if (g_dsBFramePlan.vram.anyDirty()) {
+		for (u32 w = 0; w < kDsBVramWords; ++w)
+			for (u32 b = d.vram[w]; b; b &= b - 1)
+				if (g_dsBFramePlan.vram.isPageDirty((w << 5) + (u32)__builtin_ctz(b)))
+					return true;
+	}
+	if (g_dsBFramePlan.palette.anyDirty()) {
+		for (u32 w = 0; w < 2; ++w)
+			for (u32 b = d.pal[w]; b; b &= b - 1)
+				if (g_dsBFramePlan.palette.isPageDirty((w << 5) + (u32)__builtin_ctz(b)))
+					return true;
+	}
+	return false;
+}
+
+// A cached texture that is NOT being (re)baked this frame -- disabled plane, invisible
+// / parked sprite, fade variant not in use -- must still be dropped when its inputs
+// changed, because the dirty bitmaps are cleared every frame (see Stage 1 below).
+#ifdef DSB_MUTATE_NOINVAL
+#define GX_DSB_DROP_IF_STALE(valid_, bank_, deps_) do { } while (0)   // mutation test: the task-9 hygiene removed
+#else
+#define GX_DSB_DROP_IF_STALE(valid_, bank_, deps_) do { if ((valid_) && ((bank_) || gxDsBDepsDirty(deps_))) (valid_) = false; } while (0)
+#endif
 
 // ---------------------------------------------------------------------
 // Caches (Stage 1). Every texture here is plain RGB5A3 with the palette
@@ -232,6 +338,7 @@ struct GxDsBBgPlaneCache {
 	u32 cfgAuxBase;    // BG_bmp_ram / BG_bmp_large_ram at bake time (bitmap-ish types)
 	const u8 *cfgExtPal; // extended-palette slot pointer baked in, NULL if the regular palette was used
 	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
+	GxDsBDeps deps;    // task 10: the VRAM / palette bytes the last bake read
 };
 static GxDsBBgPlaneCache s_bgPlane[4];
 static GxDsBBgPlaneCache s_bgPlaneFx[4]; // task 9: brighten/darken variant of each plane (lazily baked)
@@ -271,6 +378,7 @@ struct GxDsBObjTexSlot {
 	u16 bufW, bufH;
 	u8 cfgBordered;
 	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
+	GxDsBDeps deps;    // task 10: the VRAM / palette bytes the last bake read
 };
 static GxDsBObjTexSlot s_objTex[128];
 static GxDsBObjTexSlot s_objTexFx[128]; // task 9: brighten/darken variant of each sprite (lazily baked)
@@ -297,12 +405,11 @@ bool gxDsEngineBRenderInit()
 	// the DS (MMU.h: ARM9_VMEM[0x800], ARM9_OAM[0x800]); 32-byte pages give
 	// 64 pages each, i.e. 16-colour-sub-palette / 4-OAM-entry granularity --
 	// the same proportional choice gbaPpuReset() makes for the GBA's 1KB
-	// regions. VRAM is deliberately a single page: this phase's whole-region
-	// coarse gate (see the header), sized so markRange(0,1)/anyDirty() is
-	// the whole story and no caller is tempted to read a bogus page index.
+	// regions. VRAM (task 10) is tracked in LCDC space: 0xA4000 bytes at 1KB
+	// pages = 656 pages (inside GxDirtyBitmap::kMaxPages).
 	g_dsBFramePlan.palette.init(0x800, 32);
 	g_dsBFramePlan.oam.init(0x800, 32);
-	g_dsBFramePlan.vram.init(1, 1);
+	g_dsBFramePlan.vram.init(kDsBLcdcBytes, 1024);
 	g_dsBFramePlan.beginFrame();
 
 	if (!gxDsBEnsureBgScratch((u32)kDsBBgPlaneMaxPx * kDsBBgPlaneMaxPx)) return false;
@@ -777,6 +884,16 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	if (!gxDsBEnsureBgScratch((u32)lg * ht))
 		return;
 
+	// Task 10: record the read-set (see gxDsBDeps). Tiles are recorded once per tile
+	// number (a 64-byte tile never straddles a 16KB page, so its rows sit at fixed
+	// offsets from its own start); sub-palettes once per palNum.
+	gxDsBRecBegin(&pc.deps);
+	GxDsBRecGuard recGuard;
+	u32 seenTile[32] = { 0 };
+	u32 seenPal = 0;
+	if (c256 && !extPal)
+		gxDsBRecPal(kDsBBgPalOff, 512);
+
 	for (int ty = 0; ty < ht / 8; ++ty) {
 		u32 rowMap = mapBase + (u32)(ty & 31) * 64;
 		if (ty > 31)
@@ -785,11 +902,22 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 			u32 mapAddr = rowMap + (u32)((tx & 31) << 1);
 			if (tx > 31)
 				mapAddr += 32 * 32 * 2;
-			u16 entry = T1ReadWord(MMU_gpu_map(mapAddr), 0);
+			const void *const mapHost = MMU_gpu_map(mapAddr);
+			gxDsBRecVram(mapHost, 2);
+			u16 entry = T1ReadWord((void *)mapHost, 0);
 			int tileNum = entry & 0x3FF;
 			bool hflip = ((entry >> 10) & 1) != 0;
 			bool vflip = ((entry >> 11) & 1) != 0;
 			int palNum = (entry >> 12) & 0xF;
+			if (!((seenTile[tileNum >> 5] >> (tileNum & 31)) & 1)) {
+				seenTile[tileNum >> 5] |= 1u << (tileNum & 31);
+				gxDsBRecVram(MMU_gpu_map(tileBase + (u32)tileNum * tileBytes), (u32)tileBytes);
+			}
+			if (!((seenPal >> palNum) & 1)) {
+				seenPal |= 1u << palNum;
+				if (extPal) gxDsBRecVram(extPal + (u32)palNum * 512, 512);       // ext slot: 16 palettes x 256 x 2B
+				else if (!c256) gxDsBRecPal(kDsBBgPalOff + (u32)palNum * 32, 32); // 4bpp: its own 16-colour sub-palette
+			}
 
 			for (int sy = 0; sy < 8; ++sy) {
 				int srcY = vflip ? 7 - sy : sy;
@@ -893,6 +1021,8 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	if (!gxDsBEnsureBgScratch((u32)bufW * bufH))
 		return;
 
+	gxDsBRecBegin(&pc.deps);   // task 10: read-set (see gxDsBDeps)
+	GxDsBRecGuard recGuard;
 	u16 *const buf = s_bgBakeScratch;
 	if (!wrap)
 		memset(buf, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent RGB5A3
@@ -906,6 +1036,11 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	// 4-bit palette number selects one of 16 256-entry palettes in the ext
 	// slot (rot_tiled_16bit_entry<extPal=true>: `pal[(entry + (Palette<<8))<<1]`).
 	const u8 *extPal = gxDsBExtPalFor(bg);
+	// The 256-entry regular palette is read (lut) by every flavour except a
+	// direct-colour bitmap and an extended-palette 256x16 (which never uses lut).
+	if (type != BGType_AffineExt_Direct && !(type == BGType_AffineExt_256x16 && extPal))
+		gxDsBRecPal(kDsBBgPalOff, 512);
+	u32 seenExtPal = 0;
 
 	const u32 tileBase = gpu->BG_tile_ram[bg];
 	const u32 mapBase = gpu->BG_map_ram[bg];
@@ -918,15 +1053,24 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 				int tileNum, palNum = 0;
 				bool hflip = false, vflip = false;
 				if (type == BGType_Affine) {
-					tileNum = *(const u8 *)MMU_gpu_map(mapBase + (u32)(tx + ty * tw));
+					const void *const mh = MMU_gpu_map(mapBase + (u32)(tx + ty * tw));
+					gxDsBRecVram(mh, 1);
+					tileNum = *(const u8 *)mh;
 				} else {
-					u16 e = T1ReadWord(MMU_gpu_map(mapBase + (((u32)(tx + ty * tw)) << 1)), 0);
+					const void *const mh = MMU_gpu_map(mapBase + (((u32)(tx + ty * tw)) << 1));
+					gxDsBRecVram(mh, 2);
+					u16 e = T1ReadWord((void *)mh, 0);
 					tileNum = e & 0x3FF;
 					hflip = ((e >> 10) & 1) != 0;
 					vflip = ((e >> 11) & 1) != 0;
 					palNum = (e >> 12) & 0xF;
 				}
 				const u8 *tile = (const u8 *)MMU_gpu_map(tileBase + ((u32)tileNum << 6));
+				gxDsBRecVram(tile, 64);   // (the recorder de-duplicates consecutive same-page marks)
+				if (extPal && !((seenExtPal >> palNum) & 1)) {
+					seenExtPal |= 1u << palNum;
+					gxDsBRecVram(extPal + (u32)palNum * 512, 512);
+				}
 				for (int sy = 0; sy < 8; ++sy) {
 					const u8 *row = tile + (vflip ? 7 - sy : sy) * 8;
 					u16 *out = buf + (u32)(ty * 8 + sy + border) * bufW + tx * 8 + border;
@@ -947,6 +1091,7 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 		auxBase = (type == BGType_Large8bpp) ? gpu->BG_bmp_large_ram[bg] : gpu->BG_bmp_ram[bg];
 		for (int y = 0; y < ht; ++y) {
 			const u8 *row = (const u8 *)MMU_gpu_map(auxBase + (u32)y * lg);
+			gxDsBRecVram(row, (u32)lg);
 			u16 *out = buf + (u32)(y + border) * bufW + border;
 			for (int x = 0; x < lg; ++x)
 				out[x] = lut[row[x]];
@@ -955,6 +1100,7 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 		auxBase = gpu->BG_bmp_ram[bg];
 		for (int y = 0; y < ht; ++y) {
 			void *row = MMU_gpu_map(auxBase + (((u32)y * lg) << 1));
+			gxDsBRecVram(row, (u32)lg << 1);
 			u16 *out = buf + (u32)(y + border) * bufW + border;
 			for (int x = 0; x < lg; ++x) {
 				u16 c = T1ReadWord(row, (u32)x << 1);
@@ -1162,6 +1308,20 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 	if (bordered)
 		affBase = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << (oneDim ? gpu->sprBoundary : 5)));
 
+	// Task 10: read-set (see gxDsBDeps). Each row reads from `src` up to the byte
+	// index of its last texel, which is a physical (LCDC-linear) span even where it
+	// runs past the 16KB page `src` was mapped in.
+	gxDsBRecBegin(&slot.deps);
+	GxDsBRecGuard recGuard;
+	u32 rowSpan;
+	{
+		const int xm = d.w - 1;
+		if (d.depth) rowSpan = (u32)((xm & 7) + ((xm & 0xFFF8) << 3) + 1);
+		else { const int x1 = xm >> 1; rowSpan = (u32)((x1 & 3) + ((x1 & 0xFFFC) << 3) + 1); }
+	}
+	if (d.depth) gxDsBRecPal(kDsBObjPalOff, 512);                       // 256-colour: the whole OBJ palette
+	else gxDsBRecPal(kDsBObjPalOff + (u32)d.palIndex * 32, 32);         // 16-colour: its own sub-palette
+
 	for (int y = 0; y < d.h; ++y) {
 		const u8 *src;
 		if (oneDim) {
@@ -1173,6 +1333,7 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 			src = bordered ? affBase + rel
 			               : (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << 5) + rel);
 		}
+		gxDsBRecVram(src, rowSpan);
 		u16 *out = s_objBakeScratch + (u32)(y + off) * bufW + off;
 		for (int x = 0; x < d.w; ++x) {
 			int idx;
@@ -1610,8 +1771,10 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 }
 
 // Bake-if-stale for one BG plane variant (plain, or the brighten/darken one).
+// Stale = never baked / VRAMCNT remap / config fingerprint mismatch / any byte of the
+// recorded read-set written since (task 10; replaces the coarse whole-region flags).
 static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int fadeLvl,
-                               bool bankChanged, bool vramDirty, bool palDirty)
+                               bool bankChanged)
 {
 	GPU *gpu = SubScreen.gpu;
 	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
@@ -1621,14 +1784,32 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 	if (type == BGType_Large8bpp) auxBase = gpu->BG_bmp_large_ram[bg];
 	else if (type == BGType_AffineExt_256x1 || type == BGType_AffineExt_Direct) auxBase = gpu->BG_bmp_ram[bg];
 	const u16 fx = (u16)((fadeMode << 8) | fadeLvl);
-	bool needBake = !pc.valid || bankChanged || vramDirty || palDirty || pc.cfgFx != fx ||
+	bool needBake = !pc.valid || bankChanged || pc.cfgFx != fx ||
 	                pc.wpx != (u16)gpu->BGSize[bg][0] || pc.hpx != (u16)gpu->BGSize[bg][1] ||
 	                pc.cfgTileBase != gpu->BG_tile_ram[bg] || pc.cfgMapBase != gpu->BG_map_ram[bg] ||
 	                pc.cfgColorMode != (u8)(cnt.Palette_256 ? 1 : 0) ||
 	                pc.cfgScreenSize != (u8)cnt.ScreenSize ||
 	                pc.cfgType != (u8)type || pc.cfgExtPal != gxDsBExtPalFor(bg) ||
 	                (affine && (pc.cfgWrap != (u8)(cnt.PaletteSet_Wrap ? 1 : 0) || pc.cfgAuxBase != auxBase));
+	if (!needBake && gxDsBDepsDirty(pc.deps)) needBake = true;
+#ifdef DSB_VERIFY
+	// Test hook: a plane the gate says is still fresh is re-baked into a scratch copy
+	// and compared byte-for-byte; any difference is a missed dependency.
+	if (!needBake && pc.valid) {
+		GxDsBBgPlaneCache tmp; memset(&tmp, 0, sizeof(tmp));
+		s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+		if (affine) gxDsBBakeAffineBgPlane(bg, tmp); else gxDsBBakeBgPlane(bg, tmp);
+		s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
+		u32 sz = (u32)tmp.bufW * tmp.bufH * 2;
+		if (tmp.valid && (tmp.bufW != pc.bufW || tmp.bufH != pc.bufH || memcmp(tmp.texData, pc.texData, sz) != 0))
+			++s_dsbStale;
+		free(tmp.texData);
+	}
+#endif
 	if (!needBake) return;
+#ifdef DSB_STATS
+	if (fadeMode) ++s_dsbBgFxBake[bg]; else ++s_dsbBgBake[bg];
+#endif
 	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
 	if (affine) gxDsBBakeAffineBgPlane(bg, pc);
 	else gxDsBBakeBgPlane(bg, pc);
@@ -1636,12 +1817,12 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 }
 
 static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int fadeMode, int fadeLvl,
-                              bool anyDirty)
+                              bool bankChanged)
 {
 	GPU *gpu = SubScreen.gpu;
 	const u8 oneDim = (u8)((gpu->spriteRenderMode == GPU::SPRITE_1D) ? 1 : 0);
 	const u16 fx = (u16)((fadeMode << 8) | fadeLvl);
-	bool needBake = !slot.valid || anyDirty || slot.cfgFx != fx ||
+	bool needBake = !slot.valid || bankChanged || slot.cfgFx != fx ||
 	                slot.w != d.w || slot.h != d.h ||
 	                slot.cfgTileIndex != d.tileIndex ||
 	                slot.cfgPalIndex != d.palIndex ||
@@ -1649,7 +1830,23 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	                slot.cfgOneDim != oneDim ||
 	                slot.cfgBoundary != gpu->sprBoundary ||
 	                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
+	if (!needBake && gxDsBDepsDirty(slot.deps)) needBake = true;
+#ifdef DSB_VERIFY
+	if (!needBake && slot.valid) {
+		GxDsBObjTexSlot tmp; memset(&tmp, 0, sizeof(tmp));
+		s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+		gxDsBBakeObjTexture(d, tmp);
+		s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
+		u32 sz = (u32)tmp.bufW * tmp.bufH * 2;
+		if (tmp.valid && (tmp.bufW != slot.bufW || tmp.bufH != slot.bufH || memcmp(tmp.texData, slot.texData, sz) != 0))
+			++s_dsbStale;
+		free(tmp.texData);
+	}
+#endif
 	if (!needBake) return;
+#ifdef DSB_STATS
+	if (fadeMode) ++s_dsbObjFxBake[d.oamIndex]; else ++s_dsbObjBake[d.oamIndex];
+#endif
 	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
 	gxDsBBakeObjTexture(d, slot);
 	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
@@ -1700,6 +1897,16 @@ bool gxDsEngineBRenderFrame()
 				                      (unsigned)s_dsbWinOk, (unsigned)s_dsbFadeOk, (unsigned)s_dsbAlphaOk,
 				                      (unsigned)s_dsbSemiOk, (unsigned)s_dsbMbOk,
 				                      (unsigned)s_dsbDispcnt, (unsigned)s_dsbTypes, s_dsbWhy);
+				u32 ot = 0, oft = 0;
+				for (int i = 0; i < 128; ++i) { ot += s_dsbObjBake[i]; oft += s_dsbObjFxBake[i]; }
+				harness_profile_emitf("dsbk n=%u bg=%u/%u/%u/%u fxbg=%u/%u/%u/%u obj=%u fxobj=%u o=%u,%u,%u,%u,%u,%u,%u,%u old_bg=%u old_obj=%u stale=%u",
+				                      (unsigned)(s_dsbOk + s_dsbBail),
+				                      (unsigned)s_dsbBgBake[0], (unsigned)s_dsbBgBake[1], (unsigned)s_dsbBgBake[2], (unsigned)s_dsbBgBake[3],
+				                      (unsigned)s_dsbBgFxBake[0], (unsigned)s_dsbBgFxBake[1], (unsigned)s_dsbBgFxBake[2], (unsigned)s_dsbBgFxBake[3],
+				                      (unsigned)ot, (unsigned)oft,
+				                      (unsigned)s_dsbObjBake[0], (unsigned)s_dsbObjBake[1], (unsigned)s_dsbObjBake[2], (unsigned)s_dsbObjBake[3],
+				                      (unsigned)s_dsbObjBake[4], (unsigned)s_dsbObjBake[5], (unsigned)s_dsbObjBake[6], (unsigned)s_dsbObjBake[7],
+				                      (unsigned)s_dsbOldBg, (unsigned)s_dsbOldObj, (unsigned)s_dsbStale);
 #endif
 			}
 		}
@@ -1769,44 +1976,60 @@ bool gxDsEngineBRenderFrame()
 	// A fade/alpha item is only ever drawn if its layer is enabled in the band
 	// (gxDsBPlanBand walked enabled layers only), so no extra gating is needed.
 
-	// Stage 1. Coarse gate (see the header): any Engine-B-visible VRAM
-	// write, any Engine-B palette write, any Engine-B OAM write, or a
-	// VRAMCNT bank remap re-bakes everything. `force` also covers the very
-	// first frame, where nothing is baked yet.
+	// Stage 1 (task 10): per-plane / per-slot dependency gates.
+	//
+	// A cached texture is stale iff (a) a VRAMCNT remap (or reset / savestate load)
+	// changed what the bake's addresses resolve to, (b) its config fingerprint no
+	// longer matches the live registers / OAM entry, or (c) a byte of the read-set
+	// recorded at its last bake (LCDC-space VRAM pages + palette pages) was written
+	// since. The dirty bitmaps are cleared at the end of every successful frame, so
+	// EVERY cached texture must be checked every frame, whether or not this frame
+	// draws it: a plane/slot that is disabled / invisible / not needing its fade
+	// variant this frame would otherwise miss a write made in this interval, keep
+	// `valid` and show stale texels when it is next used (task 9 closed that gap
+	// coarsely; the same rule is what makes the precise gates safe). Such a texture
+	// is INVALIDATED here, and re-baked on demand.
 	bool bankChanged = gxDsBBankMapChanged();
-	bool palDirty = g_dsBFramePlan.palette.anyDirty();
-	bool vramDirty = g_dsBFramePlan.vram.anyDirty();
-	bool oamDirty = g_dsBFramePlan.oam.anyDirty();
-	const bool anyBgDirty = bankChanged || vramDirty || palDirty;
+#ifdef DSB_MUTATE_NOBANK
+	bankChanged = false; s_forceRebakeAll = false;   // mutation test: VRAMCNT remaps go unnoticed (case 2 must FAIL)
+#endif
+	if (s_forceRebakeAll) { bankChanged = true; s_forceRebakeAll = false; }
+#ifdef DSB_STATS
+	{
+		// What the pre-task-10 whole-region gate would have re-baked this frame.
+		const bool oldGate = bankChanged || s_dsbOldVramArm || g_dsBFramePlan.palette.anyDirty();
+		if (oldGate) for (int bg = 0; bg < 4; ++bg) if (bgEnabledAnyBand[bg]) ++s_dsbOldBg;
+		if (objEnabledAnyBand && (oldGate || g_dsBFramePlan.oam.anyDirty())) s_dsbOldObj += (u32)s_objDrawCount;
+	}
+#endif
 
 	for (int b = 0; b < bandCount; ++b)
 		gxDsBBakeBackdrop(b, s_bandPlan[b].backdropFade ? s_bandPlan[b].mode : 0, s_bandPlan[b].evy);
 
 	for (int bg = 0; bg < 4; ++bg) {
-		// A plane/variant that is not (re)baked this frame while its inputs changed
-		// must not survive to a later frame that needs it: the dirty flags are
-		// cleared below, so a stale `valid` would otherwise be trusted forever.
-		if (bgEnabledAnyBand[bg]) gxDsBEnsureBgPlane(bg, s_bgPlane[bg], 0, 0, bankChanged, vramDirty, palDirty);
-		else if (anyBgDirty) s_bgPlane[bg].valid = false;
-		if (bgEnabledAnyBand[bg] && ((fadeBgAny >> bg) & 1))
-			gxDsBEnsureBgPlane(bg, s_bgPlaneFx[bg], fadeMode, fadeLvl, bankChanged, vramDirty, palDirty);
-		else if (anyBgDirty) s_bgPlaneFx[bg].valid = false;
+		GxDsBBgPlaneCache &pl0 = s_bgPlane[bg], &pl1 = s_bgPlaneFx[bg];
+		if (bgEnabledAnyBand[bg]) gxDsBEnsureBgPlane(bg, pl0, 0, 0, bankChanged);
+		else GX_DSB_DROP_IF_STALE(pl0.valid, bankChanged, pl0.deps);
+		if (bgEnabledAnyBand[bg] && ((fadeBgAny >> bg) & 1)) gxDsBEnsureBgPlane(bg, pl1, fadeMode, fadeLvl, bankChanged);
+		else GX_DSB_DROP_IF_STALE(pl1.valid, bankChanged, pl1.deps);
 	}
-	if (objEnabledAnyBand) {
-		const bool anyObjDirty = bankChanged || vramDirty || palDirty || oamDirty;
+	{
 		bool visible[128] = { false };
-		for (int i = 0; i < s_objDrawCount; ++i) {
-			const GxDsBObjDraw &d = s_objDraws[i];
-			visible[d.oamIndex] = true;
-			gxDsBEnsureObjTex(d, s_objTex[d.oamIndex], 0, 0, anyObjDirty);
-			if (fadeObjAny) gxDsBEnsureObjTex(d, s_objTexFx[d.oamIndex], fadeMode, fadeLvl, anyObjDirty);
-			else if (anyObjDirty) s_objTexFx[d.oamIndex].valid = false;
+		if (objEnabledAnyBand) {
+			for (int i = 0; i < s_objDrawCount; ++i) {
+				const GxDsBObjDraw &d = s_objDraws[i];
+				visible[d.oamIndex] = true;
+				gxDsBEnsureObjTex(d, s_objTex[d.oamIndex], 0, 0, bankChanged);
+				if (fadeObjAny) gxDsBEnsureObjTex(d, s_objTexFx[d.oamIndex], fadeMode, fadeLvl, bankChanged);
+				else GX_DSB_DROP_IF_STALE(s_objTexFx[d.oamIndex].valid, bankChanged, s_objTexFx[d.oamIndex].deps);
+			}
 		}
-		if (anyObjDirty)
-			for (int i = 0; i < 128; ++i)
-				if (!visible[i]) { s_objTex[i].valid = false; s_objTexFx[i].valid = false; }
-	} else if (bankChanged || vramDirty || palDirty || oamDirty) {
-		for (int i = 0; i < 128; ++i) { s_objTex[i].valid = false; s_objTexFx[i].valid = false; }
+		for (int i = 0; i < 128; ++i) {
+			if (visible[i]) continue;
+			GxDsBObjTexSlot &a = s_objTex[i], &f = s_objTexFx[i];
+			GX_DSB_DROP_IF_STALE(a.valid, bankChanged, a.deps);
+			GX_DSB_DROP_IF_STALE(f.valid, bankChanged, f.deps);
+		}
 	}
 
 	// ---- Stage 4 + EFB copy, under vidmutex ----------------------------
@@ -1913,6 +2136,9 @@ bool gxDsEngineBRenderFrame()
 	g_dsBFramePlan.vram.clear();
 	g_dsBFramePlan.palette.clear();
 	g_dsBFramePlan.oam.clear();
+#ifdef DSB_STATS
+	s_dsbOldVramArm = false;
+#endif
 
 #ifdef DSB_STATS
 	statsOk = true;

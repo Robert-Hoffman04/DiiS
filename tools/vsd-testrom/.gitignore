@@ -6,3 +6,5 @@
 /affinerom/*.nds
 /fxrom/build/
 /fxrom/*.nds
+/dirtyrom/build/
+/dirtyrom/*.nds

@@ -111,6 +111,15 @@ docker run --rm -v "$HERE/fxrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do cp "$HERE"/fxrom/fx_c$c.nds "$OUT"/; done
 
+# --- dirtyrom (gx-next-steps-log.md task 10) ----------------------------------
+# DS Engine B dirty-gating fixtures for source/gx/gx_ds_engineb_render.cpp:
+# dr_c0 .. dr_c8 (see the header of dirtyrom/source/main.c for the case list).
+docker run --rm -v "$HERE/dirtyrom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
+docker run --rm -v "$HERE/dirtyrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
+	for c in 0 1 2 3 4 5 6 7 8; do build dr_c$c "-DDR_CASE=$c"; done
+'
+for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/dirtyrom/dr_c$c.nds "$OUT"/; done
+
 echo
 echo "ROMs in $OUT :"
 ls -la "$OUT"/*.nds

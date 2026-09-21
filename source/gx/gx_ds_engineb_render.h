@@ -54,8 +54,54 @@
     rebake gate: a VRAMCNT write can change what Engine B's BG/OBJ windows
     point at without any write landing in VRAM at all. gx_ds_engineb_render.
     cpp keeps a copy of the 256 `vram_arm9_map` entries that cover the BBG
-    and BOBJ page ranges and re-bakes everything when they change (see
-    gxDsBBankMapChanged()).
+    and BOBJ page ranges (plus the four MMU.ExtPal[1][] slot pointers) and
+    re-bakes/invalidates EVERY cached texture when they change (see
+    gxDsBBankMapChanged()). That is still the only whole-cache trigger.
+
+    ------------------------------------------------------------------
+    Dirty gating (task 10) -- per-plane / per-OBJ-slot read-set gates
+    ------------------------------------------------------------------
+    Replaces phase 1's single whole-region VRAM flag (any Engine-B-visible VRAM
+    write, any palette write, any OAM write => re-bake all four planes and every
+    visible sprite -- for a 1024x1024 affine plane a 2MB bake). Shape follows the
+    GBA slice's tasks 4/5 (config fingerprint + `GxDirtyBitmap::isPageDirty` over
+    exactly the bytes the bake reads) with three deliberate differences:
+     - WRITES are tracked in LCDC SPACE: 0xA4000 bytes at 1KB pages = 656 pages.
+       MMU.cpp tags each mapped VRAM write with the address MMU_LCDmap() just
+       RESOLVED (post-map, `adr - 0x06000000` = a byte offset into MMU.ARM9_LCD), so
+       ARM9 mirrors, bank remaps and the LCDC window (bank H's ext palette is filled
+       through it) all land on the same bytes. The display-capture unit, which writes
+       guest VRAM without the MMU funnel, tags its destination line too (GPU.cpp).
+       Palette RAM (32B pages) and OAM stay tagged pre-map as before.
+     - DEPENDENCIES ARE RECORDED, NOT DERIVED. While a plane / sprite bakes, every
+       VRAM read (a host pointer out of MMU_gpu_map(), i.e. into MMU.ARM9_LCD) and
+       palette read is marked in a per-texture read-set (`GxDsBDeps`: a 656-bit VRAM
+       bitmap + 64-bit palette bitmap, 92 bytes). So the gate is exact by construction
+       and cannot drift from the bake: the tiles the tilemap actually references (not
+       the GBA's "1024 tiles worst case"), the tilemap bytes themselves, the 16-colour
+       sub-palettes actually used (4bpp text/OBJ) or the whole 512-byte bank (8bpp /
+       affine lut), the extended-palette slices actually used (LCDC-space, so a fill
+       through bank H's LCD window is caught), bitmap rows, and sprite rows as a
+       PHYSICAL span (a row that runs off the end of its 16KB page reads the next LCDC
+       page, as the bake's own pointer arithmetic does). Engine A's palette/VRAM/OAM
+       traffic no longer re-arms anything.
+     - EVERY cached texture is checked EVERY frame, drawn or not. The dirty bitmaps
+       are cleared at the end of each successful frame, so a plane that is disabled, a
+       sprite that is parked/invisible/OBJ-disabled, or a brighten/darken variant not
+       in use this frame would otherwise miss a write made in that interval and show
+       stale texels when next used. Such a texture is invalidated (`valid = false`) on
+       the frame its read-set was dirtied (task 9 did this with the coarse flag; task
+       10 keeps it with the precise one). This hole is documented for the GBA slice
+       (task 5) and is NOT fixed there -- see queue item 21.
+     - Config fingerprints are unchanged (BGxCNT/type/wrap/size, OAM tile/pal/depth/
+       size/mapping/boundary, fade key) and still force a re-bake on a mismatch; a
+       scroll (HOFS/VOFS/affine origin/matrix) and a sprite move never re-bake.
+     - NDS_Reset() (hence savestate load) invalidates everything: those rewrite
+       VRAM/palette/OAM without any MMU write.
+    Not tracked, by construction: ARM7 writes to VRAM (an ARM7-mapped bank cannot also
+    be BBG/BOBJ; the VRAMCNT remap that would expose it is caught by the bank-map
+    fingerprint). Mid-frame VRAM/palette writes still resolve to frame-final data
+    (inherited, see below).
 
     ------------------------------------------------------------------
     Scope (phase 1 + task 8) -- everything outside it bails to the CPU compositor
@@ -219,7 +265,19 @@
      -DDSB_STATS      counts engaged/bailed frames, affine-BG / affine-OBJ
                       frames, the last bail reason and DISPCNT/BG types into
                       the harness profile log every 30 frames (needs
-                      DESMUME_HARNESS + HARNESS_PROFILE).
+                      DESMUME_HARNESS + HARNESS_PROFILE). Task 10 adds a `dsbk`
+                      line: bakes per BG plane (plain / fade variant) and per
+                      OAM index, plus `old_bg` / `old_obj`, the bakes the
+                      pre-task-10 whole-region gate WOULD have done on the same
+                      frames (in stats builds MMU tags still feed that flag).
+     -DDSB_VERIFY     (with DSB_STATS) every cached texture the gate calls
+                      fresh is re-baked into scratch and byte-compared; the
+                      `stale=` counter of the `dsbk` line must stay 0.
+     -DDSB_MUTATE_NOINVAL / _NODEPS / _NOBANK
+                      mutation tests for the tools/vsd-testrom/dirtyrom fixtures: drop the
+                      not-drawn-texture invalidation / make the dependency gate
+                      never fire / ignore VRAMCNT remaps. The fixtures must
+                      then FAIL (they do; see the task 10 log section).
 
     ------------------------------------------------------------------
     Deliberate deviations from the pipeline doc's ideal Stage 0/1/4
@@ -231,14 +289,14 @@
        for Engine B (including the per-BG-plane dedicated-TLUT-slot hazard
        task 6 documents, which would be *worse* here since Engine B's text
        BGs have the same per-tile palNum problem) is queued as a follow-up.
-     - **Coarse VRAM dirty-gating.** Stage 0's dirty trace for Engine B
-       tracks palette and OAM at 32-byte page granularity but treats VRAM as
-       a single whole-region flag: any write landing in the BBG or BOBJ
-       address windows re-arms every BG plane and every sprite bake for that
-       frame. This matches the GBA slice's original coarse `anyDirty()` gate
-       (tasks 4/5 are what refined it there) and is correct, just wasteful.
-       Writes to the ABG/AOBJ windows (the bulk of a 3D game's VRAM traffic)
-       do NOT dirty Engine B, so this is coarse rather than useless.
+     - **Dirty gating: RESOLVED by task 10** (see "Dirty gating" above; this used
+       to be a single whole-region VRAM flag). Deviations from the GBA pattern it
+       was modelled on: dependencies are recorded during the bake (a read-set)
+       instead of derived from config, and the check runs for every cached texture
+       every frame, invalidating the ones not being drawn (the GBA slice has a
+       documented hole there, queue item 21). Granularity: 1KB LCDC pages, so two
+       sprites/tile sets closer than 1KB share a page (a write to one re-bakes the
+       other; conservative, never stale).
      - **Bake from frame-final VRAM/OAM/palette.** Exactly like
        gx_gba_render.cpp, Stage 1 runs once at end of frame and reads
        whatever the VRAM/OAM/palette contents are at that point. Only
@@ -361,8 +419,19 @@ bool gxDsEngineBRenderFrame();
 // Stage 0 dirty tagging, called from MMU.cpp's ARM9 write funnel (the
 // single MMU_LCDmap() tail shared by write08/16/32, which every CPU *and*
 // DMA write to palette RAM / VRAM / OAM passes through). `adr` is the
-// already-masked 0x0FFFFFFF address; only 0x05 (palette), 0x06 (VRAM) and
-// 0x07 (OAM) are of interest and everything else returns immediately.
+// already-masked 0x0FFFFFFF address; only 0x05 (palette) and 0x07 (OAM) are
+// tracked here (task 10: VRAM moved to gxDsEngineBMarkVram) and everything
+// else returns immediately.
 void gxDsEngineBMarkWrite(u32 adr, u32 size);
+
+// Task 10: VRAM dirty tagging in LCDC space. Called from MMU.cpp right AFTER
+// MMU_LCDmap() has resolved a mapped ARM9 VRAM write (with `adr - 0x06000000`,
+// a byte offset into MMU.ARM9_LCD, 0 .. 0xA3FFF), and from GPU.cpp's display
+// capture, which writes guest VRAM without going through the MMU.
+void gxDsEngineBMarkVram(u32 lcdcOffset, u32 size);
+
+// Task 10: force every cached Engine B texture to re-bake on the next frame
+// (NDS_Reset(), hence savestate load: VRAM/palette/OAM are rewritten wholesale).
+void gxDsEngineBInvalidateAll();
 
 #endif // GX_DS_ENGINEB_RENDER_H

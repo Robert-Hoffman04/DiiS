@@ -103,6 +103,7 @@ void GPU_DispCapDumpRing()
 #include "NDSSystem.h"
 #include "readwrite.h"
 #include "guDesmume.h"
+#include "gx/gx_ds_engineb_render.h"
 
 #ifdef FASTBUILD
 	#undef FORCEINLINE
@@ -2352,6 +2353,10 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 		if(!skip)
 		if (l < gpu->dispCapCnt.capy)
 		{
+			// gx-next-steps-log.md task 10: the capture unit writes guest VRAM directly,
+			// bypassing the MMU write funnel that feeds Engine B's LCDC-space dirty
+			// tracking, so tag its destination line (<= 512 bytes) here.
+			gxDsEngineBMarkVram(cap_dst_adr, 512);
 			switch (gpu->dispCapCnt.capSrc)
 			{
 				case 0:		// Capture source is SourceA

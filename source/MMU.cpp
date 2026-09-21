@@ -2577,6 +2577,11 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
+	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
+	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
+	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
+	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 1);
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM9][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]]=val;
@@ -3070,6 +3075,11 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
+	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
+	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
+	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
+	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 2);
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);
@@ -3479,6 +3489,11 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
 	if(unmapped) return;
+	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
+	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
+	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
+	if(adr - 0x06000000u < 0xA4000u) gxDsEngineBMarkVram(adr - 0x06000000u, 4);
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20], val);

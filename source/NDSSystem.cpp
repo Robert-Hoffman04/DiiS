@@ -2205,6 +2205,11 @@ void NDS_Reset()
 
 	DEBUG_reset();
 
+	// gx-next-steps-log.md task 10: a reset / savestate load (which calls this) rewrites VRAM,
+	// palette and OAM without going through the MMU write funnel, so every dirty-gated
+	// Engine B cache is stale by construction.
+	gxDsEngineBInvalidateAll();
+
 	if (!header) return ;
 
 	nds.sleeping = FALSE;
