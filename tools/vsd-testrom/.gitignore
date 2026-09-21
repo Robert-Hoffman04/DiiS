@@ -2,3 +2,5 @@
 /out/
 /mergerom/build/
 /mergerom/*.nds
+/affinerom/build/
+/affinerom/*.nds

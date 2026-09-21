@@ -8,6 +8,25 @@
 #include <gccore.h>
 #include <malloc.h>
 #include <string.h>
+#include <stddef.h>
+#if defined(DSB_STATS) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#include "../harness/harness_profile.h"
+#endif
+
+// Test hooks (compile-time only, zero cost when undefined):
+//  -DDSB_FORCE_CPU : gxDsEngineBRenderFrame() always bails, so the CPU
+//                    compositor renders every frame. The A/B reference for
+//                    byte-comparing the GX path against GPU.cpp.
+//  -DDSB_STATS     : (needs the harness profile sink) counts engaged vs.
+//                    bailed frames, the last bail reason and the BG-type mix
+//                    of engaged frames, and emits one line per 30 frames.
+#ifdef DSB_STATS
+static const char *s_dsbWhy = "";
+static u32 s_dsbOk = 0, s_dsbBail = 0, s_dsbAffOk = 0, s_dsbAffObjOk = 0, s_dsbDispcnt = 0, s_dsbTypes = 0;
+#define DSB_WHY(s_) do { s_dsbWhy = (s_); } while (0)
+#else
+#define DSB_WHY(s_) do { } while (0)
+#endif
 
 // main.cpp: re-applies the one-time GX present state InitVideo() sets up
 // (viewport / scissor / projection / Z-mode / EFB-copy src+dst / vertex
@@ -79,6 +98,10 @@ static inline u16 gxDsBRgb5a3ToNds(u16 v)
 static bool s_frameOutOfScope = true;   // no scanline seen yet == don't render
 static bool s_frameSawLine0 = false;
 static GxDsBBandRegs s_lastBandRegs;
+// DISPCNT.ExBGxPalette_Enable as seen on this frame's line 0 (see
+// gxDsBScanlineOutOfScope); reset at every line 0.
+static u8 s_frameExtBgPal = 0;
+static bool s_frameExtBgPalKnown = false;
 
 // vram_arm9_map (MMU.h) page ranges that back Engine B's BG and OBJ
 // windows. VRAM_ARM9_PAGES is 512 16KB pages covering 0x06000000-0x067FFFFF,
@@ -94,7 +117,13 @@ static bool gxDsBBankMapChanged()
 	u8 cur[256];
 	memcpy(cur, vram_arm9_map + VRAM_PAGE_BBG, 128);
 	memcpy(cur + 128, vram_arm9_map + VRAM_PAGE_BOBJ, 128);
-	if (s_bankMapCopyValid && memcmp(cur, s_bankMapCopy, sizeof(cur)) == 0)
+	// Task 8: Engine B's four extended-BG-palette slot pointers
+	// (MMU_VRAMmapControl repoints them on a VRAMCNT_H write).
+	static u8 *s_extPalCopy[4];
+	bool extChanged = false;
+	for (int i = 0; i < 4; ++i)
+		if (s_extPalCopy[i] != MMU.ExtPal[1][i]) { extChanged = true; s_extPalCopy[i] = MMU.ExtPal[1][i]; }
+	if (s_bankMapCopyValid && !extChanged && memcmp(cur, s_bankMapCopy, sizeof(cur)) == 0)
 		return false;
 	memcpy(s_bankMapCopy, cur, sizeof(cur));
 	s_bankMapCopyValid = true;
@@ -117,6 +146,14 @@ void gxDsEngineBMarkWrite(u32 adr, u32 size)
 		u32 page = (adr >> 14) & (VRAM_ARM9_PAGES - 1);
 		if ((page >= VRAM_PAGE_BBG && page < VRAM_PAGE_BBG + 128) ||
 		    (page >= VRAM_PAGE_BOBJ && page < VRAM_PAGE_BOBJ + 128))
+			g_dsBFramePlan.vram.markRange(0, 1);
+		// Engine B's extended BG palette lives in VRAM bank H, which a game
+		// fills through H's LCDC window (0x06898000-0x0689FFFF) while H is
+		// in LCDC mode and only then remaps to "BG ext palette" -- so the
+		// write carries a BBG/BOBJ-free address and the page test above
+		// can't see it. (A later remap that repoints MMU.ExtPal[1][] is
+		// caught separately by gxDsBBankMapChanged.)
+		else if ((adr & 0x00FFFFFF) >= 0x898000 && (adr & 0x00FFFFFF) < 0x8A0000)
 			g_dsBFramePlan.vram.markRange(0, 1);
 		break;
 	}
@@ -148,10 +185,33 @@ struct GxDsBBgPlaneCache {
 	// the same way gx_gba_render.cpp's per-plane gate does.
 	u32 cfgTileBase, cfgMapBase;
 	u8 cfgColorMode, cfgScreenSize;
+	// Task 8 (affine / extended-affine / large-8bpp planes):
+	u16 bufW, bufH;    // baked texture size: wpx x hpx for text and wrapping
+	                   // affine planes; (wpx+4) x (hpx+4) when a 1-texel
+	                   // transparent border (+ pad to a 4-texel block) is baked
+	u8 cfgType;        // BGType baked (text and each affine flavour differ)
+	u8 cfgWrap;        // BGxCNT overflow-wrap bit at bake time (affine only)
+	u32 cfgAuxBase;    // BG_bmp_ram / BG_bmp_large_ram at bake time (bitmap-ish types)
+	const u8 *cfgExtPal; // extended-palette slot pointer baked in, NULL if the regular palette was used
 };
 static GxDsBBgPlaneCache s_bgPlane[4];
 static const int kDsBBgPlaneMaxPx = 512; // text BG max (BGSize table, GPU.cpp sizeTab row 1)
 static u16 *s_bgBakeScratch;
+static u32 s_bgBakeScratchCap; // in u16 elements
+// Task 8: an affine/bitmap plane can be up to 1024x1024 (+ transparent
+// border/pad), far past the 512x512 text-BG maximum this scratch used to be
+// sized for, and most sub screens never need it -- so it grows on demand.
+static bool gxDsBEnsureBgScratch(u32 elems)
+{
+	if (elems <= s_bgBakeScratchCap)
+		return s_bgBakeScratch != NULL;
+	u16 *n = (u16 *)malloc((size_t)elems * sizeof(u16));
+	if (!n) return false;
+	free(s_bgBakeScratch);
+	s_bgBakeScratch = n;
+	s_bgBakeScratchCap = elems;
+	return true;
+}
 
 struct GxDsBObjTexSlot {
 	GXTexObj texObj;
@@ -165,6 +225,11 @@ struct GxDsBObjTexSlot {
 	// resulting box size happens to be identical.
 	u16 cfgTileIndex;
 	u8 cfgPalIndex, cfgDepth, cfgOneDim, cfgBoundary;
+	// Task 8: an affine sprite is baked with a 1-texel transparent border
+	// (padded to the 4x4 RGB5A3 block) and a plain one without, so which of the
+	// two this slot currently holds is part of what a re-bake depends on.
+	u16 bufW, bufH;
+	u8 cfgBordered;
 };
 static GxDsBObjTexSlot s_objTex[128];
 static const int kDsBObjMaxPx = 64;
@@ -195,9 +260,10 @@ bool gxDsEngineBRenderInit()
 	g_dsBFramePlan.vram.init(1, 1);
 	g_dsBFramePlan.beginFrame();
 
-	s_bgBakeScratch = (u16 *)malloc((u32)kDsBBgPlaneMaxPx * kDsBBgPlaneMaxPx * sizeof(u16));
-	if (!s_bgBakeScratch) return false;
-	s_objBakeScratch = (u16 *)malloc((u32)kDsBObjMaxPx * kDsBObjMaxPx * sizeof(u16));
+	if (!gxDsBEnsureBgScratch((u32)kDsBBgPlaneMaxPx * kDsBBgPlaneMaxPx)) return false;
+	// An affine OBJ bakes with a 1-texel transparent border padded up to a power
+	// of two (see gxDsBBakeObjTexture), so a 64-texel sprite needs 128x128.
+	s_objBakeScratch = (u16 *)malloc((u32)(2 * kDsBObjMaxPx) * (2 * kDsBObjMaxPx) * sizeof(u16));
 	if (!s_objBakeScratch) return false;
 
 	for (int i = 0; i < 4; ++i) {
@@ -233,7 +299,7 @@ void gxDsEngineBRenderShutdown()
 		return;
 	for (int i = 0; i < 4; ++i) { free(s_bgPlane[i].texData); s_bgPlane[i].texData = NULL; s_bgPlane[i].texDataCap = 0; s_bgPlane[i].valid = false; }
 	for (int i = 0; i < 128; ++i) { free(s_objTex[i].texData); s_objTex[i].texData = NULL; s_objTex[i].texDataCap = 0; s_objTex[i].valid = false; }
-	free(s_bgBakeScratch); s_bgBakeScratch = NULL;
+	free(s_bgBakeScratch); s_bgBakeScratch = NULL; s_bgBakeScratchCap = 0;
 	free(s_objBakeScratch); s_objBakeScratch = NULL;
 	free(s_backdropTexData); s_backdropTexData = NULL;
 	free(s_copyBackBuf); s_copyBackBuf = NULL;
@@ -245,15 +311,70 @@ void gxDsEngineBRenderShutdown()
 // ---------------------------------------------------------------------
 // Stage 0: per-scanline layout snapshot + scope check
 // ---------------------------------------------------------------------
-static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r)
+// Per-BG affine running-state prediction (see GxDsBBandRegs's affine block).
+// The CPU reference (GPU.cpp lineRot/lineExtRot) advances BGxX/BGxY by PB/PD
+// after every line it renders the BG on, and re-latches them from
+// affineInfo[] at the start of line 0 / on any reference-point register
+// write. A frame whose affine BGs simply follow that recurrence is one band;
+// a mid-frame reference-point or matrix rewrite (the classic HDMA
+// wave/mode-7 effect) breaks the prediction and starts a new band.
+struct GxDsBAffPred {
+	bool valid;
+	s32 x, y;
+	s16 pa, pb, pc, pd;
+};
+static GxDsBAffPred s_affPred[2];
+
+static inline bool gxDsBIsAffineType(u8 t)
 {
+	return t == BGType_Affine || t == BGType_AffineExt_256x16 || t == BGType_AffineExt_256x1 ||
+	       t == BGType_AffineExt_Direct || t == BGType_Large8bpp;
+}
+
+// Fills `r` with the layout state this scanline is about to be drawn with.
+// `affChanged` is set when an enabled affine BG's running state differs from
+// what the previous line predicted (it is never set on line 0: line 0 is the
+// band-0 baseline by definition).
+static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r, int line, bool *affChanged)
+{
+	memset(r, 0, sizeof(*r));
+	*affChanged = false;
 	const _DISPCNT &d = gpu->dispx_st->dispx_DISPCNT.bits;
 	r->bgEnable = (u8)((d.BG0_Enable) | (d.BG1_Enable << 1) | (d.BG2_Enable << 2) | (d.BG3_Enable << 3));
 	r->objEnable = (u8)d.OBJ_Enable;
 	for (int i = 0; i < 4; ++i) {
 		r->bgPrio[i] = (u8)gpu->dispx_st->dispx_BGxCNT[i].bits.Priority;
-		r->hofs[i] = (u16)gpu->getHOFS(i);
-		r->vofs[i] = (u16)gpu->getVOFS(i);
+		r->bgType[i] = (u8)gpu->BGTypes[i];
+		if (gpu->BGTypes[i] == BGType_Text) {
+			r->hofs[i] = (u16)gpu->getHOFS(i);
+			r->vofs[i] = (u16)gpu->getVOFS(i);
+		}
+	}
+	for (int w = 0; w < 2; ++w) {
+		const int bg = w + 2;
+		GxDsBAffPred &pr = s_affPred[w];
+		if (!((r->bgEnable >> bg) & 1) || !gxDsBIsAffineType(r->bgType[bg])) {
+			pr.valid = false;
+			continue;
+		}
+		const BGxPARMS *p = (bg == 2) ? &gpu->dispx_st->dispx_BG2PARMS : &gpu->dispx_st->dispx_BG3PARMS;
+		// Line 0: the CPU re-latches BGxX/BGxY from affineInfo[] inside
+		// GPU_RenderLine(l==0), which runs AFTER this hook, so the live
+		// parms->BGxX still holds last frame's accumulated value here.
+		s32 x = (line == 0) ? (s32)gpu->affineInfo[w].x : p->BGxX;
+		s32 y = (line == 0) ? (s32)gpu->affineInfo[w].y : p->BGxY;
+		// GPU.cpp reads the matrix through LE_TO_LOCAL_16 (host-endian fixup);
+		// BGxX/BGxY are plain host s32 and are read unswapped, as it does.
+		s16 pa = (s16)LE_TO_LOCAL_16(p->BGxPA), pb = (s16)LE_TO_LOCAL_16(p->BGxPB);
+		s16 pc = (s16)LE_TO_LOCAL_16(p->BGxPC), pd = (s16)LE_TO_LOCAL_16(p->BGxPD);
+		r->affX[w] = x; r->affY[w] = y;
+		r->affPA[w] = pa; r->affPB[w] = pb; r->affPC[w] = pc; r->affPD[w] = pd;
+		if (line != 0 && (!pr.valid || pr.x != x || pr.y != y || pr.pa != pa || pr.pb != pb || pr.pc != pc || pr.pd != pd))
+			*affChanged = true;
+		pr.valid = true;
+		pr.x = (s32)((u32)x + (u32)(s32)pb);
+		pr.y = (s32)((u32)y + (u32)(s32)pd);
+		pr.pa = pa; pr.pb = pb; pr.pc = pc; pr.pd = pd;
 	}
 }
 
@@ -264,15 +385,25 @@ static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r)
 static bool gxDsBScanlineOutOfScope(GPU *gpu)
 {
 	const _DISPCNT &d = gpu->dispx_st->dispx_DISPCNT.bits;
+#ifdef DSB_STATS
+	s_dsbDispcnt = gpu->dispx_st->dispx_DISPCNT.val;
+	s_dsbTypes = (u32)gpu->BGTypes[0] | ((u32)gpu->BGTypes[1] << 4) | ((u32)gpu->BGTypes[2] << 8) | ((u32)gpu->BGTypes[3] << 12);
+#endif
 
-	if (gpu->dispMode != 1) return true;   // 0 = white; 2/3 are Engine-A-only
-	if (d.BG_Mode != 0) return true;         // text BGs only (GPU_mode2type row 0)
-	if (d.ForceBlank) return true;
-	if (d.ExBGxPalette_Enable || d.ExOBJPalette_Enable) return true;
-	if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) return true;
-	if (((gpu->BLDCNT >> 6) & 3) != 0) return true;
-	if (gpu->MasterBrightMode != 0 && gpu->MasterBrightFactor != 0) return true;
-	if (!CommonSettings.showGpu.screens[GPU_SUB]) return true;
+	if (gpu->dispMode != 1) { DSB_WHY("dispmode"); return true; }   // 0 = white; 2/3 are Engine-A-only
+	if (d.ForceBlank) { DSB_WHY("forceblank"); return true; }
+	// Extended OBJ palettes stay out of scope. Extended BG palettes are IN scope
+	// (task 8 -- SM64DS's in-game sub screen needs them; see gxDsBExtPalFor()),
+	// but the flag is baked once from the frame-final state, so a mid-frame
+	// toggle can't be replayed.
+	if (d.ExOBJPalette_Enable) { DSB_WHY("objextpal"); return true; }
+	if (s_frameExtBgPalKnown && d.ExBGxPalette_Enable != s_frameExtBgPal) { DSB_WHY("extpalchange"); return true; }
+	s_frameExtBgPal = d.ExBGxPalette_Enable;
+	s_frameExtBgPalKnown = true;
+	if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) { DSB_WHY("window"); return true; }
+	if (((gpu->BLDCNT >> 6) & 3) != 0) { DSB_WHY("blend"); return true; }
+	if (gpu->MasterBrightMode != 0 && gpu->MasterBrightFactor != 0) { DSB_WHY("masterbright"); return true; }
+	if (!CommonSettings.showGpu.screens[GPU_SUB]) { DSB_WHY("hidden"); return true; }
 
 	// Mosaic: only matters when a layer actually enables it. Checked on the
 	// BG side here (the OBJ side is checked per sprite in
@@ -281,14 +412,26 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 		bool enabled = (bg == 0) ? d.BG0_Enable : (bg == 1) ? d.BG1_Enable :
 		               (bg == 2) ? d.BG2_Enable : d.BG3_Enable;
 		if (!enabled) continue;
-		if (gpu->dispx_st->dispx_BGxCNT[bg].bits.Mosaic_Enable) return true;
-		if (gpu->BGTypes[bg] != BGType_Text) return true;
+		const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
+		if (cnt.Mosaic_Enable) { DSB_WHY("mosaic"); return true; }
+		// Task 8: text plus every affine flavour is in scope. Anything else
+		// (BGType_Invalid -- e.g. BG0/1 enabled in BG_Mode 6/7 -- or the
+		// unresolved BGType_AffineExt placeholder) has no reference behaviour
+		// worth reproducing here.
+		const BGType t = gpu->BGTypes[bg];
+		if (t != BGType_Text && !gxDsBIsAffineType((u8)t)) { DSB_WHY("bgtype"); return true; }
+		// A non-wrapping affine plane is baked with a 1-texel transparent
+		// border padded to a power of two, and GX textures top out at 1024
+		// texels per side, so a non-wrapping 1024-wide/tall plane cannot
+		// carry one (512 + border -> 1024 still fits).
+		if (t != BGType_Text && !cnt.PaletteSet_Wrap &&
+		    (gpu->BGSize[bg][0] >= 1024 || gpu->BGSize[bg][1] >= 1024)) { DSB_WHY("aff1024nowrap"); return true; }
 		// GPU_resortBGs()'s `dispLayers OP enable` idiom inverts visibility
 		// for a *hidden* layer; rather than reproduce that debug-only quirk,
 		// bail whenever the user has toggled any Engine-B layer off.
-		if (!CommonSettings.dispLayers[GPU_SUB][bg]) return true;
+		if (!CommonSettings.dispLayers[GPU_SUB][bg]) { DSB_WHY("hiddenlayer"); return true; }
 	}
-	if (d.OBJ_Enable && !CommonSettings.dispLayers[GPU_SUB][4]) return true;
+	if (d.OBJ_Enable && !CommonSettings.dispLayers[GPU_SUB][4]) { DSB_WHY("hiddenobj"); return true; }
 
 	return false;
 }
@@ -315,6 +458,8 @@ void gxDsEngineBScanline(int line)
 	if (line == 0) {
 		s_frameSawLine0 = true;
 		s_frameOutOfScope = false;
+		s_affPred[0].valid = s_affPred[1].valid = false;
+		s_frameExtBgPalKnown = false;
 	} else if (!s_frameSawLine0) {
 		// Mid-frame entry (e.g. right after a savestate load): no frame-start
 		// snapshot exists, so this frame can't be replayed. Next frame's
@@ -331,13 +476,14 @@ void gxDsEngineBScanline(int line)
 		return; // already failed this frame; nothing to gain from banding it
 
 	GxDsBBandRegs cur;
-	gxDsBSnapshotBandRegs(gpu, &cur);
+	bool affChanged;
+	gxDsBSnapshotBandRegs(gpu, &cur, line, &affChanged);
 	if (line == 0) {
 		g_dsBBandRegs[0] = cur;
 		s_lastBandRegs = cur;
 		return;
 	}
-	if (memcmp(&cur, &s_lastBandRegs, sizeof(cur)) == 0)
+	if (!affChanged && memcmp(&cur, &s_lastBandRegs, GX_DSB_BANDREGS_CMP_BYTES) == 0)
 		return;
 
 	g_dsBFramePlan.bands.recordChangeAtLine(line);
@@ -402,9 +548,75 @@ static void gxDsBDrawQuad(GXTexObj *tex, f32 x0, f32 y0, f32 x1, f32 y1, f32 s0,
 	GX_End();
 }
 
+// Same screen rectangle as gxDsBDrawQuad but with an independent UV per corner
+// (order: top-left, top-right, bottom-right, bottom-left), which is what an
+// affine BG/OBJ needs -- its screen rectangle maps to a rotated/scaled
+// parallelogram in texture space. GX interpolates UVs linearly across the quad
+// with w == 1, and the affine transform is itself linear in screen (x,y), so
+// the 4 corner UVs reproduce GPU.cpp's per-pixel `X += PA` / `Y += PC` walk.
+static void gxDsBDrawQuadFree(GXTexObj *tex, f32 x0, f32 y0, f32 x1, f32 y1,
+                              f32 u0, f32 v0, f32 u1, f32 v1, f32 u2, f32 v2, f32 u3, f32 v3)
+{
+	GX_LoadTexObj(tex, GX_TEXMAP0);
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position2f32(x0, y0); GX_TexCoord2f32(u0, v0);
+		GX_Position2f32(x1, y0); GX_TexCoord2f32(u1, v1);
+		GX_Position2f32(x1, y1); GX_TexCoord2f32(u2, v2);
+		GX_Position2f32(x0, y1); GX_TexCoord2f32(u3, v3);
+	GX_End();
+}
+
+// The CPU reference samples texel floor(U) where U is the running 8.8 value
+// at the pixel's own (integer) position. GX_NEAR samples at the pixel's
+// SAMPLE POINT, and the quad's corner UVs are interpolated to there. That
+// sample point is NOT the geometric pixel centre 0.5: the console GPU places
+// it at 7/12 of a pixel (Dolphin's VertexShaderManager documents this as
+// "pixel_center_correction = 7/12 - 0.5" and reproduces it). Found the hard
+// way: assuming 0.5 made ~5% of texels of a rotated/scaled BG land one texel
+// off in Dolphin; a pure translation or an integer-aligned scale can't see it,
+// which is why SM64DS's scrolling clouds were byte-exact even before the fix.
+//
+// The corners are given the value that makes the interpolated sample at pixel
+// (i,r) equal U(i,r) + 1/512 -- half a fixed-point step INTO the correct
+// texel (every U the CPU can produce is a multiple of 1/256, so that is the
+// maximum-margin choice; a 1:1 unrotated BG would otherwise sit exactly on
+// texel boundaries):
+//   corner = U(corner) + 1/512 - t*(dA + dB)/256          t = sample point
+// `num` is U(corner) as the 8.8 numerator, dA/dB the per-column / per-row
+// 8.8 steps. All in double, narrowed once.
+//
+// t: 149/256 = 0.58203125, NOT the nominal 7/12 = 0.58333. The host GPU snaps
+// the sample point to its 8-bit sub-pixel grid, which turns Dolphin's 7/12
+// into 0.5 + 21/256; with t = 7/12 the residual error (0.0013 px, x a 2.0
+// matrix entry) exceeds the 1/512-texel margin and lattice-edge texels flip
+// (measured: a 2x-zoomed BG and a small affine OBJ mismatched with 7/12 and
+// were byte-exact with 149/256; see the log's task 8 section). On another
+// host GPU or on real hardware the true value may differ by ~0.001 px, which
+// can only ever move a texel that sits within ~0.004 of a texel edge.
+static const double kGxSamplePoint = 149.0 / 256.0;
+static inline f32 gxDsBAffineCorner(s32 num, s32 dA, s32 dB)
+{
+	return (f32)(((double)num + 0.5 - kGxSamplePoint * ((double)dA + (double)dB)) / 256.0);
+}
+
 // ---------------------------------------------------------------------
 // Stage 1: bakes
 // ---------------------------------------------------------------------
+// Smallest power of two >= n. Every affine texture (BG plane or OBJ) is baked
+// at a power-of-two size: Dolphin's GX_NEAR sampling of a NON-power-of-two
+// texture through an interpolated, sub-texel-exact UV was measured to land
+// texels wrongly (a 20-wide texture picked the neighbouring texel on every
+// 5th column; 36/132/516-wide ones were off by a small negative bias that
+// flips lattice-edge texels), whereas the identical UVs on a 32/64/256-wide
+// texture were byte-exact. Exactness of the sample is the whole point of this
+// path, so the (transparent) padding is worth the memory.
+static inline int gxDsBPow2Ge(int n)
+{
+	int p = 1;
+	while (p < n) p <<= 1;
+	return p;
+}
+
 static bool gxDsBEnsureCap(void **buf, u32 *cap, u32 needed)
 {
 	if (needed <= *cap)
@@ -427,6 +639,24 @@ static bool gxDsBEnsureCap(void **buf, u32 *cap, u32 needed)
 // 7-y, HFlip source column 7-x; the CPU expresses both as reversed
 // traversal, which is the same mapping). Every VRAM access goes through
 // MMU_gpu_map() so bank mapping/unmapped pages behave identically.
+// The extended BG palette slot a plane samples, or NULL when it uses the
+// regular BG palette. Mirrors GPU.cpp exactly: the ext palette only applies
+// when DISPCNT.ExBGxPalette_Enable is set AND the plane is a 256-colour text
+// BG (renderline_textBG's `if(dispCnt->ExBGxPalette_Enable) pal =
+// MMU.ExtPal[core][BGExtPalSlot[num]]`, reached only in the Palette_256
+// branch) or a BGType_AffineExt_256x16 plane (extRotBG2). Every other BG kind
+// -- 4bpp text, plain affine, 256x1, direct, large-8bpp -- ignores it.
+static const u8 *gxDsBExtPalFor(int bg)
+{
+	GPU *gpu = SubScreen.gpu;
+	if (!gpu->dispx_st->dispx_DISPCNT.bits.ExBGxPalette_Enable)
+		return NULL;
+	const BGType t = gpu->BGTypes[bg];
+	const bool applies = (t == BGType_Text) ? (gpu->dispx_st->dispx_BGxCNT[bg].bits.Palette_256 != 0)
+	                                        : (t == BGType_AffineExt_256x16);
+	return applies ? MMU.ExtPal[1][gpu->BGExtPalSlot[bg]] : NULL;
+}
+
 static void gxDsBBakeBgPlane(int bg)
 {
 	GPU *gpu = SubScreen.gpu;
@@ -437,13 +667,18 @@ static void gxDsBBakeBgPlane(int bg)
 	const u32 mapBase = gpu->BG_map_ram[bg];
 	const bool c256 = cnt.Palette_256 != 0;
 	const int screenSize = cnt.ScreenSize;
-	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
+	const u8 *extPal = gxDsBExtPalFor(bg);
+	// 256-colour text with ext palettes: index = (tile palNum << 8) + texel
+	// (GPU.cpp: `tilePal = pal + ((Palette<<9) & extPalMask)`, 2 bytes/entry).
+	u8 *const pal = extPal ? (u8 *)extPal : MMU.ARM9_VMEM + kDsBBgPalOff;
 	const int tileBytes = c256 ? 0x40 : 0x20;
 	const int rowBytes = c256 ? 8 : 4;
 
 	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
 	pc.valid = false;
 	if (lg <= 0 || ht <= 0 || lg > kDsBBgPlaneMaxPx || ht > kDsBBgPlaneMaxPx)
+		return;
+	if (!gxDsBEnsureBgScratch((u32)lg * ht))
 		return;
 
 	for (int ty = 0; ty < ht / 8; ++ty) {
@@ -476,7 +711,7 @@ static void gxDsBBakeBgPlane(int bg)
 					if (!idx) {
 						out[sx] = kDsBTransparentTexel;
 					} else {
-						int palIdx = c256 ? idx : (palNum * 16 + idx);
+						int palIdx = c256 ? (extPal ? (palNum << 8) + idx : idx) : (palNum * 16 + idx);
 						out[sx] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)palIdx * 2));
 					}
 				}
@@ -500,16 +735,170 @@ static void gxDsBBakeBgPlane(int bg)
 	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR);
 	pc.wpx = (u16)lg;
 	pc.hpx = (u16)ht;
+	pc.bufW = (u16)lg;
+	pc.bufH = (u16)ht;
 	pc.cfgTileBase = tileBase;
 	pc.cfgMapBase = mapBase;
 	pc.cfgColorMode = (u8)(c256 ? 1 : 0);
 	pc.cfgScreenSize = (u8)screenSize;
+	pc.cfgType = (u8)BGType_Text;
+	pc.cfgWrap = 0;
+	pc.cfgAuxBase = 0;
+	pc.cfgExtPal = extPal;
+	pc.valid = true;
+}
+
+// Task 8: one affine-flavoured BG plane -> one RGB5A3 texture.
+//
+// Covers BGType_Affine (1-byte map entries, no flip), BGType_AffineExt_256x16
+// (2-byte entries WITH per-tile H/V flip, 8bpp tiles; the entry's palette bits
+// only matter with extended palettes, which are out of scope), _256x1 (an
+// 8bpp bitmap), _Direct (a 15-bit direct-colour bitmap whose bit 15 is the
+// per-pixel opaque flag) and BGType_Large8bpp (a big 8bpp bitmap). Every
+// address/decode rule below is transcribed from GPU.cpp's rot_tiled_8bit_entry,
+// rot_tiled_16bit_entry, rot_256_map and rot_BMP_map -- NOT from the GBA
+// slice: in particular the DS extended-affine map entry is 16-bit TILEENTRY
+// layout (TileNum 10 bits, HFlip bit 10, VFlip bit 11), which the GBA's
+// 1-byte affine map has no analogue of.
+//
+// Transparent-border technique (same as gx_gba_render.cpp): when the plane's
+// overflow-wrap bit is clear an out-of-map sample must read TRANSPARENT (the
+// CPU simply skips such a pixel), so the map is baked inside a 1-texel
+// transparent border and sampled GX_CLAMP; when it wraps, the plane is baked
+// at exactly its own power-of-two size and sampled GX_REPEAT (== the CPU's
+// `& (wh-1)`). The bordered size is padded up to the next power of two (see
+// gxDsBPow2Ge for why non-power-of-two affine textures are avoided).
+//
+// Row/tile address mapping: the CPU calls MMU_gpu_map() once per *pixel* on
+// (base + linear offset). Bases are 16KB-aligned (MMU_BBG + n*16KB), a 64-byte
+// tile block never straddles a 16KB page, and a bitmap row (<= 1024 bytes,
+// row starts at multiples of its own power-of-two length) never does either,
+// so mapping once per tile / once per row resolves to exactly the same host
+// bytes.
+static void gxDsBBakeAffineBgPlane(int bg)
+{
+	GPU *gpu = SubScreen.gpu;
+	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
+	const BGType type = gpu->BGTypes[bg];
+	const int lg = (int)gpu->BGSize[bg][0];
+	const int ht = (int)gpu->BGSize[bg][1];
+	const bool wrap = cnt.PaletteSet_Wrap != 0;
+	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
+
+	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
+	pc.valid = false;
+	if (lg <= 0 || ht <= 0 || lg > 1024 || ht > 1024)
+		return;
+	const int border = wrap ? 0 : 1;
+	const int bufW = wrap ? lg : gxDsBPow2Ge(lg + 2);
+	const int bufH = wrap ? ht : gxDsBPow2Ge(ht + 2);
+	if (bufW > 1024 || bufH > 1024)
+		return; // scope check bails these frames; defensive
+	if (!gxDsBEnsureBgScratch((u32)bufW * bufH))
+		return;
+
+	u16 *const buf = s_bgBakeScratch;
+	if (!wrap)
+		memset(buf, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent RGB5A3
+
+	// Index -> RGB5A3 lookup for the 8bpp flavours; index 0 is transparent.
+	u16 lut[256];
+	lut[0] = kDsBTransparentTexel;
+	for (int i = 1; i < 256; ++i)
+		lut[i] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)i * 2));
+	// BGType_AffineExt_256x16 with DISPCNT.ExBGxPalette_Enable: the tile's
+	// 4-bit palette number selects one of 16 256-entry palettes in the ext
+	// slot (rot_tiled_16bit_entry<extPal=true>: `pal[(entry + (Palette<<8))<<1]`).
+	const u8 *extPal = gxDsBExtPalFor(bg);
+
+	const u32 tileBase = gpu->BG_tile_ram[bg];
+	const u32 mapBase = gpu->BG_map_ram[bg];
+	u32 auxBase = 0;
+
+	if (type == BGType_Affine || type == BGType_AffineExt_256x16) {
+		const int tw = lg >> 3, th = ht >> 3;
+		for (int ty = 0; ty < th; ++ty) {
+			for (int tx = 0; tx < tw; ++tx) {
+				int tileNum, palNum = 0;
+				bool hflip = false, vflip = false;
+				if (type == BGType_Affine) {
+					tileNum = *(const u8 *)MMU_gpu_map(mapBase + (u32)(tx + ty * tw));
+				} else {
+					u16 e = T1ReadWord(MMU_gpu_map(mapBase + (((u32)(tx + ty * tw)) << 1)), 0);
+					tileNum = e & 0x3FF;
+					hflip = ((e >> 10) & 1) != 0;
+					vflip = ((e >> 11) & 1) != 0;
+					palNum = (e >> 12) & 0xF;
+				}
+				const u8 *tile = (const u8 *)MMU_gpu_map(tileBase + ((u32)tileNum << 6));
+				for (int sy = 0; sy < 8; ++sy) {
+					const u8 *row = tile + (vflip ? 7 - sy : sy) * 8;
+					u16 *out = buf + (u32)(ty * 8 + sy + border) * bufW + tx * 8 + border;
+					if (extPal) {
+						for (int sx = 0; sx < 8; ++sx) {
+							int idx = row[hflip ? 7 - sx : sx];
+							out[sx] = idx ? gxDsBOpaqueTexel(T1ReadWord((void *)extPal, (u32)((palNum << 8) + idx) * 2))
+							              : kDsBTransparentTexel;
+						}
+					} else {
+						for (int sx = 0; sx < 8; ++sx)
+							out[sx] = lut[row[hflip ? 7 - sx : sx]];
+					}
+				}
+			}
+		}
+	} else if (type == BGType_AffineExt_256x1 || type == BGType_Large8bpp) {
+		auxBase = (type == BGType_Large8bpp) ? gpu->BG_bmp_large_ram[bg] : gpu->BG_bmp_ram[bg];
+		for (int y = 0; y < ht; ++y) {
+			const u8 *row = (const u8 *)MMU_gpu_map(auxBase + (u32)y * lg);
+			u16 *out = buf + (u32)(y + border) * bufW + border;
+			for (int x = 0; x < lg; ++x)
+				out[x] = lut[row[x]];
+		}
+	} else if (type == BGType_AffineExt_Direct) {
+		auxBase = gpu->BG_bmp_ram[bg];
+		for (int y = 0; y < ht; ++y) {
+			void *row = MMU_gpu_map(auxBase + (((u32)y * lg) << 1));
+			u16 *out = buf + (u32)(y + border) * bufW + border;
+			for (int x = 0; x < lg; ++x) {
+				u16 c = T1ReadWord(row, (u32)x << 1);
+				out[x] = (c & 0x8000) ? gxDsBOpaqueTexel(c) : kDsBTransparentTexel;
+			}
+		}
+	} else {
+		return;
+	}
+
+	u32 needed = (u32)bufW * bufH * sizeof(u16);
+	if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, needed))
+		return;
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+	gxSwizzle16bpp(buf, (u16 *)pc.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
+	DCFlushRange(pc.texData, needed);
+	const u8 wm = wrap ? GX_REPEAT : GX_CLAMP;
+	GX_InitTexObj(&pc.texObj, pc.texData, bufW, bufH, GX_TF_RGB5A3, wm, wm, GX_FALSE);
+	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	pc.wpx = (u16)lg;
+	pc.hpx = (u16)ht;
+	pc.bufW = (u16)bufW;
+	pc.bufH = (u16)bufH;
+	pc.cfgTileBase = tileBase;
+	pc.cfgMapBase = mapBase;
+	pc.cfgColorMode = (u8)(cnt.Palette_256 ? 1 : 0);
+	pc.cfgScreenSize = (u8)cnt.ScreenSize;
+	pc.cfgType = (u8)type;
+	pc.cfgWrap = (u8)(wrap ? 1 : 0);
+	pc.cfgAuxBase = auxBase;
+	pc.cfgExtPal = extPal;
 	pc.valid = true;
 }
 
 struct GxDsBObjDraw {
 	s16 x, y;
-	u16 w, h;
+	u16 w, h;          // sprite (texture) size
+	u16 boxW, boxH;    // on-screen box: == w,h, or 2x for a double-size affine sprite
+	bool affine;
+	s16 pa, pb, pc, pd; // 8.8 fixed point OAM rot/scale matrix (affine only)
 	u8 priority;
 	bool hflip, vflip;
 	bool depth;      // OAM attr0 bit13: 0 = 16-colour, 1 = 256-colour
@@ -560,6 +949,7 @@ static bool gxDsBCollectVisibleObj()
 		// pass would have to bail on anyway.
 		int boxW = (rotScale == 3) ? w * 2 : w;
 		int boxH = (rotScale == 3) ? h * 2 : h;
+		if (boxW > 2 * kDsBObjMaxPx || boxH > 2 * kDsBObjMaxPx) continue;
 
 		int sprY = a0 & 0xFF;
 		if (sprY >= 192) sprY = (s32)(s8)(u8)sprY;
@@ -574,13 +964,22 @@ static bool gxDsBCollectVisibleObj()
 		if (sprX + boxW <= 0 || sprX >= kDsBScreenW) continue;
 		if (sprY + boxH <= 0 || sprY >= kDsBScreenH) continue;
 
-		if (rotScale != 0) return false;
+		const bool affine = (rotScale & 1) != 0; // 1 or 3 (2 was skipped above)
+		// GPU.cpp tests a sprite's rows with `(l - sprY) & 255 < fieldY`, i.e.
+		// a box that hangs past line 255 wraps round and ALSO appears at the
+		// top of the screen. Only a double-size 64-tall affine sprite can be
+		// tall enough to reach that (sprY < 192, boxH <= 128); reproducing the
+		// wrap isn't worth a quad split, so bail on it.
+		if (sprY >= 0 && sprY + boxH > 256) return false;
 		// Mode 2 (OBJ window) sprites only ever write GPU.cpp's sprWin[]
 		// mask, which is read exclusively when WINOBJ_ENABLED -- and this
 		// file already bails the frame for that (gxDsBScanlineOutOfScope).
 		// With the OBJ window off they draw no pixels and take no part in
 		// prioTab, so skipping them is exact, not a shortcut.
-		if (mode == 2) continue;
+		// (An AFFINE Mode-2 sprite is different: GPU.cpp's rot/scale branch
+		// has no Mode-2 special case and draws its texels as ordinary pixels
+		// tagged type 2, a path this file has no model for -> bail.)
+		if (mode == 2 && !affine) continue;
 		// Mode 1 (semi-transparent) blends against the layer beneath
 		// whenever BLDCNT's 2nd-target bits select it, INDEPENDENTLY of
 		// BLDCNT's effect field (GPU.cpp's _master_setFinalOBJColor tests
@@ -595,9 +994,25 @@ static bool gxDsBCollectVisibleObj()
 		d.y = (s16)sprY;
 		d.w = (u16)w;
 		d.h = (u16)h;
+		d.boxW = (u16)boxW;
+		d.boxH = (u16)boxH;
+		d.affine = affine;
+		d.pa = d.pb = d.pc = d.pd = 0;
+		if (affine) {
+			// Same selector GPU.cpp uses: the 5-bit group is RotScalIndex
+			// (attr1 bits 9-11) + HFlip<<3 + VFlip<<4 == attr1 bits 9-13, and
+			// group g's matrix lives in the attr3 words of OAM entries
+			// 4g..4g+3 (PA, PB, PC, PD).
+			u32 bp = (u32)((a1 >> 9) & 0x1F) * 4;
+			d.pa = (s16)T1ReadWord(oam, (bp + 0) * 8 + 6);
+			d.pb = (s16)T1ReadWord(oam, (bp + 1) * 8 + 6);
+			d.pc = (s16)T1ReadWord(oam, (bp + 2) * 8 + 6);
+			d.pd = (s16)T1ReadWord(oam, (bp + 3) * 8 + 6);
+		}
 		d.priority = (u8)((a2 >> 10) & 3);
-		d.hflip = ((a1 >> 12) & 1) != 0;
-		d.vflip = ((a1 >> 13) & 1) != 0;
+		// For an affine sprite attr1 bits 12/13 are matrix-group bits, not flips.
+		d.hflip = !affine && ((a1 >> 12) & 1) != 0;
+		d.vflip = !affine && ((a1 >> 13) & 1) != 0;
 		d.depth = ((a0 >> 13) & 1) != 0;
 		d.palIndex = (u8)((a2 >> 12) & 0xF);
 		d.tileIndex = (u16)(a2 & 0x3FF);
@@ -623,16 +1038,41 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d)
 	GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
 	slot.valid = false;
 
+	// Task 8: an affine sprite is sampled through an arbitrary matrix, so any
+	// sample landing outside the w x h image must read transparent (the CPU
+	// simply doesn't draw it). Same trick as the affine BG planes: bake inside
+	// a 1-texel transparent border and sample GX_CLAMP. The border is padded to
+	// the RGB5A3 4x4 block size; a plain sprite keeps its exact-size,
+	// borderless bake so task 7's output is untouched.
+	const bool bordered = d.affine;
+	const int off = bordered ? 1 : 0;
+	const int bufW = bordered ? gxDsBPow2Ge(d.w + 2) : d.w;
+	const int bufH = bordered ? gxDsBPow2Ge(d.h + 2) : d.h;
+	if (bordered)
+		memset(s_objBakeScratch, 0, (size_t)bufW * bufH * sizeof(u16)); // 0 == transparent
+
+	// Plain sprites: GPU.cpp resolves MMU_gpu_map() once per ROW (compute_
+	// sprite_vars/_spriteRender's per-line `src = MMU_gpu_map(...)`), affine
+	// sprites once per SPRITE (one `src = MMU_gpu_map(sprMem + (TileIndex <<
+	// block))`, then flat offsets from that host pointer). Reproduce whichever
+	// applies so a sprite whose data straddles two non-contiguous 16KB VRAM
+	// pages reads the same bytes the reference does.
+	const u8 *affBase = NULL;
+	if (bordered)
+		affBase = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << (oneDim ? gpu->sprBoundary : 5)));
+
 	for (int y = 0; y < d.h; ++y) {
-		u32 addr;
-		if (oneDim)
-			addr = gpu->sprMem + ((u32)d.tileIndex << gpu->sprBoundary)
-			       + (u32)(y >> 3) * (u32)d.w * rowBytes + (u32)(y & 7) * rowBytes;
-		else
-			addr = gpu->sprMem + ((u32)d.tileIndex << 5)
-			       + ((u32)(y >> 3) << 10) + (u32)(y & 7) * rowBytes;
-		const u8 *src = (const u8 *)MMU_gpu_map(addr);
-		u16 *out = s_objBakeScratch + (u32)y * d.w;
+		const u8 *src;
+		if (oneDim) {
+			u32 rel = (u32)(y >> 3) * (u32)d.w * rowBytes + (u32)(y & 7) * rowBytes;
+			src = bordered ? affBase + rel
+			               : (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << gpu->sprBoundary) + rel);
+		} else {
+			u32 rel = ((u32)(y >> 3) << 10) + (u32)(y & 7) * rowBytes;
+			src = bordered ? affBase + rel
+			               : (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << 5) + rel);
+		}
+		u16 *out = s_objBakeScratch + (u32)(y + off) * bufW + off;
 		for (int x = 0; x < d.w; ++x) {
 			int idx;
 			if (d.depth) {
@@ -651,17 +1091,20 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d)
 		}
 	}
 
-	u32 needed = (u32)d.w * d.h * sizeof(u16);
+	u32 needed = (u32)bufW * bufH * sizeof(u16);
 	if (!gxDsBEnsureCap(&slot.texData, &slot.texDataCap, needed))
 		return;
 
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, d.w, d.h);
+	gxSwizzle16bpp(s_objBakeScratch, (u16 *)slot.texData, blk.texelsWide, blk.texelsTall, bufW, bufH);
 	DCFlushRange(slot.texData, needed);
-	GX_InitTexObj(&slot.texObj, slot.texData, d.w, d.h, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&slot.texObj, slot.texData, bufW, bufH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjFilterMode(&slot.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
 	slot.w = d.w;
 	slot.h = d.h;
+	slot.bufW = (u16)bufW;
+	slot.bufH = (u16)bufH;
+	slot.cfgBordered = (u8)(bordered ? 1 : 0);
 	slot.cfgTileIndex = d.tileIndex;
 	slot.cfgPalIndex = d.palIndex;
 	slot.cfgDepth = (u8)(d.depth ? 1 : 0);
@@ -693,6 +1136,70 @@ static void gxDsBDrawBgQuad(int bg, const GxDsBBandRegs &r, int y0, int y1)
 	gxDsBDrawQuad(&pc.texObj, 0, (f32)y0, (f32)kDsBScreenW, (f32)y1, s0, t0, s1, t1);
 }
 
+// Affine BG band draw. Band [y0,y1) starts at reference point (X0,Y0) -- the
+// CPU's running latch value at line y0, recorded per band by Stage 0 -- and
+// GPU.cpp's per-pixel/per-line walk is
+//   U(i, r) = X0 + i*PA + r*PB     V(i, r) = Y0 + i*PC + r*PD   (8.8 fixed)
+// with i the screen column and r the line offset within the band; texel =
+// (floor(U/256), floor(V/256)), wrapped by `& (size-1)` if BGxCNT's overflow
+// bit is set, skipped (transparent) otherwise. The 4 band corners are (i,r) =
+// (0,0) (256,0) (256,H) (0,H).
+static void gxDsBDrawAffineBgQuad(int bg, const GxDsBBandRegs &r, int y0, int y1)
+{
+	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
+	if (!pc.valid) return;
+	const int w = bg - 2;
+	// ROTOCOORD's Integer field is 20 bits above 8 fraction bits (a 28-bit
+	// signed fixed-point value); the top 4 bits are ignored by GPU.cpp.
+	s32 X0 = (s32)((u32)r.affX[w] << 4) >> 4;
+	s32 Y0 = (s32)((u32)r.affY[w] << 4) >> 4;
+	const s32 pa = r.affPA[w], pb = r.affPB[w], pcm = r.affPC[w], pd = r.affPD[w];
+	if (pc.cfgWrap) {
+		// Wrapping: only the position modulo the map size matters, and the
+		// wrapped value keeps the float UVs small (GX_REPEAT with a huge
+		// coordinate would burn precision). Exact, since the CPU masks the
+		// integer part after summing and adding a multiple of the size to the
+		// integer part changes nothing.
+		X0 = (X0 & 0xFF) | ((((X0 >> 8) & (pc.wpx - 1))) << 8);
+		Y0 = (Y0 & 0xFF) | ((((Y0 >> 8) & (pc.hpx - 1))) << 8);
+	}
+	const s32 W = kDsBScreenW, H = y1 - y0;
+	const f32 off = pc.cfgWrap ? 0.0f : 1.0f; // border texel offset
+	const f32 nW = (f32)pc.bufW, nH = (f32)pc.bufH;
+
+	f32 u[4], v[4];
+	const s32 ci[4] = { 0, W, W, 0 }, ri[4] = { 0, 0, H, H };
+	for (int k = 0; k < 4; ++k) {
+		u[k] = (gxDsBAffineCorner(X0 + ci[k] * pa + ri[k] * pb, pa, pb) + off) / nW;
+		v[k] = (gxDsBAffineCorner(Y0 + ci[k] * pcm + ri[k] * pd, pcm, pd) + off) / nH;
+	}
+	gxDsBDrawQuadFree(&pc.texObj, 0, (f32)y0, (f32)kDsBScreenW, (f32)y1,
+	                  u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]);
+}
+
+// One affine sprite. Box-relative pixel (col,row) samples texel
+//   U = texW/2 + ((col-cx)*PA + (row-cy)*PB)/256 ,  V likewise with PC/PD,
+// cx/cy = half the on-screen box -- GPU.cpp's realX/realY start value plus its
+// per-pixel `+= dx/dy` (a double-size sprite's box is 2x the texture, which is
+// why the centre is the BOX centre while the origin offset is the TEXTURE
+// half-size). Texel coordinates are +1 for the baked transparent border.
+static void gxDsBDrawAffineObj(const GxDsBObjDraw &d, const GxDsBObjTexSlot &slot)
+{
+	const s32 cx = d.boxW >> 1, cy = d.boxH >> 1;
+	const s32 pa = d.pa, pb = d.pb, pcm = d.pc, pd = d.pd;
+	const s32 baseU = (s32)d.w * 128, baseV = (s32)d.h * 128;
+	const s32 ci[4] = { 0, d.boxW, d.boxW, 0 }, ri[4] = { 0, 0, d.boxH, d.boxH };
+	f32 u[4], v[4];
+	for (int k = 0; k < 4; ++k) {
+		s32 dc = ci[k] - cx, dr = ri[k] - cy;
+		u[k] = (gxDsBAffineCorner(baseU + dc * pa + dr * pb, pa, pb) + 1.0f) / (f32)slot.bufW;
+		v[k] = (gxDsBAffineCorner(baseV + dc * pcm + dr * pd, pcm, pd) + 1.0f) / (f32)slot.bufH;
+	}
+	gxDsBDrawQuadFree(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
+	                  (f32)(d.x + d.boxW), (f32)(d.y + d.boxH),
+	                  u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]);
+}
+
 static void gxDsBDrawObjLayer(int prio, int y0, int y1)
 {
 	// GPU.cpp resolves per-pixel sprite ownership by walking OAM from index
@@ -702,9 +1209,13 @@ static void gxDsBDrawObjLayer(int prio, int y0, int y1)
 	for (int i = s_objDrawCount - 1; i >= 0; --i) {
 		const GxDsBObjDraw &d = s_objDraws[i];
 		if (d.priority != prio) continue;
-		if (d.y >= y1 || d.y + d.h <= y0) continue;
+		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
 		GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
 		if (!slot.valid) continue;
+		if (d.affine) {
+			gxDsBDrawAffineObj(d, slot);
+			continue;
+		}
 		f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
 		f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
 		gxDsBDrawQuad(&slot.texObj, (f32)d.x, (f32)d.y,
@@ -733,8 +1244,27 @@ bool gxDsEngineBRenderFrame()
 		}
 	} bandResetter;
 
+#ifdef DSB_FORCE_CPU
+	return false;
+#endif
 	if (gameInfo.isGBA)
 		return false;
+#ifdef DSB_STATS
+	bool statsOk = false;
+	struct StatsEmit {
+		bool *ok;
+		~StatsEmit() {
+			if (*ok) ++s_dsbOk; else ++s_dsbBail;
+			if (((s_dsbOk + s_dsbBail) % 30) == 0) {
+#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+				harness_profile_emitf("dsb n=%u ok=%u bail=%u affbg=%u affobj=%u dispcnt=%08x types=%04x why=%s",
+				                      (unsigned)(s_dsbOk + s_dsbBail), (unsigned)s_dsbOk, (unsigned)s_dsbBail,
+				                      (unsigned)s_dsbAffOk, (unsigned)s_dsbAffObjOk, (unsigned)s_dsbDispcnt, (unsigned)s_dsbTypes, s_dsbWhy);
+#endif
+			}
+		}
+	} statsEmit = { &statsOk };
+#endif
 	if (!s_frameSawLine0 || s_frameOutOfScope)
 		return false;
 	if (!SubScreen.gpu)
@@ -749,11 +1279,15 @@ bool gxDsEngineBRenderFrame()
 	// documents that as a safe degrade for the GBA's rarer case). For a DS
 	// engine, per-scanline HDMA scroll is common enough that silently
 	// merging would mean visibly wrong output, so bail instead.
-	if (g_dsBFramePlan.bands.boundaryCount() >= GxBandTracker::kMaxBoundaries)
+	if (g_dsBFramePlan.bands.boundaryCount() >= GxBandTracker::kMaxBoundaries) {
+		DSB_WHY("bandoverflow");
 		return false;
+	}
 
-	if (!gxDsBCollectVisibleObj())
+	if (!gxDsBCollectVisibleObj()) {
+		DSB_WHY("obj");
 		return false;
+	}
 
 	int bandStarts[GxBandTracker::kMaxBands], bandEnds[GxBandTracker::kMaxBands];
 	int bandCount = g_dsBFramePlan.bands.finalize(kDsBScreenH, bandStarts, bandEnds);
@@ -775,7 +1309,16 @@ bool gxDsEngineBRenderFrame()
 	bool objEnabledAnyBand = false;
 	for (int b = 0; b < bandCount; ++b) {
 		for (int bg = 0; bg < 4; ++bg)
-			if ((g_dsBBandRegs[b].bgEnable >> bg) & 1) bgEnabledAnyBand[bg] = true;
+			if ((g_dsBBandRegs[b].bgEnable >> bg) & 1) {
+				bgEnabledAnyBand[bg] = true;
+				// A plane is baked once, from the frame-final BGxCNT/mode. A
+				// BG whose type changed between bands (a mid-frame BG_Mode
+				// switch) can't be replayed from that one bake -> bail.
+				if (g_dsBBandRegs[b].bgType[bg] != (u8)gpu->BGTypes[bg]) {
+					DSB_WHY("bgtypechange");
+					return false;
+				}
+			}
 		if (g_dsBBandRegs[b].objEnable) objEnabledAnyBand = true;
 	}
 
@@ -783,13 +1326,22 @@ bool gxDsEngineBRenderFrame()
 		if (!bgEnabledAnyBand[bg]) continue;
 		GxDsBBgPlaneCache &pc = s_bgPlane[bg];
 		const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
+		const BGType type = gpu->BGTypes[bg];
+		const bool affine = (type != BGType_Text);
+		u32 auxBase = 0;
+		if (type == BGType_Large8bpp) auxBase = gpu->BG_bmp_large_ram[bg];
+		else if (type == BGType_AffineExt_256x1 || type == BGType_AffineExt_Direct) auxBase = gpu->BG_bmp_ram[bg];
 		bool needBake = !pc.valid || bankChanged || vramDirty || palDirty ||
 		                pc.wpx != (u16)gpu->BGSize[bg][0] || pc.hpx != (u16)gpu->BGSize[bg][1] ||
 		                pc.cfgTileBase != gpu->BG_tile_ram[bg] || pc.cfgMapBase != gpu->BG_map_ram[bg] ||
 		                pc.cfgColorMode != (u8)(cnt.Palette_256 ? 1 : 0) ||
-		                pc.cfgScreenSize != (u8)cnt.ScreenSize;
-		if (needBake)
-			gxDsBBakeBgPlane(bg);
+		                pc.cfgScreenSize != (u8)cnt.ScreenSize ||
+		                pc.cfgType != (u8)type || pc.cfgExtPal != gxDsBExtPalFor(bg) ||
+		                (affine && (pc.cfgWrap != (u8)(cnt.PaletteSet_Wrap ? 1 : 0) || pc.cfgAuxBase != auxBase));
+		if (needBake) {
+			if (affine) gxDsBBakeAffineBgPlane(bg);
+			else gxDsBBakeBgPlane(bg);
+		}
 	}
 	if (objEnabledAnyBand) {
 		const u8 oneDim = (u8)((gpu->spriteRenderMode == GPU::SPRITE_1D) ? 1 : 0);
@@ -802,7 +1354,8 @@ bool gxDsEngineBRenderFrame()
 			                slot.cfgPalIndex != d.palIndex ||
 			                slot.cfgDepth != (u8)(d.depth ? 1 : 0) ||
 			                slot.cfgOneDim != oneDim ||
-			                slot.cfgBoundary != gpu->sprBoundary;
+			                slot.cfgBoundary != gpu->sprBoundary ||
+			                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
 			if (needBake)
 				gxDsBBakeObjTexture(d);
 		}
@@ -836,7 +1389,10 @@ bool gxDsEngineBRenderFrame()
 			for (int bg = 3; bg >= 0; --bg) {
 				if (!((r.bgEnable >> bg) & 1)) continue;
 				if (r.bgPrio[bg] != prio) continue;
-				gxDsBDrawBgQuad(bg, r, y0, y1);
+				if (r.bgType[bg] == (u8)BGType_Text)
+					gxDsBDrawBgQuad(bg, r, y0, y1);
+				else
+					gxDsBDrawAffineBgQuad(bg, r, y0, y1);
 			}
 			if (r.objEnable)
 				gxDsBDrawObjLayer(prio, y0, y1);
@@ -888,5 +1444,12 @@ bool gxDsEngineBRenderFrame()
 	g_dsBFramePlan.palette.clear();
 	g_dsBFramePlan.oam.clear();
 
+#ifdef DSB_STATS
+	statsOk = true;
+	for (int bg = 0; bg < 4; ++bg)
+		if (bgEnabledAnyBand[bg] && gpu->BGTypes[bg] != BGType_Text) { ++s_dsbAffOk; break; }
+	for (int i = 0; i < s_objDrawCount; ++i)
+		if (s_objDraws[i].affine) { ++s_dsbAffObjOk; break; }
+#endif
 	return true;
 }

@@ -1324,8 +1324,8 @@ template<bool MOSAIC, int FUNCNUM> void lineRot(GPU * gpu)
 			LE_TO_LOCAL_16(parms->BGxPD),
 			256);
 
-		parms->BGxX += LE_TO_LOCAL_16(parms->BGxPB);
-		parms->BGxY += LE_TO_LOCAL_16(parms->BGxPD);
+		parms->BGxX += (s16)LE_TO_LOCAL_16(parms->BGxPB);
+		parms->BGxY += (s16)LE_TO_LOCAL_16(parms->BGxPD);
 //	}
 }
 
@@ -1354,8 +1354,8 @@ template<bool MOSAIC, int FUNCNUM> void lineExtRot(GPU * gpu)
 			LE_TO_LOCAL_16(parms->BGxPD),
 			256);
 
-		parms->BGxX += LE_TO_LOCAL_16(parms->BGxPB);
-		parms->BGxY += LE_TO_LOCAL_16(parms->BGxPD);
+		parms->BGxX += (s16)LE_TO_LOCAL_16(parms->BGxPB);
+		parms->BGxY += (s16)LE_TO_LOCAL_16(parms->BGxPD);
 //	}
 }
 

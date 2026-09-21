@@ -58,7 +58,7 @@
     gxDsBBankMapChanged()).
 
     ------------------------------------------------------------------
-    Scope (phase 1) -- everything outside it bails to the CPU compositor
+    Scope (phase 1 + task 8) -- everything outside it bails to the CPU compositor
     ------------------------------------------------------------------
     gxDsEngineBRenderFrame() returns false, leaving GPU_screen exactly as
     GPU_RenderLine() already rendered it, unless ALL of the following hold
@@ -67,18 +67,33 @@
      - DS mode (not GBA), Engine B display mode 1 ("display BG and OBJ
        layers"); mode 0 (white) has no GX work worth doing and mode 2/3 are
        Engine-A-only anyway.
-     - DISPCNT BG_Mode == 0, i.e. all four BGs are plain text-mode BGs
-       (GPU.cpp's GPU_mode2type table row 0). No affine, no extended-affine,
-       no large-8bpp, no bitmap BG.
+     - Every ENABLED BG is one of (task 8 widened this from "BG_Mode == 0,
+       all text"): a text BG; BGType_Affine (1-byte map entries, no flip);
+       BGType_AffineExt_256x16 (2-byte TILEENTRY map entries with H/V flip
+       + 8bpp tiles); BGType_AffineExt_256x1 (8bpp bitmap);
+       BGType_AffineExt_Direct (15-bit direct colour, bit 15 = opaque);
+       BGType_Large8bpp. i.e. any DISPCNT BG_Mode 0-6 whose enabled BGs are
+       not BGType_Invalid. Wrap (BGxCNT overflow bit) on and off are both
+       handled -- EXCEPT a non-wrapping 1024-texel-wide/tall plane, which
+       cannot carry the 1-texel transparent border inside GX's 1024-texel
+       texture limit (bails). A running affine reference point is tracked
+       per scanline (see "Affine" below); a per-line rewrite of it (HDMA
+       wave effects) exceeds the band budget and bails.
+     - Every drawn sprite is a regular OBJ or (task 8) an affine one
+       (OAM RotScale 1 = normal box, 3 = double-size box), both in Mode 0.
      - No windows (WIN0/WIN1/OBJ window all disabled), no colour special
        effect (BLDCNT effect field 0), no mosaic on any enabled BG or any
-       drawn sprite, no MASTER_BRIGHT, no extended BG/OBJ palettes, no
-       forced blank.
-     - Every drawn sprite is a regular (non-rot/scale) OBJ in Mode 0
-       (normal): no affine OBJ, no semi-transparent OBJ (which blends
-       against the layer beneath it regardless of BLDCNT's effect field --
-       see GPU.cpp's _master_setFinalOBJColor), no OBJ-window sprites, no
-       bitmap OBJ.
+       drawn sprite, no MASTER_BRIGHT, no extended OBJ palettes, no forced
+       blank. (Extended BG palettes ARE handled since task 8: 256-colour
+       text BGs and the 256x16 extended-affine flavour, nothing else -- see
+       "Extended BG palettes" below.)
+     - No semi-transparent OBJ (Mode 1: blends against the layer beneath it
+       regardless of BLDCNT's effect field -- see GPU.cpp's
+       _master_setFinalOBJColor), no OBJ-window sprite (Mode 2 non-affine is
+       skipped exactly; an AFFINE Mode-2 sprite bails), no bitmap OBJ
+       (Mode 3), and no affine sprite whose box hangs past scanline 255 (the
+       CPU's `(l - sprY) & 255` row test would also draw it wrapped at the
+       top of the screen).
      - The user hasn't hidden a layer or the sub screen via
        CommonSettings.dispLayers / showGpu.
      - The frame's scanline-band count fits GxBandTracker's boundary budget.
@@ -90,6 +105,67 @@
     guard, and GPU_setVideoProp() masks Engine B's DisplayMode to 2 bits'
     worth of `(gpu->core)?1:3`. So those are Engine-A-only concerns and are
     simply absent here rather than "not implemented yet".
+
+    ------------------------------------------------------------------
+    Affine BG / OBJ (task 8): technique + the two hardware facts it needed
+    ------------------------------------------------------------------
+     - Same corner-UV-quad technique as gx_gba_render.cpp's affine BG/OBJ:
+       one quad per band (BG) / per sprite (OBJ) whose 4 corner UVs are the
+       texture coordinates the CPU's per-pixel `X += PA / Y += PC` walk
+       reaches at those corners, so GX's linear interpolation reproduces the
+       whole walk. Baked RGB5A3 (native CI is queue item 11), GX_NEAR.
+       Out-of-map / out-of-sprite samples read TRANSPARENT via a 1-texel
+       transparent border + GX_CLAMP; a wrapping BG plane is baked at its
+       own size and sampled GX_REPEAT (== the CPU's `& (size-1)`).
+     - The per-band reference point is the CPU's own running BGxX/BGxY latch:
+       Stage 0 predicts it (X+PB, Y+PD, matrix unchanged) each line and
+       records a band boundary when the prediction breaks. At line 0 it reads
+       GPU::affineInfo[] directly, because GPU_RenderLine(line 0) -- which
+       re-latches BGxX/BGxY from it -- runs AFTER the hook.
+     - HARDWARE FACT 1 -- the GX sample point is not the pixel centre. The
+       console GPU (and Dolphin, which reproduces it) samples at 7/12 of a
+       pixel, quantised further by the host GPU's sub-pixel grid; the corner
+       UVs are compensated for it (kGxSamplePoint, tuned to 149/256 on this
+       Dolphin host; see the comment on gxDsBAffineCorner for the numbers).
+       Pure translation and integer scaling are blind to it, which is why it
+       only showed up on rotated/scaled content.
+     - HARDWARE FACT 2 -- affine textures are baked at POWER-OF-TWO sizes.
+       Dolphin's GX_NEAR sampling of a non-power-of-two texture through
+       sub-texel-exact interpolated UVs mis-sampled (20-wide: a wrong texel
+       every 5th column; 36/132/516-wide: a small negative bias flipping
+       lattice-edge texels); the same UVs on 32/64/256-wide textures were
+       byte-exact. Cost: a bordered 512-wide plane is a 1024-wide texture.
+     - A CPU-reference bug on big-endian hosts was found and fixed on the way
+       (GPU.cpp lineRot/lineExtRot): `BGxX += LE_TO_LOCAL_16(BGxPB)` added
+       the byte-swapped value as an unsigned 0..65535 int, so a NEGATIVE
+       PB/PD advanced the reference point by +65536-|PB| instead of -|PB|.
+       Now `(s16)`-cast. Only affine BG lines with a negative PB/PD change.
+
+    ------------------------------------------------------------------
+    Extended BG palettes (task 8 scope extension -- see the log)
+    ------------------------------------------------------------------
+     SM64DS's in-game sub screen is BG_Mode 3 with BG3 = extended-affine
+     256x16 AND DISPCNT.ExBGxPalette_Enable, so without ext-palette support
+     the affine work would never have engaged on the primary real-content
+     target. Handled exactly where GPU.cpp uses them: a 256-colour text BG
+     (`ExtPal[SUB][BGExtPalSlot]`, palette = tile palNum << 8) and the
+     BGType_AffineExt_256x16 flavour (same indexing); every other BG kind
+     ignores the flag, as in GPU.cpp. Dependency tracking: writes to bank H's
+     LCDC window (0x06898000-0x0689FFFF) arm the whole-region VRAM flag, and
+     the four MMU.ExtPal[1][] slot pointers are part of the bank-map
+     fingerprint (a VRAMCNT_H remap re-bakes). Extended OBJ palettes
+     (MMU.ObjExtPal) still bail.
+
+    ------------------------------------------------------------------
+    Test hooks (compile-time, zero cost when undefined)
+    ------------------------------------------------------------------
+     -DDSB_FORCE_CPU  gxDsEngineBRenderFrame() always bails -> the CPU
+                      compositor renders everything: the byte-compare
+                      reference for A/B captures.
+     -DDSB_STATS      counts engaged/bailed frames, affine-BG / affine-OBJ
+                      frames, the last bail reason and DISPCNT/BG types into
+                      the harness profile log every 30 frames (needs
+                      DESMUME_HARNESS + HARNESS_PROFILE).
 
     ------------------------------------------------------------------
     Deliberate deviations from the pipeline doc's ideal Stage 0/1/4
@@ -119,7 +195,8 @@
        inherited simplification of the GBA slice's design, not a new one,
        and is documented here rather than assumed away.
      - **Per-band replay covers the layout registers Stage 4 actually
-       consumes** -- per-BG enable, per-BG priority, per-BG HOFS/VOFS, OBJ
+       consumes** -- per-BG enable, per-BG priority, per-BG type, per-BG
+       HOFS/VOFS (text) or reference point + PA..PD (affine), OBJ
        enable -- captured per scanline (gxDsEngineBScanline) rather than at
        a register-write funnel. Everything else a BG plane's *bake* depends
        on (char base, screen base, size selector, colour depth) is read once
@@ -153,6 +230,7 @@
 #ifndef GX_DS_ENGINEB_RENDER_H
 #define GX_DS_ENGINEB_RENDER_H
 
+#include <stddef.h>
 #include "../types.h"
 #include "gx_frameplan.h"
 
@@ -170,12 +248,25 @@ extern GxFramePlan g_dsBFramePlan;
 // GxGbaBandRegs relies on, and valid for the same reason (scanlines are
 // visited in strictly increasing order within a frame).
 struct GxDsBBandRegs {
+	// --- compared band-to-band with memcmp (a change => new band boundary) ---
 	u8  bgEnable;     // bit n = BG n enabled this band (DISPCNT BGn_Enable)
 	u8  objEnable;    // DISPCNT OBJ_Enable this band
 	u8  bgPrio[4];    // BGxCNT Priority (0..3) this band
-	u16 hofs[4];      // BGxHOFS & 0x1FF this band
-	u16 vofs[4];      // BGxVOFS & 0x1FF this band
+	u8  bgType[4];    // GPU::BGTypes[n] (BGType enum) this band; Stage 4 dispatches on it
+	u16 hofs[4];      // BGxHOFS & 0x1FF this band (0 for a non-text BG: unused by affine)
+	u16 vofs[4];      // BGxVOFS & 0x1FF this band (0 for a non-text BG)
+	// --- NOT memcmp'd: task 8 affine state for BG2 (index 0) / BG3 (index 1).
+	// Meaningful only for an enabled, non-text BG; zero otherwise. These are
+	// the values *at this band's first scanline* (the CPU reference's running
+	// BGxX/BGxY latch, which advances by PB/PD per rendered line) -- a boundary
+	// is recorded when the per-line prediction X+PB / Y+PD or PA..PD stop
+	// matching, i.e. on a reference-point/matrix rewrite, not on every line.
+	s32 affX[2], affY[2];
+	s16 affPA[2], affPB[2], affPC[2], affPD[2];
 };
+// Bytes of GxDsBBandRegs that are compared with memcmp (everything before the
+// affine block; ends exactly at vofs's end so no padding bytes are included).
+#define GX_DSB_BANDREGS_CMP_BYTES ((int)(offsetof(GxDsBBandRegs, vofs) + sizeof(((GxDsBBandRegs *)0)->vofs)))
 static const int GX_DSB_MAX_BAND_REGS = GxBandTracker::kMaxBands;
 extern GxDsBBandRegs g_dsBBandRegs[GX_DSB_MAX_BAND_REGS];
 

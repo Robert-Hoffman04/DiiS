@@ -91,6 +91,16 @@ cp "$HERE"/mergerom/merge_normal.nds "$HERE"/mergerom/merge_det.nds \
    "$HERE"/mergerom/merge_frozen.nds "$HERE"/mergerom/merge_fblend.nds \
    "$HERE"/mergerom/merge_mbright.nds "$HERE"/mergerom/merge_mbsplit.nds "$OUT"/
 
+# --- affinerom (gx-next-steps-log.md task 8) ---------------------------------
+# DS Engine B affine/extended-affine/large-8bpp BG + affine OBJ fixtures for
+# source/gx/gx_ds_engineb_render.cpp. One scenario per ROM (see the header of
+# affinerom/source/main.c): aff_c0 .. aff_c10.
+docker run --rm -v "$HERE/affinerom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
+docker run --rm -v "$HERE/affinerom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
+	for c in 0 1 2 3 4 5 6 7 8 9 10; do build aff_c$c "-DAT_CASE=$c"; done
+'
+for c in 0 1 2 3 4 5 6 7 8 9 10; do cp "$HERE"/affinerom/aff_c$c.nds "$OUT"/; done
+
 echo
 echo "ROMs in $OUT :"
 ls -la "$OUT"/*.nds
