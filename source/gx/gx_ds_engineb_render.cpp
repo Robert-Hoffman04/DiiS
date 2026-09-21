@@ -23,6 +23,9 @@
 #ifdef DSB_STATS
 static const char *s_dsbWhy = "";
 static u32 s_dsbOk = 0, s_dsbBail = 0, s_dsbAffOk = 0, s_dsbAffObjOk = 0, s_dsbDispcnt = 0, s_dsbTypes = 0;
+// task 9: engaged-frame counts per feature (window / fade / alpha / semi-transparent OBJ / master brightness)
+static u32 s_dsbWinOk = 0, s_dsbFadeOk = 0, s_dsbAlphaOk = 0, s_dsbSemiOk = 0, s_dsbMbOk = 0;
+static bool s_dsbFrWin, s_dsbFrFade, s_dsbFrAlpha, s_dsbFrSemi, s_dsbFrMb;
 #define DSB_WHY(s_) do { s_dsbWhy = (s_); } while (0)
 #else
 #define DSB_WHY(s_) do { } while (0)
@@ -65,7 +68,40 @@ static const int kDsBScreenH = 192;
 // reference (GPU.cpp here) stays the independently-verified implementation
 // this file's output is matched against, not a library it builds on.
 // ---------------------------------------------------------------------
-static inline u16 gxDsBOpaqueTexel(u16 ndsColor) { return gxPackRGB5A3Opaque(gxExtractBGR555(ndsColor)); }
+// Task 9: DS brighten/darken tables, per 5-bit channel, built with the SAME float
+// expression GPU.cpp's GPU_InitFadeColors() uses (`c + (31-c)*i/16` for
+// brighten, `c - c*i/16` for darken, truncated by the bitfield store), so a
+// baked fade texel is exactly the CPU's fadeInColors/fadeOutColors entry.
+// GPU.cpp's tables are per whole 15-bit colour but every channel is independent.
+static u8 s_fadeUp[17][32], s_fadeDown[17][32];
+static bool s_fadeTablesInit = false;
+static void gxDsBInitFadeTables()
+{
+	if (s_fadeTablesInit) return;
+	for (int i = 0; i <= 16; i++) {
+		float idiv16 = ((float)i) / 16;
+		for (int c = 0; c < 32; c++) {
+			s_fadeUp[i][c]   = (u8)(c + ((31 - c) * idiv16));
+			s_fadeDown[i][c] = (u8)(c - (c * idiv16));
+		}
+	}
+	s_fadeTablesInit = true;
+}
+static inline u16 gxDsBFadeColor(u16 c, int mode /*2 up, 3 down*/, int lvl)
+{
+	const u8 *t = (mode == 2) ? s_fadeUp[lvl] : s_fadeDown[lvl];
+	return (u16)(t[c & 31] | (t[(c >> 5) & 31] << 5) | (t[(c >> 10) & 31] << 10));
+}
+// The fade (if any) the bake currently in progress applies to every opaque texel
+// (BLDCNT brighten/darken as a bake-time transform: exact, since the CPU applies
+// the fade to the layer's own colour before it is written).
+static int s_bakeFadeMode = 0, s_bakeFadeLvl = 0;
+static inline u16 gxDsBOpaqueTexel(u16 ndsColor)
+{
+	if (s_bakeFadeMode)
+		ndsColor = gxDsBFadeColor(ndsColor & 0x7FFF, s_bakeFadeMode, s_bakeFadeLvl);
+	return gxPackRGB5A3Opaque(gxExtractBGR555(ndsColor));
+}
 static const u16 kDsBTransparentTexel = 0; // RGB5A3 alpha sub-format, alpha 0
 
 // RGB5A3 -> DS-native X-B5-G5-R5 (GPU_screen's layout, GPU.h). Exact
@@ -102,6 +138,8 @@ static GxDsBBandRegs s_lastBandRegs;
 // gxDsBScanlineOutOfScope); reset at every line 0.
 static u8 s_frameExtBgPal = 0;
 static bool s_frameExtBgPalKnown = false;
+// Task 9: per-scanline MASTER_BRIGHT mode (0 none, 1 up, 2 down) and factor (0..16).
+static u8 s_mbMode[192], s_mbFac[192];
 
 // vram_arm9_map (MMU.h) page ranges that back Engine B's BG and OBJ
 // windows. VRAM_ARM9_PAGES is 512 16KB pages covering 0x06000000-0x067FFFFF,
@@ -193,8 +231,10 @@ struct GxDsBBgPlaneCache {
 	u8 cfgWrap;        // BGxCNT overflow-wrap bit at bake time (affine only)
 	u32 cfgAuxBase;    // BG_bmp_ram / BG_bmp_large_ram at bake time (bitmap-ish types)
 	const u8 *cfgExtPal; // extended-palette slot pointer baked in, NULL if the regular palette was used
+	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
 };
 static GxDsBBgPlaneCache s_bgPlane[4];
+static GxDsBBgPlaneCache s_bgPlaneFx[4]; // task 9: brighten/darken variant of each plane (lazily baked)
 static const int kDsBBgPlaneMaxPx = 512; // text BG max (BGSize table, GPU.cpp sizeTab row 1)
 static u16 *s_bgBakeScratch;
 static u32 s_bgBakeScratchCap; // in u16 elements
@@ -230,12 +270,17 @@ struct GxDsBObjTexSlot {
 	// two this slot currently holds is part of what a re-bake depends on.
 	u16 bufW, bufH;
 	u8 cfgBordered;
+	u16 cfgFx;         // task 9: (fadeMode << 8) | level baked in; 0 for the plain variant
 };
 static GxDsBObjTexSlot s_objTex[128];
+static GxDsBObjTexSlot s_objTexFx[128]; // task 9: brighten/darken variant of each sprite (lazily baked)
 static const int kDsBObjMaxPx = 64;
 static u16 *s_objBakeScratch;
 
-static GXTexObj s_backdropTexObj;
+// Task 9: one 1-texel backdrop per band (the colour can differ per band under
+// BLDY fades, and GX draws read texture memory asynchronously, so the texel of an
+// earlier band must not be rewritten while its draw is still queued).
+static GXTexObj s_backdropTexObj[GX_DSB_MAX_BAND_REGS];
 static void *s_backdropTexData;
 
 static void *s_copyBackBuf;
@@ -270,18 +315,27 @@ bool gxDsEngineBRenderInit()
 		s_bgPlane[i].texData = NULL;
 		s_bgPlane[i].texDataCap = 0;
 		s_bgPlane[i].valid = false;
+		s_bgPlaneFx[i].texData = NULL;
+		s_bgPlaneFx[i].texDataCap = 0;
+		s_bgPlaneFx[i].valid = false;
 	}
 	for (int i = 0; i < 128; ++i) {
 		s_objTex[i].texData = NULL;
 		s_objTex[i].texDataCap = 0;
 		s_objTex[i].valid = false;
+		s_objTexFx[i].texData = NULL;
+		s_objTexFx[i].texDataCap = 0;
+		s_objTexFx[i].valid = false;
 	}
 
-	s_backdropTexData = memalign(32, 32); // GX minimum texture allocation granularity
+	s_backdropTexData = memalign(32, 32 * GX_DSB_MAX_BAND_REGS); // 32B = GX minimum texture allocation granularity
 	if (!s_backdropTexData) return false;
-	memset(s_backdropTexData, 0, 32);
-	GX_InitTexObj(&s_backdropTexObj, s_backdropTexData, 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObjFilterMode(&s_backdropTexObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	memset(s_backdropTexData, 0, 32 * GX_DSB_MAX_BAND_REGS);
+	for (int b = 0; b < GX_DSB_MAX_BAND_REGS; ++b) {
+		GX_InitTexObj(&s_backdropTexObj[b], (u8 *)s_backdropTexData + 32 * b, 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_backdropTexObj[b], GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	}
+	gxDsBInitFadeTables();
 
 	u32 copySz = GX_GetTexBufferSize(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE, 0);
 	s_copyBackBuf = memalign(32, copySz);
@@ -297,8 +351,14 @@ void gxDsEngineBRenderShutdown()
 {
 	if (!s_initDone)
 		return;
-	for (int i = 0; i < 4; ++i) { free(s_bgPlane[i].texData); s_bgPlane[i].texData = NULL; s_bgPlane[i].texDataCap = 0; s_bgPlane[i].valid = false; }
-	for (int i = 0; i < 128; ++i) { free(s_objTex[i].texData); s_objTex[i].texData = NULL; s_objTex[i].texDataCap = 0; s_objTex[i].valid = false; }
+	for (int i = 0; i < 4; ++i) {
+		free(s_bgPlane[i].texData); s_bgPlane[i].texData = NULL; s_bgPlane[i].texDataCap = 0; s_bgPlane[i].valid = false;
+		free(s_bgPlaneFx[i].texData); s_bgPlaneFx[i].texData = NULL; s_bgPlaneFx[i].texDataCap = 0; s_bgPlaneFx[i].valid = false;
+	}
+	for (int i = 0; i < 128; ++i) {
+		free(s_objTex[i].texData); s_objTex[i].texData = NULL; s_objTex[i].texDataCap = 0; s_objTex[i].valid = false;
+		free(s_objTexFx[i].texData); s_objTexFx[i].texData = NULL; s_objTexFx[i].texDataCap = 0; s_objTexFx[i].valid = false;
+	}
 	free(s_bgBakeScratch); s_bgBakeScratch = NULL; s_bgBakeScratchCap = 0;
 	free(s_objBakeScratch); s_objBakeScratch = NULL;
 	free(s_backdropTexData); s_backdropTexData = NULL;
@@ -348,6 +408,26 @@ static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r, int line, bool *af
 		if (gpu->BGTypes[i] == BGType_Text) {
 			r->hofs[i] = (u16)gpu->getHOFS(i);
 			r->vofs[i] = (u16)gpu->getVOFS(i);
+		}
+	}
+	// Task 9: window / colour-effect state (see GxDsBBandRegs).
+	r->bldcnt = (u16)(gpu->BLDCNT & 0x3FFF);
+	r->eva = gpu->BLDALPHA_EVA;
+	r->evb = gpu->BLDALPHA_EVB;
+	{
+		const int fx = (r->bldcnt >> 6) & 3;
+		r->evy = (fx == 2 || fx == 3) ? gpu->BLDY_EVY : 0;
+		if (gpu->WIN0_ENABLED) {
+			r->winEn |= 1;
+			r->win0h0 = gpu->WIN0H0; r->win0h1 = gpu->WIN0H1; r->win0v0 = gpu->WIN0V0; r->win0v1 = gpu->WIN0V1;
+		}
+		if (gpu->WIN1_ENABLED) {
+			r->winEn |= 2;
+			r->win1h0 = gpu->WIN1H0; r->win1h1 = gpu->WIN1H1; r->win1v0 = gpu->WIN1V0; r->win1v1 = gpu->WIN1V1;
+		}
+		if (r->winEn) {
+			r->winIn0 = gpu->WININ0 & 0x1F; r->winIn1 = gpu->WININ1 & 0x1F; r->winOut = gpu->WINOUT & 0x1F;
+			r->winSp = (u8)((gpu->WININ0_SPECIAL ? 1 : 0) | (gpu->WININ1_SPECIAL ? 2 : 0) | (gpu->WINOUT_SPECIAL ? 4 : 0));
 		}
 	}
 	for (int w = 0; w < 2; ++w) {
@@ -400,9 +480,14 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 	if (s_frameExtBgPalKnown && d.ExBGxPalette_Enable != s_frameExtBgPal) { DSB_WHY("extpalchange"); return true; }
 	s_frameExtBgPal = d.ExBGxPalette_Enable;
 	s_frameExtBgPalKnown = true;
-	if (gpu->WIN0_ENABLED || gpu->WIN1_ENABLED || gpu->WINOBJ_ENABLED) { DSB_WHY("window"); return true; }
-	if (((gpu->BLDCNT >> 6) & 3) != 0) { DSB_WHY("blend"); return true; }
-	if (gpu->MasterBrightMode != 0 && gpu->MasterBrightFactor != 0) { DSB_WHY("masterbright"); return true; }
+	// Task 9: WIN0/WIN1, BLDCNT effects, semi-transparent OBJ and MASTER_BRIGHT are
+	// now in scope. Still out: the OBJ window (a sprite-shaped mask), and a
+	// window combined with brighten/darken -- GPU.cpp's WINDOWED backdrop path
+	// tests `blend1 && windowEffect` where `blend1` is stale state left by
+	// whichever layer the PREVIOUS line composited last (it is not the backdrop's
+	// own BLDCNT bit), a CPU quirk this file has no model for.
+	if (gpu->WINOBJ_ENABLED) { DSB_WHY("objwin"); return true; }
+	if ((gpu->WIN0_ENABLED || gpu->WIN1_ENABLED) && (((gpu->BLDCNT >> 6) & 3) >= 2)) { DSB_WHY("winfade"); return true; }
 	if (!CommonSettings.showGpu.screens[GPU_SUB]) { DSB_WHY("hidden"); return true; }
 
 	// Mosaic: only matters when a layer actually enables it. Checked on the
@@ -466,6 +551,18 @@ void gxDsEngineBScanline(int line)
 		// line 0 re-arms it.
 		s_frameOutOfScope = true;
 		return;
+	}
+
+	// Task 9: MASTER_BRIGHT is applied by the CPU reference to every finished
+	// scanline (GPU_RenderLine_MasterBrightness), so it is sampled per line here
+	// -- exactly what GPU_RenderLine(line) is about to read -- and replayed on
+	// the CPU during readback (see gxDsEngineBRenderFrame), which is exact.
+	{
+		int f = (int)gpu->MasterBrightFactor;
+		if (f > 16) f = 16;
+		const int m = gpu->MasterBrightMode;
+		s_mbMode[line] = (u8)((m == 1 || m == 2) ? m : 0);
+		s_mbFac[line] = (u8)((m == 1 || m == 2) ? f : 0);
 	}
 
 	if (gxDsBScanlineOutOfScope(gpu)) {
@@ -657,7 +754,7 @@ static const u8 *gxDsBExtPalFor(int bg)
 	return applies ? MMU.ExtPal[1][gpu->BGExtPalSlot[bg]] : NULL;
 }
 
-static void gxDsBBakeBgPlane(int bg)
+static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 {
 	GPU *gpu = SubScreen.gpu;
 	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
@@ -674,7 +771,6 @@ static void gxDsBBakeBgPlane(int bg)
 	const int tileBytes = c256 ? 0x40 : 0x20;
 	const int rowBytes = c256 ? 8 : 4;
 
-	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
 	pc.valid = false;
 	if (lg <= 0 || ht <= 0 || lg > kDsBBgPlaneMaxPx || ht > kDsBBgPlaneMaxPx)
 		return;
@@ -745,6 +841,7 @@ static void gxDsBBakeBgPlane(int bg)
 	pc.cfgWrap = 0;
 	pc.cfgAuxBase = 0;
 	pc.cfgExtPal = extPal;
+	pc.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
 	pc.valid = true;
 }
 
@@ -775,7 +872,7 @@ static void gxDsBBakeBgPlane(int bg)
 // row starts at multiples of its own power-of-two length) never does either,
 // so mapping once per tile / once per row resolves to exactly the same host
 // bytes.
-static void gxDsBBakeAffineBgPlane(int bg)
+static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 {
 	GPU *gpu = SubScreen.gpu;
 	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
@@ -785,7 +882,6 @@ static void gxDsBBakeAffineBgPlane(int bg)
 	const bool wrap = cnt.PaletteSet_Wrap != 0;
 	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
 
-	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
 	pc.valid = false;
 	if (lg <= 0 || ht <= 0 || lg > 1024 || ht > 1024)
 		return;
@@ -890,6 +986,7 @@ static void gxDsBBakeAffineBgPlane(int bg)
 	pc.cfgWrap = (u8)(wrap ? 1 : 0);
 	pc.cfgAuxBase = auxBase;
 	pc.cfgExtPal = extPal;
+	pc.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
 	pc.valid = true;
 }
 
@@ -901,6 +998,7 @@ struct GxDsBObjDraw {
 	s16 pa, pb, pc, pd; // 8.8 fixed point OAM rot/scale matrix (affine only)
 	u8 priority;
 	bool hflip, vflip;
+	bool semi;       // task 9: OAM Mode == 1 (semi-transparent: blends with the layer beneath)
 	bool depth;      // OAM attr0 bit13: 0 = 16-colour, 1 = 256-colour
 	u8 palIndex;
 	u16 tileIndex;
@@ -983,10 +1081,13 @@ static bool gxDsBCollectVisibleObj()
 		// Mode 1 (semi-transparent) blends against the layer beneath
 		// whenever BLDCNT's 2nd-target bits select it, INDEPENDENTLY of
 		// BLDCNT's effect field (GPU.cpp's _master_setFinalOBJColor tests
-		// `type == GPU_OBJ_MODE_Transparent` outside the FUNC switch), so
-		// the frame's "no colour effect" check does not cover it.
-		// Mode 3 is bitmap OBJ. Both are out of scope.
-		if (mode != 0) return false;
+		// `type == GPU_OBJ_MODE_Transparent` outside the FUNC switch). Task 9
+		// brings it in scope: it becomes an alpha-blended draw when the layer
+		// beneath is a 2nd target (see gxDsBPlanBand); the rot/scale branch of
+		// _spriteRender tags its pixels with spriteInfo->Mode the same way the
+		// plain branches tag them (alpha ? 1 : 0), so affine sprites qualify too.
+		// Mode 3 is bitmap OBJ, and an affine Mode 2 (see above) has no model.
+		if (mode == 2 || mode == 3) return false;
 		if ((a0 >> 12) & 1) return false;
 
 		GxDsBObjDraw &d = s_objDraws[s_objDrawCount++];
@@ -1009,6 +1110,7 @@ static bool gxDsBCollectVisibleObj()
 			d.pc = (s16)T1ReadWord(oam, (bp + 2) * 8 + 6);
 			d.pd = (s16)T1ReadWord(oam, (bp + 3) * 8 + 6);
 		}
+		d.semi = (mode == 1);
 		d.priority = (u8)((a2 >> 10) & 3);
 		// For an affine sprite attr1 bits 12/13 are matrix-group bits, not flips.
 		d.hflip = !affine && ((a1 >> 12) & 1) != 0;
@@ -1028,14 +1130,13 @@ static bool gxDsBCollectVisibleObj()
 // both SPRITE_1D and SPRITE_2D mapping, including the per-row
 // MMU_gpu_map() call the CPU makes (so a row that straddles a 16KB VRAM
 // page behaves identically to the reference).
-static void gxDsBBakeObjTexture(const GxDsBObjDraw &d)
+static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 {
 	GPU *gpu = SubScreen.gpu;
 	const bool oneDim = (gpu->spriteRenderMode == GPU::SPRITE_1D);
 	const int rowBytes = d.depth ? 8 : 4;
 	u8 *const pal = MMU.ARM9_VMEM + kDsBObjPalOff;
 
-	GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
 	slot.valid = false;
 
 	// Task 8: an affine sprite is sampled through an arbitrary matrix, so any
@@ -1110,24 +1211,271 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d)
 	slot.cfgDepth = (u8)(d.depth ? 1 : 0);
 	slot.cfgOneDim = (u8)(oneDim ? 1 : 0);
 	slot.cfgBoundary = gpu->sprBoundary;
+	slot.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
 	slot.valid = true;
 }
 
-static void gxDsBBakeBackdrop()
+static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 {
 	// GPU_RenderLine_layer(): backdrop colour is BG palette entry 0 of this
-	// engine's own 1KB palette half, masked to 15 bits.
+	// engine's own 1KB palette half, masked to 15 bits. With no window and a
+	// brighten/darken effect whose 1st-target set includes the backdrop
+	// (BLDCNT bit 5) the CPU fades it too (case 2/3 of its backdrop switch).
 	u16 c = (u16)(T1ReadWord(MMU.ARM9_VMEM, kDsBBgPalOff) & 0x7FFF);
-	((u16 *)s_backdropTexData)[0] = gxDsBOpaqueTexel(c);
-	DCFlushRange(s_backdropTexData, 32);
+	if (fadeMode) c = gxDsBFadeColor(c, fadeMode, fadeLvl);
+	u16 *t = (u16 *)((u8 *)s_backdropTexData + 32 * band);
+	t[0] = gxPackRGB5A3Opaque(gxExtractBGR555(c));
+	DCFlushRange(t, 32);
+}
+
+// ---------------------------------------------------------------------
+// Task 9: per-band window / colour-effect plan
+// ---------------------------------------------------------------------
+// Everything below is derived from GPU.cpp, not from the GBA slice:
+//  - Painter order is GPU_RenderLine_layer's: backdrop, then priority 3..0,
+//    within a tier BG3..BG0 and then that tier's sprites.
+//  - A BG pixel is written iff the window test passes for ITS layer bit; the
+//    test order is WIN0 > WIN1 > (OBJ window, out of scope) > WINOUT
+//    (renderline_checkWindows). The backdrop is always drawn.
+//  - BG colour effect (_master_setFinalBGColor): iff the layer is a BLDCNT
+//    1st target AND the region's window "effect" bit allows it; brighten/darken
+//    recolour the layer's own colour, alpha blends with the pixel ALREADY in the
+//    line buffer only if the layer that produced that pixel is a 2nd target,
+//    otherwise the pixel is written raw.
+//  - OBJ (_master_setFinalOBJColor): same fade rule; a sprite pixel blends with
+//    the pixel beneath iff that pixel's layer is a 2nd target AND it is not
+//    another sprite (`bg_under != 4`), and only if the sprite is Mode 1
+//    (semi-transparent, regardless of BLDCNT's effect/1st-target bits/window
+//    effect bit) or the effect is alpha with OBJ as a 1st target.
+//  - EVA/EVB are each clamped to 16 and combined per channel as
+//    min(31, (a*EVA + b*EVB) >> 4).
+//
+// GX can only do "blend with whatever is in the EFB" (no per-pixel knowledge of
+// which layer produced it -- the EFB carries no alpha, see task 2), so an alpha
+// item is drawn natively only when EVERY layer that could lie beneath it in this
+// region is a 2nd target (then "blend with dst" == the CPU's rule everywhere),
+// or NONE is (then the CPU never blends it and it is an ordinary draw). Mixed
+// cases bail the frame (queue item: dst-alpha mask via an RGBA6 EFB).
+struct GxDsBCfg { u8 mask; u8 effect; };            // window region: layers drawn, effect allowed
+struct GxDsBRun { s16 x0, x1; u8 cfg; };
+struct GxDsBSlab { s16 y0, y1; u8 nrun; GxDsBRun run[10]; };
+struct GxDsBBandPlan {
+	u8 nslab;
+	GxDsBSlab slab[10];
+	GxDsBCfg cfg[3];       // 0 = outside all windows (or "no windows"), 1 = WIN1, 2 = WIN0
+	u8 cfgUsed;            // bit c: some run uses cfg c
+	u8 mode, t1, t2, eva, evb, evy;
+	u8 fadeBg, fadeObj;    // BGs / OBJ that need their faded variant in this band
+	u8 blendLive[3];       // per cfg, slot-indexed (BG b -> bit b, OBJ tier p -> bit 4+p): items that really alpha-blend
+	u8 tierHas, tierSemi;  // bit p: a sprite / a semi-transparent sprite of priority p touches this band
+	bool backdropFade;
+	bool windows;
+};
+static GxDsBBandPlan s_bandPlan[GX_DSB_MAX_BAND_REGS];
+
+// Which pixel columns / rows a DS window covers: GPU.cpp's update_winh() /
+// setup_windows(). start > end wraps (inside = [0,end] U [start,255]); start ==
+// end is empty. Returns the number of half-open intervals written to iv[].
+static int gxDsBWinIv(u8 s, u8 e, int iv[2][2])
+{
+	if (s > e) { iv[0][0] = 0; iv[0][1] = (int)e + 1; iv[1][0] = s; iv[1][1] = 256; return 2; }
+	if (e > s) { iv[0][0] = s; iv[0][1] = e; return 1; }
+	return 0;
+}
+static bool gxDsBInIv(const int iv[2][2], int n, int v)
+{
+	for (int i = 0; i < n; ++i)
+		if (v >= iv[i][0] && v < iv[i][1]) return true;
+	return false;
+}
+static void gxDsBSortUniq(int *a, int &n)
+{
+	for (int i = 1; i < n; ++i) { int v = a[i], j = i - 1; while (j >= 0 && a[j] > v) { a[j + 1] = a[j]; --j; } a[j + 1] = v; }
+	int m = 0;
+	for (int i = 0; i < n; ++i) if (m == 0 || a[i] != a[m - 1]) a[m++] = a[i];
+	n = m;
+}
+
+// Decomposes the band [y0,y1) into disjoint rectangles, each classified with the
+// window region (cfg) that wins there. Draw order alone cannot express "layer L
+// is off inside WIN1" (an earlier full-band pass of L would still show through),
+// so unlike the GBA slice's overdraw scheme every layer is drawn ONLY into the
+// rectangles whose region enables it.
+static void gxDsBBuildRegions(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan &p)
+{
+	const bool en[2] = { (r.winEn & 1) != 0, (r.winEn & 2) != 0 };
+	int vy[2][2][2], hx[2][2][2], nvy[2] = { 0, 0 }, nhx[2] = { 0, 0 };
+	if (en[0]) { nvy[0] = gxDsBWinIv(r.win0v0, r.win0v1, vy[0]); nhx[0] = gxDsBWinIv(r.win0h0, r.win0h1, hx[0]); }
+	if (en[1]) { nvy[1] = gxDsBWinIv(r.win1v0, r.win1v1, vy[1]); nhx[1] = gxDsBWinIv(r.win1h0, r.win1h1, hx[1]); }
+	p.windows = en[0] || en[1];
+	if (!p.windows) {
+		p.cfg[0].mask = 0x1F; p.cfg[0].effect = 1;
+	} else {
+		p.cfg[0].mask = r.winOut;  p.cfg[0].effect = (r.winSp >> 2) & 1;
+		p.cfg[1].mask = r.winIn1;  p.cfg[1].effect = (r.winSp >> 1) & 1;
+		p.cfg[2].mask = r.winIn0;  p.cfg[2].effect = r.winSp & 1;
+	}
+
+	int cuts[12], nc = 0;
+	cuts[nc++] = y0; cuts[nc++] = y1;
+	for (int w = 0; w < 2; ++w)
+		for (int i = 0; i < nvy[w]; ++i)
+			for (int e = 0; e < 2; ++e) {
+				int v = vy[w][i][e];
+				if (v > y0 && v < y1) cuts[nc++] = v;
+			}
+	gxDsBSortUniq(cuts, nc);
+
+	p.nslab = 0;
+	p.cfgUsed = 0;
+	for (int k = 0; k + 1 < nc; ++k) {
+		GxDsBSlab &sl = p.slab[p.nslab++];
+		sl.y0 = (s16)cuts[k]; sl.y1 = (s16)cuts[k + 1]; sl.nrun = 0;
+		bool act[2];
+		for (int w = 0; w < 2; ++w) act[w] = en[w] && gxDsBInIv(vy[w], nvy[w], sl.y0);
+		int xc[12], nx = 0;
+		xc[nx++] = 0; xc[nx++] = 256;
+		for (int w = 0; w < 2; ++w)
+			if (act[w])
+				for (int i = 0; i < nhx[w]; ++i)
+					for (int e = 0; e < 2; ++e) {
+						int v = hx[w][i][e];
+						if (v > 0 && v < 256) xc[nx++] = v;
+					}
+		gxDsBSortUniq(xc, nx);
+		for (int j = 0; j + 1 < nx; ++j) {
+			int c = (act[0] && gxDsBInIv(hx[0], nhx[0], xc[j])) ? 2 : (act[1] && gxDsBInIv(hx[1], nhx[1], xc[j])) ? 1 : 0;
+			if (sl.nrun && sl.run[sl.nrun - 1].cfg == c && sl.run[sl.nrun - 1].x1 == xc[j]) {
+				sl.run[sl.nrun - 1].x1 = (s16)xc[j + 1];
+			} else {
+				GxDsBRun &ru = sl.run[sl.nrun++];
+				ru.x0 = (s16)xc[j]; ru.x1 = (s16)xc[j + 1]; ru.cfg = (u8)c;
+			}
+			p.cfgUsed |= (u8)(1 << c);
+		}
+	}
+}
+
+// What BLDCNT asks of `layer` (0-3 BG, 4 OBJ) in window region `c`.
+static inline void gxDsBResolveFx(const GxDsBBandPlan &p, const GxDsBCfg &c, int layer, bool semi, bool &fade, bool &want)
+{
+	const bool eff = c.effect && ((p.t1 >> layer) & 1);
+	fade = eff && p.mode >= 2;
+	want = (eff && p.mode == 1) || (layer == 4 && semi);
+}
+
+static bool gxDsBBoxOverlap(const GxDsBObjDraw &a, const GxDsBObjDraw &b)
+{
+	return a.x < b.x + b.boxW && b.x < a.x + a.boxW && a.y < b.y + b.boxH && b.y < a.y + a.boxH;
+}
+
+// Builds and validates one band's plan. Returns false (with DSB_WHY set) when
+// the band needs something GX can't do exactly -> the whole frame bails.
+static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan &p)
+{
+	p.mode = (u8)((r.bldcnt >> 6) & 3);
+	p.t1 = (u8)(r.bldcnt & 0x3F);
+	p.t2 = (u8)((r.bldcnt >> 8) & 0x3F);
+	p.eva = r.eva; p.evb = r.evb; p.evy = r.evy;
+	p.fadeBg = p.fadeObj = 0;
+	p.blendLive[0] = p.blendLive[1] = p.blendLive[2] = 0;
+	p.tierHas = p.tierSemi = 0;
+	for (int i = 0; i < s_objDrawCount; ++i) {
+		const GxDsBObjDraw &d = s_objDraws[i];
+		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
+		p.tierHas |= (u8)(1 << d.priority);
+		if (d.semi) p.tierSemi |= (u8)(1 << d.priority);
+	}
+	gxDsBBuildRegions(r, y0, y1, p);
+	p.backdropFade = !p.windows && p.mode >= 2 && (p.t1 & 0x20);
+
+	bool needOverlapCheck = false, anyLive = false;
+	for (int c = 0; c < 3; ++c) {
+		if (!((p.cfgUsed >> c) & 1)) continue;
+		const GxDsBCfg &cf = p.cfg[c];
+		u8 under = 0x20; // the backdrop is always beneath everything
+		for (int prio = 3; prio >= 0; --prio) {
+			for (int bg = 3; bg >= 0; --bg) {
+				if (!((r.bgEnable >> bg) & 1) || r.bgPrio[bg] != prio || !((cf.mask >> bg) & 1)) continue;
+				bool fade, want;
+				gxDsBResolveFx(p, cf, bg, false, fade, want);
+				if (fade) p.fadeBg |= (u8)(1 << bg);
+				if (want && (under & p.t2)) {
+					if (under & ~p.t2) { DSB_WHY("blendunder"); return false; }
+					p.blendLive[c] |= (u8)(1 << bg);
+					anyLive = true;
+				}
+				under |= (u8)(1 << bg);
+			}
+			if (r.objEnable && ((cf.mask >> 4) & 1) && ((p.tierHas >> prio) & 1)) {
+				bool fade, want;
+				gxDsBResolveFx(p, cf, 4, false, fade, want);
+				if (fade) p.fadeObj = 1;
+				want = want || ((p.tierSemi >> prio) & 1);
+				const u8 u = (u8)(under & ~0x10); // a sprite never blends with another sprite
+				if (want && (u & p.t2)) {
+					if (u & ~p.t2) { DSB_WHY("blendunder"); return false; }
+					p.blendLive[c] |= (u8)(1 << (4 + prio));
+					anyLive = true;
+					needOverlapCheck = true;
+				}
+				under |= 0x10;
+			}
+		}
+	}
+	if (anyLive && (int)p.eva + (int)p.evb != 16) { DSB_WHY("blendcoef"); return false; }
+	if (needOverlapCheck) {
+		// A blended sprite must sit directly on the BG/backdrop line buffer. Painter
+		// order would blend it with any sprite drawn earlier under it (the CPU
+		// resolves sprite-vs-sprite first and blends only the winner), so any box
+		// overlap with another sprite bails.
+		for (int i = 0; i < s_objDrawCount; ++i) {
+			const GxDsBObjDraw &a = s_objDraws[i];
+			if (a.y >= y1 || a.y + a.boxH <= y0) continue;
+			if (!(a.semi || (p.mode == 1 && (p.t1 & 0x10)))) continue;
+			for (int j = 0; j < s_objDrawCount; ++j) {
+				if (j == i) continue;
+				const GxDsBObjDraw &o = s_objDraws[j];
+				if (o.y >= y1 || o.y + o.boxH <= y0) continue;
+				if (gxDsBBoxOverlap(a, o)) { DSB_WHY("blendobjoverlap"); return false; }
+			}
+		}
+	}
+	return true;
 }
 
 // ---------------------------------------------------------------------
 // Stage 4: per-band draw
 // ---------------------------------------------------------------------
-static void gxDsBDrawBgQuad(int bg, const GxDsBBandRegs &r, int y0, int y1)
+// TEV state. Opaque/plain draws use GX_REPLACE (texel colour + texel alpha).
+// An alpha-blended draw keeps the texel colour but replaces its alpha with a
+// CONSTANT (the EVA coefficient) wherever the texel is opaque, using the TEV
+// compare op: out = (texA > 0) ? A0 : 0. Constant-alpha rather than the RGB5A3
+// alpha sub-format because that one only has 3 bits (8 levels) and EVA has 17.
+static int s_tevK = -1; // -1: REPLACE; else the constant alpha currently loaded
+static void gxDsBTevReplace()
 {
-	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
+	if (s_tevK == -1) return;
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	s_tevK = -1;
+}
+static inline u8 gxDsBAlphaK(int eva) { return (u8)(eva >= 16 ? 255 : eva * 16); }
+static void gxDsBTevAlpha(int k)
+{
+	if (s_tevK == k) return;
+	if (s_tevK == -1) {
+		GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+		GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
+		GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_COMP_A8_GT, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	}
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)k });
+	s_tevK = k;
+}
+
+static void gxDsBDrawBgQuad(const GxDsBBgPlaneCache &pcc, const GxDsBBandRegs &r, int bg, int y0, int y1)
+{
+	GxDsBBgPlaneCache &pc = const_cast<GxDsBBgPlaneCache &>(pcc);
 	if (!pc.valid) return;
 	f32 s0 = (f32)r.hofs[bg] / pc.wpx;
 	f32 s1 = s0 + (f32)kDsBScreenW / pc.wpx;
@@ -1144,9 +1492,9 @@ static void gxDsBDrawBgQuad(int bg, const GxDsBBandRegs &r, int y0, int y1)
 // (floor(U/256), floor(V/256)), wrapped by `& (size-1)` if BGxCNT's overflow
 // bit is set, skipped (transparent) otherwise. The 4 band corners are (i,r) =
 // (0,0) (256,0) (256,H) (0,H).
-static void gxDsBDrawAffineBgQuad(int bg, const GxDsBBandRegs &r, int y0, int y1)
+static void gxDsBDrawAffineBgQuad(const GxDsBBgPlaneCache &pcc, const GxDsBBandRegs &r, int bg, int y0, int y1)
 {
-	GxDsBBgPlaneCache &pc = s_bgPlane[bg];
+	GxDsBBgPlaneCache &pc = const_cast<GxDsBBgPlaneCache &>(pcc);
 	if (!pc.valid) return;
 	const int w = bg - 2;
 	// ROTOCOORD's Integer field is 20 bits above 8 fraction bits (a 28-bit
@@ -1200,7 +1548,30 @@ static void gxDsBDrawAffineObj(const GxDsBObjDraw &d, const GxDsBObjTexSlot &slo
 	                  u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]);
 }
 
-static void gxDsBDrawObjLayer(int prio, int y0, int y1)
+// One layer (a BG plane) of one band, drawn only into the window rectangles
+// whose region enables it, with that region's colour effect applied.
+static void gxDsBDrawBgLayer(int bg, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int y0, int y1)
+{
+	for (int si = 0; si < p.nslab; ++si) {
+		const GxDsBSlab &sl = p.slab[si];
+		for (int ri = 0; ri < sl.nrun; ++ri) {
+			const GxDsBRun &ru = sl.run[ri];
+			const GxDsBCfg &cf = p.cfg[ru.cfg];
+			if (!((cf.mask >> bg) & 1)) continue;
+			bool fade, want;
+			gxDsBResolveFx(p, cf, bg, false, fade, want);
+			const bool alpha = want && ((p.blendLive[ru.cfg] >> bg) & 1);
+			const GxDsBBgPlaneCache &pc = fade ? s_bgPlaneFx[bg] : s_bgPlane[bg];
+			if (!pc.valid) continue;
+			if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+			GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
+			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
+			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
+		}
+	}
+}
+
+static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 {
 	// GPU.cpp resolves per-pixel sprite ownership by walking OAM from index
 	// 127 down to 0 with a `prio <= prioTab[x]` test, so within one priority
@@ -1210,17 +1581,78 @@ static void gxDsBDrawObjLayer(int prio, int y0, int y1)
 		const GxDsBObjDraw &d = s_objDraws[i];
 		if (d.priority != prio) continue;
 		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
-		GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
-		if (!slot.valid) continue;
-		if (d.affine) {
-			gxDsBDrawAffineObj(d, slot);
-			continue;
+		for (int si = 0; si < p.nslab; ++si) {
+			const GxDsBSlab &sl = p.slab[si];
+			if (d.y >= sl.y1 || d.y + d.boxH <= sl.y0) continue;
+			for (int ri = 0; ri < sl.nrun; ++ri) {
+				const GxDsBRun &ru = sl.run[ri];
+				if (d.x >= ru.x1 || d.x + d.boxW <= ru.x0) continue;
+				const GxDsBCfg &cf = p.cfg[ru.cfg];
+				if (!((cf.mask >> 4) & 1)) continue;
+				bool fade, want;
+				gxDsBResolveFx(p, cf, 4, d.semi, fade, want);
+				const bool alpha = want && ((p.blendLive[ru.cfg] >> (4 + prio)) & 1);
+				const GxDsBObjTexSlot &slot = fade ? s_objTexFx[d.oamIndex] : s_objTex[d.oamIndex];
+				if (!slot.valid) continue;
+				if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
+				if (d.affine) {
+					gxDsBDrawAffineObj(d, slot);
+					continue;
+				}
+				f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
+				f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
+				gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
+				              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
+			}
 		}
-		f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
-		f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
-		gxDsBDrawQuad(&slot.texObj, (f32)d.x, (f32)d.y,
-		              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
 	}
+}
+
+// Bake-if-stale for one BG plane variant (plain, or the brighten/darken one).
+static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int fadeLvl,
+                               bool bankChanged, bool vramDirty, bool palDirty)
+{
+	GPU *gpu = SubScreen.gpu;
+	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
+	const BGType type = gpu->BGTypes[bg];
+	const bool affine = (type != BGType_Text);
+	u32 auxBase = 0;
+	if (type == BGType_Large8bpp) auxBase = gpu->BG_bmp_large_ram[bg];
+	else if (type == BGType_AffineExt_256x1 || type == BGType_AffineExt_Direct) auxBase = gpu->BG_bmp_ram[bg];
+	const u16 fx = (u16)((fadeMode << 8) | fadeLvl);
+	bool needBake = !pc.valid || bankChanged || vramDirty || palDirty || pc.cfgFx != fx ||
+	                pc.wpx != (u16)gpu->BGSize[bg][0] || pc.hpx != (u16)gpu->BGSize[bg][1] ||
+	                pc.cfgTileBase != gpu->BG_tile_ram[bg] || pc.cfgMapBase != gpu->BG_map_ram[bg] ||
+	                pc.cfgColorMode != (u8)(cnt.Palette_256 ? 1 : 0) ||
+	                pc.cfgScreenSize != (u8)cnt.ScreenSize ||
+	                pc.cfgType != (u8)type || pc.cfgExtPal != gxDsBExtPalFor(bg) ||
+	                (affine && (pc.cfgWrap != (u8)(cnt.PaletteSet_Wrap ? 1 : 0) || pc.cfgAuxBase != auxBase));
+	if (!needBake) return;
+	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+	if (affine) gxDsBBakeAffineBgPlane(bg, pc);
+	else gxDsBBakeBgPlane(bg, pc);
+	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
+}
+
+static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int fadeMode, int fadeLvl,
+                              bool anyDirty)
+{
+	GPU *gpu = SubScreen.gpu;
+	const u8 oneDim = (u8)((gpu->spriteRenderMode == GPU::SPRITE_1D) ? 1 : 0);
+	const u16 fx = (u16)((fadeMode << 8) | fadeLvl);
+	bool needBake = !slot.valid || anyDirty || slot.cfgFx != fx ||
+	                slot.w != d.w || slot.h != d.h ||
+	                slot.cfgTileIndex != d.tileIndex ||
+	                slot.cfgPalIndex != d.palIndex ||
+	                slot.cfgDepth != (u8)(d.depth ? 1 : 0) ||
+	                slot.cfgOneDim != oneDim ||
+	                slot.cfgBoundary != gpu->sprBoundary ||
+	                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
+	if (!needBake) return;
+	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+	gxDsBBakeObjTexture(d, slot);
+	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 }
 
 bool gxDsEngineBRenderFrame()
@@ -1251,15 +1683,23 @@ bool gxDsEngineBRenderFrame()
 		return false;
 #ifdef DSB_STATS
 	bool statsOk = false;
+	s_dsbFrWin = s_dsbFrFade = s_dsbFrAlpha = s_dsbFrSemi = s_dsbFrMb = false;
 	struct StatsEmit {
 		bool *ok;
 		~StatsEmit() {
-			if (*ok) ++s_dsbOk; else ++s_dsbBail;
+			if (*ok) {
+				++s_dsbOk;
+				s_dsbWinOk += s_dsbFrWin; s_dsbFadeOk += s_dsbFrFade; s_dsbAlphaOk += s_dsbFrAlpha;
+				s_dsbSemiOk += s_dsbFrSemi; s_dsbMbOk += s_dsbFrMb;
+			} else ++s_dsbBail;
 			if (((s_dsbOk + s_dsbBail) % 30) == 0) {
 #if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
-				harness_profile_emitf("dsb n=%u ok=%u bail=%u affbg=%u affobj=%u dispcnt=%08x types=%04x why=%s",
+				harness_profile_emitf("dsb n=%u ok=%u bail=%u affbg=%u affobj=%u win=%u fade=%u alpha=%u semi=%u mb=%u dispcnt=%08x types=%04x why=%s",
 				                      (unsigned)(s_dsbOk + s_dsbBail), (unsigned)s_dsbOk, (unsigned)s_dsbBail,
-				                      (unsigned)s_dsbAffOk, (unsigned)s_dsbAffObjOk, (unsigned)s_dsbDispcnt, (unsigned)s_dsbTypes, s_dsbWhy);
+				                      (unsigned)s_dsbAffOk, (unsigned)s_dsbAffObjOk,
+				                      (unsigned)s_dsbWinOk, (unsigned)s_dsbFadeOk, (unsigned)s_dsbAlphaOk,
+				                      (unsigned)s_dsbSemiOk, (unsigned)s_dsbMbOk,
+				                      (unsigned)s_dsbDispcnt, (unsigned)s_dsbTypes, s_dsbWhy);
 #endif
 			}
 		}
@@ -1292,19 +1732,7 @@ bool gxDsEngineBRenderFrame()
 	int bandStarts[GxBandTracker::kMaxBands], bandEnds[GxBandTracker::kMaxBands];
 	int bandCount = g_dsBFramePlan.bands.finalize(kDsBScreenH, bandStarts, bandEnds);
 
-	// Stage 1. Coarse gate (see the header): any Engine-B-visible VRAM
-	// write, any Engine-B palette write, any Engine-B OAM write, or a
-	// VRAMCNT bank remap re-bakes everything. `force` also covers the very
-	// first frame, where nothing is baked yet.
-	bool bankChanged = gxDsBBankMapChanged();
-	bool palDirty = g_dsBFramePlan.palette.anyDirty();
-	bool vramDirty = g_dsBFramePlan.vram.anyDirty();
-	bool oamDirty = g_dsBFramePlan.oam.anyDirty();
-
-	gxDsBBakeBackdrop(); // 1 texel; cheaper than deciding whether to skip it
-
 	GPU *gpu = SubScreen.gpu;
-	const _DISPCNT &dcFinal = gpu->dispx_st->dispx_DISPCNT.bits;
 	bool bgEnabledAnyBand[4] = { false, false, false, false };
 	bool objEnabledAnyBand = false;
 	for (int b = 0; b < bandCount; ++b) {
@@ -1322,82 +1750,102 @@ bool gxDsEngineBRenderFrame()
 		if (g_dsBBandRegs[b].objEnable) objEnabledAnyBand = true;
 	}
 
-	for (int bg = 0; bg < 4; ++bg) {
-		if (!bgEnabledAnyBand[bg]) continue;
-		GxDsBBgPlaneCache &pc = s_bgPlane[bg];
-		const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
-		const BGType type = gpu->BGTypes[bg];
-		const bool affine = (type != BGType_Text);
-		u32 auxBase = 0;
-		if (type == BGType_Large8bpp) auxBase = gpu->BG_bmp_large_ram[bg];
-		else if (type == BGType_AffineExt_256x1 || type == BGType_AffineExt_Direct) auxBase = gpu->BG_bmp_ram[bg];
-		bool needBake = !pc.valid || bankChanged || vramDirty || palDirty ||
-		                pc.wpx != (u16)gpu->BGSize[bg][0] || pc.hpx != (u16)gpu->BGSize[bg][1] ||
-		                pc.cfgTileBase != gpu->BG_tile_ram[bg] || pc.cfgMapBase != gpu->BG_map_ram[bg] ||
-		                pc.cfgColorMode != (u8)(cnt.Palette_256 ? 1 : 0) ||
-		                pc.cfgScreenSize != (u8)cnt.ScreenSize ||
-		                pc.cfgType != (u8)type || pc.cfgExtPal != gxDsBExtPalFor(bg) ||
-		                (affine && (pc.cfgWrap != (u8)(cnt.PaletteSet_Wrap ? 1 : 0) || pc.cfgAuxBase != auxBase));
-		if (needBake) {
-			if (affine) gxDsBBakeAffineBgPlane(bg);
-			else gxDsBBakeBgPlane(bg);
+	// Task 9: plan + validate every band before any GX work or cache mutation,
+	// so a bail is always clean. Brighten/darken planes/sprites are baked into a
+	// single per-frame variant (one (mode,level) key), so bands needing
+	// different fade keys for layers bail.
+	u8 fadeBgAny = 0, fadeObjAny = 0;
+	int fadeMode = 0, fadeLvl = 0;
+	for (int b = 0; b < bandCount; ++b) {
+		if (!gxDsBPlanBand(g_dsBBandRegs[b], bandStarts[b], bandEnds[b], s_bandPlan[b]))
+			return false;
+		const GxDsBBandPlan &pl = s_bandPlan[b];
+		if (pl.fadeBg || pl.fadeObj) {
+			if (fadeMode && (fadeMode != pl.mode || fadeLvl != pl.evy)) { DSB_WHY("fadekeys"); return false; }
+			fadeMode = pl.mode; fadeLvl = pl.evy;
+			fadeBgAny |= pl.fadeBg; fadeObjAny |= pl.fadeObj;
 		}
+	}
+	// A fade/alpha item is only ever drawn if its layer is enabled in the band
+	// (gxDsBPlanBand walked enabled layers only), so no extra gating is needed.
+
+	// Stage 1. Coarse gate (see the header): any Engine-B-visible VRAM
+	// write, any Engine-B palette write, any Engine-B OAM write, or a
+	// VRAMCNT bank remap re-bakes everything. `force` also covers the very
+	// first frame, where nothing is baked yet.
+	bool bankChanged = gxDsBBankMapChanged();
+	bool palDirty = g_dsBFramePlan.palette.anyDirty();
+	bool vramDirty = g_dsBFramePlan.vram.anyDirty();
+	bool oamDirty = g_dsBFramePlan.oam.anyDirty();
+	const bool anyBgDirty = bankChanged || vramDirty || palDirty;
+
+	for (int b = 0; b < bandCount; ++b)
+		gxDsBBakeBackdrop(b, s_bandPlan[b].backdropFade ? s_bandPlan[b].mode : 0, s_bandPlan[b].evy);
+
+	for (int bg = 0; bg < 4; ++bg) {
+		// A plane/variant that is not (re)baked this frame while its inputs changed
+		// must not survive to a later frame that needs it: the dirty flags are
+		// cleared below, so a stale `valid` would otherwise be trusted forever.
+		if (bgEnabledAnyBand[bg]) gxDsBEnsureBgPlane(bg, s_bgPlane[bg], 0, 0, bankChanged, vramDirty, palDirty);
+		else if (anyBgDirty) s_bgPlane[bg].valid = false;
+		if (bgEnabledAnyBand[bg] && ((fadeBgAny >> bg) & 1))
+			gxDsBEnsureBgPlane(bg, s_bgPlaneFx[bg], fadeMode, fadeLvl, bankChanged, vramDirty, palDirty);
+		else if (anyBgDirty) s_bgPlaneFx[bg].valid = false;
 	}
 	if (objEnabledAnyBand) {
-		const u8 oneDim = (u8)((gpu->spriteRenderMode == GPU::SPRITE_1D) ? 1 : 0);
+		const bool anyObjDirty = bankChanged || vramDirty || palDirty || oamDirty;
+		bool visible[128] = { false };
 		for (int i = 0; i < s_objDrawCount; ++i) {
 			const GxDsBObjDraw &d = s_objDraws[i];
-			GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
-			bool needBake = !slot.valid || bankChanged || vramDirty || palDirty || oamDirty ||
-			                slot.w != d.w || slot.h != d.h ||
-			                slot.cfgTileIndex != d.tileIndex ||
-			                slot.cfgPalIndex != d.palIndex ||
-			                slot.cfgDepth != (u8)(d.depth ? 1 : 0) ||
-			                slot.cfgOneDim != oneDim ||
-			                slot.cfgBoundary != gpu->sprBoundary ||
-			                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
-			if (needBake)
-				gxDsBBakeObjTexture(d);
+			visible[d.oamIndex] = true;
+			gxDsBEnsureObjTex(d, s_objTex[d.oamIndex], 0, 0, anyObjDirty);
+			if (fadeObjAny) gxDsBEnsureObjTex(d, s_objTexFx[d.oamIndex], fadeMode, fadeLvl, anyObjDirty);
+			else if (anyObjDirty) s_objTexFx[d.oamIndex].valid = false;
 		}
+		if (anyObjDirty)
+			for (int i = 0; i < 128; ++i)
+				if (!visible[i]) { s_objTex[i].valid = false; s_objTexFx[i].valid = false; }
+	} else if (bankChanged || vramDirty || palDirty || oamDirty) {
+		for (int i = 0; i < 128; ++i) { s_objTex[i].valid = false; s_objTexFx[i].valid = false; }
 	}
-	(void)dcFinal;
 
 	// ---- Stage 4 + EFB copy, under vidmutex ----------------------------
-	// draw_thread (main.cpp) pushes its own present quads into this same GX
-	// FIFO from the video thread and is already serialized against Draw()
-	// by this mutex; taking it here extends that same contract to cover
-	// Engine B's composite pass rather than inventing a new one.
+	// draw_thread (main.cpp) pushes its own present quads into this same GX FIFO
+	// from the video thread and is already serialized against Draw() by this
+	// mutex; taking it here extends that same contract to cover Engine B's
+	// composite pass rather than inventing a new one.
 	LWP_MutexLock(vidmutex);
 
 	gxDsBSetup2DState();
+	s_tevK = -1;
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 
 	for (int b = 0; b < bandCount; ++b) {
 		const GxDsBBandRegs &r = g_dsBBandRegs[b];
+		const GxDsBBandPlan &pl = s_bandPlan[b];
 		const int y0 = bandStarts[b], y1 = bandEnds[b];
 		GX_SetScissor(0, y0, kDsBScreenW, y1 - y0);
+		gxDsBTevReplace();
 
-		// Backdrop first, then ascending priority (3 = furthest back) with
-		// OBJ of a tier drawn above the BGs of that same tier and BG3..BG0
-		// within a tier -- exactly GPU_RenderLine_layer()'s own order
-		// (itemsForPriority[].BGs is filled by GPU_resortBGs() walking
+		// Backdrop first (always drawn, never windowed), then ascending priority
+		// (3 = furthest back) with OBJ of a tier drawn above the BGs of that same
+		// tier and BG3..BG0 within a tier -- exactly GPU_RenderLine_layer()'s own
+		// order (itemsForPriority[].BGs is filled by GPU_resortBGs() walking
 		// i = 3..0, and the sprite composite runs after the BG loop).
-		gxDsBDrawQuad(&s_backdropTexObj, 0, (f32)y0, (f32)kDsBScreenW, (f32)y1, 0, 0, 1, 1);
+		gxDsBDrawQuad(&s_backdropTexObj[b], 0, (f32)y0, (f32)kDsBScreenW, (f32)y1, 0, 0, 1, 1);
 
 		for (int prio = 3; prio >= 0; --prio) {
 			for (int bg = 3; bg >= 0; --bg) {
 				if (!((r.bgEnable >> bg) & 1)) continue;
 				if (r.bgPrio[bg] != prio) continue;
-				if (r.bgType[bg] == (u8)BGType_Text)
-					gxDsBDrawBgQuad(bg, r, y0, y1);
-				else
-					gxDsBDrawAffineBgQuad(bg, r, y0, y1);
+				gxDsBDrawBgLayer(bg, r, pl, y0, y1);
 			}
 			if (r.objEnable)
-				gxDsBDrawObjLayer(prio, y0, y1);
+				gxDsBDrawObjLayer(prio, pl, y0, y1);
 		}
 	}
+	gxDsBTevReplace();
 
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_DrawDone();
@@ -1431,9 +1879,29 @@ bool gxDsEngineBRenderFrame()
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);
 
+	// Readback + MASTER_BRIGHT. GPU_RenderLine_MasterBrightness() runs on the
+	// finished 15-bit line, so applying the same per-channel tables here (with the
+	// per-line mode/factor sampled by Stage 0) is exact -- no GX pass, no rounding.
 	u16 *dst = (u16 *)(GPU_screen + (u32)SubScreen.offset * 512);
-	for (int i = 0; i < kDsBScreenW * kDsBScreenH; ++i)
-		dst[i] = gxDsBRgb5a3ToNds(s_copyBackLinear[i]);
+	bool anyMb = false;
+	for (int y = 0; y < kDsBScreenH; ++y) {
+		const u16 *src = s_copyBackLinear + (u32)y * kDsBScreenW;
+		u16 *out = dst + (u32)y * kDsBScreenW;
+		const int mode = s_mbMode[y], fac = s_mbFac[y];
+		if (mode == 0 || fac == 0) {
+			for (int x = 0; x < kDsBScreenW; ++x)
+				out[x] = gxDsBRgb5a3ToNds(src[x]);
+			continue;
+		}
+		anyMb = true;
+		if (fac == 16) {
+			const u16 v = (mode == 1) ? 0x7FFF : 0;
+			for (int x = 0; x < kDsBScreenW; ++x) out[x] = v;
+			continue;
+		}
+		for (int x = 0; x < kDsBScreenW; ++x)
+			out[x] = gxDsBFadeColor(gxDsBRgb5a3ToNds(src[x]) & 0x7FFF, mode + 1 /* 1->2 up, 2->3 down */, fac);
+	}
 
 	// Success path only (see BandResetter's comment): every write recorded
 	// this frame has now been consumed by a bake, so the trace can start
@@ -1450,6 +1918,16 @@ bool gxDsEngineBRenderFrame()
 		if (bgEnabledAnyBand[bg] && gpu->BGTypes[bg] != BGType_Text) { ++s_dsbAffOk; break; }
 	for (int i = 0; i < s_objDrawCount; ++i)
 		if (s_objDraws[i].affine) { ++s_dsbAffObjOk; break; }
+	for (int b = 0; b < bandCount; ++b) {
+		const GxDsBBandPlan &pl = s_bandPlan[b];
+		if (pl.windows) s_dsbFrWin = true;
+		if (pl.fadeBg || pl.fadeObj || pl.backdropFade) s_dsbFrFade = true;
+		if (pl.blendLive[0] | pl.blendLive[1] | pl.blendLive[2]) s_dsbFrAlpha = true;
+	}
+	for (int i = 0; i < s_objDrawCount; ++i)
+		if (s_objDraws[i].semi) { s_dsbFrSemi = true; break; }
+	s_dsbFrMb = anyMb;
 #endif
+	(void)anyMb;
 	return true;
 }

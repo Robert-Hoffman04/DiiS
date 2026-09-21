@@ -101,6 +101,16 @@ docker run --rm -v "$HERE/affinerom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8 9 10; do cp "$HERE"/affinerom/aff_c$c.nds "$OUT"/; done
 
+# --- fxrom (gx-next-steps-log.md task 9) -------------------------------------
+# DS Engine B window / BLDCNT effect / semi-transparent OBJ / MASTER_BRIGHT
+# fixtures for source/gx/gx_ds_engineb_render.cpp: fx_c0 .. fx_c23 (see the
+# header of fxrom/source/main.c for the case list).
+docker run --rm -v "$HERE/fxrom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
+docker run --rm -v "$HERE/fxrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
+	for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do build fx_c$c "-DFX_CASE=$c"; done
+'
+for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do cp "$HERE"/fxrom/fx_c$c.nds "$OUT"/; done
+
 echo
 echo "ROMs in $OUT :"
 ls -la "$OUT"/*.nds

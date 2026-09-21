@@ -2079,7 +2079,17 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	gpu->currentFadeInColors = &fadeInColors[gpu->BLDY_EVY][0];
 	gpu->currentFadeOutColors = &fadeOutColors[gpu->BLDY_EVY][0];
 
-	u16 backdrop_color = LE_TO_LOCAL_16(T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF);
+	// backdrop_num is the colour's numeric value (what the fade tables are indexed by
+	// and what HostWriteWord must store); backdrop_color is the same value in the
+	// byte order memset_u16_le() expects (it stores its argument as little-endian
+	// bytes, so on a big-endian host the argument has to be pre-swapped). The
+	// plain fill was right on both endiannesses; the fade fills and the windowed
+	// per-pixel path used the swapped value where the numeric one belongs, which
+	// on a big-endian host (this Wii port) produced garbage backdrops for any
+	// brighten/darken-of-backdrop or windowed frame (gx-next-steps-log.md task 9).
+	// A no-op on little-endian hosts, where the two are identical.
+	const u16 backdrop_num = T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF;
+	u16 backdrop_color = LE_TO_LOCAL_16(backdrop_num);
 
 	//we need to write backdrop colors in the same way as we do BG pixels in order to do correct window processing
 	//this is currently eating up 2fps or so. it is a reasonable candidate for optimization. 
@@ -2095,22 +2105,22 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 		//for backdrops, fade in and fade out can be applied if it's a 1st target screen
 		case 2:
 			if(gpu->BLDCNT & 0x20) //backdrop is selected for color effect
-				memset_u16_le<256>(gpu->currDst,gpu->currentFadeInColors[backdrop_color]);
+				memset_u16_le<256>(gpu->currDst,LE_TO_LOCAL_16(gpu->currentFadeInColors[backdrop_num]));
 			else 
 				memset_u16_le<256>(gpu->currDst,backdrop_color); 
 			break;
 		case 3:
 			if(gpu->BLDCNT & 0x20) //backdrop is selected for color effect
-				memset_u16_le<256>(gpu->currDst,gpu->currentFadeOutColors[backdrop_color]);
+				memset_u16_le<256>(gpu->currDst,LE_TO_LOCAL_16(gpu->currentFadeOutColors[backdrop_num]));
 			else
 				memset_u16_le<256>(gpu->currDst,backdrop_color); 
 			break;
 
 		//windowed cases apparently need special treatment? why? can we not render the backdrop? how would that even work?
-		case 4: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,4>(backdrop_color,x,1); break;
-		case 5: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,5>(backdrop_color,x,1); break;
-		case 6: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,6>(backdrop_color,x,1); break;
-		case 7: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,7>(backdrop_color,x,1); break;
+		case 4: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,4>(backdrop_num,x,1); break;
+		case 5: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,5>(backdrop_num,x,1); break;
+		case 6: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,6>(backdrop_num,x,1); break;
+		case 7: for(int x=0;x<256;x++) gpu->___setFinalColorBck<false,true,7>(backdrop_num,x,1); break;
 	}
 	
 	memset(gpu->bgPixels,5,256);

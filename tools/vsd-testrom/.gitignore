@@ -4,3 +4,5 @@
 /mergerom/*.nds
 /affinerom/build/
 /affinerom/*.nds
+/fxrom/build/
+/fxrom/*.nds

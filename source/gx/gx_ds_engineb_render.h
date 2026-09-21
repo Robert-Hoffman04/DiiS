@@ -81,19 +81,21 @@
        wave effects) exceeds the band budget and bails.
      - Every drawn sprite is a regular OBJ or (task 8) an affine one
        (OAM RotScale 1 = normal box, 3 = double-size box), both in Mode 0.
-     - No windows (WIN0/WIN1/OBJ window all disabled), no colour special
-       effect (BLDCNT effect field 0), no mosaic on any enabled BG or any
-       drawn sprite, no MASTER_BRIGHT, no extended OBJ palettes, no forced
-       blank. (Extended BG palettes ARE handled since task 8: 256-colour
-       text BGs and the 256x16 extended-affine flavour, nothing else -- see
-       "Extended BG palettes" below.)
-     - No semi-transparent OBJ (Mode 1: blends against the layer beneath it
-       regardless of BLDCNT's effect field -- see GPU.cpp's
-       _master_setFinalOBJColor), no OBJ-window sprite (Mode 2 non-affine is
-       skipped exactly; an AFFINE Mode-2 sprite bails), no bitmap OBJ
-       (Mode 3), and no affine sprite whose box hangs past scanline 255 (the
-       CPU's `(l - sprY) & 255` row test would also draw it wrapped at the
-       top of the screen).
+     - No mosaic on any enabled BG or any drawn sprite, no extended OBJ
+       palettes, no forced blank, no OBJ window (DISPCNT WinOBJ_Enable). (Extended
+       BG palettes ARE handled since task 8: 256-colour text BGs and the 256x16
+       extended-affine flavour, nothing else -- see "Extended BG palettes" below.)
+       TASK 9 brought WIN0/WIN1 windows, all BLDCNT effects, semi-transparent
+       OBJ and MASTER_BRIGHT IN scope -- see "Windows / colour effects /
+       MASTER_BRIGHT (task 9)" below for exactly what is exact, what is
+       near-exact, and the narrow conditions that still bail (window +
+       brighten/darken, alpha over a mixed 2nd-target set, blended sprite
+       overlapping a sprite, EVA+EVB != 16, different fade keys per band).
+     - No OBJ-window sprite (Mode 2 non-affine is skipped exactly; an AFFINE
+       Mode-2 sprite bails), no bitmap OBJ (Mode 3), and no affine sprite whose
+       box hangs past scanline 255 (the CPU's `(l - sprY) & 255` row test would
+       also draw it wrapped at the top of the screen). Semi-transparent
+       (Mode 1) sprites, plain and affine, are IN scope since task 9.
      - The user hasn't hidden a layer or the sub screen via
        CommonSettings.dispLayers / showGpu.
      - The frame's scanline-band count fits GxBandTracker's boundary budget.
@@ -140,6 +142,58 @@
        the byte-swapped value as an unsigned 0..65535 int, so a NEGATIVE
        PB/PD advanced the reference point by +65536-|PB| instead of -|PB|.
        Now `(s16)`-cast. Only affine BG lines with a negative PB/PD change.
+
+    ------------------------------------------------------------------
+    Windows / colour effects / MASTER_BRIGHT (task 9)
+    ------------------------------------------------------------------
+    Semantics were read from GPU.cpp (renderline_checkWindows,
+    _master_setFinalBGColor / _master_setFinalOBJColor, setup_windows /
+    update_winh, GPU_RenderLine_MasterBrightness), not from the GBA slice.
+     - WINDOWS (WIN0/WIN1; exact, byte-identical to the CPU). Each band is cut
+       into disjoint rectangles (gxDsBBuildRegions: y-slabs x x-runs, honouring
+       the DS wrap rule start>end => [0,end] U [start,255] and start==end =>
+       empty) and every layer is drawn ONLY into rectangles whose window
+       region (WIN0 > WIN1 > outside) enables it -- NOT the GBA slice's
+       "outside pass then scissored overdraw" scheme, which cannot express "layer
+       off inside WIN1" when it is on outside (see the log: a latent GBA bug).
+       The backdrop is never windowed (GPU.cpp always draws it).
+     - BRIGHTEN / DARKEN (exact): a bake-time texel transform through the SAME
+       float tables GPU_InitFadeColors builds (gxDsBFadeColor), baked into a second
+       "fade variant" texture per plane / sprite. The backdrop is faded per band
+       when it is a 1st target and no window is active.
+     - ALPHA BLEND / SEMI-TRANSPARENT OBJ (near-exact: GX-high by exactly 1 LSB
+       of one 5-bit channel on roughly 40% of blended pixel-channels, never more).
+       Drawn as constant-alpha (EVA*16, via a TEV compare op so the RGB5A3 3-bit
+       alpha sub-format is not used) SRCALPHA/INVSRCALPHA over the EFB. The 1-LSB
+       bias is the 8-bit expansion (c<<3|c>>2 = 8.25c) of the two operands
+       being blended and truncated back to 5 bits; it cannot be removed on the
+       GX side (a fix-up pass would still leave ~5%, see the log). Preconditions,
+       checked per band and window region BEFORE any GX work (gxDsBPlanBand):
+       GX can only blend with "whatever is in the EFB", so an alpha item is
+       native only if EVERY layer that can lie beneath it is a 2nd target, or
+       NONE is (then the CPU never blends it = an ordinary draw). Mixed sets
+       bail ("blendunder"), as does EVA+EVB != 16 ("blendcoef"; SRC/INVSRC
+       alpha can only express complementary weights) and a blended sprite whose
+       box overlaps another sprite ("blendobjoverlap": the CPU resolves
+       sprite-vs-sprite first and blends only the winner). A sprite never blends
+       with another sprite pixel (`bg_under != 4`), and a Mode-1 sprite blends
+       independently of BLDCNT's effect field / OBJ 1st-target bit / window
+       effect bit -- all reproduced.
+     - MASTER_BRIGHT (exact): sampled per scanline by Stage 0 and applied on the
+       CPU in the EFB readback loop through the same per-channel tables (factor
+       16 => all white / all black), i.e. after the GX composite exactly like
+       GPU_RenderLine_MasterBrightness runs after the CPU one. No GX pass.
+     - Still bails: OBJ window; mosaic (BG and OBJ; unchanged); a window
+       combined with brighten/darken ("winfade": GPU.cpp's windowed backdrop tests
+       a STALE `blend1` left by the previous line's last layer, a quirk with no
+       model here); two bands needing different (mode, EVY) fade variants
+       ("fadekeys").
+     - Two big-endian bugs in the CPU reference's backdrop were fixed on the way
+       (GPU.cpp GPU_RenderLine_layer): the brighten/darken backdrop fill indexed
+       the fade table with a byte-swapped colour, and the windowed per-pixel
+       backdrop path stored a byte-swapped colour. Both were garbage on this
+       Wii host only; identical on little-endian. Engine A is affected the same
+       way (it now renders windowed / faded backdrops correctly).
 
     ------------------------------------------------------------------
     Extended BG palettes (task 8 scope extension -- see the log)
@@ -197,13 +251,14 @@
      - **Per-band replay covers the layout registers Stage 4 actually
        consumes** -- per-BG enable, per-BG priority, per-BG type, per-BG
        HOFS/VOFS (text) or reference point + PA..PD (affine), OBJ
-       enable -- captured per scanline (gxDsEngineBScanline) rather than at
+       enable, and (task 9) BLDCNT/BLDALPHA/BLDY + WIN0/WIN1 geometry and
+       masks; MASTER_BRIGHT is a per-line array instead of a band -- captured per scanline (gxDsEngineBScanline) rather than at
        a register-write funnel. Everything else a BG plane's *bake* depends
        on (char base, screen base, size selector, colour depth) is read once
        at bake time, i.e. the frame's final value, same cut gx_gba_render.h
        documents for the GBA. Any other Engine-B state change mid-frame that
-       this file can't replay (a window turning on, a blend mode appearing,
-       master brightness, a mode switch, ...) is detected by the same
+       this file can't replay (an OBJ window turning on, mosaic appearing, a mode
+       switch, ...) is detected by the same
        per-scanline hook and bails the whole frame, so it degrades to the
        CPU compositor rather than rendering something wrong.
      - **Sub-screen-only.** Stage 6 ("Engine B + display composition") is
@@ -255,6 +310,18 @@ struct GxDsBBandRegs {
 	u8  bgType[4];    // GPU::BGTypes[n] (BGType enum) this band; Stage 4 dispatches on it
 	u16 hofs[4];      // BGxHOFS & 0x1FF this band (0 for a non-text BG: unused by affine)
 	u16 vofs[4];      // BGxVOFS & 0x1FF this band (0 for a non-text BG)
+	// --- task 9: window / colour-effect registers (compared with memcmp too).
+	// Coordinates are zeroed for a disabled window and the window masks for a
+	// frame-region with no window at all, so an unused register being rewritten
+	// does not spawn a needless band boundary.
+	u16 bldcnt;       // BLDCNT & 0x3FFF (effect field, 1st-target bits 0-5, 2nd-target bits 8-13)
+	u8  winEn;        // bit0 WIN0 enabled, bit1 WIN1 enabled (OBJ window bails)
+	u8  win0h0, win0h1, win0v0, win0v1;   // WIN0 X1/X2/Y1/Y2 as GPU.cpp stores them (0 if disabled)
+	u8  win1h0, win1h1, win1v0, win1v1;
+	u8  winIn0, winIn1, winOut;           // 5-bit layer-enable masks (BG0-3, OBJ)
+	u8  winSp;        // bit0 WININ0 effect, bit1 WININ1 effect, bit2 WINOUT effect
+	u8  eva, evb;     // BLDALPHA EVA/EVB (already clamped to 16 by GPU.h)
+	u8  evy;          // BLDY EVY (already clamped to 16); 0 unless the effect is brighten/darken
 	// --- NOT memcmp'd: task 8 affine state for BG2 (index 0) / BG3 (index 1).
 	// Meaningful only for an enabled, non-text BG; zero otherwise. These are
 	// the values *at this band's first scanline* (the CPU reference's running
@@ -265,8 +332,8 @@ struct GxDsBBandRegs {
 	s16 affPA[2], affPB[2], affPC[2], affPD[2];
 };
 // Bytes of GxDsBBandRegs that are compared with memcmp (everything before the
-// affine block; ends exactly at vofs's end so no padding bytes are included).
-#define GX_DSB_BANDREGS_CMP_BYTES ((int)(offsetof(GxDsBBandRegs, vofs) + sizeof(((GxDsBBandRegs *)0)->vofs)))
+// affine block; ends exactly at evy's end so no trailing padding bytes are included).
+#define GX_DSB_BANDREGS_CMP_BYTES ((int)(offsetof(GxDsBBandRegs, evy) + sizeof(((GxDsBBandRegs *)0)->evy)))
 static const int GX_DSB_MAX_BAND_REGS = GxBandTracker::kMaxBands;
 extern GxDsBBandRegs g_dsBBandRegs[GX_DSB_MAX_BAND_REGS];
 
