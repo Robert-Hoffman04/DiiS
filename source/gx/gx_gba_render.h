@@ -297,23 +297,24 @@
        deliberately NOT part of any BG fingerprint, for the same reason
        task 4 excludes OBJ's affine matrix: both are read fresh every frame
        via UV/quad math and never affect the baked texture's pixels.
-       Per-frame dirty tracking's inherent limitation (both task 4's OBJ
-       gate and task 5's BG/backdrop gates share this): the dirty bitmaps
-       are cleared every frame (GxFramePlan::beginFrame()), so a plane/
-       sprite that goes temporarily invisible/disabled (and is therefore
-       skipped by the rebake check entirely while it stays that way) could
-       in principle miss a dependency write that happened only during that
-       invisible interval, then render stale once visible again with no
-       further writes to re-trigger it. The old coarse anyDirty() gate
-       accidentally avoided this in practice (virtually any VRAM/palette
-       write anywhere re-armed it), which the new fine-grained gates no
-       longer do by construction. Not fixed here -- doing so would mean
-       either accumulating dirty state across multiple frames (a bigger
-       change to gx_frameplan.h's contract) or force-rebaking on every
-       enable-after-disable transition (inconsistent with task 4's existing
-       OBJ design, which has the identical characteristic and was left
-       as-is) -- flagged as a known, shared limitation of this whole
-       per-frame dirty-tracking approach rather than silently assumed away.
+       Per-frame dirty tracking (queue item 21, closed): the dirty bitmaps
+       are cleared every frame (GxFramePlan::beginFrame()), and the rebake
+       gates above only run for a plane that is enabled / a sprite that is
+       visible, so a dependency write made while a plane was disabled, a
+       sprite was parked / off-screen / hidden by DISPCNT's OBJ enable, or
+       the bitmap layer was inactive used to be lost and the stale cached
+       texture shown when it came back. gxInvalidateStaleCaches() (called at
+       the very top of gxGbaRenderFrame, before any bail) now evaluates the
+       dependency test of EVERY valid cache each frame from its own cached
+       fingerprint (backdrop, s_bgPlane[], s_affBgPlane[], s_objTex[],
+       bitmap) and clears `valid` on those whose bytes were written; the
+       existing gates then re-bake lazily only when the layer is next drawn.
+       Skipped entirely on a frame with no VRAM/palette write. Same rule as
+       DS Engine B's GX_DSB_DROP_IF_STALE. The bitmap layer additionally
+       carries a mode/page fingerprint (a mode 3/4/5 or DISPCNT page switch
+       with no write must re-bake) and is only baked/drawn while DISPCNT
+       BG2 is enabled, like the CPU sampler. Fixtures: tools/gba-refcheck/
+       dirtygate.s, dirtybmp.s.
      - Affine BG's per-band reference point (GxGbaBandRegs::affX/affY)
        inherits gba_ppu.cpp's own documented simplification: it's an
        accumulator latched once at frame start and advanced by PB/PD per

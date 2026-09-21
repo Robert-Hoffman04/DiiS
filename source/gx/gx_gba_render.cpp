@@ -444,6 +444,12 @@ static void *s_bmpTexDataCI;
 static GXTlutObj s_bmpTlutObj;
 static void *s_bmpTlutData;
 static bool s_bmpValidCI;
+// Task 21: the mode/page the bitmap cache (either s_bmpTexObj or s_bmpTexObjCI)
+// was last baked for. Modes 3/4/5 read different VRAM layouts, and DISPCNT
+// bit4 flips the page, none of which raises a dirty bit, so a mode/page
+// change with no VRAM/palette write must still re-bake.
+static int s_bmpCfgMode = -1;
+static bool s_bmpCfgPage;
 static u8 *s_bmpBakeIdxScratch;
 
 // 1x1 solid-color texture used for the backdrop fill (see gxGbaRenderFrame).
@@ -1112,6 +1118,17 @@ static bool gxObjPaletteDepsDirty(bool colorMode, int palNum)
 	return gxRangeDirty(g_gbaFramePlan.palette, 0x200 + (u32)palNum * 32, 32);
 }
 
+// Dependency test of a slot's OWN cached fingerprint (the config its current
+// bake was built from), independent of what the OAM entry says now. Used both
+// by gxObjNeedsRebake (fingerprint matches -> same answer as with the live
+// fields) and by the task 21 not-drawn invalidation pass.
+static bool gxObjSlotDepsDirty(const GxObjTexSlot &slot)
+{
+	if (gxObjVramDepsDirty(slot.oneDim, slot.colorMode, slot.tileNum, slot.texW / 8, slot.texH / 8))
+		return true;
+	return gxObjPaletteDepsDirty(slot.colorMode, slot.palNum);
+}
+
 // True if s_objTex[d.oamIndex] is stale and gxBakeObjTexture() needs to
 // run for it this frame -- either its own OAM fields changed since the
 // last bake into this slot (including a completely different sprite now
@@ -1140,9 +1157,7 @@ static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
 	if (!sameConfig)
 		return true;
 
-	if (gxObjVramDepsDirty(oneDim, colorMode, tileNum, d.texW / 8, d.texH / 8))
-		return true;
-	return gxObjPaletteDepsDirty(colorMode, palNum);
+	return gxObjSlotDepsDirty(slot);
 }
 
 // ---------------------------------------------------------------------
@@ -1208,6 +1223,19 @@ static bool gxBackdropNeedsRebake()
 	return gxRangeDirty(g_gbaFramePlan.palette, 0, 2);
 }
 
+// Task 21: dependency test from the plane's cached fingerprint (see
+// gxObjSlotDepsDirty). Same ranges the drawn-plane gate always used.
+static bool gxBgPlaneDepsDirty(const GxBgPlaneCache &pc)
+{
+	u32 tileBytes = pc.cfgColorMode ? 64 : 32;
+	if (gxVramSpanDirty(pc.cfgCharBase, 1024u * tileBytes))
+		return true;
+	u32 mapRangeBytes = (u32)(pc.mapWpx / 8) * (u32)(pc.mapHpx / 8) * 2;
+	if (gxVramSpanDirty(pc.cfgMapBase, mapRangeBytes))
+		return true;
+	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
+}
+
 // True if s_bgPlane[bg] is stale and gxBakeBgPlane(bg) needs to run for it
 // this frame -- either its own tile/map layout changed since the last bake
 // into this slot, or its fields are unchanged but the (conservative, see
@@ -1224,11 +1252,17 @@ static bool gxBgPlaneNeedsRebake(int bg, const GxBgLayout &li)
 	if (!sameConfig)
 		return true;
 
-	u32 tileBytes = li.colorMode ? 64 : 32;
-	if (gxVramSpanDirty(li.charBase, 1024u * tileBytes))
+	return gxBgPlaneDepsDirty(pc);
+}
+
+// Task 21: dependency test from the affine plane's cached fingerprint.
+static bool gxAffineBgPlaneDepsDirty(const GxAffineBgPlaneCache &pc)
+{
+	if (gxVramSpanDirty(pc.cfgCharBase, 256u * 64))
 		return true;
-	u32 mapRangeBytes = (u32)li.mapWtiles * (u32)li.mapHtiles * 2;
-	if (gxVramSpanDirty(li.mapBase, mapRangeBytes))
+	u32 mapTiles = (u32)pc.mapPx / 8;
+	u32 mapRangeBytes = mapTiles * mapTiles;
+	if (gxVramSpanDirty(pc.cfgMapBase, mapRangeBytes))
 		return true;
 	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
 }
@@ -1254,12 +1288,49 @@ static bool gxAffineBgPlaneNeedsRebake(int which, u16 cnt)
 	if (!sameConfig)
 		return true;
 
-	if (gxVramSpanDirty(charBase, 256u * 64))
-		return true;
-	u32 mapRangeBytes = (u32)mapTiles * (u32)mapTiles;
-	if (gxVramSpanDirty(mapBase, mapRangeBytes))
-		return true;
-	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
+	return gxAffineBgPlaneDepsDirty(pc);
+}
+
+// ---------------------------------------------------------------------
+// gx-next-steps-log.md queue item 21: not-drawn cache invalidation.
+//
+// g_gbaFramePlan.beginFrame() clears the VRAM/palette dirty bitmaps every
+// frame, and the per-texture rebake gates above only run for a layer that is
+// enabled / a sprite that is visible THIS frame. A dependency byte written
+// while a BG is disabled, an OBJ is parked / off-screen, DISPCNT hides the
+// OBJ layer, or a bitmap layer is not the active mode was therefore lost
+// with the bitmap, and the cache kept `valid` with its old fingerprint and
+// showed stale texels the frame the layer came back. This is Engine B's rule
+// (GX_DSB_DROP_IF_STALE, task 10): every frame, before anything can bail or
+// skip, evaluate every VALID cache's dependency test against the frame's
+// dirty bitmaps and drop the ones that were written. Only invalidates (a
+// cheap page-bitmap probe per valid texture, skipped entirely on a frame with
+// no VRAM/palette write); the re-bake happens lazily through the normal gates
+// when the layer is next drawn, so a texture that is never drawn again is
+// never re-baked. The OAM half of an OBJ gate reads OAM fresh at draw time
+// (fingerprint compare), so it needs no invalidation. Also run for drawn
+// textures: their gate reaches the same answer, and it keeps one code path.
+// Effect-scratch (task 2) textures are transient per-draw bakes with no
+// cache, so there is nothing to invalidate for them. The bitmap layers keep
+// the coarse whole-VRAM/palette dependency (tasks 4/5 left them alone).
+// ---------------------------------------------------------------------
+static void gxInvalidateStaleCaches()
+{
+	if (!g_gbaFramePlan.vram.anyDirty() && !g_gbaFramePlan.palette.anyDirty())
+		return;
+	if (s_backdropValid && gxRangeDirty(g_gbaFramePlan.palette, 0, 2))
+		s_backdropValid = false;
+	for (int i = 0; i < 4; ++i)
+		if (s_bgPlane[i].valid && gxBgPlaneDepsDirty(s_bgPlane[i]))
+			s_bgPlane[i].valid = false;
+	for (int i = 0; i < 2; ++i)
+		if (s_affBgPlane[i].valid && gxAffineBgPlaneDepsDirty(s_affBgPlane[i]))
+			s_affBgPlane[i].valid = false;
+	for (int i = 0; i < 128; ++i)
+		if (s_objTex[i].valid && gxObjSlotDepsDirty(s_objTex[i]))
+			s_objTex[i].valid = false;
+	s_bmpValid = false;
+	s_bmpValidCI = false;
 }
 
 // Decodes one sprite's texW x texH source pixels into a (texW+4)x(texH+4)
@@ -1476,6 +1547,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 		GX_InitTexObjCI(&s_bmpTexObjCI, s_bmpTexDataCI, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_CI8, GX_CLAMP, GX_CLAMP, GX_FALSE, kBmpTlutSlot);
 		GX_InitTexObjFilterMode(&s_bmpTexObjCI, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 		s_bmpValidCI = true;
+		s_bmpCfgMode = mode; s_bmpCfgPage = (mode != 3) && ((dispcnt >> 4) & 1);
 		s_bmpValid = false; // stale/unused RGB5A3 buffer for this mode -- mode-exclusive, but keep the flags honest
 		return;
 	}
@@ -1500,6 +1572,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 	GX_InitTexObj(&s_bmpTexObj, s_bmpTexData, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjFilterMode(&s_bmpTexObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 	s_bmpValid = true;
+	s_bmpCfgMode = mode; s_bmpCfgPage = (mode != 3) && ((dispcnt >> 4) & 1);
 	s_bmpValidCI = false;
 }
 
@@ -1821,6 +1894,10 @@ bool gxGbaRenderFrame()
 	if (!s_initDone)
 		return false;
 
+	// Queue item 21: must precede every bail / early return below, since the
+	// dirty bitmaps are cleared next frame whether or not this one rendered.
+	gxInvalidateStaleCaches();
+
 	// OBJ window and mosaic remain permanent bails -- narrower than task
 	// 1's original blanket "any window/mosaic/blend" bail, but still real,
 	// documented remaining gaps, not stubs to be removed later. See
@@ -1983,7 +2060,15 @@ bool gxGbaRenderFrame()
 			}
 		}
 	} else {
-		if (dirty)
+		// Item 21: a bitmap layer is only drawn (and baked) while DISPCNT
+		// BG2 is enabled (the CPU's sampler gates on bit10 the same way).
+		// Re-bake when there is no cache for THIS mode/page (a dirty write
+		// while another mode / BG2-off dropped it, or a mode/page switch
+		// with no VRAM write) or on any dirty write.
+		const bool bmpOn = (dispcnt >> 10) & 1;
+		const bool bmpPage = (mode == 3) ? false : (((dispcnt >> 4) & 1) != 0);
+		const bool bmpHave = (mode == 4 ? s_bmpValidCI : s_bmpValid) && s_bmpCfgMode == mode && s_bmpCfgPage == bmpPage;
+		if (bmpOn && (dirty || !bmpHave))
 			gxBakeBitmapMode(mode, dispcnt);
 
 		const GxGbaBandRegs &r = g_gbaBandRegs[0];
@@ -1991,7 +2076,7 @@ bool gxGbaRenderFrame()
 		GxWindowPlan wp = gxBuildWindowPlan(r, 0, GBA_SCREEN_H);
 		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 
-		if (s_bmpValid || s_bmpValidCI) {
+		if (bmpOn && (s_bmpValid || s_bmpValidCI)) {
 			GxTexelEffectParams fx = gxResolveLayerEffect(2, bp); // bitmap BG2 == layer bit 2
 			GXTexObj *effTex = nullptr;
 			if (fx.mode != GXTEXEFFECT_NONE) {
