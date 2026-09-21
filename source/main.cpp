@@ -314,7 +314,7 @@ int main(int argc, char **argv){
 	if (harness_boot_load(device ? "usb:" : "sd:") > 0) {
 		strncpy(rom_filename, harness_boot_rom_path(), MAXPATHLEN - 1);
 		rom_filename[MAXPATHLEN - 1] = 0;
-		if (harness_boot_core() > 0)
+		if (harness_boot_core() == 0 || harness_boot_core() == 1)
 			current3Dcore = (u8)harness_boot_core();
 		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d\n",
 			harness_boot_rom_count(),

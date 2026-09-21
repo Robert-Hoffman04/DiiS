@@ -46,8 +46,6 @@
 #include "perf_zones.h"
 #include <queue>
 
-extern u8 current3Dcore; // In main
-
 /*
 thoughts on flush timing:
 I think a flush is supposed to queue up and wait to happen during vblank sometime.
@@ -594,16 +592,7 @@ static void SetVertex(){
 	//when we need to)
 
 	// do projection
-	switch(current3Dcore){
-		case 1: //GX
-			MatrixMultVec4x4 (mtxCurrent[1], coordTransformed);  
-			break;
-		case 2: // raster
-			MatrixMultVec4x4_M2(mtxCurrent[0], coordTransformed); 
-			break;
-		default:
-			break;
-	};
+	MatrixMultVec4x4_M2(mtxCurrent[0], coordTransformed);
 
 	//TODO - culling should be done here.
 	//TODO - viewport transform?
