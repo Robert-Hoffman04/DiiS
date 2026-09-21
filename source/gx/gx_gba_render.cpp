@@ -140,50 +140,98 @@ static inline GxWinMasks gxDecodeWinByte(u16 v, int shift)
 	return m;
 }
 
-// Precomputed per-band window decomposition: up to 3 scissor-rect passes
-// (WINOUT, WIN1, WIN0) in strict precedence order -- see gx_gba_render.h.
-// `active` is false whenever neither WIN0 nor WIN1 is enabled this band,
-// in which case callers must skip this machinery entirely and draw once,
-// unclipped, with effect always enabled (matching gba_ppu.cpp's
-// `!windowsActive` branch exactly).
+// Precomputed per-band window decomposition (gx-next-steps-log.md task 16):
+// the band is split into DISJOINT rectangles (y-slabs x x-runs), each
+// tagged with the winning region's layer/effect masks under WIN0 > WIN1 >
+// outside precedence. A layer is drawn only into the rectangles whose mask
+// enables it, so a layer enabled outside but disabled inside a window is
+// never painted there (the previous "draw full band for WINOUT, then
+// overdraw scissored windows" scheme could not erase it). Same pattern as
+// Engine B's gxDsBBuildRegions. `active` is false whenever neither WIN0 nor
+// WIN1 is enabled this band, in which case callers must skip this
+// machinery entirely and draw once, unclipped, with effect always enabled
+// (matching gba_ppu.cpp's `!windowsActive` branch exactly).
+struct GxWinRegion { int x0, y0, x1, y1; GxWinMasks m; };
+static const int kMaxWinRegions = 32; // <=5 y-slabs x <=5 x-runs
 struct GxWindowPlan {
 	bool active;
-	GxWinMasks out;
-	bool win1On; int win1Y0, win1Y1, win1X0, win1X1; GxWinMasks win1;
-	bool win0On; int win0Y0, win0Y1, win0X0, win0X1; GxWinMasks win0;
+	int count;
+	GxWinRegion reg[kMaxWinRegions];
 };
 
 static GxWindowPlan gxBuildWindowPlan(const GxGbaBandRegs &r, int bandY0, int bandY1)
 {
 	GxWindowPlan p;
+	p.count = 0;
 	bool win0Dc = (r.dispcnt >> 13) & 1, win1Dc = (r.dispcnt >> 14) & 1;
 	p.active = win0Dc || win1Dc;
-	p.out = gxDecodeWinByte(r.winOut, 0);
-	p.win1On = false;
-	p.win0On = false;
 	if (!p.active)
 		return p;
-	if (win1Dc) {
+
+	// Window rects (empty ones dropped), clamped to the band in Y.
+	struct Rect { bool on; int x0, x1, y0, y1; GxWinMasks m; } w[2]; // [0]=WIN0 [1]=WIN1
+	const bool dc[2] = { win0Dc, win1Dc };
+	const u16 hh[2] = { r.win0h, r.win1h }, vv[2] = { r.win0v, r.win1v };
+	for (int k = 0; k < 2; k++) {
+		w[k].on = false;
+		if (!dc[k]) continue;
 		int y1, y2;
-		gxWindowYRange(r.win1v, y1, y2);
-		int oy0 = y1 > bandY0 ? y1 : bandY0, oy1 = y2 < bandY1 ? y2 : bandY1;
-		if (oy1 > oy0) {
-			p.win1On = true; p.win1Y0 = oy0; p.win1Y1 = oy1;
-			gxWindowXRange(r.win1h, p.win1X0, p.win1X1);
-			p.win1 = gxDecodeWinByte(r.winIn, 8);
-		}
+		gxWindowYRange(vv[k], y1, y2);
+		w[k].y0 = y1 > bandY0 ? y1 : bandY0;
+		w[k].y1 = y2 < bandY1 ? y2 : bandY1;
+		gxWindowXRange(hh[k], w[k].x0, w[k].x1);
+		w[k].m = gxDecodeWinByte(r.winIn, k ? 8 : 0);
+		w[k].on = w[k].y1 > w[k].y0 && w[k].x1 > w[k].x0;
 	}
-	if (win0Dc) {
-		int y1, y2;
-		gxWindowYRange(r.win0v, y1, y2);
-		int oy0 = y1 > bandY0 ? y1 : bandY0, oy1 = y2 < bandY1 ? y2 : bandY1;
-		if (oy1 > oy0) {
-			p.win0On = true; p.win0Y0 = oy0; p.win0Y1 = oy1;
-			gxWindowXRange(r.win0h, p.win0X0, p.win0X1);
-			p.win0 = gxDecodeWinByte(r.winIn, 0);
+	const GxWinMasks outM = gxDecodeWinByte(r.winOut, 0);
+
+	int ys[6], ny = 0, xs[6], nx = 0;
+	ys[ny++] = bandY0; ys[ny++] = bandY1;
+	xs[nx++] = 0; xs[nx++] = GBA_SCREEN_W;
+	for (int k = 0; k < 2; k++) if (w[k].on) {
+		ys[ny++] = w[k].y0; ys[ny++] = w[k].y1;
+		xs[nx++] = w[k].x0; xs[nx++] = w[k].x1;
+	}
+	for (int a = 1; a < ny; a++) for (int b = a; b > 0 && ys[b] < ys[b-1]; b--) { int t = ys[b]; ys[b] = ys[b-1]; ys[b-1] = t; }
+	for (int a = 1; a < nx; a++) for (int b = a; b > 0 && xs[b] < xs[b-1]; b--) { int t = xs[b]; xs[b] = xs[b-1]; xs[b-1] = t; }
+
+	for (int a = 0; a + 1 < ny; a++) {
+		int ya = ys[a], yb = ys[a + 1];
+		if (yb <= ya) continue;
+		int slabStart = p.count;
+		for (int c = 0; c + 1 < nx; c++) {
+			int xa = xs[c], xb = xs[c + 1];
+			if (xb <= xa) continue;
+			int id = -1; // -1 outside, 0 WIN0, 1 WIN1 (WIN0 wins overlaps)
+			for (int k = 0; k < 2; k++) {
+				if (w[k].on && ya >= w[k].y0 && yb <= w[k].y1 && xa >= w[k].x0 && xb <= w[k].x1) { id = k; break; }
+			}
+			const GxWinMasks &m = id < 0 ? outM : w[id].m;
+			// merge with the previous run in this slab if it has the same mask
+			if (p.count > slabStart) {
+				GxWinRegion &pr = p.reg[p.count - 1];
+				if (pr.x1 == xa && !memcmp(&pr.m, &m, sizeof(m))) { pr.x1 = xb; continue; }
+			}
+			if (p.count < kMaxWinRegions) {
+				GxWinRegion &rg = p.reg[p.count++];
+				rg.x0 = xa; rg.x1 = xb; rg.y0 = ya; rg.y1 = yb; rg.m = m;
+			}
 		}
 	}
 	return p;
+}
+
+// Invokes `fn(effectEnabled)` once per plan region whose mask enables the
+// layer (`enabled(mask)`), with the scissor set to that region.
+template <class EnableFn, class DrawFn>
+static inline void gxForWindowRegions(const GxWindowPlan &wp, EnableFn enabled, DrawFn draw)
+{
+	for (int i = 0; i < wp.count; i++) {
+		const GxWinRegion &g = wp.reg[i];
+		if (!enabled(g.m)) continue;
+		GX_SetScissor(g.x0, g.y0, g.x1 - g.x0, g.y1 - g.y0);
+		draw(g.m.effect);
+	}
 }
 
 // ---------------------------------------------------------------------
@@ -1621,18 +1669,8 @@ static void gxDrawBgLayerWindowed(int bg, const GxGbaBandRegs &r, int y0, int y1
 		gxDrawBgQuad(bg, r, y0, y1, effTex);
 		return;
 	}
-	if (wp.out.bg[bg]) {
-		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
-		gxDrawBgQuad(bg, r, y0, y1, wp.out.effect ? effTex : nullptr);
-	}
-	if (wp.win1On && wp.win1.bg[bg] && wp.win1X1 > wp.win1X0) {
-		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
-		gxDrawBgQuad(bg, r, y0, y1, wp.win1.effect ? effTex : nullptr);
-	}
-	if (wp.win0On && wp.win0.bg[bg] && wp.win0X1 > wp.win0X0) {
-		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
-		gxDrawBgQuad(bg, r, y0, y1, wp.win0.effect ? effTex : nullptr);
-	}
+	gxForWindowRegions(wp, [&](const GxWinMasks &m) { return m.bg[bg]; },
+	                   [&](bool fx) { gxDrawBgQuad(bg, r, y0, y1, fx ? effTex : nullptr); });
 	GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0); // restore band scissor for later draws
 }
 
@@ -1643,18 +1681,8 @@ static void gxDrawAffineBgLayerWindowed(int which, int bgBit, const GxGbaBandReg
 		gxDrawAffineBgQuad(which, r, y0, y1, effTex);
 		return;
 	}
-	if (wp.out.bg[bgBit]) {
-		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
-		gxDrawAffineBgQuad(which, r, y0, y1, wp.out.effect ? effTex : nullptr);
-	}
-	if (wp.win1On && wp.win1.bg[bgBit] && wp.win1X1 > wp.win1X0) {
-		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
-		gxDrawAffineBgQuad(which, r, y0, y1, wp.win1.effect ? effTex : nullptr);
-	}
-	if (wp.win0On && wp.win0.bg[bgBit] && wp.win0X1 > wp.win0X0) {
-		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
-		gxDrawAffineBgQuad(which, r, y0, y1, wp.win0.effect ? effTex : nullptr);
-	}
+	gxForWindowRegions(wp, [&](const GxWinMasks &m) { return m.bg[bgBit]; },
+	                   [&](bool fx) { gxDrawAffineBgQuad(which, r, y0, y1, fx ? effTex : nullptr); });
 	GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
 }
 
@@ -1669,18 +1697,8 @@ static void gxDrawBitmapLayerWindowed(int mode, const GxWindowPlan &wp, GXTexObj
 	auto draw = [&](GXTexObj *tex) { gxDrawQuad(tex, 0, 0, (f32)w, (f32)h, 0, 0, s1, t1); };
 	const int bgBit = 2; // bitmap-mode content is always "BG2" for BLDCNT/window purposes
 	if (!wp.active) { draw(effTex ? effTex : baseTex); return; }
-	if (wp.out.bg[bgBit]) {
-		GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
-		draw(wp.out.effect && effTex ? effTex : baseTex);
-	}
-	if (wp.win1On && wp.win1.bg[bgBit] && wp.win1X1 > wp.win1X0) {
-		GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
-		draw(wp.win1.effect && effTex ? effTex : baseTex);
-	}
-	if (wp.win0On && wp.win0.bg[bgBit] && wp.win0X1 > wp.win0X0) {
-		GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
-		draw(wp.win0.effect && effTex ? effTex : baseTex);
-	}
+	gxForWindowRegions(wp, [&](const GxWinMasks &m) { return m.bg[bgBit]; },
+	                   [&](bool fx) { draw(fx && effTex ? effTex : baseTex); });
 	GX_SetScissor(0, 0, GBA_SCREEN_W, GBA_SCREEN_H);
 }
 
@@ -1718,18 +1736,8 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 		};
 
 		if (!wp.active) { drawWith(true); continue; }
-		if (wp.out.obj) {
-			GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);
-			drawWith(wp.out.effect);
-		}
-		if (wp.win1On && wp.win1.obj && wp.win1X1 > wp.win1X0) {
-			GX_SetScissor(wp.win1X0, wp.win1Y0, wp.win1X1 - wp.win1X0, wp.win1Y1 - wp.win1Y0);
-			drawWith(wp.win1.effect);
-		}
-		if (wp.win0On && wp.win0.obj && wp.win0X1 > wp.win0X0) {
-			GX_SetScissor(wp.win0X0, wp.win0Y0, wp.win0X1 - wp.win0X0, wp.win0Y1 - wp.win0Y0);
-			drawWith(wp.win0.effect);
-		}
+		gxForWindowRegions(wp, [&](const GxWinMasks &m) { return m.obj; },
+		                   [&](bool fx) { drawWith(fx); });
 	}
 	if (wp.active)
 		GX_SetScissor(0, y0, GBA_SCREEN_W, y1 - y0);

@@ -37,5 +37,6 @@ build_one objcache      "OBJCACHE"   "AOCA"
 build_one bgcache       "BGCACHE"    "ABGC"
 build_one ci8check      "CI8CHECK"   "ACI8"
 build_one bmp4check     "BMP4CHECK"  "ABM4"
+build_one winlayeroff   "WINLAYOFF"  "AWLO"
 
-echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba $(pwd)/bgcache.gba $(pwd)/ci8check.gba $(pwd)/bmp4check.gba"
+echo "built: $(pwd)/gradient.gba $(pwd)/checkerboard.gba $(pwd)/affinecheck.gba $(pwd)/irqsoak.gba $(pwd)/dsound.gba $(pwd)/waitcnt.gba $(pwd)/dmavcap.gba $(pwd)/windowcheck.gba $(pwd)/winblend.gba $(pwd)/objcache.gba $(pwd)/bgcache.gba $(pwd)/ci8check.gba $(pwd)/bmp4check.gba $(pwd)/winlayeroff.gba"

@@ -66,18 +66,23 @@
     GxWindowPlan/gxBuildWindowPlan) are static per band (WIN0H/V, WIN1H/V,
     WININ, WINOUT are all layout registers -- gxIsLayoutRegister -- so a
     write to any of them already forces a new GxGbaBandRegs snapshot, same
-    as BGxCNT/scroll), so each layer's draw for a given band is turned into
-    up to 3 scissored sub-draws in *precedence* order: WINOUT first (using
-    the full band's Y range -- window-disabled layers just don't get a
-    WINOUT pass at all, correctly leaving whatever's already in the
-    framebuffer there untouched, since these are the "layer that shouldn't
-    show here" case, same underlying trick this file already relies on for
-    ordinary per-pixel transparency), then WIN1 scissored to
-    [max(bandY0,win1Y0), min(bandY1,win1Y1)) x [win1X0,win1X1), then WIN0
-    the same way -- each later pass overwrites the earlier one only within
-    its own smaller rectangle, so precedence falls out of plain draw order,
-    no stencil/mask buffer needed. This is exact for WIN0/WIN1 (both are
-    genuinely axis-aligned rectangles in GBATEK), unlike OBJ window.
+    as BGxCNT/scroll), so each band is decomposed once (task 16) into
+    DISJOINT rectangles (y-slabs x x-runs, same pattern as Engine B's
+    gxDsBBuildRegions), each tagged with the winning region's layer/effect
+    masks under WIN0 > WIN1 > outside precedence (X2>240 / X1>X2 garbage
+    values clamp to 240 per Task 1; empty windows are dropped). Every layer
+    is drawn, scissored, only into the rectangles whose mask enables it, so
+    a layer that is enabled in WINOUT but disabled in WIN0/WIN1 is never
+    painted inside the window (the earlier "full band for WINOUT, then
+    overdraw WIN1/WIN0" scheme could not erase it). Exact for WIN0/WIN1
+    (genuinely axis-aligned rectangles in GBATEK), unlike OBJ window.
+    Known pre-existing issue (found in task 16, NOT fixed here): text-BG
+    textures are sampled GX_LINEAR, and Dolphin puts the sample ~1/16 texel
+    off centre, so every tile edge between differing texels bleeds (e.g.
+    checkerboard.gba pixel x=7 is (239,0,16), CPU reference (255,0,0)).
+    The documented checkerboard hash 56dc88a8... encodes that artifact;
+    switching text BG to GX_NEAR makes it CPU-exact (hash 11ea296b...) but
+    re-baselines every fixture, so it is left as a follow-up (queue item 19).
 
     ### Blend (BLDCNT/BLDALPHA/BLDY)
 
