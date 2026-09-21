@@ -76,13 +76,22 @@
     painted inside the window (the earlier "full band for WINOUT, then
     overdraw WIN1/WIN0" scheme could not erase it). Exact for WIN0/WIN1
     (genuinely axis-aligned rectangles in GBATEK), unlike OBJ window.
-    Known pre-existing issue (found in task 16, NOT fixed here): text-BG
-    textures are sampled GX_LINEAR, and Dolphin puts the sample ~1/16 texel
-    off centre, so every tile edge between differing texels bleeds (e.g.
-    checkerboard.gba pixel x=7 is (239,0,16), CPU reference (255,0,0)).
-    The documented checkerboard hash 56dc88a8... encodes that artifact;
-    switching text BG to GX_NEAR makes it CPU-exact (hash 11ea296b...) but
-    re-baselines every fixture, so it is left as a follow-up (queue item 19).
+    Texture sampling (task 19): EVERY texture this file bakes (text BG,
+    affine BG, OBJ, bitmap, effect scratch, backdrop) is GX_NEAR. GX_LINEAR
+    had bled neighbouring texels into every tile edge (Dolphin samples ~1/16
+    texel off centre). Affine BG/OBJ additionally (a) emit sample-point-
+    compensated corner UVs (gxGbaAffineCorner, t=149/256, same technique
+    and constant as DS Engine B's gxDsBAffineCorner) because GX samples
+    pixel (x,y) at UV(x+t,y+t) while the CPU PPU samples at the integer
+    pixel, and (b) use POWER-OF-TWO texture buffers (gxObjBufDim for OBJ,
+    gxAffineBufDim for non-wrapping affine planes; wrapping planes are
+    already pow2) because non-pow2 textures sample with a small negative
+    bias under Dolphin. Consequence: a non-wrapping 1024px affine map
+    (needs a 2048 texture) now bails to the CPU compositor
+    (gxAffinePlaneUnsupported). Result: byte-identical to the CPU reference
+    on all gba-refcheck fixtures incl. rotated/zoomed affinezoom/affinemag/
+    affineshrink/affinenowrap. Fixture hashes were re-baselined -- see
+    gx-next-steps-log.md task 19.
 
     ### Blend (BLDCNT/BLDALPHA/BLDY)
 

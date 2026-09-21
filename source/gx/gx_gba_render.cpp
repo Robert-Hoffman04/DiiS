@@ -296,7 +296,7 @@ struct GxAffineBgPlaneCache {
 	GXTlutObj tlutObj;
 	void *tlutData; // fixed 256-entry RGB5A3 table (affine BG is always 8bpp) -- allocated once at init, not regrown
 	u16 mapPx;      // logical (unbordered) map size, square
-	u16 bufPx;      // baked/allocated texture size (mapPx, or mapPx+8 if bordered -- see gxBakeAffineBgPlane's CI8 padding note)
+	u16 bufPx;      // baked/allocated texture size (mapPx if wrapping, else gxAffineBufDim(mapPx): pow2 >= mapPx+2, task 19)
 	bool wrap;
 	bool valid;
 	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
@@ -311,7 +311,27 @@ static GxAffineBgPlaneCache s_affBgPlane[2];
 // +4 pad (only ever a multiple of 4) isn't guaranteed to be a multiple of 8
 // the way +8 is (mapPx itself is always a multiple of 8). The toEffectScratch
 // RGB5A3 path is unaffected -- it still only ever needs mapPx+4.
-static const int kAffineBgPlaneMaxPx = 1024 + 8;
+// Task 19: a bordered (non-wrapping) affine plane is baked into a
+// POWER-OF-TWO texture (gxAffineBufDim: smallest pow2 >= mapPx+2), because
+// non-pow2 textures sample with a small negative bias under Dolphin that
+// flips lattice-edge texels of a zoomed/rotated plane (DS Engine B task 8,
+// finding 2; reproduced here by tools/gba-refcheck/affinenowrap.s). That
+// makes a non-wrapping 1024px map need a 2048 texture, past GX's 1024 limit
+// -> gxAffinePlaneUnsupported() bails that one case to the CPU compositor
+// (this also fixes the earlier latent 1024+8=1032 > 1024 texture).
+// Wrapping planes are already exactly mapPx (128/256/512/1024, all pow2).
+static const int kAffineBgPlaneMaxPx = 1024;
+static inline int gxAffineBufDim(int mapPx)
+{
+	int n = 8;
+	while (n < mapPx + 2) n <<= 1;
+	return n;
+}
+// True for the one affine-plane config GX cannot hold (see above).
+static inline bool gxAffinePlaneUnsupported(u16 cnt)
+{
+	return !((cnt >> 13) & 1) && ((cnt >> 14) & 3) == 3;
+}
 static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG (toEffectScratch RGB5A3 path only)
 static u8 *s_affBgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-index scratch for the persistent CI8 bake, reused per-BG
 
@@ -361,7 +381,22 @@ static const int kObjTexMaxPx = 64; // max regular-OBJ box (visibility/size gate
 // gx_texformat.h, both wider than RGB5A3's 4x4 that the old +4 padding was
 // sized for). The toEffectScratch RGB5A3 path still uses its own local
 // texW+4/texH+4 buffers (see gxBakeObjTexture), unaffected by this constant.
-static const int kObjTexBufMaxPx = kObjTexMaxPx + 8;
+// Task 19: OBJ texture buffers are now POWER-OF-TWO sized (gxObjBufDim):
+// the smallest power of two >= texW+2 (1-texel border each side), min 8.
+// Max is therefore 128 for a 64px sprite. Reason: non-power-of-two
+// textures sampled with the affine corner-UV technique showed a small
+// negative sample bias in Dolphin (DS Engine B task 8, finding 2: every
+// 5th column of a 20px affine sprite wrong; identical UVs on 32x32 exact),
+// which flips the texel right on a lattice edge -- exactly where a zoomed
+// affine sprite's first row/column of texels sit. Also covers CI4's 8x8 /
+// CI8's 8x4 block alignment (kObjTexBufMaxPx replaces the old +8 padding).
+static const int kObjTexBufMaxPx = 128;
+static inline int gxObjBufDim(int texPx)
+{
+	int n = 8;
+	while (n < texPx + 2) n <<= 1;
+	return n;
+}
 static u16 *s_objBakeScratch; // toEffectScratch RGB5A3 path only
 static u8 *s_objBakeIdxScratch; // gx-next-steps-log.md task 6: persistent CI4/CI8 path
 
@@ -438,6 +473,7 @@ static void gxUploadEffectTex(const u16 *linear, int w, int h, u8 wrapMode)
 	gxSwizzle16bpp(linear, (u16 *)s_effectTex.texData, blk.texelsWide, blk.texelsTall, w, h);
 	DCFlushRange(s_effectTex.texData, needed);
 	GX_InitTexObj(&s_effectTex.texObj, s_effectTex.texData, w, h, GX_TF_RGB5A3, wrapMode, wrapMode, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_effectTex.texObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 }
 
 // ---------------------------------------------------------------------
@@ -507,7 +543,7 @@ bool gxGbaRenderInit()
 	if (!s_affBgBakeIdxScratch) return false;
 
 	for (int i = 0; i < 128; ++i) {
-		u32 sz = kObjTexBufMaxPx * kObjTexBufMaxPx * sizeof(u16);
+		u32 sz = kObjTexBufMaxPx * kObjTexBufMaxPx; // CI8 worst case, 1 byte/texel (task 19: pow2 buffers)
 		s_objTex[i].texData = memalign(32, sz);
 		if (!s_objTex[i].texData) return false;
 		memset(s_objTex[i].texData, 0, sz);
@@ -542,6 +578,7 @@ bool gxGbaRenderInit()
 	if (!s_backdropTexData) return false;
 	memset(s_backdropTexData, 0, 32);
 	GX_InitTexObj(&s_backdropTexObj, s_backdropTexData, 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_backdropTexObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 	s_backdropValid = false;
 
 	u32 copySz = GX_GetTexBufferSize(GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_FALSE, 0);
@@ -781,6 +818,7 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
 	GX_LoadTlut(&pc.tlutObj, tlutSlot);
 	GX_InitTexObjCI(&pc.texObj, pc.texData, mapWpx, mapHpx, GX_TF_CI8, GX_REPEAT, GX_REPEAT, GX_FALSE, tlutSlot);
+	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 	pc.mapWpx = (u16)mapWpx;
 	pc.mapHpx = (u16)mapHpx;
 	pc.cfgCharBase = li.charBase;
@@ -802,8 +840,10 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	bool wrap = (cnt >> 13) & 1;
 
 	if (toEffectScratch) {
-		int bufPx = wrap ? mapPx : mapPx + 4;
+		int bufPx = wrap ? mapPx : gxAffineBufDim(mapPx);
 		int borderOff = wrap ? 0 : 1;
+		if (!wrap) // whole buffer transparent first: border + pow2 padding
+			for (int i = 0; i < bufPx * bufPx; ++i) s_affBgBakeScratch[i] = kTransparentTexel;
 		for (int ty = 0; ty < mapTiles; ++ty) {
 			for (int tx = 0; tx < mapTiles; ++tx) {
 				u32 entryAddr = mapBase + (ty * mapTiles + tx);
@@ -818,16 +858,6 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 						s_affBgBakeScratch[dstY * bufPx + dstX] = texel;
 					}
 				}
-			}
-		}
-		if (!wrap) {
-			for (int x = 0; x < bufPx; ++x) {
-				s_affBgBakeScratch[x] = kTransparentTexel;
-				s_affBgBakeScratch[(bufPx - 1) * bufPx + x] = kTransparentTexel;
-			}
-			for (int y = 0; y < bufPx; ++y) {
-				s_affBgBakeScratch[y * bufPx] = kTransparentTexel;
-				s_affBgBakeScratch[y * bufPx + (bufPx - 1)] = kTransparentTexel;
 			}
 		}
 		gxUploadEffectTex(s_affBgBakeScratch, bufPx, bufPx, wrap ? GX_REPEAT : GX_CLAMP);
@@ -846,7 +876,7 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	// isn't guaranteed to be a multiple of 8 the way mapPx+8 is (mapPx
 	// itself always is). The wrap (unbordered) case needs no padding at
 	// all -- mapPx is already a multiple of 8.
-	int bufPx = wrap ? mapPx : mapPx + 8;
+	int bufPx = wrap ? mapPx : gxAffineBufDim(mapPx);
 	int borderOff = wrap ? 0 : 1;
 	// Zero the WHOLE buffer up front (index 0 == transparent via the TLUT
 	// built below) rather than writing an explicit 1-texel border loop
@@ -899,6 +929,7 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 	GX_LoadTlut(&pc.tlutObj, tlutSlot);
 	u8 wm = wrap ? GX_REPEAT : GX_CLAMP;
 	GX_InitTexObjCI(&pc.texObj, pc.texData, bufPx, bufPx, GX_TF_CI8, wm, wm, GX_FALSE, tlutSlot);
+	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 	pc.mapPx = (u16)mapPx;
 	pc.bufPx = (u16)bufPx;
 	pc.wrap = wrap;
@@ -1243,7 +1274,9 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	int w = d.texW, h = d.texH;
 
 	if (toEffectScratch) {
-		int bufW = w + 4, bufH = h + 4;
+		int bufW = gxObjBufDim(w), bufH = gxObjBufDim(h);
+		// whole buffer transparent first: covers border + pow2 padding
+		for (int i = 0; i < bufW * bufH; ++i) s_objBakeScratch[i] = kTransparentTexel;
 		for (int texy = 0; texy < h; ++texy) {
 			int tileY = texy / 8, suby = texy % 8;
 			for (int texx = 0; texx < w; ++texx) {
@@ -1297,7 +1330,7 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	// padding was sized for; w/h+4 isn't guaranteed to be a multiple of 8
 	// the way w/h+8 is (w/h themselves always are, being whole 8px OBJ
 	// tiles). One padding scheme covers both CI4 and CI8 uniformly.
-	int bufW = w + 8, bufH = h + 8;
+	int bufW = gxObjBufDim(w), bufH = gxObjBufDim(h);
 	// Zero the whole buffer first (index 0 == transparent via the TLUT
 	// below), same rationale as gxBakeAffineBgPlane's identical choice --
 	// covers the real 1-texel border AND the extra unused padding beyond
@@ -1368,6 +1401,7 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 	// only ever used for gxBlockShape() above; the actual GX API call
 	// needs the real hardware format constant.
 	GX_InitTexObjCI(&slot.texObj, slot.texData, bufW, bufH, colorMode ? GX_TF_CI8 : GX_TF_CI4, GX_CLAMP, GX_CLAMP, GX_FALSE, kObjTlutSlot);
+	GX_InitTexObjFilterMode(&slot.texObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 
 	// Record the config this bake was built from (task 4's rebake-gate
 	// fingerprint -- see gxObjNeedsRebake above).
@@ -1433,6 +1467,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 		GX_InitTlutObj(&s_bmpTlutObj, s_bmpTlutData, GX_TL_RGB5A3, 256);
 		GX_LoadTlut(&s_bmpTlutObj, kBmpTlutSlot);
 		GX_InitTexObjCI(&s_bmpTexObjCI, s_bmpTexDataCI, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_CI8, GX_CLAMP, GX_CLAMP, GX_FALSE, kBmpTlutSlot);
+		GX_InitTexObjFilterMode(&s_bmpTexObjCI, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 		s_bmpValidCI = true;
 		s_bmpValid = false; // stale/unused RGB5A3 buffer for this mode -- mode-exclusive, but keep the flags honest
 		return;
@@ -1456,6 +1491,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 	memcpy(s_bmpTexData, s_bgBakeScratch, GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16));
 	DCFlushRange(s_bmpTexData, GBA_SCREEN_W * GBA_SCREEN_H * sizeof(u16));
 	GX_InitTexObj(&s_bmpTexObj, s_bmpTexData, GBA_SCREEN_W, GBA_SCREEN_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_bmpTexObj, GX_NEAR, GX_NEAR); // task 19: GX_LINEAR bleeds (see kGbaGxSamplePoint)
 	s_bmpValid = true;
 	s_bmpValidCI = false;
 }
@@ -1463,6 +1499,27 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 // ---------------------------------------------------------------------
 // Stage 4: per-band draw
 // ---------------------------------------------------------------------
+// Task 19: affine sample-point compensation. GX (Dolphin, and the console GPU
+// it reproduces) samples quad pixel (x,y) at UV(x+t, y+t), t ~= 7/12 (host
+// GPU snaps it to an 8-bit sub-pixel grid: 149/256 is what makes the DS
+// Engine B affine paths byte-exact on this host -- see task 8 /
+// gx_ds_engineb_render.cpp kGxSamplePoint), whereas the CPU PPU
+// (sampleAffineBg / renderObjLine) samples texel floor(num/256) with
+// num = X0 + x*pA + y*pB exactly AT the integer pixel. A corner UV is
+// therefore emitted as
+//     (num + 0.5 - t*(dA + dB)) / 256
+// where dA/dB are the per-x / per-y steps: the -t*(dA+dB) cancels the
+// sample-point offset, and the +0.5 (half of one 1/256 step, since every
+// CPU numerator is an integer multiple of 1/256 texel) centres the sample
+// inside the texel's 1/256 cell so a 1-ULP host-GPU error cannot flip the
+// floor. Only affine paths need this: the non-affine quads advance exactly
+// one texel per pixel, so any 0<=t<1 selects the right texel.
+static const double kGbaGxSamplePoint = 149.0 / 256.0;
+static inline f32 gxGbaAffineCorner(s32 num, s32 dA, s32 dB)
+{
+	return (f32)(((double)num + 0.5 - kGbaGxSamplePoint * ((double)dA + (double)dB)) / 256.0);
+}
+
 // Texel coordinate (not yet border-offset/normalized) an affine OBJ's
 // screen-space box position (col,row), box-relative, maps back to in source
 // texture space -- exact port of renderObjLine()'s (gba_ppu.cpp) per-pixel
@@ -1473,10 +1530,11 @@ static void gxAffineObjTexCorner(const GxObjDraw &d, s32 col, s32 row, f32 *tx, 
 {
 	s32 cx = d.boxW / 2, cy = d.boxH / 2;
 	s32 relx = col - cx, rely = row - cy;
-	s32 origx = (relx * d.pa + rely * d.pb) >> 8;
-	s32 origy = (relx * d.pc + rely * d.pd) >> 8;
-	*tx = (f32)(origx + d.texW / 2);
-	*ty = (f32)(origy + d.texH / 2);
+	// CPU: origx = (relx*pa + rely*pb) >> 8, texel = origx + texW/2. The
+	// fractional part of (num/256) is what the GX sample sees, so emit the
+	// compensated corner (gxGbaAffineCorner) rather than the floored value.
+	*tx = gxGbaAffineCorner(relx * d.pa + rely * d.pb, d.pa, d.pb) + (f32)(d.texW / 2);
+	*ty = gxGbaAffineCorner(relx * d.pc + rely * d.pd, d.pc, d.pd) + (f32)(d.texH / 2);
 }
 
 // Single-sprite draw, shared by the windowed OBJ path (gxDrawObjLayerWindowed)
@@ -1536,10 +1594,12 @@ static void gxDrawAffineBgQuad(int which, const GxGbaBandRegs &r, int y0, int y1
 	s32 X0 = r.affX[which], Y0 = r.affY[which];
 	int W = GBA_SCREEN_W, H = y1 - y0;
 
-	f32 tx0 = X0 / 256.0f,                    ty0 = Y0 / 256.0f;
-	f32 tx1 = (X0 + W * pa) / 256.0f,          ty1 = (Y0 + W * pcMat) / 256.0f;
-	f32 tx2 = (X0 + W * pa + H * pb) / 256.0f, ty2 = (Y0 + W * pcMat + H * pd) / 256.0f;
-	f32 tx3 = (X0 + H * pb) / 256.0f,          ty3 = (Y0 + H * pd) / 256.0f;
+	// Corner numerators exactly as sampleAffineBg (gba_ppu.cpp) accumulates
+	// them; compensated for GX's sample point (see gxGbaAffineCorner).
+	f32 tx0 = gxGbaAffineCorner(X0, pa, pb),                       ty0 = gxGbaAffineCorner(Y0, pcMat, pd);
+	f32 tx1 = gxGbaAffineCorner(X0 + W * pa, pa, pb),              ty1 = gxGbaAffineCorner(Y0 + W * pcMat, pcMat, pd);
+	f32 tx2 = gxGbaAffineCorner(X0 + W * pa + H * pb, pa, pb),     ty2 = gxGbaAffineCorner(Y0 + W * pcMat + H * pd, pcMat, pd);
+	f32 tx3 = gxGbaAffineCorner(X0 + H * pb, pa, pb),              ty3 = gxGbaAffineCorner(Y0 + H * pd, pcMat, pd);
 
 	f32 norm = (f32)pc.bufPx;
 	f32 off = pc.wrap ? 0.0f : 1.0f;
@@ -1721,7 +1781,7 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 			if (useEffect && blends) {
 				GxTexelEffectParams fx = { GXTEXEFFECT_ALPHA, bp.eva, 0 };
 				gxBakeObjTexture(dispcnt, d, fx, true);
-				gxDrawOneObj(d, &s_effectTex.texObj, (f32)(d.texW + 4), (f32)(d.texH + 4));
+				gxDrawOneObj(d, &s_effectTex.texObj, (f32)gxObjBufDim(d.texW), (f32)gxObjBufDim(d.texH));
 			} else {
 				// gx-next-steps-log.md task 6: reload the shared OBJ TLUT
 				// slot from this sprite's own tlutData immediately before
@@ -1804,6 +1864,12 @@ bool gxGbaRenderFrame()
 	for (int b = 0; b < blendBandCount; ++b) {
 		const GxGbaBandRegs &r = tiled ? g_gbaBandRegs[b] : g_gbaBandRegs[0];
 		blendPlan[b] = gxComputeBandBlendPlan(mode, dispcnt, r);
+		// Task 19: non-wrapping 1024px affine map cannot fit a pow2 bordered
+		// texture in GX's 1024 limit -> CPU fallback (see kAffineBgPlaneMaxPx).
+		if (mode == 1 || mode == 2) {
+			if ((dispcnt & (1 << 10)) && gxAffinePlaneUnsupported(r.bgcnt[2])) return false;
+			if (mode == 2 && (dispcnt & (1 << 11)) && gxAffinePlaneUnsupported(r.bgcnt[3])) return false;
+		}
 		if (blendPlan[b].effect == 1 && !blendPlan[b].alphaNativeOk)
 			return false;
 	}
