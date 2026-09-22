@@ -2497,10 +2497,31 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 					// texel on any of its lines) nothing drawn before it can show through, and the layers
 					// above it blend against the 3D layer alone: `under` restarts at {BG0}. This is what
 					// lets SM64DS's BG3-over-3D alpha blend (BLDCNT 2nd target = BG0 only) be native.
+					//
+					// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug --
+					// see gx-next-steps-log.md): that restart is only sound for the OLD single-pass
+					// draw, where a "covered" band really does leave the 3D layer's own drawn colour
+					// as the pixel's complete history (an unconditional REPLACE, or an unconditional
+					// blend, with no per-pixel split). The two-pass MASKED draw exists precisely
+					// because this band's under-stack is a MIX (some 2nd-target, some not --
+					// `(under & ~p.t2)` above, the very condition that routed us into mask3dCfg in the
+					// first place) -- "covered" says nothing about that mix, only that every pixel has
+					// SOME 3D texel. Collapsing `under` to {BG0} here throws away which of BG1..BG3
+					// were 2nd-target, so a layer drawn ABOVE BG0 that wants to blend gets its
+					// `want && (under & p.t2)` check evaluated against the wrong (collapsed) set --
+					// wrongly classified as non-alpha (or alpha) native-blend-eligible -- and ends up
+					// drawing with the wrong TEV mode entirely. Root cause of the a3_c6/a3_c8
+					// whole-frame corruption this task chased under a "TEV state leak" theory: it
+					// is not a leaked GX register, it is this CPU-side plan miscomputing a later
+					// layer's blend eligibility. Fix: only take the {BG0} shortcut when this cfg's
+					// under-stack was NOT the mixed case mask3dCfg exists for; otherwise keep the
+					// full accumulated `under` set (with BG0 added) so later layers see the real
+					// 2nd-target membership of everything beneath them.
 					bool covered = (r.hofs[0] == 0);
 					for (int y = y0; covered && y < y1; ++y)
 						if (s_3dLineHole[y]) covered = false;
-					under = covered ? (u8)1 : (u8)(under | 1);
+					const bool mixedUnder = (p.mask3dCfg >> c) & 1;
+					under = (covered && !mixedUnder) ? (u8)1 : (u8)(under | 1);
 					continue;
 				}
 #endif
@@ -2574,7 +2595,18 @@ static inline u8 gxDsBAlphaK(int eva) { return (u8)(eva >= 16 ? 255 : eva * 16);
 static void gxDsBTevAlpha(int k)
 {
 	if (s_tevK == k) return;
-	if (s_tevK == -1) {
+	// s_tevK < 0 covers BOTH -1 (plain REPLACE wiring) and -2 (task 13d's mask
+	// build / two-pass 3D draw, which deliberately parks s_tevK at -2 to force
+	// a resync here -- see gxDsBTevMaskConst()'s and gxDsA3dDrawBandTwoPass()'s
+	// comments). A guard of `== -1` alone missed the -2 case: after a two-pass
+	// 3D draw, stage0 is left in pass B's plain-REPLACE wiring (alpha = raw
+	// texture alpha, no A8_GT compare), and the next gxDsBTevAlpha() call would
+	// take this fast path, update only the GX_TEVREG0 constant, and leave that
+	// stale REPLACE alpha wiring in place -- silently breaking constant-alpha
+	// blending for the next alpha-blended layer in the band (root cause of the
+	// 13d whole-frame corruption even after the mask primitive itself was
+	// fixed; see gx-next-steps-log.md's gx_mask-fix follow-up).
+	if (s_tevK < 0) {
 		GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
 		GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
@@ -3026,6 +3058,50 @@ static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y
 	GX_SetVtxDesc(GX_VA_TEX1, GX_NONE);
 	s_tevK = -2;
 }
+
+// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug --
+// see gx-next-steps-log.md): pass A's GX_BM_BLEND(SRCALPHA,INVSRCALPHA) blend
+// of a GENUINELY translucent 3D texel (real per-texel alpha 1..254, not the
+// old code's binary present/absent) mathematically leaves the EFB's OWN alpha
+// channel below 255 at that pixel -- out_A = srcA*(srcA/255) + dstA*(1-srcA/255),
+// which is < 255 for any dstA==255, 0<srcA<255. Every OTHER alpha-blended draw
+// in this renderer (gxDsBTevAlpha's ordinary BG/OBJ blending) gets away with
+// the exact same math because something opaque is painted on top of it later
+// in painter's-algorithm order, which re-stamps that pixel's alpha back to 255
+// (srcA=255 -> out_A = 255*1 + dst*0 = 255) before the frame's single
+// GX_CopyTex readback below. BG0's 3D slot has no such guarantee -- it can be
+// (and in a3_c6/a3_c8 IS) the topmost thing drawn for a pixel, so its
+// sub-255 EFB alpha survives all the way to the copy. GX's own RGB5A3 EFB
+// copy format silently drops to half precision (4-4-4 colour + 3-bit alpha,
+// bit15=0) for any texel whose EFB alpha isn't 255, instead of the full 5-5-5
+// (bit15=1) encoding -- exactly the "flat suspicious constant" symptom
+// (dsaabd's gx=001f: small colour components rounding down to 0 in 4-bit).
+// Fix: right after the whole frame's 2D/3D draw loop, before the single
+// end-of-frame EFB->texture copy, stamp the EFB alpha channel back to a flat
+// 255 everywhere (colour update off, so this cannot touch any pixel's colour,
+// only its alpha) -- the same "make sure the EFB is fully opaque before this
+// copy reads it" invariant every OTHER pixel already gets for free from a
+// later opaque draw. Gated with the rest of 13d's two-pass machinery: the
+// ordinary single-pass 3D draw and non-3D layers never leave fractional EFB
+// alpha as the LAST word on a pixel, so this is a no-op cost the rest of the
+// renderer does not need.
+static void gxDsA3dStampOpaqueAlpha()
+{
+	GX_SetColorUpdate(GX_FALSE);
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, 255 });
+	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO);
+	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_A0);
+	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position2f32(0, 0);                             GX_TexCoord2f32(0, 0);
+		GX_Position2f32((f32)kDsBScreenW, 0);               GX_TexCoord2f32(0, 0);
+		GX_Position2f32((f32)kDsBScreenW, (f32)kDsBScreenH); GX_TexCoord2f32(0, 0);
+		GX_Position2f32(0, (f32)kDsBScreenH);               GX_TexCoord2f32(0, 0);
+	GX_End();
+	GX_SetColorUpdate(GX_TRUE);
+	s_tevK = -2;   // stage0 wiring left non-standard -- force a resync next use
+}
 #endif // GXDS_CORE == 0
 
 // Bake-if-stale for one BG plane variant (plain, or the brighten/darken one).
@@ -3475,6 +3551,11 @@ static bool gxDsBRenderFrameImpl()
 	gxDsBTevReplace();
 
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+#if GXDS_CORE == 0 && defined(DSA_MASK3D_ENABLE)
+	// Task 13d follow-up: re-opaque the EFB alpha channel before the frame's
+	// one EFB->texture copy below -- see gxDsA3dStampOpaqueAlpha()'s comment.
+	gxDsA3dStampOpaqueAlpha();
+#endif
 	GX_DrawDone();
 	// Deflicker OFF for this copy. main.cpp's InitVideo() leaves
 	// GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE,
