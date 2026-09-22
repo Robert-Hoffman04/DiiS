@@ -63,4 +63,14 @@ void gxMaskEnd(GXMaskTarget *mt, u16 efbX, u16 efbY);
 // after setting up every earlier TEV stage, since it reads GX_CC_CPREV.
 void gxMaskApply(GXMaskTarget *mt, u8 tevStage, u8 texMapSlot, u8 texCoordSlot);
 
+// Same idea as gxMaskApply, but multiplies by (1 - mask) instead of mask -
+// i.e. the complement: pixels the mask marked as "in" become 0, pixels it
+// marked "out" pass the running colour/alpha through unchanged. Built for
+// item 13d's two-pass translucent-3D-over-mixed-2nd-target technique: pass
+// A consumes the mask directly (gxMaskApply) to keep only the "beneath is a
+// 2nd target" pixels for the blend draw, pass B consumes the complement
+// (this function) to keep only the rest for the plain/fade overwrite draw,
+// without needing a second mask texture.
+void gxMaskApplyInverse(GXMaskTarget *mt, u8 tevStage, u8 texMapSlot, u8 texCoordSlot);
+
 #endif // GX_MASK_H

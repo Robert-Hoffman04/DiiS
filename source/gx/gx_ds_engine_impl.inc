@@ -40,6 +40,7 @@
 #if (defined(DSB_STATS) || defined(DSLZ_STATS)) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 #include "../harness/harness_profile.h"
 #endif
+#include "gx_mask.h"
 
 // Test hooks (compile-time only, zero cost when undefined):
 //  -DDSB_FORCE_CPU : Engine B's RenderFrame always bails, so the CPU compositor
@@ -323,6 +324,28 @@ static const int k3dW = 256, k3dH = 192;
 // this layer: SM64DS frames with hundreds of one-texel-off pixels at polygon edges; the same fact task 8 found
 // for affine planes), while power-of-two heights are byte-exact.
 static const int k3dTexH = 256;
+
+// Task 13d: real per-texel alpha (0..31, not collapsed to present/absent) for the
+// two-pass translucent-3D-over-mixed-2nd-target technique below. Kept as a separate
+// GX_TF_A8 texture (true 8-bit alpha, no quantization loss) rather than trying to
+// widen s_3d's RGB5A3 alpha sub-format (only 3 bits / 8 levels there). Built lazily
+// -- only when a band actually needs the two-pass draw this frame -- from the same
+// gfx3d_convertedScreen buffer gxDsA3dScan() already linearized, keyed the same way
+// (g_gfx3dRenderSeq) so it never gets rebuilt more than once per rendered 3D frame.
+static void *s_3dAlphaTexData;
+static u32 s_3dAlphaTexDataCap;
+static GXTexObj s_3dAlphaTexObj;
+static bool s_3dAlphaValid;
+static u32 s_3dAlphaSeq;
+
+// Task 13d: the per-pixel "was the EFB pixel beneath BG0's 3D slot produced by a
+// BLDCNT 2nd-target layer" mask (gx_mask.h primitive) plus the scratch EFB corner
+// it is built in. One mask is (re)built per (band, window-region) that actually
+// needs the two-pass draw -- see gxDsBBuildUnder3DMask() below.
+static GXMaskTarget s_3dMask;
+static bool s_3dMaskInit;
+static int s_3dMaskBand = -1, s_3dMaskCfg = -1;   // which (band,cfg) s_3dMask currently holds; reset every frame
+static const u16 k3dMaskEfbX = 256, k3dMaskEfbY = 0;   // beside the (0,0,256,192) main render corner
 
 #endif
 
@@ -1181,6 +1204,14 @@ static void gxDsBSetup2DState()
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	GX_SetAlphaUpdate(GX_TRUE);
 	GX_SetColorUpdate(GX_TRUE);
+	// Task 13d: EFB dithering (libogc/GX default state, never touched here before)
+	// silently perturbs every EFB write by a few LSBs -- invisible for ordinary BG/OBJ
+	// colour that only ever gets read back within the already-accepted "near match"
+	// alpha tolerance, but fatal for gx_mask.h's mask primitive, which needs an exact
+	// binary (0/255) constant colour to round-trip through an EFB write + I8 copy.
+	// Off unconditionally: nothing in this pixel-exact-targeting renderer wants noise
+	// added to its output.
+	GX_SetDither(GX_FALSE);
 
 	GX_SetNumChans(1);
 	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
@@ -2198,6 +2229,45 @@ static void gxDsA3dDrawBand(const GxDsA3dTex &t, int hofs, int y0, int y1)
 		gxDsBDrawQuad(tex, (f32)xb, (f32)y0, 256.0f, (f32)y1, 0.0f, v0, (f32)(hofs - 256) / 256.0f, v1);
 	}
 }
+
+// Task 13d: real per-texel alpha (0..31 -> 0..255, no quantization) as a standalone
+// GX_TF_A8 texture, same 256x256-with-transparent-padding layout as s_3d/s_3dFx (see
+// k3dTexH's comment). Only built when a band's two-pass draw actually needs it
+// (gxDsBBuildUnder3DMask / gxDsA3dDrawBandTwoPass below), keyed on the same
+// g_gfx3dRenderSeq as everything else derived from gfx3d_convertedScreen.
+static void gxDsA3dEnsureAlphaTex()
+{
+	if (!gxDsA3dScan()) return;
+	if (s_3dAlphaValid && s_3dAlphaSeq == s_3dScanSeq)
+		return;
+	s_3dAlphaValid = false;
+	const u32 needed = (u32)k3dW * k3dTexH * sizeof(u8);
+	if (!gxDsBEnsureCap(&s_3dAlphaTexData, &s_3dAlphaTexDataCap, needed))
+		return;
+	if (!s_3dScratch) s_3dScratch = (u16 *)malloc((size_t)k3dW * k3dTexH * sizeof(u16));
+	if (!s_3dScratch) return;
+	u8 *lin = (u8 *)s_3dScratch;   // reuse the scratch buffer's storage, byte-sized here
+	const u8 *c = gfx3d_convertedScreen;
+	for (int y = 0; y < k3dH; ++y)
+		for (int x = 0; x < k3dW; ++x, c += 4)
+			// CPU blend weight for texel alpha a (1..31, a==0 is "absent", never
+			// blended) is (a+1)/32 (GPU.cpp _master_setFinal3dColor:
+			// (src*(a+1)+dst*2*(31-a))>>6); GX_BL_SRCALPHA's hardware weight is
+			// alpha8/255, so alpha8 = round(255*(a+1)/32) is the matching 8-bit
+			// value for a present texel, not a plain 5->8 bit expansion (which
+			// targets a/31, not (a+1)/32 -- the two diverge most at small a).
+			// a==0 (absent) must stay exactly 0, not (0+1)*255/32 -- the formula
+			// only models a present, blendable texel.
+			lin[y * k3dW + x] = c[0] ? (u8)(((unsigned)c[0] + 1) * 255 / 32) : 0;
+	memset(lin + (size_t)k3dW * k3dH, 0, (size_t)k3dW * (k3dTexH - k3dH));   // padding rows: alpha 0
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_I8);   // A8 is also 8bpp / 8x4 blocks on this hardware
+	gxSwizzle8bpp(lin, (u8 *)s_3dAlphaTexData, blk.texelsWide, blk.texelsTall, k3dW, k3dTexH);
+	DCFlushRange(s_3dAlphaTexData, needed);
+	GX_InitTexObj(&s_3dAlphaTexObj, s_3dAlphaTexData, k3dW, k3dTexH, GX_TF_A8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_3dAlphaTexObj, GX_NEAR, GX_NEAR);
+	s_3dAlphaSeq = s_3dScanSeq;
+	s_3dAlphaValid = true;
+}
 #endif // GXDS_CORE == 0
 
 // ---------------------------------------------------------------------
@@ -2240,6 +2310,10 @@ struct GxDsBBandPlan {
 	u8 fadeBg, fadeObj;    // BGs / OBJ that need their faded variant in this band
 	u8 fade3d;             // task 13 (Engine A): the 3D layer needs its faded variant in this band
 	u8 fade3dCfg;          // ... per window-region cfg (bit c): drawn faded there
+	u8 mask3dCfg;          // task 13d: ... per window-region cfg (bit c): 2nd-target set beneath BG0's
+	                       // 3D slot is a MIX in this region -> two-pass mask-and-discard draw instead
+	                       // of the single-pass draw (see gxDsBBuildUnder3DMask / the bg==0+r.bg3d branch
+	                       // of gxDsBDrawBgLayer)
 	u8 blendLive[3];       // per cfg, slot-indexed (BG b -> bit b, OBJ tier p -> bit 4+p): items that really alpha-blend
 	u8 tierHas, tierSemi;  // bit p: a sprite / a semi-transparent sprite of priority p touches this band
 	bool backdropFade;
@@ -2354,6 +2428,7 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 	p.fadeBg = p.fadeObj = 0;
 	p.fade3d = 0;
 	p.fade3dCfg = 0;
+	p.mask3dCfg = 0;
 	p.blendLive[0] = p.blendLive[1] = p.blendLive[2] = 0;
 	p.tierHas = p.tierSemi = 0;
 	for (int i = 0; i < s_objDrawCount; ++i) {
@@ -2379,14 +2454,42 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				if (bg == 0 && r.bg3d) {
 					// The 3D layer (_master_setFinal3dColor): the alpha EFFECT is never applied to it;
 					// over a 2nd-target layer an opaque texel is written UNFADED and a translucent one
-					// is blended (not exact); over anything else it is faded iff BG0 is a 1st target.
+					// is blended; over anything else it is faded iff BG0 is a 1st target.
 					// `under` is every layer that can lie beneath: none a 2nd target => always faded /
-					// never blended; all of them => never faded (plain opaque); a mix is per-pixel => bail.
+					// never blended; all of them, with no translucent texel => never faded (plain
+					// opaque), a single draw suffices; a mix, OR a pure 2nd-target set with a
+					// genuinely translucent line, needs a per-pixel choice a single draw mode can't
+					// give (task 13d) -> two-pass mask-and-discard draw instead (gxDsBBuildUnder3DMask /
+					// the bg==0+r.bg3d branch of gxDsBDrawBgLayer). Pass A (GX_BM_BLEND, masked to the
+					// "beneath is 2nd target" pixels, real per-texel alpha) reproduces the blend rule
+					// exactly (and degenerates to an exact opaque overwrite where the texel itself is
+					// opaque, since srcAlpha=255 there); pass B (the mask's complement) reproduces the
+					// "everywhere else" rule, still faded iff `fade` below is set.
 					if (under & p.t2) {
-						if (fade && (under & ~p.t2)) { DSB_WHY("3dfade"); return false; }
-						fade = false;
+						bool trans = false;
 						for (int y = y0; y < y1; ++y)
-							if (s_3dLineTrans[y]) { DSB_WHY("3dtrans"); return false; }
+							if (s_3dLineTrans[y]) { trans = true; break; }
+						if ((under & ~p.t2) || trans) {
+#ifdef DSA_MASK3D_ENABLE
+							// Gated off by default: the two-pass draw itself (gxDsBBuildUnder3DMask /
+							// gxDsA3dDrawBandTwoPass below) is fully built and wired, but real-hardware
+							// verification (gx-next-steps-log.md Task 13d) found the gx_mask.h EFB-copy
+							// primitive it depends on does not round-trip a flat constant colour/alpha
+							// correctly on this renderer's EFB pixel format (RGB565_Z16 / RGB8_Z24, never
+							// RGBA6_Z24 -- GX_TF_A8 copies are undefined outside RGBA6 per libogc's own
+							// docs, and GX_TF_I8 copies came back majority neither-0-nor-255 for even a
+							// flat single-colour full-screen quad, unexplained by dither or by the
+							// KONST-vs-RASC constant-colour mechanism). Left bailing (as before this
+							// task) until that primitive-level blocker is root-caused; define
+							// DSA_MASK3D_ENABLE to turn the two-pass path back on for further work.
+							p.mask3dCfg |= (u8)(1 << c);
+#else
+							if (trans) { DSB_WHY("3dtrans"); return false; }
+							DSB_WHY("3dfade"); return false;
+#endif
+						}
+						else
+							fade = false;
 					}
 					if (fade) { p.fade3d = 1; p.fade3dCfg |= (u8)(1 << c); }
 					// Coverage: where the 3D layer has a texel it overwrites whatever was beneath
@@ -2570,7 +2673,15 @@ static void gxDsBDrawAffineObj(const GxDsBObjDraw &d, const GxDsBObjTexSlot &slo
 
 // One layer (a BG plane) of one band, drawn only into the window rectangles
 // whose region enables it, with that region's colour effect applied.
-static void gxDsBDrawBgLayer(int bg, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int y0, int y1)
+#if GXDS_CORE == 0
+// Forward declarations: task 13d's two-pass mask-and-discard draw (defined below,
+// after gxDsBDrawObjLayer -- it needs that function, and the BG/OBJ quad helpers
+// above, to replay the under-stack) is called from inside gxDsBDrawBgLayer.
+static void gxDsBBuildUnder3DMask(int b, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int cfgIdx, int y0, int y1);
+static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y1);
+#endif
+
+static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int y0, int y1)
 {
 	for (int si = 0; si < p.nslab; ++si) {
 		const GxDsBSlab &sl = p.slab[si];
@@ -2582,6 +2693,19 @@ static void gxDsBDrawBgLayer(int bg, const GxDsBBandRegs &r, const GxDsBBandPlan
 			gxDsBResolveFx(p, cf, bg, false, fade, want);
 #if GXDS_CORE == 0
 			if (bg == 0 && r.bg3d) {   // task 13: the 3D layer (never alpha-blended by BLDCNT)
+				if ((p.mask3dCfg >> ru.cfg) & 1) {   // task 13d: mixed under -> two-pass draw
+					if (s_3dMaskBand != b || s_3dMaskCfg != ru.cfg) {
+						gxDsBBuildUnder3DMask(b, r, p, ru.cfg, y0, y1);
+						s_3dMaskBand = b; s_3dMaskCfg = ru.cfg;
+						GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+					}
+					const GxDsA3dTex &tB = ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
+					if (tB.valid) {
+						GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
+						gxDsA3dDrawBandTwoPass(tB, (int)r.hofs[0] & 0x1FF, y0, y1);
+					}
+					continue;
+				}
 				const GxDsA3dTex &t3 = ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
 				if (!t3.valid) continue;
 				gxDsBTevReplace();
@@ -2640,6 +2764,269 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 		}
 	}
 }
+
+#if GXDS_CORE == 0
+// ---------------------------------------------------------------------
+// Task 13d: two-pass mask-and-discard draw for BG0's 3D slot when the
+// 2nd-target set beneath it is a per-pixel mix (or a pure 2nd-target set with
+// a genuinely translucent 3D texel) -- see the bg==0+r.bg3d branch of
+// gxDsBPlanBand above for the rule this reproduces and why a single draw
+// mode can't do it.
+// ---------------------------------------------------------------------
+
+// Stage0 forced to a constant b/w colour (KONST, by `t2`) with alpha still the
+// usual "texel present" test (GX_TEV_COMP_A8_GT against a 255 constant, same
+// wiring gxDsBTevAlpha uses) -- i.e. "paint this layer's real shape (holes and
+// all) with a flat colour that says whether it's a 2nd target", the building
+// block gxDsBBuildUnder3DMask() below replays the under-stack with. Never
+// cached in s_tevK (called at most a few times per rare band, and it must
+// leave s_tevK in a state that forces the next gxDsBTevReplace()/gxDsBTevAlpha()
+// to fully reprogram stage0, since this leaves it in neither of those shapes).
+// Task 13d, revised: the mask is captured through the EFB's ALPHA channel (an
+// A8 copy destination) rather than its colour (an I8 copy destination samples
+// colour/luma, and a solid-colour round-trip through that path did not come
+// back as clean 0/255 on real hardware -- see gx-next-steps-log.md Task 13d).
+// A8 is the natural fit for gx_mask.h's own stated shadow-mask use case too
+// (alpha/stencil coverage, not colour). Colour is left as plain texture
+// replace (irrelevant -- never read back), and alpha does both jobs at once:
+// C in the presence compare (`GX_TEV_COMP_A8_GT`, same wiring gxDsBTevAlpha
+// uses) is the t2-conditional constant itself (255 if t2, 0 if not), so a
+// surviving (real-texel-present) pixel gets exactly that value and a hole
+// (blend no-op, alpha 0) leaves whatever an earlier lower-priority layer
+// already wrote there.
+static void gxDsBTevMaskConst(bool t2)
+{
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);   // colour: plain texture replace, never read back
+	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
+	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_COMP_A8_GT, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)(t2 ? 255 : 0) });
+	s_tevK = -2;   // neither TevReplace's (-1) nor a TevAlpha k: force a resync next use
+}
+
+// Replays exactly the layers gxDsBPlanBand's `under` walk enumerates as lying
+// beneath BG0's 3D slot in window-region `cfgIdx` of this band (backdrop, then
+// priority 3..0 -- BG3..BG0 then that tier's OBJ -- stopping just before BG0's
+// own priority tier's BG0/OBJ, the same stop point `under` is read at), but
+// into the mask scratch corner with each layer's real shape (its true holes)
+// painted a flat 2nd-target-or-not colour instead of its real colour. Always
+// the *plain* (non-fade) texture cache: only presence/absence and the t2 bit
+// matter here, and using the already-baked plain cache avoids depending on the
+// fade variant being baked too (it may not be, if nothing else in the band
+// needs it).
+static void gxDsBDrawBgLayerForMask(int bg, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int cfgIdx, int y0, int y1)
+{
+	const GxDsBCfg &cf = p.cfg[cfgIdx];
+	if (!((cf.mask >> bg) & 1)) return;
+	const GxDsBBgPlaneCache &pc = s_bgPlane[bg];
+	if (!pc.valid) return;
+	gxDsBTevMaskConst((bool)((p.t2 >> bg) & 1));
+	if (pc.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&pc.tlutObj), gxDsBBgSlotFor(bg));
+	for (int si = 0; si < p.nslab; ++si) {
+		const GxDsBSlab &sl = p.slab[si];
+		if (sl.y1 <= y0 || sl.y0 >= y1) continue;
+		for (int ri = 0; ri < sl.nrun; ++ri) {
+			const GxDsBRun &ru = sl.run[ri];
+			if (ru.cfg != cfgIdx) continue;
+			GX_SetScissor(k3dMaskEfbX + ru.x0, k3dMaskEfbY + sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
+			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
+			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
+		}
+	}
+}
+
+static void gxDsBDrawObjLayerForMask(int prio, const GxDsBBandPlan &p, int cfgIdx, int y0, int y1)
+{
+	const GxDsBCfg &cf = p.cfg[cfgIdx];
+	if (!((cf.mask >> 4) & 1)) return;
+	for (int i = s_objDrawCount - 1; i >= 0; --i) {
+		const GxDsBObjDraw &d = s_objDraws[i];
+		if (d.priority != prio) continue;
+		if (d.y >= y1 || d.y + d.boxH <= y0) continue;
+		bool inCfg = false;
+		for (int si = 0; si < p.nslab && !inCfg; ++si) {
+			const GxDsBSlab &sl = p.slab[si];
+			if (d.y >= sl.y1 || d.y + d.boxH <= sl.y0) continue;
+			for (int ri = 0; ri < sl.nrun; ++ri) {
+				const GxDsBRun &ru = sl.run[ri];
+				if (ru.cfg != cfgIdx) continue;
+				if (d.x >= ru.x1 || d.x + d.boxW <= ru.x0) continue;
+				inCfg = true; break;
+			}
+		}
+		if (!inCfg) continue;
+		const GxDsBObjTexSlot &slot = s_objTex[d.oamIndex];
+		if (!slot.valid) continue;
+		gxDsBTevMaskConst((bool)((p.t2 >> 4) & 1));
+		if (slot.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&slot.tlutObj), gxDsBObjSlotFor());
+		for (int si = 0; si < p.nslab; ++si) {
+			const GxDsBSlab &sl = p.slab[si];
+			if (d.y >= sl.y1 || d.y + d.boxH <= sl.y0) continue;
+			for (int ri = 0; ri < sl.nrun; ++ri) {
+				const GxDsBRun &ru = sl.run[ri];
+				if (ru.cfg != cfgIdx) continue;
+				if (d.x >= ru.x1 || d.x + d.boxW <= ru.x0) continue;
+				GX_SetScissor(k3dMaskEfbX + ru.x0, k3dMaskEfbY + sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
+				if (d.affine) { gxDsBDrawAffineObj(d, slot); continue; }
+				f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
+				f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
+				gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
+				              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
+			}
+		}
+	}
+}
+
+// Builds (into s_3dMask) the per-pixel "was the EFB pixel beneath BG0's 3D
+// slot produced by a BLDCNT 2nd-target layer" mask for band `b`'s window-region
+// `cfgIdx`, by replaying that under-stack into the scratch EFB corner with the
+// gx_mask.h primitive. Leaves viewport/scissor pointed at the scratch corner;
+// callers restore both before drawing anything else (gxMaskEnd() only undoes
+// the copy-src wiring, per its own contract).
+static void gxDsBBuildUnder3DMask(int b, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int cfgIdx, int y0, int y1)
+{
+	if (!s_3dMaskInit) {
+		s_3dMaskInit = gxMaskTarget_Init(&s_3dMask, kDsBScreenW, kDsBScreenH, GX_TF_A8);
+		if (!s_3dMaskInit) return;
+	}
+	gxMaskBegin(&s_3dMask, k3dMaskEfbX, k3dMaskEfbY);
+
+	// Backdrop: always beneath everything, never windowed, never has a hole.
+	gxDsBTevMaskConst((bool)((p.t2 >> 5) & 1));
+	GX_SetScissor(k3dMaskEfbX, k3dMaskEfbY + y0, kDsBScreenW, y1 - y0);
+	gxDsBDrawQuad(&s_backdropTexObj[b], 0, (f32)y0, (f32)kDsBScreenW, (f32)y1, 0, 0, 1, 1);
+
+	const int bg0Prio = r.bgPrio[0];
+	for (int prio = 3; prio >= bg0Prio; --prio) {
+		for (int bg = 3; bg >= 0; --bg) {
+			if (prio == bg0Prio && bg == 0) break;   // stop at BG0/3D's own slot -- `under` is read just before it
+			if (!((r.bgEnable >> bg) & 1) || r.bgPrio[bg] != prio) continue;
+			gxDsBDrawBgLayerForMask(bg, r, p, cfgIdx, y0, y1);
+		}
+		if (prio != bg0Prio && r.objEnable)
+			gxDsBDrawObjLayerForMask(prio, p, cfgIdx, y0, y1);
+	}
+
+	gxMaskEnd(&s_3dMask, k3dMaskEfbX, k3dMaskEfbY);
+	s_tevK = -2;   // gxDsBTevMaskConst() calls above never kept s_tevK in sync
+#ifdef DSB_STATS
+	{
+		const u8 *td = (const u8 *)s_3dMask.texData;
+		u32 zero = 0, full = 0, other = 0;
+		for (u32 i = 0; i < (u32)kDsBScreenW * kDsBScreenH; ++i) {
+			u8 v = td[i];
+			if (v == 0) ++zero; else if (v == 255) ++full; else ++other;
+		}
+		harness_profile_emitf(GXDS_TAG "mask3d b=%d cfg=%d bg0prio=%d zero=%u full=%u other=%u t2=%02x",
+		                       b, cfgIdx, r.bgPrio[0], zero, full, other, (unsigned)p.t2);
+	}
+#endif
+}
+
+// Adds an explicit second per-vertex UV attribute (GX_VA_TEX1 -> GX_TEXCOORD1,
+// identity texgen -- the same pass-through wiring gxDsBSetup2DState() already
+// uses for TEXCOORD0/TEX0) for the mask sample: always plain absolute
+// screen-pixel/[0,1] UV, independent of whatever scrolled/split UV the 3D
+// texture itself is using at TEXCOORD0/TEX0. An explicit attribute rather
+// than a GX_TG_POS-derived texgen so this only depends on the same
+// vertex-attribute pass-through gxDsBDrawQuad's TEXCOORD0 already relies on
+// (proven correct everywhere else in this file), not on a second, untested
+// mechanism. Callers must GX_SetNumTexGens(1) and GX_SetVtxDesc(GX_VA_TEX1,
+// GX_NONE) back down once done; nothing else in the per-band draw loop
+// expects a second texcoord to be live.
+static void gxDsBSetupMaskTexCoord1()
+{
+	GX_SetNumTexGens(2);
+	GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+	GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+}
+
+// Same screen rectangle as gxDsBDrawQuad, but also emits a second UV
+// (mask-space, plain absolute screen-pixel/[0,1]) at GX_VA_TEX1/TEXCOORD1.
+static void gxDsBDrawQuadMasked(GXTexObj *tex, f32 x0, f32 y0, f32 x1, f32 y1,
+                                 f32 s0, f32 t0, f32 s1, f32 t1)
+{
+	const f32 mu0 = x0 / (f32)kDsBScreenW, mu1 = x1 / (f32)kDsBScreenW;
+	const f32 mv0 = y0 / (f32)kDsBScreenH, mv1 = y1 / (f32)kDsBScreenH;
+	GX_LoadTexObj(tex, GX_TEXMAP0);
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position2f32(x0, y0); GX_TexCoord2f32(s0, t0); GX_TexCoord2f32(mu0, mv0);
+		GX_Position2f32(x1, y0); GX_TexCoord2f32(s1, t0); GX_TexCoord2f32(mu1, mv0);
+		GX_Position2f32(x1, y1); GX_TexCoord2f32(s1, t1); GX_TexCoord2f32(mu1, mv1);
+		GX_Position2f32(x0, y1); GX_TexCoord2f32(s0, t1); GX_TexCoord2f32(mu0, mv1);
+	GX_End();
+}
+
+// The two-pass draw itself: pass A (GX_BM_BLEND, masked to "beneath is a 2nd
+// target", real per-texel alpha from s_3dAlphaTexObj) then pass B (the mask's
+// complement, plain/fade opaque overwrite, same presence-only alpha the
+// existing single-pass gxDsA3dDrawBand uses). Same hofs quad-splitting as
+// gxDsA3dDrawBand (called per screen-space sub-quad, up to two).
+static void gxDsA3dDrawTwoPassQuad(const GxDsA3dTex &tB, f32 x0, f32 y0, f32 x1, f32 y1,
+                                    f32 s0, f32 t0, f32 s1, f32 t1)
+{
+	// Pass A: colour = s_3d (never faded -- the CPU never fades a blended 3D
+	// texel), alpha = real per-texel alpha (s_3dAlphaTexObj) masked to the
+	// "beneath is 2nd target" pixels. GX_BM_BLEND (global, SRCALPHA/INVSRCALPHA)
+	// then reproduces the CPU's blend formula for a translucent texel, and
+	// degenerates to an exact opaque overwrite for an opaque one (srcAlpha=255).
+	// Elsewhere (mask=0, or the 3D texel itself absent) alpha=0 -> no-op, left
+	// for pass B.
+	GX_SetNumTevStages(3);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
+	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
+	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+
+	GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP1, GX_COLORNULL);
+	GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+	GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
+	GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+
+	gxMaskApply(&s_3dMask, GX_TEVSTAGE2, GX_TEXMAP2, GX_TEXCOORD1);
+
+	GX_LoadTexObj(const_cast<GXTexObj *>(&s_3dAlphaTexObj), GX_TEXMAP1);
+	gxDsBDrawQuadMasked(const_cast<GXTexObj *>(&s_3d.texObj), x0, y0, x1, y1, s0, t0, s1, t1);
+
+	// Pass B: colour+presence-alpha = tB (plain or fade, caller's choice), then
+	// multiplied by the mask's complement -- everywhere pass A didn't already
+	// (correctly) claim.
+	GX_SetNumTevStages(2);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	gxMaskApplyInverse(&s_3dMask, GX_TEVSTAGE1, GX_TEXMAP2, GX_TEXCOORD1);
+	gxDsBDrawQuadMasked(const_cast<GXTexObj *>(&tB.texObj), x0, y0, x1, y1, s0, t0, s1, t1);
+}
+
+static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y1)
+{
+	gxDsA3dEnsureAlphaTex();
+#ifdef DSB_STATS
+	harness_profile_emitf(GXDS_TAG "mask3ddraw avalid=%d tbvalid=%d s3valid=%d hofs=%d y0=%d y1=%d",
+	                       (int)s_3dAlphaValid, (int)tB.valid, (int)s_3d.valid, hofs, y0, y1);
+#endif
+	if (!s_3dAlphaValid || !tB.valid || !s_3d.valid) return;
+	gxDsBSetupMaskTexCoord1();
+	const f32 v0 = (f32)y0 / (f32)k3dTexH, v1 = (f32)y1 / (f32)k3dTexH;
+	if (hofs < 256) {
+		const int xe = 256 - hofs;
+		gxDsA3dDrawTwoPassQuad(tB, 0, (f32)y0, (f32)xe, (f32)y1, (f32)hofs / 256.0f, v0, 1.0f, v1);
+	}
+	if (hofs > 256) {
+		const int xb = 512 - hofs;
+		gxDsA3dDrawTwoPassQuad(tB, (f32)xb, (f32)y0, 256.0f, (f32)y1, 0.0f, v0, (f32)(hofs - 256) / 256.0f, v1);
+	}
+	// Restore the single-texgen / single-tev-stage / single-UV baseline
+	// gxDsBSetup2DState() established: nothing else in the per-band draw loop
+	// expects a second texcoord/texgen or more than one TEV stage to be live.
+	GX_SetNumTevStages(1);
+	GX_SetNumTexGens(1);
+	GX_SetVtxDesc(GX_VA_TEX1, GX_NONE);
+	s_tevK = -2;
+}
+#endif // GXDS_CORE == 0
 
 // Bake-if-stale for one BG plane variant (plain, or the brighten/darken one).
 // Stale = never baked / VRAMCNT remap / config fingerprint mismatch / any byte of the
@@ -3055,6 +3442,9 @@ static bool gxDsBRenderFrameImpl()
 	gxDsBSetup2DState();
 	gxDsBTlutReset();   // task 11: assume nothing about TMEM's TLUT contents from an earlier frame / another engine
 	s_tevK = -1;
+#if GXDS_CORE == 0
+	s_3dMaskBand = -1; s_3dMaskCfg = -1;   // task 13d: this frame's mask cache is empty
+#endif
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 
@@ -3076,7 +3466,7 @@ static bool gxDsBRenderFrameImpl()
 			for (int bg = 3; bg >= 0; --bg) {
 				if (!((r.bgEnable >> bg) & 1)) continue;
 				if (r.bgPrio[bg] != prio) continue;
-				gxDsBDrawBgLayer(bg, r, pl, y0, y1);
+				gxDsBDrawBgLayer(b, bg, r, pl, y0, y1);
 			}
 			if (r.objEnable)
 				gxDsBDrawObjLayer(prio, pl, y0, y1);

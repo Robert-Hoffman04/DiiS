@@ -61,3 +61,19 @@ void gxMaskApply(GXMaskTarget *mt, u8 tevStage, u8 texMapSlot, u8 texCoordSlot)
 	GX_SetTevAlphaIn(tevStage, GX_CA_ZERO, GX_CA_APREV, GX_CA_TEXA, GX_CA_ZERO);
 	GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 }
+
+void gxMaskApplyInverse(GXMaskTarget *mt, u8 tevStage, u8 texMapSlot, u8 texCoordSlot)
+{
+	GX_LoadTexObj(&mt->texObj, texMapSlot);
+	GX_SetTevOrder(tevStage, texCoordSlot, texMapSlot, GX_COLORNULL);
+
+	// The standard TEV lerp combiner is out = A*(1-C) + B*C (+D, D=0 here).
+	// Picking A = CPREV/APREV (the running value), B = ZERO, C = TEXC/TEXA
+	// (the mask) gives out = running * (1 - mask) - the complement of
+	// gxMaskApply's running * mask.
+	GX_SetTevColorIn(tevStage, GX_CC_CPREV, GX_CC_ZERO, GX_CC_TEXC, GX_CC_ZERO);
+	GX_SetTevColorOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+
+	GX_SetTevAlphaIn(tevStage, GX_CA_APREV, GX_CA_ZERO, GX_CA_TEXA, GX_CA_ZERO);
+	GX_SetTevAlphaOp(tevStage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+}
