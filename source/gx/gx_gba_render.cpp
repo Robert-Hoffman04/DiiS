@@ -1,3 +1,4 @@
+#include <math.h>
 #include "gx_gba_render.h"
 #include "gx_color.h"
 #include "gx_swizzle.h"
@@ -1683,11 +1684,18 @@ static void gxDrawAffineBgQuad(int which, const GxGbaBandRegs &r, int y0, int y1
 
 	f32 norm = (f32)pc.bufPx;
 	f32 off = pc.wrap ? 0.0f : 1.0f;
+	f32 uu[4] = { (tx0 + off) / norm, (tx1 + off) / norm, (tx2 + off) / norm, (tx3 + off) / norm };
+	f32 vv[4] = { (ty0 + off) / norm, (ty1 + off) / norm, (ty2 + off) / norm, (ty3 + off) / norm };
+	if (pc.wrap) {
+		// Task 25: the host GPU samples negative GX_REPEAT texcoords inexactly (see the DS twin,
+		// gxDsBDrawAffineBgQuad). Lift by whole periods so every corner is >= 0: exact when wrapping.
+		f32 mu = uu[0], mv = vv[0];
+		for (int k = 1; k < 4; ++k) { if (uu[k] < mu) mu = uu[k]; if (vv[k] < mv) mv = vv[k]; }
+		const f32 su = mu < 0.0f ? ceilf(-mu) : 0.0f, sv = mv < 0.0f ? ceilf(-mv) : 0.0f;
+		for (int k = 0; k < 4; ++k) { uu[k] += su; vv[k] += sv; }
+	}
 	gxDrawQuadFree(texOverride ? texOverride : &pc.texObj, 0, (f32)y0, GBA_SCREEN_W, (f32)y1,
-	               (tx0 + off) / norm, (ty0 + off) / norm,
-	               (tx1 + off) / norm, (ty1 + off) / norm,
-	               (tx2 + off) / norm, (ty2 + off) / norm,
-	               (tx3 + off) / norm, (ty3 + off) / norm);
+	               uu[0], vv[0], uu[1], vv[1], uu[2], vv[2], uu[3], vv[3]);
 }
 
 // ---------------------------------------------------------------------

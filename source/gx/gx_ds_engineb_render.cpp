@@ -10,6 +10,7 @@
 #ifdef DSB_FORCE_CPU
 #define GXDS_FORCE_CPU 1
 #endif
+#include <math.h>
 #include "gx_ds_engine_impl.inc"
 
 // Shared write-funnel entry points (declared in gx_ds_engineb_render.h): one call from

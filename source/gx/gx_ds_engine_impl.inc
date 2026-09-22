@@ -2438,6 +2438,18 @@ static void gxDsBDrawAffineBgQuad(const GxDsBBgPlaneCache &pcc, const GxDsBBandR
 		u[k] = (gxDsBAffineCorner(X0 + ci[k] * pa + ri[k] * pb, pa, pb) + off) / nW;
 		v[k] = (gxDsBAffineCorner(Y0 + ci[k] * pcm + ri[k] * pd, pcm, pd) + off) / nH;
 	}
+	if (pc.cfgWrap) {
+		// Task 25 (root cause of lz_c10/lz_c17 GX != CPU): the host GPU samples NEGATIVE texture
+		// coordinates inexactly under GX_NEAR + GX_REPEAT (measured on Dolphin: with V in
+		// [-0.16, 1.4) a sparse set of pixels sitting 2/256 texel below a texel edge picked the
+		// next texel; the same UVs shifted by +1 were byte-exact). With wrapping, adding whole
+		// texture periods is exact, so lift every corner to >= 0 (interpolation is linear, so the
+		// corners bound the whole quad).
+		f32 mu = u[0], mv = v[0];
+		for (int k = 1; k < 4; ++k) { if (u[k] < mu) mu = u[k]; if (v[k] < mv) mv = v[k]; }
+		const f32 su = mu < 0.0f ? ceilf(-mu) : 0.0f, sv = mv < 0.0f ? ceilf(-mv) : 0.0f;
+		for (int k = 0; k < 4; ++k) { u[k] += su; v[k] += sv; }
+	}
 	gxDsBDrawQuadFree(&pc.texObj, 0, (f32)y0, (f32)kDsBScreenW, (f32)y1,
 	                  u[0], v[0], u[1], v[1], u[2], v[2], u[3], v[3]);
 }
