@@ -1130,6 +1130,37 @@ static bool gxObjSlotDepsDirty(const GxObjTexSlot &slot)
 	return gxObjPaletteDepsDirty(slot.colorMode, slot.palNum);
 }
 
+// Task 23: split form of gxObjSlotDepsDirty(), same rationale as the BG-plane
+// split helpers above.
+static void gxObjSlotDepsDirtySplit(const GxObjTexSlot &slot, bool *vramDirty, bool *palDirty)
+{
+	*vramDirty = gxObjVramDepsDirty(slot.oneDim, slot.colorMode, slot.tileNum, slot.texW / 8, slot.texH / 8);
+	*palDirty = gxObjPaletteDepsDirty(slot.colorMode, slot.palNum);
+}
+
+// Task 23: rebuild ONLY this sprite slot's TLUT -- see gxRebuildBgPlaneTlut's
+// identical rationale. Mirrors gxBakeObjTexture's TLUT-build block exactly.
+// No GX_LoadTlut here: s_objTex[] slots share ONE hardware TLUT name
+// (kObjTlutSlot), reloaded from slot.tlutData at DRAW time every draw
+// regardless of whether this frame rebaked or rebuilt-only (see
+// gxDrawObjLayerWindowed) -- a full bake relies on exactly the same reload,
+// so this fast path needs no extra bookkeeping to stay correct.
+static void gxRebuildObjTlut(GxObjTexSlot &slot)
+{
+	u16 *tlut = (u16 *)slot.tlutData;
+	if (slot.colorMode) {
+		for (int e = 0; e < 256; ++e)
+			tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxObjPalColor(e));
+		DCFlushRange(slot.tlutData, 256 * sizeof(u16));
+		GX_InitTlutObj(&slot.tlutObj, slot.tlutData, GX_TL_RGB5A3, 256);
+	} else {
+		for (int e = 0; e < 16; ++e)
+			tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxObjPalColor(slot.palNum * 16 + e));
+		DCFlushRange(slot.tlutData, 16 * sizeof(u16));
+		GX_InitTlutObj(&slot.tlutObj, slot.tlutData, GX_TL_RGB5A3, 16);
+	}
+}
+
 // True if s_objTex[d.oamIndex] is stale and gxBakeObjTexture() needs to
 // run for it this frame -- either its own OAM fields changed since the
 // last bake into this slot (including a completely different sprite now
@@ -1139,9 +1170,13 @@ static bool gxObjSlotDepsDirty(const GxObjTexSlot &slot)
 // bytes since both bakes read the same VRAM/palette bytes under the same
 // field values), or its fields are unchanged but the exact VRAM/palette
 // bytes that configuration depends on were written since.
+// Task 23: when the config fingerprint and the VRAM tile bytes are unchanged
+// and only this sprite's palette dependency was written, this rebuilds the
+// TLUT in place (cheap: 32-512 bytes) and returns false -- no full re-bake
+// (re-decode + re-swizzle + re-upload of the index texture) needed.
 static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
 {
-	const GxObjTexSlot &slot = s_objTex[d.oamIndex];
+	GxObjTexSlot &slot = s_objTex[d.oamIndex];
 
 	u32 oamOff = d.oamIndex * 8;
 	u16 a0 = T1ReadWord(MMU.GBA_OAM, oamOff);
@@ -1158,7 +1193,13 @@ static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
 	if (!sameConfig)
 		return true;
 
-	return gxObjSlotDepsDirty(slot);
+	bool vramDirty, palDirty;
+	gxObjSlotDepsDirtySplit(slot, &vramDirty, &palDirty);
+	if (vramDirty)
+		return true;
+	if (palDirty)
+		gxRebuildObjTlut(slot);
+	return false;
 }
 
 // ---------------------------------------------------------------------
@@ -1237,13 +1278,51 @@ static bool gxBgPlaneDepsDirty(const GxBgPlaneCache &pc)
 	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
 }
 
+// Task 23: same ranges as gxBgPlaneDepsDirty(), split into VRAM (char+map) vs
+// palette so a caller can tell "the tile/tilemap bytes are untouched" from
+// "only the BG palette bank was written". This file's text-BG TLUT (see
+// gxBakeBgPlane) is already a pure function of the whole 512-byte BG palette
+// bank -- it never walks the tilemap, so a palette-only-dirty plane can have
+// its TLUT rebuilt in place with no tilemap/tile re-decode, re-swizzle or
+// re-upload of the (unchanged) index texture at all.
+static void gxBgPlaneDepsDirtySplit(const GxBgPlaneCache &pc, bool *vramDirty, bool *palDirty)
+{
+	u32 tileBytes = pc.cfgColorMode ? 64 : 32;
+	*vramDirty = gxVramSpanDirty(pc.cfgCharBase, 1024u * tileBytes);
+	if (!*vramDirty) {
+		u32 mapRangeBytes = (u32)(pc.mapWpx / 8) * (u32)(pc.mapHpx / 8) * 2;
+		*vramDirty = gxVramSpanDirty(pc.cfgMapBase, mapRangeBytes);
+	}
+	*palDirty = gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
+}
+
+// Task 23: rebuild ONLY a text BG plane's TLUT (see the identical index-0
+// transparency rule inside gxBakeBgPlane -- kept in sync with it, not a
+// reimplementation) without touching pc.texData (the CI8 index texture),
+// which cannot have changed since the plane's char/map VRAM read-set is, by
+// the caller's own check, clean.
+static void gxRebuildBgPlaneTlut(GxBgPlaneCache &pc, u8 tlutSlot)
+{
+	u16 *tlut = (u16 *)pc.tlutData;
+	for (int e = 0; e < 256; ++e) {
+		bool transparentEntry = pc.cfgColorMode ? (e == 0) : ((e & 0xF) == 0);
+		tlut[e] = transparentEntry ? kTransparentTexel : gxOpaqueTexel(gxBgPalColor(e));
+	}
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
+	GX_LoadTlut(&pc.tlutObj, tlutSlot);
+}
+
 // True if s_bgPlane[bg] is stale and gxBakeBgPlane(bg) needs to run for it
 // this frame -- either its own tile/map layout changed since the last bake
 // into this slot, or its fields are unchanged but the (conservative, see
 // above) VRAM char/map ranges or the BG palette bank were written since.
+// Task 23: when the config and the char/map VRAM ranges are unchanged and
+// only the BG palette bank was written, this rebuilds the TLUT in place
+// (cheap: 512 bytes) and returns false -- no full re-bake needed.
 static bool gxBgPlaneNeedsRebake(int bg, const GxBgLayout &li)
 {
-	const GxBgPlaneCache &pc = s_bgPlane[bg];
+	GxBgPlaneCache &pc = s_bgPlane[bg];
 	int mapWpx = li.mapWtiles * 8, mapHpx = li.mapHtiles * 8;
 
 	bool sameConfig = pc.valid &&
@@ -1253,7 +1332,13 @@ static bool gxBgPlaneNeedsRebake(int bg, const GxBgLayout &li)
 	if (!sameConfig)
 		return true;
 
-	return gxBgPlaneDepsDirty(pc);
+	bool vramDirty, palDirty;
+	gxBgPlaneDepsDirtySplit(pc, &vramDirty, &palDirty);
+	if (vramDirty)
+		return true;
+	if (palDirty)
+		gxRebuildBgPlaneTlut(pc, gxBgTlutSlot(bg));
+	return false;
 }
 
 // Task 21: dependency test from the affine plane's cached fingerprint.
@@ -1268,11 +1353,37 @@ static bool gxAffineBgPlaneDepsDirty(const GxAffineBgPlaneCache &pc)
 	return gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
 }
 
+// Task 23: split form of gxAffineBgPlaneDepsDirty(), same rationale as
+// gxBgPlaneDepsDirtySplit() above. The affine-BG TLUT (gxBakeAffineBgPlane)
+// is also a pure function of the whole 512-byte BG palette bank.
+static void gxAffineBgPlaneDepsDirtySplit(const GxAffineBgPlaneCache &pc, bool *vramDirty, bool *palDirty)
+{
+	*vramDirty = gxVramSpanDirty(pc.cfgCharBase, 256u * 64);
+	if (!*vramDirty) {
+		u32 mapTiles = (u32)pc.mapPx / 8;
+		*vramDirty = gxVramSpanDirty(pc.cfgMapBase, mapTiles * mapTiles);
+	}
+	*palDirty = gxRangeDirty(g_gbaFramePlan.palette, 0, 512);
+}
+
+// Task 23: rebuild ONLY an affine BG plane's TLUT -- see gxRebuildBgPlaneTlut's
+// identical rationale. Mirrors gxBakeAffineBgPlane's TLUT-build block exactly.
+static void gxRebuildAffineBgTlut(GxAffineBgPlaneCache &pc, u8 tlutSlot)
+{
+	u16 *tlut = (u16 *)pc.tlutData;
+	for (int e = 0; e < 256; ++e)
+		tlut[e] = (e == 0) ? kTransparentTexel : gxOpaqueTexel(gxBgPalColor(e));
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
+	GX_LoadTlut(&pc.tlutObj, tlutSlot);
+}
+
 // True if s_affBgPlane[which] is stale and gxBakeAffineBgPlane(which, cnt)
-// needs to run for it this frame. `which`: 0=BG2, 1=BG3.
+// needs to run for it this frame. `which`: 0=BG2, 1=BG3. Task 23: same
+// palette-only fast path as gxBgPlaneNeedsRebake() above.
 static bool gxAffineBgPlaneNeedsRebake(int which, u16 cnt)
 {
-	const GxAffineBgPlaneCache &pc = s_affBgPlane[which];
+	GxAffineBgPlaneCache &pc = s_affBgPlane[which];
 	u32 charBase = ((cnt >> 2) & 3) * 0x4000;
 	u32 mapBase = ((cnt >> 8) & 0x1F) * 0x800;
 	int sizeSel = (cnt >> 14) & 3;
@@ -1289,7 +1400,13 @@ static bool gxAffineBgPlaneNeedsRebake(int which, u16 cnt)
 	if (!sameConfig)
 		return true;
 
-	return gxAffineBgPlaneDepsDirty(pc);
+	bool vramDirty, palDirty;
+	gxAffineBgPlaneDepsDirtySplit(pc, &vramDirty, &palDirty);
+	if (vramDirty)
+		return true;
+	if (palDirty)
+		gxRebuildAffineBgTlut(pc, gxAffineBgTlutSlot(which));
+	return false;
 }
 
 // ---------------------------------------------------------------------

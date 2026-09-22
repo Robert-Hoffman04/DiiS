@@ -95,6 +95,10 @@ static bool s_dsbOldVramArm; // the old whole-region VRAM flag (BBG/BOBJ page wr
 static u32 s_dsbBakeCi, s_dsbBakeRgb, s_dsbBakeFallback, s_dsbTlutLoads;
 static u64 s_dsbBakedBytes, s_dsbBakedBytesRgbEquiv;
 static u64 s_dsbBakeTicks;   // emulated-timebase ticks spent inside bakes (Dolphin's PPC timing is approximate: indicative only)
+// task 23: palette-only TLUT rebuilds (index texture untouched) counted separately from
+// a full bake (s_dsbBakeCi/s_dsbBakeRgb above) -- see gxDsBEnsureBgPlane/gxDsBEnsureObjTex.
+static u32 s_dsbTlutOnlyBg, s_dsbTlutOnlyObj;
+static u64 s_dsbTlutOnlyTicks;
 #define DSB_WHY(s_) do { s_dsbWhy = (s_); } while (0)
 #else
 #define DSB_WHY(s_) do { } while (0)
@@ -451,6 +455,34 @@ static bool gxDsBDepsDirty(const GxDsBDeps &d)
 	return false;
 }
 
+// Task 23: same as gxDsBDepsDirty(), split into its two independent halves so a caller
+// can tell "the recorded VRAM read-set is untouched" from "only the recorded palette
+// read-set was written" -- the two are already tracked as separate bitmasks in
+// GxDsBDeps (vram[]/pal[]), so this is a read-only decomposition of the existing
+// dependency test, not new tracking. A palette-only-dirty cache whose format is `ci`
+// (task 11) only needs its TLUT rebuilt (see gxDsBRebuildBgTlut/gxDsBRebuildObjTlut),
+// not its index texture re-decoded/re-swizzled/re-uploaded, because the TLUT is the
+// entire palette dependency: the index texture never encodes colour, only which
+// palette entry a texel names (see gx_ds_engineb_render.h "Native CI4/CI8 + TLUT").
+static void gxDsBDepsDirtySplit(const GxDsBDeps &d, bool *vramDirty, bool *palDirty)
+{
+#ifdef DSB_MUTATE_NODEPS
+	*vramDirty = false; *palDirty = false; return;
+#endif
+	*vramDirty = false;
+	if (GXDS_PLAN.vram.anyDirty()) {
+		for (u32 w = 0; w < kDsBVramWords && !*vramDirty; ++w)
+			for (u32 b = d.vram[w]; b; b &= b - 1)
+				if (GXDS_PLAN.vram.isPageDirty((w << 5) + (u32)__builtin_ctz(b))) { *vramDirty = true; break; }
+	}
+	*palDirty = false;
+	if (GXDS_PLAN.palette.anyDirty()) {
+		for (u32 w = 0; w < 2 && !*palDirty; ++w)
+			for (u32 b = d.pal[w]; b; b &= b - 1)
+				if (GXDS_PLAN.palette.isPageDirty((w << 5) + (u32)__builtin_ctz(b))) { *palDirty = true; break; }
+	}
+}
+
 // A cached texture that is NOT being (re)baked this frame -- disabled plane, invisible
 // / parked sprite, fade variant not in use -- must still be dropped when its inputs
 // changed, because the dirty bitmaps are cleared every frame (see Stage 1 below).
@@ -498,6 +530,15 @@ struct GxDsBBgPlaneCache {
 	GXTlutObj tlutObj;
 	void *tlutData;    // 256 RGB5A3 entries (512B), owned by this cache, rebuilt by every bake
 	u16 tlutEntries;
+	// task 23: which 16-colour sub-banks (4bpp text, combined index) / which extended-
+	// palette 256-colour slice (single-slice ext text / ext AffineExt_256x16) had at
+	// least one opaque texel in the LAST full bake -- exactly gxDsBBakeBgPlane's/
+	// gxDsBBakeAffineBgPlane's own local `usedPal`, kept around so a palette-only
+	// rebuild (index bytes unchanged, so which banks/slice are referenced cannot have
+	// changed either) can rebuild the TLUT without re-walking the tilemap. Unused
+	// (0) for the plain-8bpp/plain-affine/bitmap cases, which always TLUT the whole
+	// 256-entry bank regardless of usedPal -- see gxDsBRebuildBgTlut().
+	u32 usedPal;
 };
 static GxDsBBgPlaneCache s_bgPlane[4];
 static GxDsBBgPlaneCache s_bgPlaneFx[4]; // task 9: brighten/darken variant of each plane (lazily baked)
@@ -1293,6 +1334,54 @@ static void gxDsBTlutFromPal(u16 *tlut, const u8 *base, int n)
 	for (int e = 1; e < n; ++e)
 		tlut[e] = gxDsBOpaqueTexel(T1ReadWord((void *)base, (u32)e * 2));
 }
+// Task 23: rebuild ONLY the TLUT of an already-CI, already-valid BG plane cache whose
+// recorded VRAM read-set (tilemap + tiles + ext-palette-slice pointer bytes) is clean
+// but whose recorded palette read-set was written -- e.g. a palette-fade effect that
+// rewrites colours in place without touching a single tile or map byte. The index
+// texture (`pc.texData`) is exactly what the last full bake left it as and does not
+// need re-decoding, re-swizzling or re-uploading; only the 256-entry RGB5A3 TLUT next
+// to it is out of date. Mirrors exactly the TLUT-building block inside
+// gxDsBBakeBgPlane()/gxDsBBakeAffineBgPlane() (kept in sync with those, not a
+// reimplementation with independent logic) but reads `pc.usedPal`/`pc.cfgExtPal`/
+// `pc.cfgColorMode`/`pc.cfgType` (the last full bake's own results) instead of
+// re-deriving them from a VRAM walk. Caller has already confirmed `pc.ci` (a
+// multi-slice extended-palette plane's RGB5A3 fallback form has no TLUT at all: it
+// must always take the full re-resolve path, same as before this task).
+static void gxDsBRebuildBgTlut(GxDsBBgPlaneCache &pc, u8 slot)
+{
+	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
+	u16 *const tlut = (u16 *)pc.tlutData;
+	memset(tlut, 0, 256 * sizeof(u16));
+	const bool text4bpp = (pc.cfgType == (u8)BGType_Text) && !pc.cfgColorMode;
+	if (text4bpp) {
+		for (int pn = 0; pn < 16; ++pn)
+			if ((pc.usedPal >> pn) & 1)
+				for (int e = 1; e < 16; ++e)
+					tlut[pn * 16 + e] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)(pn * 16 + e) * 2));
+	} else if (pc.cfgExtPal) {
+		if (pc.usedPal)
+			gxDsBTlutFromPal(tlut, pc.cfgExtPal + (u32)__builtin_ctz(pc.usedPal) * 512, 256);
+	} else {
+		gxDsBTlutFromPal(tlut, pal, 256);
+	}
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	s_tlutOwner[slot] = NULL;   // force the next gxDsBBindTlut() to reload this name from the new data
+}
+
+// Task 23: same idea as gxDsBRebuildBgTlut() for one OBJ slot. An OBJ's TLUT depends
+// only on its own fixed (palIndex, depth, extPal-slice) fields -- already the slot's
+// own cached fingerprint -- and the current palette bytes, never on the sprite's
+// index texture, so this needs no per-sprite "usedPal"-style bookkeeping at all.
+static void gxDsBRebuildObjTlut(GxDsBObjTexSlot &slot, u8 tlutSlot)
+{
+	u8 *const pal = MMU.ARM9_VMEM + kDsBObjPalOff;
+	u16 *const tlut = (u16 *)slot.tlutData;
+	if (slot.cfgDepth) gxDsBTlutFromPal(tlut, slot.cfgExtPal ? slot.cfgExtPal : pal, 256);
+	else gxDsBTlutFromPal(tlut, pal + (u32)slot.cfgPalIndex * 32, 16);
+	DCFlushRange(slot.tlutData, (u32)slot.tlutEntries * sizeof(u16));
+	s_tlutOwner[tlutSlot] = NULL;
+}
+
 // In-place u16 -> u8 compaction (write index i lands at or before read index i).
 static void gxDsBCompact8(u16 *buf, u32 n)
 {
@@ -1507,6 +1596,7 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	pc.cfgAuxBase = 0;
 	pc.cfgExtPal = extPal;
 	pc.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
+	pc.usedPal = usedPal;   // task 23: which sub-banks/slice this bake's index data actually references
 	pc.valid = true;
 }
 
@@ -1695,6 +1785,7 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	pc.cfgAuxBase = auxBase;
 	pc.cfgExtPal = extPal;
 	pc.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
+	pc.usedPal = usedPal;   // task 23: see gxDsBBakeBgPlane's identical field for the rationale
 	pc.valid = true;
 }
 
@@ -2571,7 +2662,33 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 	                pc.cfgScreenSize != (u8)cnt.ScreenSize ||
 	                pc.cfgType != (u8)type || pc.cfgExtPal != gxDsBExtPalFor(bg) ||
 	                (affine && (pc.cfgWrap != (u8)(cnt.PaletteSet_Wrap ? 1 : 0) || pc.cfgAuxBase != auxBase));
-	if (!needBake && gxDsBDepsDirty(pc.deps)) needBake = true;
+	// Task 23: a config-fingerprint-clean, still-valid, CI cache whose recorded VRAM
+	// read-set is untouched but whose recorded palette read-set was written needs
+	// only its TLUT rebuilt, not a full re-bake (re-decode + re-swizzle + re-upload
+	// of the index texture, which cannot have changed: the index texture never
+	// encodes colour). A non-CI cache (RGB5A3 fallback: direct-colour or multi-slice
+	// extended palette) has no separable TLUT and always takes the full path below,
+	// same as before this task.
+	if (!needBake) {
+		bool vramDirty = false, palDirty = false;
+		gxDsBDepsDirtySplit(pc.deps, &vramDirty, &palDirty);
+		if (vramDirty) {
+			needBake = true;
+		} else if (palDirty) {
+			if (pc.ci) {
+#ifdef DSB_STATS
+				const u64 t0 = gettime();
+#endif
+				gxDsBRebuildBgTlut(pc, gxDsBBgSlotFor(bg));
+#ifdef DSB_STATS
+				s_dsbTlutOnlyTicks += gettime() - t0;
+				++s_dsbTlutOnlyBg;
+#endif
+			} else {
+				needBake = true;
+			}
+		}
+	}
 #ifdef DSB_VERIFY
 	// Test hook: a plane the gate says is still fresh is re-baked into a scratch copy
 	// and compared byte-for-byte; any difference is a missed dependency.
@@ -2618,7 +2735,27 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	                slot.cfgBoundary != gpu->sprBoundary ||
 	                slot.cfgExtPal != gxDsBObjExtPalFor(d) ||
 	                slot.cfgBordered != (u8)(d.affine ? 1 : 0);
-	if (!needBake && gxDsBDepsDirty(slot.deps)) needBake = true;
+	// Task 23: same palette-only fast path as gxDsBEnsureBgPlane() above.
+	if (!needBake) {
+		bool vramDirty = false, palDirty = false;
+		gxDsBDepsDirtySplit(slot.deps, &vramDirty, &palDirty);
+		if (vramDirty) {
+			needBake = true;
+		} else if (palDirty) {
+			if (slot.ci) {
+#ifdef DSB_STATS
+				const u64 t0 = gettime();
+#endif
+				gxDsBRebuildObjTlut(slot, gxDsBObjSlotFor());
+#ifdef DSB_STATS
+				s_dsbTlutOnlyTicks += gettime() - t0;
+				++s_dsbTlutOnlyObj;
+#endif
+			} else {
+				needBake = true;
+			}
+		}
+	}
 #ifdef DSB_VERIFY
 	if (!needBake && slot.valid) {
 		GxDsBObjTexSlot tmp; memset(&tmp, 0, sizeof(tmp));
@@ -2733,11 +2870,13 @@ static bool gxDsBRenderFrameImpl()
 						const GxDsBObjTexSlot *c[2] = { &s_objTex[i], &s_objTexFx[i] };
 						for (int k = 0; k < 2; ++k) if (c[k]->valid) { live += c[k]->texBytes; rgb += (u32)c[k]->bufW * c[k]->bufH * 2; nci += c[k]->ci; ++ntex; }
 					}
-					harness_profile_emitf(GXDS_TAG "m tex=%u ci=%u live=%u rgb5a3equiv=%u bakes_ci=%u bakes_rgb=%u fallback=%u baked_bytes=%u baked_equiv=%u tlutloads=%u bake_us=%u",
+					harness_profile_emitf(GXDS_TAG "m tex=%u ci=%u live=%u rgb5a3equiv=%u bakes_ci=%u bakes_rgb=%u fallback=%u baked_bytes=%u baked_equiv=%u tlutloads=%u bake_us=%u tlut_only_bg=%u tlut_only_obj=%u tlut_only_us=%u",
 					                      (unsigned)ntex, (unsigned)nci, (unsigned)live, (unsigned)rgb,
 					                      (unsigned)s_dsbBakeCi, (unsigned)s_dsbBakeRgb, (unsigned)s_dsbBakeFallback,
 					                      (unsigned)s_dsbBakedBytes, (unsigned)s_dsbBakedBytesRgbEquiv, (unsigned)s_dsbTlutLoads,
-					                      (unsigned)ticks_to_microsecs(s_dsbBakeTicks));
+					                      (unsigned)ticks_to_microsecs(s_dsbBakeTicks),
+					                      (unsigned)s_dsbTlutOnlyBg, (unsigned)s_dsbTlutOnlyObj,
+					                      (unsigned)ticks_to_microsecs(s_dsbTlutOnlyTicks));
 				}
 #endif
 			}
