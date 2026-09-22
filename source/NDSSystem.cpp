@@ -1441,6 +1441,14 @@ static void execHardware_hblank()
 					const u16 *px = (const u16 *)GPU_screen;
 					for (u32 i = 0; i < sizeof(GPU_screen) / 2; ++i) h = (h ^ (u32)(px[i] & 0x7FFF)) * 16777619u;
 					harness_profile_emitf("fcrc %u %08x", (unsigned)s_fcrcFrame++, (unsigned)h);
+					// Task 24 hook: hash emulated state (main RAM, LCDC VRAM) to find whether divergence is in
+					// emulation or only in rendering.
+					u32 hm = 2166136261u, hv = 2166136261u;
+					const u32 *pm = (const u32 *)MMU.MAIN_MEM;
+					for (u32 i = 0; i < 0x400000 / 4; ++i) hm = (hm ^ pm[i]) * 16777619u;
+					const u32 *pv = (const u32 *)MMU.ARM9_LCD;
+					for (u32 i = 0; i < 0xA4000 / 4; ++i) hv = (hv ^ pv[i]) * 16777619u;
+					harness_profile_emitf("fmem %u %08x %08x", (unsigned)(s_fcrcFrame - 1), (unsigned)hm, (unsigned)hv);
 				}
 #endif
 			}

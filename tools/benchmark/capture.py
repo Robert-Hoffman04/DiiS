@@ -140,7 +140,13 @@ class Capture:
         a = self.args
         if not a.capture_frame or self.requested_capture:
             return
-        if self.frame >= a.settle_frame:
+        # Task 24: ask for the capture at an exact device frame (the "@N" suffix) and send it
+        # immediately, so the captured frame no longer depends on host->device latency
+        # (which made animated scenes hash differently run to run).
+        if a.settle_frame > 0:
+            send(wire.PKT_CTRL, f"capture_frame {a.capture_frame} @{a.settle_frame}")
+            self.requested_capture = True
+        elif self.frame >= a.settle_frame:
             send(wire.PKT_CTRL, f"capture_frame {a.capture_frame}")
             self.requested_capture = True
 

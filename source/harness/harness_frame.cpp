@@ -22,12 +22,29 @@
 static u32  s_every  = 0;
 static char s_label[32];
 static int  s_pending = 0;
+static u32  s_target  = 0;   // 0 = capture at the next tick; N = capture exactly when the frame counter reaches N
 
 void harness_frame_set_every(u32 n) { s_every = n; }
 
+// label may carry a trailing "@N" (e.g. "frame @200"): capture exactly at device frame N instead
+// of at whichever frame the request happens to be drained. Without it the captured frame depends
+// on host->device network latency, which made animated scenes hash differently run to run
+// (gx-next-steps-log.md task 24).
 void harness_frame_request(const char *label)
 {
 	s_label[0] = 0;
+	s_target = 0;
+	char tmp[32];
+	if (label) {
+		strncpy(tmp, label, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
+		char *at = strchr(tmp, '@');
+		if (at) {
+			s_target = (u32)strtoul(at + 1, 0, 10);
+			while (at > tmp && at[-1] == ' ') at--;
+			*at = 0;
+			label = tmp;
+		}
+	}
 	if (label) { strncpy(s_label, label, sizeof s_label - 1); s_label[sizeof s_label - 1] = 0; }
 	s_pending = 1;
 }
@@ -78,8 +95,9 @@ void harness_frame_capture(const char *label)
 
 void harness_frame_tick(u32 frame)
 {
-	if (s_pending) {
+	if (s_pending && (s_target == 0 || frame >= s_target)) {
 		s_pending = 0;
+		s_target = 0;
 		harness_frame_capture(s_label[0] ? s_label : 0);
 		return;
 	}
