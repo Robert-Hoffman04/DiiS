@@ -129,7 +129,7 @@ public:
 			commandCursor = 0;
 			size = 0;
 
-			// A “command without parameters” is one of the four following commands:
+			// A ï¿½command without parametersï¿½ is one of the four following commands:
 			// - PushMatrix
 			// - LoadIdentity
 			// - End
@@ -618,6 +618,11 @@ static void SetVertex(){
 	vert.coord[1] = coordTransformed[1];
 	vert.coord[2] = coordTransformed[2];
 	vert.coord[3] = coordTransformed[3];
+	// Task 13e: stash the pre-transform object-space position too -- see VERT::objcoord's
+	// comment in gfx3d.h. `coord[]` here is still the un-multiplied value at this point.
+	vert.objcoord[0] = coord[0];
+	vert.objcoord[1] = coord[1];
+	vert.objcoord[2] = coord[2];
 	vert.color[0] = GFX3D_5TO6(colorRGB[0]);
 	vert.color[1] = GFX3D_5TO6(colorRGB[1]);
 	vert.color[2] = GFX3D_5TO6(colorRGB[2]);

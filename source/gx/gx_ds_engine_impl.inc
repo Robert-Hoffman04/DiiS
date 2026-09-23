@@ -28,6 +28,7 @@
 #include "../MMU.h"
 #if GXDS_CORE == 0
 #include "../gfx3d.h"    // gfx3d_convertedScreen / g_gfx3dRenderSeq (Engine A's 3D layer input)
+#include "gx_ds_3d_render.h"   // task 13e: GX geometry-pass test draw (DSA_GXGEOM_ENABLE)
 #endif
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
@@ -3621,6 +3622,31 @@ static bool gxDsBRenderFrameImpl()
 				gxDsBDrawObjLayer(prio, pl, y0, y1);
 		}
 	}
+
+#if GXDS_CORE == 0 && defined(DSA_GXGEOM_ENABLE)
+	// Task 13e: GX geometry-pass vertical slice, first real consumer of a second
+	// producer for the 3D layer (the existing CPU-rasterizer-into-texture path above
+	// is untouched and remains the only producer unless this compiles in AND the
+	// current frame is in scope). Deliberately drawn as a direct EFB overlay on top of
+	// the just-drawn 2D bands rather than replacing gxDsA3dEnsureTex's texture-slot
+	// contract (see gx-13e-design.md's deviation note + gx-next-steps-log.md's
+	// "Task 13e-slice" section for why: an EFB-only readback can't reproduce the 3D
+	// layer's per-pixel hole/opaque alpha without the same two-pass mask machinery
+	// task 13d needed, out of scope for this first slice). Exact-or-bail: only engages
+	// when gxDs3dGeomFrameSupported() says this frame's polylist is fully within the
+	// slice's supported scope (opaque, untextured, Z-buffer, no shadow, unclipped) --
+	// any other frame leaves the CPU-rasterizer-into-texture band draw above as the
+	// only thing that ran, byte-identical to a DSA_GXGEOM_ENABLE-off build.
+	if (any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported()) {
+		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+		if (gxRenderModeIsFast())
+			gxDs3dRenderFast();
+		else
+			gxDs3dRenderAccurate();
+	}
+#endif
+
 	gxDsBTevReplace();
 
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);

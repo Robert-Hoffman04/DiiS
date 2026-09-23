@@ -48,6 +48,13 @@
 //  26  same as case 6's BLDCNT/priorities but DISPCNT BG0_3D is off entirely (BG0 is a plain text
 //      BG, not routed through the 3D-layer/mask3d path at all) -- the other half of the "test it
 //      both ways" instruction
+//  27  item 13e minimal fixture: ONE flat-coloured opaque untextured triangle (no per-vertex
+//      colour variation, no quad, no second polygon), Z-buffer mode (glFlush WITHOUT
+//      GL_WBUFFERING -- every other case in this file uses W-buffering). Deliberately simpler
+//      than case 0: this is the true first byte-exact target for the GX geometry pass
+//      (gx-next-steps-log.md task 13e / gx-13e-design.md section 3's "suggested first
+//      fixture"), proving vertex placement + depth before any texturing/lighting/translucency
+//      plumbing is layered on. holes (clear alpha 0), no effects -> engaged like case 1.
 
 #include <nds.h>
 #include <stdio.h>
@@ -155,6 +162,18 @@ static void draw3D(void)
 	glMaterialf(GL_SPECULAR, RGB15(0, 0, 0));
 	glMaterialf(GL_EMISSION, RGB15(0, 0, 0));
 
+#if A3_CASE == 27
+	// minimal fixture: one flat opaque untextured triangle, same colour on all three
+	// vertices (no Gouraud), Z-buffer depth mode (see glFlush below).
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_TRIANGLES);
+		glColor3b(200, 80, 40); glVertex3f(-1.0f,  1.0f, 0.0f);
+		glColor3b(200, 80, 40); glVertex3f(-1.0f, -1.0f, 0.0f);
+		glColor3b(200, 80, 40); glVertex3f( 1.0f, -1.0f, 0.0f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	return;
+#endif
 #if A3_CASE != 25
 	// big gradient quad (covers most of the screen), polygon id 1
 		glPolyFmt(POLY_ALPHA(polyAlpha) | POLY_CULL_NONE | POLY_ID(1));
@@ -270,6 +289,12 @@ int main(void)
 	// mask3d path at all.
 	M_BLDCNT = ((L_BG1 | L_BG2 | L_BD) << 8);
 	dcnt &= ~ENABLE_3D;
+#elif A3_CASE == 27
+	// Isolate the 3D layer completely: no other BG/OBJ visible, so a GX geometry-pass test
+	// draw that composites on top of Engine A's normal 2D bands (rather than going through
+	// the full 3D-layer/priority/hole compositing contract those other cases exercise) is
+	// still position-correct with nothing else able to occlude it. Backdrop only + BG0/3D.
+	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #endif
 
 	setupObjs(semi);

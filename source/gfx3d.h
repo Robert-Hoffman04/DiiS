@@ -222,6 +222,15 @@ struct VERT {
 	}
 	u8 color[3];
 	float fcolor[3];
+	// Task 13e (gx-next-steps-log.md#task-13e / gx-13e-design.md): the DS-space OBJECT-space
+	// position (post float16table decode, pre mtxCurrent[0] clip transform) -- SetVertex()
+	// (gfx3d.cpp) overwrites coord[]/x,y,z,w in place with the clip-space result and never
+	// otherwise retains the pre-transform value, so the GX-Fast geometry producer (which needs
+	// to feed GX's own hardware transform an object-space vertex, not a pre-transformed one --
+	// see gx-13e-design.md section 2's revised matrix row) has nothing to read without this.
+	// Purely additive: nothing else in this codebase reads it, so it does not affect
+	// savestate format (deliberately not in save()/load() below) or CPU rasterizer behaviour.
+	float objcoord[3];
 	void color_to_float() {
 		fcolor[0] = color[0];
 		fcolor[1] = color[1];
