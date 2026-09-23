@@ -3637,6 +3637,9 @@ static bool gxDsBRenderFrameImpl()
 	// slice's supported scope (opaque, untextured, Z-buffer, no shadow, unclipped) --
 	// any other frame leaves the CPU-rasterizer-into-texture band draw above as the
 	// only thing that ran, byte-identical to a DSA_GXGEOM_ENABLE-off build.
+#ifdef DSA_GXGEOM_DEBUGWHY
+	harness_profile_emitf("gxds3dgate any3dBand=%d sw=%d", (int)any3dBand, (int)gxRenderModeIsSoftware());
+#endif
 	if (any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported()) {
 		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
@@ -3644,6 +3647,16 @@ static bool gxDsBRenderFrameImpl()
 			gxDs3dRenderFast();
 		else
 			gxDs3dRenderAccurate();
+#ifdef DSA_GXGEOM_DEBUGWHY
+		{
+			GX_DrawDone();
+			GXColor peek;
+			GX_PeekARGB(132, 107, &peek);
+			harness_profile_emitf("gxds3dPEEK (132,107) argb=%d,%d,%d,%d", peek.a, peek.r, peek.g, peek.b);
+			GX_PeekARGB(10, 10, &peek);
+			harness_profile_emitf("gxds3dPEEK (10,10) argb=%d,%d,%d,%d", peek.a, peek.r, peek.g, peek.b);
+		}
+#endif
 	}
 #endif
 

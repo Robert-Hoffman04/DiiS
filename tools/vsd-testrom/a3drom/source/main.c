@@ -55,6 +55,14 @@
 //      (gx-next-steps-log.md task 13e / gx-13e-design.md section 3's "suggested first
 //      fixture"), proving vertex placement + depth before any texturing/lighting/translucency
 //      plumbing is layered on. holes (clear alpha 0), no effects -> engaged like case 1.
+//  28  item 13e-precision fixture (Task 13e-precision, gx-next-steps-log.md): FOUR flat-coloured
+//      opaque untextured triangles, Z-buffer mode, an extra X-axis rotation stacked on the usual
+//      27-degree Y rotation (genuinely off-axis, not aligned to either screen axis), spanning a
+//      wide depth range (near/steeply-oblique, far/small, and a long thin sliver placed close to
+//      the left frustum edge) -- built specifically to stress GxFast's real-GX-matrix-hardware
+//      transform against the CPU fixed-point reference, since case 27's single small axis-aligned
+//      triangle was proven too simple to expose any drift. Also exercises multi-polygon submission
+//      (item 13e-slice's known gap: only ever tested with N=1). holes (clear alpha 0), no effects.
 
 #include <nds.h>
 #include <stdio.h>
@@ -170,6 +178,42 @@ static void draw3D(void)
 		glColor3b(200, 80, 40); glVertex3f(-1.0f,  1.0f, 0.0f);
 		glColor3b(200, 80, 40); glVertex3f(-1.0f, -1.0f, 0.0f);
 		glColor3b(200, 80, 40); glVertex3f( 1.0f, -1.0f, 0.0f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	return;
+#endif
+#if A3_CASE == 28
+	// precision-stress fixture: extra off-axis rotation stacked on the standard 27-degree
+	// Y rotation from above (genuinely oblique on two axes at once, not aligned to either
+	// screen edge), four flat-coloured opaque triangles spanning a wide depth range.
+	glRotatef(15.0f, 1.0f, 0.0f, 0.0f);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_TRIANGLES);
+		// 1: near-ish, oblique in depth
+		glColor3b(220, 40, 40);
+		glVertex3f(-0.9f,  0.55f, -0.5f);
+		glVertex3f(-0.9f, -0.55f,  0.35f);
+		glVertex3f( 0.9f, -0.55f, -0.1f);
+		// 2: far, smaller
+		glColor3b(40, 220, 40);
+		glVertex3f(-0.3f,  0.25f,  0.9f);
+		glVertex3f(-0.3f, -0.25f,  1.05f);
+		glVertex3f( 0.3f, -0.25f,  0.95f);
+		// 3: long thin sliver placed close to the left frustum edge (NDC x ~ -0.89,
+		// verified in Python against this exact projection/modelview before landing
+		// on these numbers -- gluPerspective(70, 4:3, 0.1, 40) + translate(-2.4) +
+		// rotate(27,Y) + rotate(15,X), worst-case |NDC| ~0.94 on all three vertices
+		// of this fixture, comfortable margin below the [-1,1] clip-avoidance check
+		// in gxDs3dGeomFrameSupported() while still stressing near-edge precision)
+		glColor3b(40, 40, 220);
+		glVertex3f(-1.5f,  0.5f,  0.2f);
+		glVertex3f(-1.5f, -0.5f,  0.25f);
+		glVertex3f(-1.3f,  0.0f, -0.15f);
+		// 4: mid triangle, different winding/orientation, depth-overlaps #1
+		glColor3b(220, 200, 20);
+		glVertex3f( 0.1f,  0.7f, -0.2f);
+		glVertex3f( 0.75f, 0.1f,  0.4f);
+		glVertex3f( 0.3f, -0.65f, 0.05f);
 	glEnd();
 	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
 	return;
@@ -294,6 +338,10 @@ int main(void)
 	// draw that composites on top of Engine A's normal 2D bands (rather than going through
 	// the full 3D-layer/priority/hole compositing contract those other cases exercise) is
 	// still position-correct with nothing else able to occlude it. Backdrop only + BG0/3D.
+	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
+#elif A3_CASE == 28
+	// same isolation as case 27 -- nothing but the backdrop + BG0/3D visible, so the GX
+	// overlay draw is position-correct with nothing else able to occlude it.
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #endif
 

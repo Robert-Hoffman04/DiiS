@@ -43,6 +43,39 @@
     rasterization for this mode, which if anything is a MORE faithful reading of "GX
     only rasterizes, CPU keeps doing the DS-precise math" than the original mechanism
     would have been.
+
+    ADDED 2026-09-22/23 (Task 13e-precision, see the log section): the prior slice's
+    "GxAccurate verified byte-exact against CPU" claim on the case_27 fixture was a
+    FALSE NEGATIVE -- the overlay draw was never actually visible in the captured
+    output at all (proven with a forced full-screen probe triangle: 0 pixels showed
+    up), so every prior comparison was silently comparing the CPU-rasterizer's
+    pre-existing, already-correct texture-fed 3D layer against itself. Three real bugs
+    found and fixed this pass (all in gxDs3dSetupCommonState()/gxDs3dRenderAccurate(),
+    see their comments for detail):
+      1. Positive Z (the DS's natural 0=near/1=far convention) falls entirely outside
+         guOrtho's actual visible eye-space Z range ([-1,0], "-z axis" per libogc's own
+         doc comment) -- GxAccurate now negates sz before feeding GX_Position3f32.
+      2. GX's hardware clipper still rejected every vertex even after the Z fix, for a
+         reason not fully root-caused this pass -- worked around with
+         GX_SetClipMode(GX_CLIP_DISABLE), safe because gxDs3dGeomFrameSupported()
+         already guarantees every vertex is within [-1,1] NDC on the CPU side.
+      3. VERT::color is a 6-bit-per-channel (0-63) DS material color, not 0-255 --
+         GX_Color4u8 needs the standard 6-to-8-bit bit-replication expansion
+         (gxDs3d6To8()); without it every triangle rendered ~4x too dark.
+      A fourth issue remains OPEN, not fixed: turning the Z-TEST back on (GX_TRUE,
+      tried GX_GEQUAL to match the negated convention) also made draws invisible again,
+      for a reason not isolated this pass (suspected: the EFB Z-buffer's actual cleared
+      content, from main.cpp's global GX_SetCopyClear(..., GX_MAX_Z24), doesn't satisfy
+      GEQUAL against this function's tiny negative Z range). Z-test is therefore left
+      OFF (GX_FALSE) -- correct for this pass's non-overlapping-in-depth-order fixtures
+      by luck of submission order, but NOT a real fix for depth-correct compositing;
+      this is the top-priority item for whoever continues 13e. gxDs3dRenderFast() was
+      NOT fixed this pass and is still confirmed non-functional (verified via
+      GX_PeekARGB: it draws nothing) -- it inherits the Z-test-off/clip-disable fix via
+      the shared gxDs3dSetupCommonState() but has its own separate, still-unfixed
+      visibility problem in its real-GX-transform-hardware path (gxDs3dConvertProj()),
+      not investigated this pass. Do not trust ANY prior GxFast "byte-exact" result,
+      including case_27's -- it was never actually drawing either.
 */
 #ifndef GX_DS_3D_RENDER_H
 #define GX_DS_3D_RENDER_H
