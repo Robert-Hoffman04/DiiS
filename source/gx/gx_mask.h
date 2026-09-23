@@ -36,7 +36,12 @@ struct GXMaskTarget {
 // object. `texFmt` defaults to GX_TF_I8 - a single 0-255 mask value per
 // texel is exactly what both consumers need (shadow coverage, OBJ-window
 // coverage), and it's the cheapest format that provides it. Returns false
-// if the allocation fails or width/height are zero.
+// if the allocation fails or width/height are zero. `texFmt` is the COPY
+// format; an 8-bit single-channel GX_CTF_* copy is sampled as GX_TF_I8.
+// Note GX_TF_I8 as a copy format is luma (YUV-weighted), not a raw channel,
+// and the renderer's EFB (RGB565_Z16 / RGB8_Z24) has no alpha channel, so
+// GX_CTF_A8 reads a constant 255: for an exact 0/255 mask, paint the value
+// into colour and copy with GX_CTF_R8.
 bool gxMaskTarget_Init(GXMaskTarget *mt, u16 width, u16 height, u32 texFmt = GX_TF_I8);
 void gxMaskTarget_Free(GXMaskTarget *mt);
 

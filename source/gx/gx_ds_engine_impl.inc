@@ -327,7 +327,7 @@ static const int k3dTexH = 256;
 
 // Task 13d: real per-texel alpha (0..31, not collapsed to present/absent) for the
 // two-pass translucent-3D-over-mixed-2nd-target technique below. Kept as a separate
-// GX_TF_A8 texture (true 8-bit alpha, no quantization loss) rather than trying to
+// 8-bit (GX_TF_I8, sampled TEXA = I) texture (no quantization loss) rather than trying to
 // widen s_3d's RGB5A3 alpha sub-format (only 3 bits / 8 levels there). Built lazily
 // -- only when a band actually needs the two-pass draw this frame -- from the same
 // gfx3d_convertedScreen buffer gxDsA3dScan() already linearized, keyed the same way
@@ -2239,7 +2239,7 @@ static void gxDsA3dDrawBand(const GxDsA3dTex &t, int hofs, int y0, int y1)
 }
 
 // Task 13d: real per-texel alpha (0..31 -> 0..255, no quantization) as a standalone
-// GX_TF_A8 texture, same 256x256-with-transparent-padding layout as s_3d/s_3dFx (see
+// GX_TF_I8 texture, same 256x256-with-transparent-padding layout as s_3d/s_3dFx (see
 // k3dTexH's comment). Only built when a band's two-pass draw actually needs it
 // (gxDsBBuildUnder3DMask / gxDsA3dDrawBandTwoPass below), keyed on the same
 // g_gfx3dRenderSeq as everything else derived from gfx3d_convertedScreen.
@@ -2268,10 +2268,11 @@ static void gxDsA3dEnsureAlphaTex()
 			// only models a present, blendable texel.
 			lin[y * k3dW + x] = c[0] ? (u8)(((unsigned)c[0] + 1) * 255 / 32) : 0;
 	memset(lin + (size_t)k3dW * k3dH, 0, (size_t)k3dW * (k3dTexH - k3dH));   // padding rows: alpha 0
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_I8);   // A8 is also 8bpp / 8x4 blocks on this hardware
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_I8);
 	gxSwizzle8bpp(lin, (u8 *)s_3dAlphaTexData, blk.texelsWide, blk.texelsTall, k3dW, k3dTexH);
 	DCFlushRange(s_3dAlphaTexData, needed);
-	GX_InitTexObj(&s_3dAlphaTexObj, s_3dAlphaTexData, k3dW, k3dTexH, GX_TF_A8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	// I8, not GX_TF_A8: the latter is a copy-only format that samples as invalid hw format 7.
+	GX_InitTexObj(&s_3dAlphaTexObj, s_3dAlphaTexData, k3dW, k3dTexH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjFilterMode(&s_3dAlphaTexObj, GX_NEAR, GX_NEAR);
 	s_3dAlphaSeq = s_3dScanSeq;
 	s_3dAlphaValid = true;
@@ -2495,17 +2496,12 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 #endif
 						if ((under & ~p.t2) || trans) {
 #ifdef DSA_MASK3D_ENABLE
-							// Gated off by default: the two-pass draw itself (gxDsBBuildUnder3DMask /
-							// gxDsA3dDrawBandTwoPass below) is fully built and wired, but real-hardware
-							// verification (gx-next-steps-log.md Task 13d) found the gx_mask.h EFB-copy
-							// primitive it depends on does not round-trip a flat constant colour/alpha
-							// correctly on this renderer's EFB pixel format (RGB565_Z16 / RGB8_Z24, never
-							// RGBA6_Z24 -- GX_TF_A8 copies are undefined outside RGBA6 per libogc's own
-							// docs, and GX_TF_I8 copies came back majority neither-0-nor-255 for even a
-							// flat single-colour full-screen quad, unexplained by dither or by the
-							// KONST-vs-RASC constant-colour mechanism). Left bailing (as before this
-							// task) until that primitive-level blocker is root-caused; define
-							// DSA_MASK3D_ENABLE to turn the two-pass path back on for further work.
+							// Gated off by default. The two-pass draw (gxDsBBuildUnder3DMask /
+							// gxDsA3dDrawBandTwoPass) is structurally correct (gx-next-steps-log.md
+							// Task 13d-texfmt), but NOT exact: a translucent 3D texel over a 2nd target
+							// comes out +-1 LSB vs the CPU (GX's /255 SRCALPHA lerp on a 5-bit-quantized
+							// source vs the CPU's truncating /32 lerp on 6-bit 3D colour). Engine A is
+							// exact-or-bail, so this stays a bail unless DSA_MASK3D_ENABLE is defined.
 							p.mask3dCfg |= (u8)(1 << c);
 #else
 							if (trans) { DSB_WHY("3dtrans"); return false; }
@@ -2859,32 +2855,22 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 // mode can't do it.
 // ---------------------------------------------------------------------
 
-// Stage0 forced to a constant b/w colour (KONST, by `t2`) with alpha still the
-// usual "texel present" test (GX_TEV_COMP_A8_GT against a 255 constant, same
-// wiring gxDsBTevAlpha uses) -- i.e. "paint this layer's real shape (holes and
-// all) with a flat colour that says whether it's a 2nd target", the building
-// block gxDsBBuildUnder3DMask() below replays the under-stack with. Never
-// cached in s_tevK (called at most a few times per rare band, and it must
-// leave s_tevK in a state that forces the next gxDsBTevReplace()/gxDsBTevAlpha()
-// to fully reprogram stage0, since this leaves it in neither of those shapes).
-// Task 13d, revised: the mask is captured through the EFB's ALPHA channel (an
-// A8 copy destination) rather than its colour (an I8 copy destination samples
-// colour/luma, and a solid-colour round-trip through that path did not come
-// back as clean 0/255 on real hardware -- see gx-next-steps-log.md Task 13d).
-// A8 is the natural fit for gx_mask.h's own stated shadow-mask use case too
-// (alpha/stencil coverage, not colour). Colour is left as plain texture
-// replace (irrelevant -- never read back), and alpha does both jobs at once:
-// C in the presence compare (`GX_TEV_COMP_A8_GT`, same wiring gxDsBTevAlpha
-// uses) is the t2-conditional constant itself (255 if t2, 0 if not), so a
-// surviving (real-texel-present) pixel gets exactly that value and a hole
-// (blend no-op, alpha 0) leaves whatever an earlier lower-priority layer
-// already wrote there.
+// Paints a layer's real shape (holes and all) into the mask scratch corner as
+// a flat colour saying whether it is a 2nd target: colour = C0 (255 if t2, else
+// 0), alpha = 255 where a texel is present (GX_TEV_COMP_A8_GT, as in
+// gxDsBTevAlpha), 0 in holes, so the global SRCALPHA blend overwrites on a
+// texel and leaves the lower layer's flag in a hole. The flag lives in colour
+// because the EFB (RGB565_Z16 / RGB8_Z24) has no alpha channel; the mask is
+// copied out with GX_CTF_R8 (see gx_mask.h). Leaves s_tevK = -2 so the next
+// gxDsBTevReplace()/gxDsBTevAlpha() fully reprograms stage0.
 static void gxDsBTevMaskConst(bool t2)
 {
-	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);   // colour: plain texture replace, never read back
+	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0);
+	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
 	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_COMP_A8_GT, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)(t2 ? 255 : 0) });
+	const u8 v = t2 ? 255 : 0;
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ v, v, v, 255 });
 	s_tevK = -2;   // neither TevReplace's (-1) nor a TevAlpha k: force a resync next use
 }
 
@@ -2970,7 +2956,7 @@ static void gxDsBDrawObjLayerForMask(int prio, const GxDsBBandPlan &p, int cfgId
 static void gxDsBBuildUnder3DMask(int b, const GxDsBBandRegs &r, const GxDsBBandPlan &p, int cfgIdx, int y0, int y1)
 {
 	if (!s_3dMaskInit) {
-		s_3dMaskInit = gxMaskTarget_Init(&s_3dMask, kDsBScreenW, kDsBScreenH, GX_TF_A8);
+		s_3dMaskInit = gxMaskTarget_Init(&s_3dMask, kDsBScreenW, kDsBScreenH, GX_CTF_R8);
 		if (!s_3dMaskInit) return;
 	}
 	gxMaskBegin(&s_3dMask, k3dMaskEfbX, k3dMaskEfbY);

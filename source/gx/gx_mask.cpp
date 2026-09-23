@@ -32,7 +32,14 @@ bool gxMaskTarget_Init(GXMaskTarget *mt, u16 width, u16 height, u32 texFmt)
 	if (width == 0 || height == 0)
 		return false;
 
-	u32 size = GX_GetTexBufferSize(width, height, texFmt, GX_FALSE, 0);
+	// GX_CTF_* are copy-only formats: GX_InitTexObj keeps only the low nibble,
+	// so e.g. GX_CTF_A8 (0x27) would sample as nonexistent hw format 7. The
+	// 8-bit single-channel copies write the I8 tile layout; sample them as I8.
+	u32 sampleFmt = texFmt;
+	if (texFmt == GX_CTF_R8 || texFmt == GX_CTF_G8 || texFmt == GX_CTF_B8 || texFmt == GX_CTF_A8)
+		sampleFmt = GX_TF_I8;
+
+	u32 size = GX_GetTexBufferSize(width, height, sampleFmt, GX_FALSE, 0);
 	void *data = memalign(32, size);
 	if (!data)
 		return false;
@@ -43,7 +50,8 @@ bool gxMaskTarget_Init(GXMaskTarget *mt, u16 width, u16 height, u32 texFmt)
 	mt->width = width;
 	mt->height = height;
 	mt->texFmt = texFmt;
-	GX_InitTexObj(&mt->texObj, data, width, height, texFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&mt->texObj, data, width, height, sampleFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&mt->texObj, GX_NEAR, GX_NEAR);
 	return true;
 }
 
