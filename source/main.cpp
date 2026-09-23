@@ -47,6 +47,7 @@
 #include "fps_overlay.h"
 #include "harness/harness.h"
 #include "gx/gx_gba_render.h"
+#include "gx/gx_rendermode.h"
 
 #ifdef DESMUME_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
@@ -1833,6 +1834,18 @@ void DSExec(){
 					harness_frame_request(*_a ? _a : 0);
 				} else if (!strncmp(_rx, "movie", 5)) {
 					harness_input_movie_cmd(_rx + 5);
+				} else if (!strncmp(_rx, "rendermode", 10)) {
+					// nds-wii-render-pipeline.md "three runtime-switchable render modes":
+					// test/bench-only switch (no on-screen UI exists yet). Same PKT_CTRL
+					// dispatch pattern as "movie ..." above -- see gx_rendermode.h.
+					const char *_m = _rx + 10;
+					while (*_m == ' ') _m++;
+					if (!strncmp(_m, "software", 8))
+						gxSetRenderMode(RenderMode::Software);
+					else if (!strncmp(_m, "accurate", 8))
+						gxSetRenderMode(RenderMode::GxAccurate);
+					else if (!strncmp(_m, "fast", 4))
+						gxSetRenderMode(RenderMode::GxFast);
 				}
 			} else if (_pt == HARNESS_PKT_INPUT) {
 				// §3.5: drive the shared transport-agnostic input core.

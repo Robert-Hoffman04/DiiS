@@ -3,6 +3,7 @@
 #include "gx_color.h"
 #include "gx_swizzle.h"
 #include "gx_texformat.h"
+#include "gx_rendermode.h"
 #include "../gba_ppu.h"
 #include "../MMU.h"
 #include "../readwrite.h"
@@ -2041,6 +2042,11 @@ bool gxGbaRenderFrame()
 #ifdef GBA_FORCE_CPU
 	return false;   // test hook: the CPU compositor renders every frame (reference build)
 #endif
+	// nds-wii-render-pipeline.md "three runtime-switchable render modes": Software mode
+	// bails before any GX work, uniformly, same effect as GBA_FORCE_CPU above but
+	// selectable at runtime. Must precede everything below -- no GX state may be touched.
+	if (gxRenderModeIsSoftware())
+		return false;
 	// Queue item 13j: an exactness bail latched by gba_ppu.cpp's per-line hook (out-of-scope state
 	// seen mid-frame, or a VRAM / palette / OAM write while the frame was in flight).
 	if (gbaPpuLazyForceBail())

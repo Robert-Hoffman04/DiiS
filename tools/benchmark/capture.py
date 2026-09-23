@@ -199,6 +199,10 @@ def run(args):
         except OSError:
             pass
 
+    for cmd in args.ctrl_cmd:
+        print(f"capture: sending PKT_CTRL {cmd!r}")
+        send(wire.PKT_CTRL, cmd)
+
     dec = wire.Decoder()
     sel = selectors.DefaultSelector()
     sel.register(conn, selectors.EVENT_READ)
@@ -253,6 +257,10 @@ def main():
     ap.add_argument("--connect-timeout", type=float, default=30,
                      help="seconds to wait for the device to connect (default 30)")
     ap.add_argument("--map", help="linker .map file for CRASH symbolication")
+    ap.add_argument("--ctrl-cmd", action="append", default=[], metavar="CMD",
+                     help="send an arbitrary PKT_CTRL command (e.g. 'rendermode fast') "
+                          "immediately after connecting, before any capture is requested; "
+                          "may be given multiple times, sent in order")
     args = ap.parse_args()
     sys.exit(run(args))
 

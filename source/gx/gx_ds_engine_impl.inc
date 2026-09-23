@@ -41,6 +41,7 @@
 #include "../harness/harness_profile.h"
 #endif
 #include "gx_mask.h"
+#include "gx_rendermode.h"
 
 // Test hooks (compile-time only, zero cost when undefined):
 //  -DDSB_FORCE_CPU : Engine B's RenderFrame always bails, so the CPU compositor
@@ -2495,18 +2496,22 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 						                       (int)s_3dScanValid, s_3dScanSeq, g_gfx3dRenderSeq);
 #endif
 						if ((under & ~p.t2) || trans) {
-#ifdef DSA_MASK3D_ENABLE
-							// Gated off by default. The two-pass draw (gxDsBBuildUnder3DMask /
-							// gxDsA3dDrawBandTwoPass) is structurally correct (gx-next-steps-log.md
-							// Task 13d-texfmt), but NOT exact: a translucent 3D texel over a 2nd target
-							// comes out +-1 LSB vs the CPU (GX's /255 SRCALPHA lerp on a 5-bit-quantized
-							// source vs the CPU's truncating /32 lerp on 6-bit 3D colour). Engine A is
-							// exact-or-bail, so this stays a bail unless DSA_MASK3D_ENABLE is defined.
-							p.mask3dCfg |= (u8)(1 << c);
-#else
-							if (trans) { DSB_WHY("3dtrans"); return false; }
-							DSB_WHY("3dfade"); return false;
-#endif
+							// Task 13d-texfmt / nds-wii-render-pipeline.md "three runtime-switchable
+							// render modes": the two-pass draw (gxDsBBuildUnder3DMask /
+							// gxDsA3dDrawBandTwoPass) is structurally correct, but NOT exact: a
+							// translucent 3D texel over a 2nd target comes out +-1 LSB vs the CPU
+							// (GX's /255 SRCALPHA lerp on a 5-bit-quantized source vs the CPU's
+							// truncating /32 lerp on 6-bit 3D colour). GxAccurate mode is
+							// exact-or-bail, so this stays a bail there (byte-identical to the old
+							// default-off DSA_MASK3D_ENABLE build); GxFast accepts the +-1 LSB to
+							// stay on GX instead of bailing to CPU. DSA_MASK3D_ENABLE itself is gone
+							// -- the two-pass code is always compiled in now, real and tested.
+							if (gxRenderModeIsFast()) {
+								p.mask3dCfg |= (u8)(1 << c);
+							} else {
+								if (trans) { DSB_WHY("3dtrans"); return false; }
+								DSB_WHY("3dfade"); return false;
+							}
 						}
 						else
 							fade = false;
@@ -3333,6 +3338,12 @@ static bool gxDsBRenderFrameImpl()
 #ifdef GXDS_FORCE_CPU
 	return false;
 #endif
+	// nds-wii-render-pipeline.md "three runtime-switchable render modes": Software mode
+	// bails before any GX work, uniformly across both DS engine instances (this .inc is
+	// shared by Engine A and Engine B), same effect as DSA_FORCE_CPU/DSB_FORCE_CPU but
+	// selectable at runtime. Must precede everything below -- no GX state may be touched.
+	if (gxRenderModeIsSoftware())
+		return false;
 	if (gameInfo.isGBA)
 		return false;
 #ifdef DSB_STATS
@@ -3613,10 +3624,15 @@ static bool gxDsBRenderFrameImpl()
 	gxDsBTevReplace();
 
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
-#if GXDS_CORE == 0 && defined(DSA_MASK3D_ENABLE)
+#if GXDS_CORE == 0
 	// Task 13d follow-up: re-opaque the EFB alpha channel before the frame's
 	// one EFB->texture copy below -- see gxDsA3dStampOpaqueAlpha()'s comment.
-	gxDsA3dStampOpaqueAlpha();
+	// Only meaningful (and only needed) when the two-pass mask3d draw actually ran this
+	// frame, i.e. GxFast mode; gxDsA3dStampOpaqueAlpha() itself is a no-op cost-wise
+	// otherwise but the mode check keeps GxAccurate's GX call sequence byte-identical to
+	// the pre-switch DSA_MASK3D_ENABLE-off build.
+	if (gxRenderModeIsFast())
+		gxDsA3dStampOpaqueAlpha();
 #endif
 	GX_DrawDone();
 	// Deflicker OFF for this copy. main.cpp's InitVideo() leaves
