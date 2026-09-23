@@ -2573,6 +2573,16 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 			}
 		}
 	}
+#if defined(DSB_STATS) && GXDS_CORE == 0
+	// Task 13d-statefix follow-up lead: dump the per-cfg planning outputs
+	// (mask3dCfg, blendLive, fade3dCfg/fadeBg/fadeObj) directly, not just the
+	// final draw-time `alpha` bool, to check for a planning miscomputation
+	// beyond the already-tried `under`-collapse fix (see
+	// gx-next-steps-log.md Task 13d-statefix's "Outcome" section).
+	harness_profile_emitf(GXDS_TAG "planband y0=%d y1=%d mask3dCfg=%02x blendLive=%02x,%02x,%02x fade3dCfg=%02x fadeBg=%02x fadeObj=%d t1=%02x t2=%02x mode=%d bg0prio=%d",
+	                       y0, y1, p.mask3dCfg, p.blendLive[0], p.blendLive[1], p.blendLive[2],
+	                       p.fade3dCfg, p.fadeBg, (int)p.fadeObj, p.t1, p.t2, p.mode, r.bgPrio[0]);
+#endif
 	return true;
 }
 
@@ -3087,6 +3097,13 @@ static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y
 // renderer does not need.
 static void gxDsA3dStampOpaqueAlpha()
 {
+#ifdef DSB_STATS
+	// Task 13d-blendleaklead (2026-09-22): confirms this runs every frame
+	// (87/90 a3_c8 frames) -- see gx-next-steps-log.md for why that matters
+	// (this pass proved the stamp's own effect on `dsaabd`'s printed value
+	// is unmeasurable, not that it never executes).
+	harness_profile_emitf(GXDS_TAG "stampalpha");
+#endif
 	GX_SetColorUpdate(GX_FALSE);
 	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, 255 });
 	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO);
