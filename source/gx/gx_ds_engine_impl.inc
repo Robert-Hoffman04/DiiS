@@ -2180,6 +2180,14 @@ static bool gxDsA3dScan()
 	}
 	s_3dScanSeq = g_gfx3dRenderSeq;
 	s_3dScanValid = true;
+#ifdef DSB_STATS
+	{
+		u32 nonzeroA = 0;
+		const u8 *cc = gfx3d_convertedScreen;
+		for (int i = 0; i < k3dW * k3dH; ++i, cc += 4) if (cc[0]) ++nonzeroA;
+		harness_profile_emitf(GXDS_TAG "scandbg nonzeroA=%u total=%d", nonzeroA, k3dW * k3dH);
+	}
+#endif
 	return true;
 }
 
@@ -2267,6 +2275,14 @@ static void gxDsA3dEnsureAlphaTex()
 	GX_InitTexObjFilterMode(&s_3dAlphaTexObj, GX_NEAR, GX_NEAR);
 	s_3dAlphaSeq = s_3dScanSeq;
 	s_3dAlphaValid = true;
+#ifdef DSB_STATS
+	{
+		u32 nonzero = 0;
+		const u8 *ad = (const u8 *)s_3dAlphaTexData;
+		for (u32 i = 0; i < needed; ++i) if (ad[i]) ++nonzero;
+		harness_profile_emitf(GXDS_TAG "alphatexdbg nonzero=%u needed=%u", nonzero, needed);
+	}
+#endif
 }
 #endif // GXDS_CORE == 0
 
@@ -2467,8 +2483,16 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 					// "everywhere else" rule, still faded iff `fade` below is set.
 					if (under & p.t2) {
 						bool trans = false;
-						for (int y = y0; y < y1; ++y)
-							if (s_3dLineTrans[y]) { trans = true; break; }
+						int transLines = 0, holeLines = 0;
+						for (int y = y0; y < y1; ++y) {
+							if (s_3dLineTrans[y]) { trans = true; ++transLines; }
+							if (s_3dLineHole[y]) ++holeLines;
+						}
+#ifdef DSB_STATS
+						harness_profile_emitf(GXDS_TAG "transdbg under=%02x t2=%02x trans=%d transLines=%d holeLines=%d y0=%d y1=%d scanValid=%d scanSeq=%u renderSeq=%u",
+						                       under, p.t2, (int)trans, transLines, holeLines, y0, y1,
+						                       (int)s_3dScanValid, s_3dScanSeq, g_gfx3dRenderSeq);
+#endif
 						if ((under & ~p.t2) || trans) {
 #ifdef DSA_MASK3D_ENABLE
 							// Gated off by default: the two-pass draw itself (gxDsBBuildUnder3DMask /
@@ -2736,16 +2760,35 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 #if GXDS_CORE == 0
 			if (bg == 0 && r.bg3d) {   // task 13: the 3D layer (never alpha-blended by BLDCNT)
 				if ((p.mask3dCfg >> ru.cfg) & 1) {   // task 13d: mixed under -> two-pass draw
+					// Task 13d-bg13only (2026-09-22) bisection points, inert unless defined,
+					// left in place for whoever picks this back up (see
+					// gx-next-steps-log.md#task-13d-bg13only): DSA_MASK3D_BISECT_SKIP skips
+					// gxDsBBuildUnder3DMask()+gxDsA3dDrawBandTwoPass() entirely (proved bad=0 on
+					// a3_c25); DSA_MASK3D_BISECT_SKIP_DRAW keeps the mask build but skips the
+					// two-pass draw call (also bad=0 -- mask build is NOT the corruptor);
+					// DSA_MASK3D_BISECT_NOPASSA/NOPASSB (in gxDsA3dDrawTwoPassQuad below) isolate
+					// pass A as the actual corruptor (pass A alone reproduces the FULL bad=57/60,
+					// pass B alone is bad=0); DSA_MASK3D_BISECT_PASSA_NOCOLOR/_NOALPHA (also below)
+					// found GX_SetColorUpdate(GX_FALSE) around pass A's own draw call alone makes
+					// a3_c25 bad=0 again, even though the real alpha data feeding that draw is
+					// independently proven all-zero (scandbg/alphatexdbg stats) -- i.e. pass A's
+					// GX_BM_BLEND draw is NOT behaving as the mathematical no-op its own alpha=0
+					// implies. None of these are defined by default, so the shipped (gated-off)
+					// behaviour is unchanged.
+#ifndef DSA_MASK3D_BISECT_SKIP
 					if (s_3dMaskBand != b || s_3dMaskCfg != ru.cfg) {
 						gxDsBBuildUnder3DMask(b, r, p, ru.cfg, y0, y1);
 						s_3dMaskBand = b; s_3dMaskCfg = ru.cfg;
 						GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 					}
+#ifndef DSA_MASK3D_BISECT_SKIP_DRAW
 					const GxDsA3dTex &tB = ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
 					if (tB.valid) {
 						GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 						gxDsA3dDrawBandTwoPass(tB, (int)r.hofs[0] & 0x1FF, y0, y1);
 					}
+#endif
+#endif
 					continue;
 				}
 				const GxDsA3dTex &t3 = ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
@@ -3030,7 +3073,21 @@ static void gxDsA3dDrawTwoPassQuad(const GxDsA3dTex &tB, f32 x0, f32 y0, f32 x1,
 	gxMaskApply(&s_3dMask, GX_TEVSTAGE2, GX_TEXMAP2, GX_TEXCOORD1);
 
 	GX_LoadTexObj(const_cast<GXTexObj *>(&s_3dAlphaTexObj), GX_TEXMAP1);
+#ifndef DSA_MASK3D_BISECT_NOPASSA
+#ifdef DSA_MASK3D_BISECT_PASSA_NOCOLOR
+	GX_SetColorUpdate(GX_FALSE);
+#endif
+#ifdef DSA_MASK3D_BISECT_PASSA_NOALPHA
+	GX_SetAlphaUpdate(GX_FALSE);
+#endif
 	gxDsBDrawQuadMasked(const_cast<GXTexObj *>(&s_3d.texObj), x0, y0, x1, y1, s0, t0, s1, t1);
+#ifdef DSA_MASK3D_BISECT_PASSA_NOCOLOR
+	GX_SetColorUpdate(GX_TRUE);
+#endif
+#ifdef DSA_MASK3D_BISECT_PASSA_NOALPHA
+	GX_SetAlphaUpdate(GX_TRUE);
+#endif
+#endif
 
 	// Pass B: colour+presence-alpha = tB (plain or fade, caller's choice), then
 	// multiplied by the mask's complement -- everywhere pass A didn't already
@@ -3039,7 +3096,9 @@ static void gxDsA3dDrawTwoPassQuad(const GxDsA3dTex &tB, f32 x0, f32 y0, f32 x1,
 	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
 	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
 	gxMaskApplyInverse(&s_3dMask, GX_TEVSTAGE1, GX_TEXMAP2, GX_TEXCOORD1);
+#ifndef DSA_MASK3D_BISECT_NOPASSB
 	gxDsBDrawQuadMasked(const_cast<GXTexObj *>(&tB.texObj), x0, y0, x1, y1, s0, t0, s1, t1);
+#endif
 }
 
 static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y1)

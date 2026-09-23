@@ -40,6 +40,14 @@
 //  22  holes, BG1 (lowest priority) alpha, 2nd targets BG2|BD (control: nothing but the backdrop beneath BG1) -> engaged
 //  23  DISPCNT display mode 3 (FIFO)                                  -> BAIL dispmode
 //  24  mosaic on BG1                                                  -> BAIL mosaic
+//  25  same as case 6 (BLDCNT 2nd targets BG1|BG2|BD, priorities/config identical) but the 3D
+//      list is never submitted (BG0's 3D slot stays enabled in DISPCNT/BG0CNT, fully transparent
+//      every pixel) -- isolates whether BG1-3's own GX draw is correct in this exact
+//      window-region/2nd-target config with the 3D layer contributing nothing (gx-next-steps-log.md
+//      task 13d-blendleaklead's next lead / this task, "13d-bg13only")
+//  26  same as case 6's BLDCNT/priorities but DISPCNT BG0_3D is off entirely (BG0 is a plain text
+//      BG, not routed through the 3D-layer/mask3d path at all) -- the other half of the "test it
+//      both ways" instruction
 
 #include <nds.h>
 #include <stdio.h>
@@ -147,6 +155,7 @@ static void draw3D(void)
 	glMaterialf(GL_SPECULAR, RGB15(0, 0, 0));
 	glMaterialf(GL_EMISSION, RGB15(0, 0, 0));
 
+#if A3_CASE != 25
 	// big gradient quad (covers most of the screen), polygon id 1
 		glPolyFmt(POLY_ALPHA(polyAlpha) | POLY_CULL_NONE | POLY_ID(1));
 	glBegin(GL_TRIANGLES);
@@ -165,6 +174,10 @@ static void draw3D(void)
 		glColor3b(  0, 255, 255); glVertex3f(-1.4f, -1.7f, 0.4f);
 		glColor3b(255,   0, 255); glVertex3f( 1.7f, -0.6f, 0.4f);
 	glEnd();
+#endif
+	// case 25: matrices/material state set up identically above, but zero triangles submitted --
+	// BG0's 3D slot is enabled in DISPCNT/BG0CNT and takes part in the frame exactly like every
+	// other case, it just never has any content (equivalent to an all-holes, alpha=0 3D layer).
 	glFlush(GL_TRANS_MANUALSORT | GL_WBUFFERING);
 }
 
@@ -247,6 +260,16 @@ int main(void)
 	M_BLDCNT = (1 << 6) | L_BG1 | ((L_BG2 | L_BD) << 8); M_BLDALPHA = 10 | (6 << 8);
 #elif A3_CASE == 24
 	REG_BG1CNT |= BG_MOSAIC_ON; M_MOSAIC = 0x0033;
+#elif A3_CASE == 25
+	// identical BLDCNT/priority config to case 6, but draw3D() (below) submits zero triangles --
+	// BG0's 3D slot stays enabled and takes part in mask3dCfg exactly as case 6 does.
+	M_BLDCNT = ((L_BG1 | L_BG2 | L_BD) << 8);
+#elif A3_CASE == 26
+	// identical BLDCNT/priority config to case 6, but ENABLE_3D is left out of dcnt below -- BG0
+	// is a plain text BG (its text-form BG0CNT from setup2D), never routed through the 3D-layer/
+	// mask3d path at all.
+	M_BLDCNT = ((L_BG1 | L_BG2 | L_BD) << 8);
+	dcnt &= ~ENABLE_3D;
 #endif
 
 	setupObjs(semi);
