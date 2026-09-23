@@ -3657,6 +3657,12 @@ static bool gxDsBRenderFrameImpl()
 			harness_profile_emitf("gxds3dPEEK (10,10) argb=%d,%d,%d,%d", peek.a, peek.r, peek.g, peek.b);
 		}
 #endif
+		// The 3D pass leaves a perspective projection, a POS+CLR vertex format, Z on and
+		// blending off; everything after this (TevReplace, the GxFast alpha stamp, the
+		// copy) assumes the 2D pass's state.
+		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+		gxDsBSetup2DState();
+		s_tevK = -2;
 	}
 #endif
 

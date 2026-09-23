@@ -2,6 +2,7 @@
 #include "gx_rendermode.h"
 #include "../gfx3d.h"
 #include <gccore.h>
+#include <math.h>
 #include <string.h>
 #ifdef DSA_GXGEOM_DEBUGWHY
 #include "../harness/harness.h"
@@ -13,11 +14,87 @@
 // ever differ) rather than pulling in that whole translation unit's static state.
 static const int kScreenW = 256;
 static const int kScreenH = 192;
+// GX samples pixel centres, the DS rasterizer pixel corners (see gxDs3dRenderAccurate).
+static const float kGxDs3dSampleOffset = 0.5f;
 
 // POLYGON_ATTR shading mode, bits 4-5: 0 modulate, 1 decal, 2 toon/highlight, 3 shadow.
 static inline int gxDs3dPolyMode(const POLY &p) { return (int)((p.polyAttr >> 4) & 3); }
 // TEXIMAGE_PARAM format, bits 26-28 (see POLY::isTranslucent's own use of this same shift).
 static inline int gxDs3dTexFormat(const POLY &p) { return (int)((p.texParam >> 26) & 7); }
+
+// GxFast transform for one polygon. GX_LoadProjectionMtx keeps only 6 entries and
+// hard-wires w = -z_in (perspective) or w = 1 (orthographic), and GX's clip-space Z
+// range is [-w, 0] where the DS's is [-w, w]. So a general DS projection P can't be
+// loaded as-is. Instead P's x, y and w rows are folded into the (affine) position
+// matrix together with the modelview, and GX gets a canonical projection that only
+// remaps depth: z_gx/w = (z_ds/w - 1)/2, which makes GX's depth equal the DS's
+// (nz+1)/2, i.e. the same value gxDs3dRenderAccurate() feeds. Works for any
+// P = perspective * affine; anything else is not representable and bails.
+struct GxDs3dFastXform {
+	Mtx pos;
+	Mtx44 proj;
+	u8 projType;
+};
+
+// DS matrices are column-major: element (row r, col c) = m[4*c + r].
+static inline float gxDs3dM(const float *m, int r, int c) { return m[4 * c + r]; }
+
+static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x)
+{
+	const float *P = p.projMatrix, *MV = p.mvMatrix;
+	const float eps = 1e-4f;
+	if (fabsf(gxDs3dM(MV, 3, 0)) > eps || fabsf(gxDs3dM(MV, 3, 1)) > eps ||
+	    fabsf(gxDs3dM(MV, 3, 2)) > eps || fabsf(gxDs3dM(MV, 3, 3) - 1.0f) > eps)
+		return false;
+
+	float M[3][4];
+	memset(x.proj, 0, sizeof(x.proj));
+	const bool ortho = fabsf(gxDs3dM(P, 3, 0)) <= eps && fabsf(gxDs3dM(P, 3, 1)) <= eps &&
+	                   fabsf(gxDs3dM(P, 3, 2)) <= eps;
+	if (ortho) {
+		const float w = gxDs3dM(P, 3, 3);
+		if (fabsf(w) <= eps) return false;
+		for (int c = 0; c < 4; ++c) {
+			M[0][c] = gxDs3dM(P, 0, c) / w;
+			M[1][c] = gxDs3dM(P, 1, c) / w;
+			M[2][c] = gxDs3dM(P, 2, c) / w;
+		}
+		x.proj[0][0] = 1; x.proj[1][1] = 1;
+		x.proj[2][2] = 0.5f; x.proj[2][3] = -0.5f;
+		x.proj[3][3] = 1;
+		x.projType = GX_ORTHOGRAPHIC;
+	} else {
+		// P2 must equal alpha*P3 + beta*e_w (depth affine in w).
+		int k = 0;
+		for (int c = 1; c < 3; ++c)
+			if (fabsf(gxDs3dM(P, 3, c)) > fabsf(gxDs3dM(P, 3, k))) k = c;
+		const float alpha = gxDs3dM(P, 2, k) / gxDs3dM(P, 3, k);
+		float scale = 0;
+		for (int c = 0; c < 3; ++c) scale = fmaxf(scale, fabsf(gxDs3dM(P, 2, c)));
+		for (int c = 0; c < 3; ++c)
+			if (fabsf(gxDs3dM(P, 2, c) - alpha * gxDs3dM(P, 3, c)) > eps * fmaxf(1.0f, scale))
+				return false;
+		const float beta = gxDs3dM(P, 2, 3) - alpha * gxDs3dM(P, 3, 3);
+		for (int c = 0; c < 4; ++c) {
+			M[0][c] = gxDs3dM(P, 0, c);
+			M[1][c] = gxDs3dM(P, 1, c);
+			M[2][c] = -gxDs3dM(P, 3, c);   // z_in = -w_ds, so GX's w = -z_in = w_ds
+		}
+		x.proj[0][0] = 1; x.proj[1][1] = 1;
+		x.proj[2][2] = (1.0f - alpha) * 0.5f;
+		x.proj[2][3] = beta * 0.5f;
+		x.proj[3][2] = -1;
+		x.projType = GX_PERSPECTIVE;
+	}
+	for (int r = 0; r < 3; ++r)
+		for (int c = 0; c < 4; ++c) {
+			float s = (c == 3) ? M[r][3] : 0.0f;
+			for (int k = 0; k < 3; ++k)
+				s += M[r][k] * gxDs3dM(MV, k, c);
+			x.pos[r][c] = s;
+		}
+	return true;
+}
 
 bool gxDs3dGeomFrameSupported()
 {
@@ -39,6 +116,12 @@ bool gxDs3dGeomFrameSupported()
 		harness_profile_emitf("gxds3dwhy wbuffer");
 #endif
 		return false;   // Z-buffer mode only, this first slice (see header comment)
+	}
+	if (gfx3d.enableClearImage) {
+#ifdef DSA_GXGEOM_DEBUGWHY
+		harness_profile_emitf("gxds3dwhy clearimage");
+#endif
+		return false;   // rear-plane per-pixel clear depth (Stage 2) not modelled
 	}
 
 	for (int i = 0; i < polycount; ++i) {
@@ -94,6 +177,15 @@ bool gxDs3dGeomFrameSupported()
 				return false;
 			}
 		}
+		if (gxRenderModeIsFast()) {
+			GxDs3dFastXform x;
+			if (!gxDs3dFastXformBuild(p, x)) {
+#ifdef DSA_GXGEOM_DEBUGWHY
+				harness_profile_emitf("gxds3dwhy fastproj i=%d", i);
+#endif
+				return false;
+			}
+		}
 	}
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dwhy OK polycount=%d", polycount);
@@ -105,30 +197,20 @@ bool gxDs3dGeomFrameSupported()
 static void gxDs3dSetupCommonState()
 {
 	GX_SetCullMode(GX_CULL_NONE);
-	// Found this pass: GX's hardware near/far clipper rejected every vertex this
-	// slice ever submitted (verified with a forced full-screen probe triangle --
-	// see the log section), even for vertices well inside gxDs3dGeomFrameSupported()'s
-	// own [-1,1] NDC bounds check. Root cause not fully isolated within this pass's
-	// budget (plausibly guOrtho's near/far mapping interacting with GX's clip-space
-	// W under GX_ORTHOGRAPHIC); disabling GX's own clipper is safe here because
-	// gxDs3dGeomFrameSupported() already independently guarantees every vertex is
-	// within the DS's own [-1,1] NDC cube on the CPU side before this code ever runs.
-	GX_SetClipMode(GX_CLIP_DISABLE);
-	// Z-test is disabled (GX_FALSE), not the design's originally-intended
-	// GX_TRUE/GX_LEQUAL/GX_TRUE: this pass found that even after negating Z (see
-	// gxDs3dRenderAccurate()'s comment) so geometry is inside GX's visible range at
-	// all, turning the depth test back on (tried GX_GEQUAL, the direction the negated
-	// convention should need) still made every draw invisible -- isolated with the
-	// same forced full-screen probe triangle technique, down to "Z-test enabled with
-	// ANY compare function tried" as the remaining blocker, most likely an interaction
-	// with the EFB Z-buffer's actual cleared content (GX_SetCopyClear's GX_MAX_Z24,
-	// set once globally in main.cpp) not being what GEQUAL against our negated range
-	// needs -- not root-caused further within this pass's budget. Leaving Z-test off
-	// is what makes this pass's fixture(s) draw at all; it is NOT depth-correct for
-	// overlapping geometry (submission order wins instead of nearest-wins) -- see the
-	// log section's handoff, this is the top priority for whoever continues 13e.
-	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	// GX's clipper stays on: it only appeared to reject everything while Z was fed
+	// the wrong way round (verified: enabling/disabling it gives identical output on
+	// a3_c27/a3_c28 now), and gxDs3dGeomFrameSupported() keeps every vertex in-frustum.
+	GX_SetClipMode(GX_CLIP_ENABLE);
+	// Both producers write depth = (nz+1)/2 * 0xFFFFFF: near 0, far max (the ortho
+	// matrix's -z_eye cancels gxDs3dRenderAccurate()'s negation; see
+	// gxDs3dFastXformBuild() for Fast). The CPU rasterizer rejects when
+	// depth >= dest, i.e. passes on LESS. (The previous pass tried GEQUAL, which is
+	// the wrong direction -- that, not the EFB clear, is why draws vanished.)
+	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
 	GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+#ifdef DSA_GXGEOM_MUTATE_NOZ
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);   // mutation: depth test must matter on a3_c28
+#endif
 	GX_SetColorUpdate(GX_TRUE);
 	GX_SetAlphaUpdate(GX_TRUE);
 	GX_SetDither(GX_FALSE);
@@ -160,7 +242,50 @@ static inline u8 gxDs3d6To8(u8 v6) { return (u8)((v6 << 2) | (v6 >> 4)); }
 
 static inline void gxDs3dSendColor(const VERT &v)
 {
+#ifdef DSA_GXGEOM_PROBE
+	// Debug: paint each producer a flat marker colour so a capture shows exactly
+	// which pixels GX drew (Accurate magenta, Fast cyan).
+	(void)v;
+	if (gxRenderModeIsFast()) GX_Color4u8(0, 255, 255, 255);
+	else                      GX_Color4u8(255, 0, 255, 255);
+#else
 	GX_Color4u8(gxDs3d6To8(v.color[0]), gxDs3d6To8(v.color[1]), gxDs3d6To8(v.color[2]), 255);
+#endif
+}
+
+static void gxDs3dLoadScreenOrtho()
+{
+	Mtx44 proj;
+	guOrtho(proj, 0, (f32)kScreenH, 0, (f32)kScreenW, 0, 1);
+	GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
+	Mtx mv;
+	guMtxIdentity(mv);
+	GX_LoadPosMtxImm(mv, GX_PNMTX0);
+	GX_SetCurrentMtx(GX_PNMTX0);
+}
+
+// Seeds the EFB's Z with the DS CLEAR_DEPTH value (the CPU rasterizer's
+// clearFragment.depth), independent of whatever GX_SetCopyClear or the 2D pass left
+// there. Needs gxDs3dLoadScreenOrtho() bound; colour untouched.
+static void gxDs3dClearDepth()
+{
+	const float z = -(float)(gfx3d.clearDepth & 0xFFFFFF) / 16777215.0f;
+	GX_SetColorUpdate(GX_FALSE);
+	GX_SetAlphaUpdate(GX_FALSE);
+	GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+		GX_Position3f32(0, 0, z);                           GX_Color4u8(0, 0, 0, 255);
+		GX_Position3f32((f32)kScreenW, 0, z);               GX_Color4u8(0, 0, 0, 255);
+		GX_Position3f32((f32)kScreenW, (f32)kScreenH, z);   GX_Color4u8(0, 0, 0, 255);
+		GX_Position3f32(0, (f32)kScreenH, z);               GX_Color4u8(0, 0, 0, 255);
+	GX_End();
+	GX_SetColorUpdate(GX_TRUE);
+	GX_SetAlphaUpdate(GX_TRUE);
+#ifdef DSA_GXGEOM_MUTATE_NOZ
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+#else
+	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+#endif
 }
 
 // ---------------------------------------------------------------------------------
@@ -177,14 +302,8 @@ static inline void gxDs3dSendColor(const VERT &v)
 void gxDs3dRenderAccurate()
 {
 	gxDs3dSetupCommonState();
-
-	Mtx44 proj;
-	guOrtho(proj, 0, (f32)kScreenH, 0, (f32)kScreenW, 0, 1);
-	GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
-	Mtx mv;
-	guMtxIdentity(mv);
-	GX_LoadPosMtxImm(mv, GX_PNMTX0);
-	GX_SetCurrentMtx(GX_PNMTX0);
+	gxDs3dLoadScreenOrtho();
+	gxDs3dClearDepth();
 
 	const int polycount = gfx3d.polylist->count;
 #ifdef DSA_GXGEOM_DEBUGWHY
@@ -216,6 +335,12 @@ void gxDs3dRenderAccurate()
 			sy = 192.0f - sy;
 			if (sx < 0.0f) sx = 0.0f; else if (sx > 256.0f) sx = 256.0f;
 			if (sy < 0.0f) sy = 0.0f; else if (sy > 192.0f) sy = 192.0f;
+			// rasterize.cpp's edge walker (Ceil28_4) samples each pixel at its top-left
+			// corner; GX samples at the pixel centre, so shift by +0.5. Deliberately NOT
+			// snapped to the CPU's truncated 1/16 grid: measured on a3_c28, that snap
+			// makes GX break sample-on-edge ties differently (29 bad px vs 15 unsnapped).
+			sx += kGxDs3dSampleOffset;
+			sy += kGxDs3dSampleOffset;
 			// Found this pass (see gx-next-steps-log.md's Task 13e-precision section):
 			// guOrtho(mt,t,b,l,r,n,f)'s "-z axis" convention (per libogc's own gu.h doc
 			// comment) means the visible eye-space Z range for near=0,far=1 is [-1,0],
@@ -241,55 +366,42 @@ void gxDs3dRenderAccurate()
 }
 
 // ---------------------------------------------------------------------------------
-// GxFast: converts the polygon's OWN captured mvMatrix/projMatrix (POLY snapshots,
-// taken at submission time by gfx3d.cpp -- a later polygon in the same list can have
-// different matrices) to real GX matrices and lets GX's fixed-function transform
-// hardware do the multiply + perspective divide against VERT::objcoord (object-space,
-// added this task -- see gfx3d.h). DS matrices are stored column-major
-// (matrix.cpp's MatrixMultVec4x4: out[i] = sum_c v[c]*m[4c+i]); GX's Mtx/Mtx44 are
-// row-major (mt[r][c]) -- converting is a transpose: gx[r][c] = ds[4*c + r].
-// Row 1 (the Y output row) of the projection matrix is additionally negated to bake
-// in the same Y-axis flip gxDs3dRenderAccurate applies on the CPU -- GX's own
-// clip-space Y convention is the opposite sense from the DS's (see the log section's
-// "clip-space convention" finding).
+// GxFast: GX's transform hardware does the multiply + perspective divide against
+// VERT::objcoord, using the polygon's own mvMatrix/projMatrix snapshot (a later
+// polygon can have different matrices) folded per gxDs3dFastXformBuild(). No Y flip:
+// GX and the DS both put NDC y=+1 at the top of the viewport. The DS viewport
+// (bottom-left origin) becomes a GX viewport (top-left origin).
 // ---------------------------------------------------------------------------------
-static void gxDs3dConvertMv(const float *ds, Mtx out)
-{
-	for (int r = 0; r < 3; ++r)
-		for (int c = 0; c < 4; ++c)
-			out[r][c] = ds[4 * c + r];
-}
-
-static void gxDs3dConvertProj(const float *ds, Mtx44 out)
-{
-	for (int r = 0; r < 4; ++r)
-		for (int c = 0; c < 4; ++c)
-			out[r][c] = ds[4 * c + r];
-	for (int c = 0; c < 4; ++c)
-		out[1][c] = -out[1][c];   // flip Y (GX vs DS clip-space convention)
-}
-
 void gxDs3dRenderFast()
 {
 	gxDs3dSetupCommonState();
+	gxDs3dLoadScreenOrtho();
+	gxDs3dClearDepth();
 
 	const int polycount = gfx3d.polylist->count;
 	float lastMv[16], lastProj[16];
+	u32 lastVp = 0;
 	bool haveLast = false;
 
 	for (int i = 0; i < polycount; ++i) {
 		const POLY &p = gfx3d.polylist->list[i];
 
+		if (!haveLast || p.viewport != lastVp) {
+			VIEWPORT vp;
+			vp.decode(p.viewport);
+			GX_SetViewport((f32)vp.x + kGxDs3dSampleOffset,
+			               (f32)(kScreenH - vp.y - vp.height) + kGxDs3dSampleOffset,
+			               (f32)vp.width, (f32)vp.height, 0, 1);
+			lastVp = p.viewport;
+		}
 		if (!haveLast || memcmp(lastMv, p.mvMatrix, sizeof(lastMv)) != 0 ||
 		    memcmp(lastProj, p.projMatrix, sizeof(lastProj)) != 0) {
-			Mtx mv44;
-			gxDs3dConvertMv(p.mvMatrix, mv44);
-			GX_LoadPosMtxImm(mv44, GX_PNMTX0);
+			GxDs3dFastXform x;
+			if (!gxDs3dFastXformBuild(p, x))
+				continue;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
+			GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
 			GX_SetCurrentMtx(GX_PNMTX0);
-
-			Mtx44 proj;
-			gxDs3dConvertProj(p.projMatrix, proj);
-			GX_LoadProjectionMtx(proj, GX_PERSPECTIVE);
+			GX_LoadProjectionMtx(x.proj, x.projType);
 
 			memcpy(lastMv, p.mvMatrix, sizeof(lastMv));
 			memcpy(lastProj, p.projMatrix, sizeof(lastProj));

@@ -55,27 +55,25 @@
       1. Positive Z (the DS's natural 0=near/1=far convention) falls entirely outside
          guOrtho's actual visible eye-space Z range ([-1,0], "-z axis" per libogc's own
          doc comment) -- GxAccurate now negates sz before feeding GX_Position3f32.
-      2. GX's hardware clipper still rejected every vertex even after the Z fix, for a
-         reason not fully root-caused this pass -- worked around with
-         GX_SetClipMode(GX_CLIP_DISABLE), safe because gxDs3dGeomFrameSupported()
-         already guarantees every vertex is within [-1,1] NDC on the CPU side.
+      2. (Superseded 2026-09-23, Task 13e-zfast.) The "clipper rejects everything"
+         and "Z-test makes draws vanish" findings were one bug: the Z test was tried
+         as GEQUAL, but guOrtho's -z_eye cancels the negation, so depth runs
+         near=0..far=max and the right test is LESS (the CPU rejects depth >= dest).
+         Z test is now on (LESS, depth cleared to gfx3d.clearDepth first) and the
+         clipper is back on; a no-Z mutation build must and does get worse on a3_c28.
       3. VERT::color is a 6-bit-per-channel (0-63) DS material color, not 0-255 --
          GX_Color4u8 needs the standard 6-to-8-bit bit-replication expansion
          (gxDs3d6To8()); without it every triangle rendered ~4x too dark.
-      A fourth issue remains OPEN, not fixed: turning the Z-TEST back on (GX_TRUE,
-      tried GX_GEQUAL to match the negated convention) also made draws invisible again,
-      for a reason not isolated this pass (suspected: the EFB Z-buffer's actual cleared
-      content, from main.cpp's global GX_SetCopyClear(..., GX_MAX_Z24), doesn't satisfy
-      GEQUAL against this function's tiny negative Z range). Z-test is therefore left
-      OFF (GX_FALSE) -- correct for this pass's non-overlapping-in-depth-order fixtures
-      by luck of submission order, but NOT a real fix for depth-correct compositing;
-      this is the top-priority item for whoever continues 13e. gxDs3dRenderFast() was
-      NOT fixed this pass and is still confirmed non-functional (verified via
-      GX_PeekARGB: it draws nothing) -- it inherits the Z-test-off/clip-disable fix via
-      the shared gxDs3dSetupCommonState() but has its own separate, still-unfixed
-      visibility problem in its real-GX-transform-hardware path (gxDs3dConvertProj()),
-      not investigated this pass. Do not trust ANY prior GxFast "byte-exact" result,
-      including case_27's -- it was never actually drawing either.
+      4. (2026-09-23) GxFast now draws: GX_LoadProjectionMtx keeps only 6 entries and
+         GX's clip Z range is [-w,0], so the DS projection is folded into the
+         position matrix and GX gets a depth-only canonical projection (see
+         gxDs3dFastXformBuild()); the old Y flip was wrong (GX and DS both put NDC
+         +1 at the top). Both producers add a +0.5 px sample offset (GX samples pixel
+         centres, the DS rasterizer pixel corners).
+      Result (a3_c27 / a3_c28 vs the DSA_FORCE_CPU reference, 98304 px): 0 / 15 bad
+      in BOTH modes -- the 15 are 5 diagonal-edge tie pixels and 10 at the triangle
+      intersection line (24-bit GX depth vs the CPU's 15-bit quantized depth). So
+      GxAccurate is NOT bit-exact on intersecting geometry yet.
 */
 #ifndef GX_DS_3D_RENDER_H
 #define GX_DS_3D_RENDER_H
