@@ -123,6 +123,13 @@ bool gxDs3dGeomFrameSupported()
 #endif
 		return false;   // rear-plane per-pixel clear depth (Stage 2) not modelled
 	}
+	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
+	if (gfx3d.enableFog || gfx3d.enableEdgeMarking) {
+#ifdef DSA_GXGEOM_DEBUGWHY
+		harness_profile_emitf("gxds3dwhy fog/edge");
+#endif
+		return false;   // post-passes the overlay would paint over (13f)
+	}
 
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
@@ -132,11 +139,11 @@ bool gxDs3dGeomFrameSupported()
 #endif
 			return false;
 		}
-		if (gxDs3dPolyMode(p) == 3) {
+		if (gxDs3dPolyMode(p) != 0) {
 #ifdef DSA_GXGEOM_DEBUGWHY
-			harness_profile_emitf("gxds3dwhy shadow i=%d", i);
+			harness_profile_emitf("gxds3dwhy polymode i=%d mode=%d", i, gxDs3dPolyMode(p));
 #endif
-			return false;   // shadow polygon -- no GX equivalent this pass (13g)
+			return false;   // modulate only: decal/toon/highlight need their own TEV, shadow is 13g
 		}
 		if (gxDs3dTexFormat(p) != 0) {
 #ifdef DSA_GXGEOM_DEBUGWHY

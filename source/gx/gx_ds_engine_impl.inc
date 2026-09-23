@@ -28,7 +28,7 @@
 #include "../MMU.h"
 #if GXDS_CORE == 0
 #include "../gfx3d.h"    // gfx3d_convertedScreen / g_gfx3dRenderSeq (Engine A's 3D layer input)
-#include "gx_ds_3d_render.h"   // task 13e: GX geometry-pass test draw (DSA_GXGEOM_ENABLE)
+#include "gx_ds_3d_render.h"   // task 13e: GX geometry pass
 #endif
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
@@ -3315,6 +3315,28 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 	s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 }
 
+#if GXDS_CORE == 0
+// Task 13e: the GX geometry pass is drawn after every band, so it is only correct
+// where the 3D layer is the frontmost, unmodified layer everywhere: BG0 is the 3D
+// layer in every band, unscrolled, nothing (BG1-3 or a sprite of its tier or nearer)
+// is drawn after it, no window can hide it, and no colour effect targets it.
+static bool gxDsA3dOverlaySafe(int bandCount)
+{
+	for (int b = 0; b < bandCount; ++b) {
+		const GxDsBBandRegs &r = GXDS_REGS[b];
+		if (!r.bg3d || !(r.bgEnable & 1) || (r.hofs[0] & 0x1FF) || r.winEn) return false;
+		const u8 p0 = r.bgPrio[0];
+		for (int bg = 1; bg < 4; ++bg)
+			if (((r.bgEnable >> bg) & 1) && r.bgPrio[bg] < p0) return false;
+		if (r.objEnable)
+			for (int i = 0; i < s_objDrawCount; ++i)
+				if (s_objDraws[i].priority <= p0) return false;
+		if (((r.bldcnt >> 6) & 3) && (r.bldcnt & 1)) return false;   // BG0/3D is a 1st target
+	}
+	return true;
+}
+#endif
+
 static bool gxDsBRenderFrameImpl()
 {
 	// Whatever happens below, this frame's band trace is finished with here;
@@ -3623,24 +3645,16 @@ static bool gxDsBRenderFrameImpl()
 		}
 	}
 
-#if GXDS_CORE == 0 && defined(DSA_GXGEOM_ENABLE)
-	// Task 13e: GX geometry-pass vertical slice, first real consumer of a second
-	// producer for the 3D layer (the existing CPU-rasterizer-into-texture path above
-	// is untouched and remains the only producer unless this compiles in AND the
-	// current frame is in scope). Deliberately drawn as a direct EFB overlay on top of
-	// the just-drawn 2D bands rather than replacing gxDsA3dEnsureTex's texture-slot
-	// contract (see gx-13e-design.md's deviation note + gx-next-steps-log.md's
-	// "Task 13e-slice" section for why: an EFB-only readback can't reproduce the 3D
-	// layer's per-pixel hole/opaque alpha without the same two-pass mask machinery
-	// task 13d needed, out of scope for this first slice). Exact-or-bail: only engages
-	// when gxDs3dGeomFrameSupported() says this frame's polylist is fully within the
-	// slice's supported scope (opaque, untextured, Z-buffer, no shadow, unclipped) --
-	// any other frame leaves the CPU-rasterizer-into-texture band draw above as the
-	// only thing that ran, byte-identical to a DSA_GXGEOM_ENABLE-off build.
+#if GXDS_CORE == 0
+	// Task 13e: GX geometry pass. Drawn as a direct EFB overlay on top of the finished
+	// bands (the CPU-rasterizer 3D texture was already drawn in BG0's slot beneath it),
+	// so it only engages when the 3D layer is the frontmost, unmodified thing on screen
+	// (gxDsA3dOverlaySafe) and the polylist is in the slice's scope
+	// (gxDs3dGeomFrameSupported); otherwise that CPU texture is the 3D layer, as before.
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dgate any3dBand=%d sw=%d", (int)any3dBand, (int)gxRenderModeIsSoftware());
 #endif
-	if (any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported()) {
+	if (any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported()) {
 		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 		if (gxRenderModeIsFast())

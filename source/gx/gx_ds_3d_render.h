@@ -74,6 +74,19 @@
       in BOTH modes -- the 15 are 5 diagonal-edge tie pixels and 10 at the triangle
       intersection line (24-bit GX depth vs the CPU's 15-bit quantized depth). So
       GxAccurate is NOT bit-exact on intersecting geometry yet.
+
+    LIVE 2026-09-23 (Task 13e-liveon): the `DSA_GXGEOM_ENABLE` compile flag is gone --
+    this file is always compiled in, and `gxDs3dGeomFrameSupported()`'s exact-or-bail
+    check plus `gxDsA3dOverlaySafe()` (gx_ds_engine_impl.inc: bails unless BG0/3D is
+    unscrolled, frontmost, and unwindowed in every band) are what a real GxAccurate/
+    GxFast build now leans on instead of a build-time off-switch. Known consequence of
+    turning it on: a3_c28-shaped scenes (opaque untextured triangles whose silhouettes
+    intersect on screen) carry the 15/98304-pixel edge/depth-quantization gap above on
+    *every* frame in both modes -- this is deliberately shipped, not silently hidden;
+    it is the same class of small, characterized, no-known-exact-fix inaccuracy item
+    17's Engine B alpha bias already ships by default. Fixing it for real needs
+    GxAccurate's depth write to reproduce rasterize.cpp's 15-bit `floor(z*0x7FFF)<<9`
+    quantization instead of GX's native 24-bit depth -- not attempted.
 */
 #ifndef GX_DS_3D_RENDER_H
 #define GX_DS_3D_RENDER_H
