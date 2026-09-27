@@ -15,7 +15,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib.sh"
 
-MODES="sw gx"
+MODES="sw gxa gxf"
 SCENE_FILTER="" WRESTLER_FILTER=""
 DO_BUILD=1 DO_CLEAN=0 COMPARE_ARG="" DO_PERF=1 DO_WRESTLERS=1
 TIMEOUT_DEFAULT=180
@@ -23,10 +23,12 @@ TIMEOUT_DEFAULT=180
 usage() {
 	cat <<'EOF'
 Usage: tools/benchmark/run.sh [options]
-  --modes "sw gx"     renderer/JIT modes to sweep (default "sw gx", both
-                       running full JIT - gx IS the "most optimized" config,
-                       there's nothing left jitfull would add on top of it;
-                       also available: jitoff jiton jit9off jit9on jitfull)
+  --modes "sw gxa gxf" render modes to sweep (default all three, all on
+                       full JIT). sw = RenderMode::Software, gxa = GxAccurate,
+                       gxf = GxFast (gx = alias for gxa). All share ONE dol;
+                       the mode is switched at connect via PKT_CTRL
+                       "rendermode ...". Also available (CPU-config A/B,
+                       software render): jitoff jiton jit9off jit9on jitfull
   --scenes "vsd ph"    subset of scene ids from scenes.conf
   --wrestlers "id id"  subset of ids from wrestlers.conf
   --no-build           reuse tools/benchmark/dols/*.dol
@@ -64,16 +66,25 @@ bench_preflight
 # TESTDEFS common to every perf mode: harness net transport + always-on
 # perf-zones breakdown (cheap - see perf_zones.cpp) + fixed test ROM slot.
 perf_defs_for() {
-	local base="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES"
+	local base="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -DDESMUME_FORCE_CORE=1"
 	case "$1" in
-		sw)      echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		gx)      echo "$base -DDESMUME_FORCE_CORE=1" ;;  # GXMerge/GX2DBG is mandatory on the GX core
-		jitoff)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		jiton)   echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		jit9off) echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		jit9on)  echo "$base -DDESMUME_FORCE_CORE=2" ;;
-		jitfull) echo "$base -DDESMUME_FORCE_CORE=1" ;;
-		*)       die "unknown mode '$1'" ;;
+		sw|gx|gxa|gxf|jitoff|jiton|jit9off|jit9on|jitfull) echo "$base" ;;
+		*) die "unknown mode '$1'" ;;
+	esac
+}
+# Modes that differ only in runtime render mode share one dol (build once).
+dol_for_mode() {
+	case "$1" in
+		sw|gx|gxa|gxf) echo perf_gx ;;
+		*)             echo "perf_$1" ;;
+	esac
+}
+# PKT_CTRL rendermode to send after connect (empty = leave the default).
+ctrl_for_mode() {
+	case "$1" in
+		sw|jitoff|jiton|jit9off|jit9on) echo "rendermode software" ;;
+		gx|gxa|jitfull)                 echo "rendermode accurate" ;;
+		gxf)                            echo "rendermode fast" ;;
 	esac
 }
 perf_jitdefs_for() {
@@ -82,7 +93,7 @@ perf_jitdefs_for() {
 		# CPU config (both JITs on) - not an interpreter-only isolation
 		# baseline. jitoff/jit9off stay interpreter-only on purpose: they are
 		# the dedicated A/B baseline for jiton/jit9on's single-core-JIT delta.
-		sw)      echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		sw|gxa|gxf) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		gx)      echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
 		jiton)   echo "-DDESMUME_JIT_ARM7" ;;
 		jit9on)  echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
@@ -109,11 +120,15 @@ RAN=0
 #--- perf matrix ---------------------------------------------------------
 if [ "$DO_PERF" = 1 ]; then
 	[ "$DO_CLEAN" = 1 ] && ( cd "$BENCH_ROOT" && make clean >/dev/null 2>&1 || true )
+	BUILT=" "
 	for m in $MODES; do
+		d="$(dol_for_mode "$m")"
+		case "$BUILT" in *" $d "*) continue ;; esac
+		BUILT="$BUILT$d "
 		if [ "$DO_BUILD" = 1 ]; then
-			build_dol "perf_$m" "$(perf_defs_for "$m")" "$(perf_jitdefs_for "$m")"
+			build_dol "$d" "$(perf_defs_for "$m")" "$(perf_jitdefs_for "$m")"
 		else
-			[ -f "$DOLDIR/perf_$m.dol" ] || die "--no-build but $DOLDIR/perf_$m.dol is missing"
+			[ -f "$DOLDIR/$d.dol" ] || die "--no-build but $DOLDIR/$d.dol is missing"
 		fi
 	done
 
@@ -142,7 +157,10 @@ if [ "$DO_PERF" = 1 ]; then
 			echo ">> perf $id / $m   $(basename "$rom")"
 			dolphin_kill; sleep 2
 			stage_rom "$rom" "$state"
-			capture_run "perf_$m" "$outdir" \
+			ctrl="$(ctrl_for_mode "$m")"
+			ctrl_args=(); [ -n "$ctrl" ] && ctrl_args=(--ctrl-cmd "$ctrl")
+			capture_run "$(dol_for_mode "$m")" "$outdir" \
+				"${ctrl_args[@]}" \
 				"${stop_args[@]}" \
 				--timeout "${timeout:-$TIMEOUT_DEFAULT}"
 			rc=$?

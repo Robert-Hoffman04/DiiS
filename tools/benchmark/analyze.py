@@ -23,11 +23,12 @@ import statistics
 import sys
 
 TARGET_HZ = 59.8261
-MODE_LABEL = {"sw": "software rasterizer", "gx": "GX hardware 3D + GXMerge",
+MODE_LABEL = {"sw": "Software", "gxa": "GX Accurate", "gxf": "GX Fast",
+              "gx": "GX Accurate",
               "jitoff": "ARM7 interpreter", "jiton": "ARM7 JIT",
               "jit9off": "ARM9 interpreter", "jit9on": "ARM9 JIT",
               "jitfull": "full JIT (GXMerge)"}
-MODE_ORDER = ["sw", "gx", "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
+MODE_ORDER = ["sw", "gx", "gxa", "gxf", "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
 REGRESSION_REL = 0.03   # >3% relative eff_fps drop vs baseline -> flag
 
 CSV_ROW_RE = re.compile(r"^\d+,\d+")
