@@ -1449,6 +1449,11 @@ static void execHardware_hblank()
 					const u32 *pv = (const u32 *)MMU.ARM9_LCD;
 					for (u32 i = 0; i < 0xA4000 / 4; ++i) hv = (hv ^ pv[i]) * 16777619u;
 					harness_profile_emitf("fmem %u %08x %08x", (unsigned)(s_fcrcFrame - 1), (unsigned)hm, (unsigned)hv);
+					// Task gx-frozen hook: the 3D raster output and its render counter, to tell a stale GX 3D bake
+					// from a raster that really stopped.
+					{ u32 h3 = 2166136261u; const u32 *p3 = (const u32 *)gfx3d_convertedScreen;
+					  for (u32 i = 0; i < 256*192; ++i) h3 = (h3 ^ p3[i]) * 16777619u;
+					  harness_profile_emitf("f3d %u seq=%u %08x", (unsigned)(s_fcrcFrame - 1), (unsigned)g_gfx3dRenderSeq, (unsigned)h3); }
 				}
 #endif
 			}
