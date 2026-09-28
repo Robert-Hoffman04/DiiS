@@ -2189,7 +2189,7 @@ static bool gxDsA3dScan(bool clearOnly = false)
 	if (clearOnly) {
 		// rasterize.cpp SoftRastRender's clearFragmentColor, in gfx3d_convertedScreen's byte
 		// order (big-endian FragmentColor: a, b, g, r).
-		const u32 cc = gfx3d.clearColor;
+		const u32 cc = gfx3d_rasterClearColor();
 		const u8 t[4] = { (u8)((cc >> 16) & 0x1F), (u8)GFX3D_5TO6((cc >> 10) & 0x1F),
 		                  (u8)GFX3D_5TO6((cc >> 5) & 0x1F), (u8)GFX3D_5TO6(cc & 0x1F) };
 		for (int x = 0; x < k3dW; ++x) memcpy(s_3dClearLine + x * 4, t, 4);
@@ -3560,7 +3560,7 @@ static bool gxDsBRenderFrameImpl()
 	const bool geomPass = any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported();
 	// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
 	// A frame with translucent polygons (GxFast) always takes the clear-only layer: the GX pass
-	// blends them over it, and a raster resolved early (a gfx3d_gl* write) has them in already.
+	// blends them over it, and a raster resolved early (e.g. a bail's GetLineData) has them in already.
 	if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
 	                             (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()))) { DSB_WHY("3dscan"); return false; }
 #endif

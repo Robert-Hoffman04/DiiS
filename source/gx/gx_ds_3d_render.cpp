@@ -580,7 +580,7 @@ static int gxDs3dFrameGate(bool requireTex)
 		if (p.isTranslucent()) {
 			// GxFast only (see the translucent section): GX's 8-bit blend is +-1 LSB.
 			if (!fast) return kGateTranslucent;
-			if (((gfx3d.clearColor >> 16) & 0x1F) != 31) return kGateTransClear;
+			if (((gfx3d_rasterClearColor() >> 16) & 0x1F) != 31) return kGateTransClear;
 			if (!gfx3d.enableAlphaBlending) return kGateTransBlend;
 			anyTrans = true;
 		}
@@ -935,9 +935,9 @@ static inline float gxDs3dWDepthInv(float invw) { return 1.0f - s_wK * invw; }
 // there. Needs gxDs3dLoadScreenOrtho() bound; colour untouched.
 static void gxDs3dClearDepth()
 {
-	float z = -(float)(gfx3d.clearDepth & 0xFFFFFF) / 16777215.0f;
+	float z = -(float)(gfx3d_rasterClearDepth() & 0xFFFFFF) / 16777215.0f;
 	if (gfx3d.wbuffer) {
-		const u32 cd = gfx3d.clearDepth & 0xFFFFFF;
+		const u32 cd = gfx3d_rasterClearDepth() & 0xFFFFFF;
 #ifdef DSA_GXGEOM_MUTATE_WREV
 		const float d = 1.0f; (void)cd;
 #else
@@ -1528,7 +1528,7 @@ void gxDs3dApplyFogFast()
 	// (the geometry pass's own GX_LESS test guarantees this), so comparing the incoming
 	// quad's Z (fed the same reference value) GX_GREATER against the buffer catches
 	// exactly "something nearer was drawn here" without needing a polygon-ID buffer.
-	const float clearZ = -(float)(gfx3d.clearDepth & 0xFFFFFF) / 16777215.0f;
+	const float clearZ = -(float)(gfx3d_rasterClearDepth() & 0xFFFFFF) / 16777215.0f;
 
 	GX_LoadTexObj(&s_fogZTex, GX_TEXMAP0);
 	GX_LoadTexObj(&s_fogLutTex, GX_TEXMAP1);

@@ -69,7 +69,16 @@ in this function: */
 static void gfx3d_doFlush();
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
 static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
+static bool s_rasterLatchValid = false;  // see gfx3d_rasterLatch; false until the first VBlank end after a reset/load
 static bool s_flushFromVBlank = false;
+#ifdef DSA_RASTERSKIP_STATS
+// Why a deferred raster got resolved (index): 7 GetLineData 8 VRAM remap 9 non-VBlank flush;
+// the rest is savestate/scan. (1-6 were the raster-input writers before gfx3d_rasterLatch.)
+static u32 s_rsWhy[10];
+#define RS_WHY(k) do { if (s_rasterDeferred) ++s_rsWhy[k]; } while (0)
+#else
+#define RS_WHY(k) ((void)0)
+#endif
 
 #define GFX_NOARG_COMMAND 0x00
 #define GFX_INVALID_COMMAND 0xFF
@@ -549,6 +558,7 @@ void gfx3d_reset(){
 	
 	memset(gfx3d_convertedScreen,0,sizeof(gfx3d_convertedScreen));
 	s_rasterDeferred = false;
+	s_rasterLatchValid = false;
 
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(0x7FFF);
 	
@@ -1512,22 +1522,18 @@ void VIEWPORT::decode(u32 v){
 }
 
 void gfx3d_glClearColor(u32 v){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.clearColor = v;
 }
 
 void gfx3d_glFogColor(u32 v){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.fogColor = v;
 }
 
 void gfx3d_glFogOffset (u32 v){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.fogOffset = (v&0x7fff);
 }
 
 void gfx3d_glClearDepth(u32 v){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	v &= 0x7FFF;
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(v);
 }
@@ -1547,12 +1553,10 @@ int gfx3d_GetNumVertex(){
 }
 
 void gfx3d_UpdateToonTable(u8 offset, u16 val){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.u16ToonTable[offset] =  val;
 }
 
 void gfx3d_UpdateToonTable(u8 offset, u32 val){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	//C.O.P. sets toon table via this method
 	gfx3d.u16ToonTable[offset] = val & 0xFFFF;
 	gfx3d.u16ToonTable[offset+1] = val >> 16;
@@ -1574,7 +1578,6 @@ s32 gfx3d_GetDirectionalMatrix (u32 index){
 }
 
 void gfx3d_glAlphaFunc(u32 v){
-	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.alphaTestRef = v&31;
 }
 
@@ -1891,9 +1894,9 @@ u32 g_gfx3dRenderSeq = 0;
 // clear image). Such a raster reads no MMU registers, and its only VRAM input
 // (textures, palettes) can change only through a VRAMCNT remap, which resolves it first
 // (gfx3d_vramRemapBarrier). Every other input
-// it reads is either latched at flush (control bits, lists, indexlist) or goes
-// through one of the gfx3d_gl* / toon-table writers, and each of those resolves
-// the deferred raster first. A late raster therefore produces the same bytes the
+// it reads is either latched at flush (control bits, lists, indexlist) or is one of
+// the plain register writes snapshot at VBlank end (gfx3d_rasterLatch), which the
+// late raster swaps in. A late raster therefore produces the same bytes the
 // eager one would have. Nothing reads convertedScreen between the VBlank-start
 // flush and VBlank end (no visible lines, the GX compositor runs at line 191, and
 // savestates are taken at VCount 0), so a raster nobody asked for by the flush is
@@ -1904,13 +1907,51 @@ u32 g_gfx3dRenderSeq = 0;
 static u32 s_rsDeferred, s_rsDropped, s_rsResolved;
 #endif
 
+// The raster inputs that are plain register writes, not latched by the flush:
+// CLEAR_COLOR, CLEAR_DEPTH, FOG_COLOR, FOG_OFFSET, ALPHA_TEST_REF, TOON_TABLE. The eager
+// raster reads them at VBlank end, so that is where they are snapshot. A deferred raster
+// swaps the snapshot in, so a write during display (SM64DS writes FOG_COLOR every frame)
+// no longer has to resolve it and only affects the next frame, as it does on the eager
+// path. The GX geometry pass reads the same snapshot (gfx3d_rasterClearColor/Depth).
+// The swap is its own inverse. rasterize.cpp reads these only inside NDS_3D_Render,
+// which is synchronous (its rasterizer tasks finish before it returns).
+static struct {
+	u32 clearColor, clearDepth, fogColor, fogOffset;
+	u16 toon[32];
+	u8 alphaTestRef;
+} s_rasterLatch;
+
+static void gfx3d_rasterLatch(){
+	s_rasterLatch.clearColor = gfx3d.clearColor;
+	s_rasterLatch.clearDepth = gfx3d.clearDepth;
+	s_rasterLatch.fogColor = gfx3d.fogColor;
+	s_rasterLatch.fogOffset = gfx3d.fogOffset;
+	memcpy(s_rasterLatch.toon, gfx3d.u16ToonTable, sizeof(s_rasterLatch.toon));
+	s_rasterLatch.alphaTestRef = gfx3d.alphaTestRef;
+	s_rasterLatchValid = true;
+}
+
+static void gfx3d_rasterLatchSwap(){
+	std::swap(s_rasterLatch.clearColor, gfx3d.clearColor);
+	std::swap(s_rasterLatch.clearDepth, gfx3d.clearDepth);
+	std::swap(s_rasterLatch.fogColor, gfx3d.fogColor);
+	std::swap(s_rasterLatch.fogOffset, gfx3d.fogOffset);
+	for (int i = 0; i < 32; ++i) std::swap(s_rasterLatch.toon[i], gfx3d.u16ToonTable[i]);
+	std::swap(s_rasterLatch.alphaTestRef, gfx3d.alphaTestRef);
+}
+
+u32 gfx3d_rasterClearColor(){ return s_rasterLatchValid ? s_rasterLatch.clearColor : gfx3d.clearColor; }
+u32 gfx3d_rasterClearDepth(){ return s_rasterLatchValid ? s_rasterLatch.clearDepth : gfx3d.clearDepth; }
+
 void gfx3d_ensureRendered(){
 	if (!s_rasterDeferred) return;
 	s_rasterDeferred = false;
 #ifdef DSA_RASTERSKIP_STATS
 	++s_rsResolved;
 #endif
+	gfx3d_rasterLatchSwap();   // the values the eager raster would have read at VBlank end
 	{ PZ_SCOPE(PZ_GPU_RENDER); gpu3D->NDS_3D_Render(); }
+	gfx3d_rasterLatchSwap();   // and back to the live registers
 }
 
 bool gfx3d_renderDeferred(){
@@ -1921,7 +1962,7 @@ bool gfx3d_renderDeferred(){
 // (texture-mapped VRAM is not CPU-writable), so resolving here keeps a deferred
 // textured raster reading what the eager one at VBlank end would have read.
 void gfx3d_vramRemapBarrier(){
-	gfx3d_ensureRendered();
+	RS_WHY(8); gfx3d_ensureRendered();
 }
 
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush){
@@ -1934,7 +1975,7 @@ static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush){
 #endif
 		return;
 	}
-	gfx3d_ensureRendered();
+	RS_WHY(9); gfx3d_ensureRendered();
 }
 
 void gfx3d_VBlankEndSignal(bool skipFrame){
@@ -1947,6 +1988,7 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 	// rasterizer run only after this point).
 	++g_gfx3dRenderSeq;
 	s_rasterDeferred = false;
+	gfx3d_rasterLatch();
 
 	//if the null 3d core is chosen, then we need to clear out the 3d buffers to keep old data from being rendered
 	if(gpu3D == &gpu3DNull || !CommonSettings.showGpu.main)
@@ -1965,8 +2007,9 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 #ifdef DSA_RASTERSKIP_STATS
 		++s_rsDeferred;
 		if ((g_gfx3dRenderSeq & 63) == 0)
-			harness_profile_emitf("rasterskip seq=%u deferred=%u dropped=%u resolved=%u",
-			                      (unsigned)g_gfx3dRenderSeq, (unsigned)s_rsDeferred, (unsigned)s_rsDropped, (unsigned)s_rsResolved);
+			harness_profile_emitf("rasterskip seq=%u deferred=%u dropped=%u resolved=%u why: line=%u remap=%u flush=%u",
+			                      (unsigned)g_gfx3dRenderSeq, (unsigned)s_rsDeferred, (unsigned)s_rsDropped, (unsigned)s_rsResolved,
+			                      (unsigned)s_rsWhy[7], (unsigned)s_rsWhy[8], (unsigned)s_rsWhy[9]);
 #endif
 		return;
 	}
@@ -2079,7 +2122,7 @@ void gfx3d_glGetLightColor(unsigned int index, unsigned int* dest){
 }
 
 void gfx3d_GetLineData(int line, u8** dst){
-	gfx3d_ensureRendered();
+	RS_WHY(7); gfx3d_ensureRendered();
 	*dst = gfx3d_convertedScreen+((line)<<(8+2));
 }
 
@@ -2268,6 +2311,10 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 		OSREAD(cacheLightDirection);
 		OSREAD(cacheHalfVector);
 	}
+
+	// The loaded G3CX is the frame to show; the snapshot is retaken at the next VBlank end.
+	s_rasterDeferred = false;
+	s_rasterLatchValid = false;
 
 	return true;
 }
