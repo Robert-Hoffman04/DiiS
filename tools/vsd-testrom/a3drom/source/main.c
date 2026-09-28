@@ -89,6 +89,7 @@
 //      near floor and in front of the far floor (intersects it in depth). White/flat colours (GxAccurate's scope). Z-buffer.
 //  39  case 38 in W-buffer mode.
 //  40  case 38 with Gouraud colours on every vertex (GxFast: clipper-interpolated colours).
+//  41-45  cases 1, 0, 11, 10, 2 in Z-buffer mode (3D below BG3/sprites: the GX pass as a texture).
 
 #include <nds.h>
 #include <stdio.h>
@@ -139,6 +140,32 @@
 #else
 #undef A3_CASE
 #define A3_CASE 30
+#endif
+#endif
+
+// 41-45: cases 1/0/11/10/2 in Z-buffer mode (gx-remaining-work.md section 1, "3D at its real
+// priority": BG3 and sprites sit above BG0/3D, so the GX pass is drawn to a texture; Z-buffer so
+// GxAccurate takes them too). 41 holes; 42 cover + BG3 alpha over 3D; 43 3D as alpha 1st target
+// over BG1/backdrop; 44 WIN0; 45 BG0HOFS 37.
+#define A3_ZBUF 0
+#if A3_CASE >= 41 && A3_CASE <= 45
+#undef A3_ZBUF
+#define A3_ZBUF 1
+#if A3_CASE == 41
+#undef A3_CASE
+#define A3_CASE 1
+#elif A3_CASE == 42
+#undef A3_CASE
+#define A3_CASE 0
+#elif A3_CASE == 43
+#undef A3_CASE
+#define A3_CASE 11
+#elif A3_CASE == 44
+#undef A3_CASE
+#define A3_CASE 10
+#else
+#undef A3_CASE
+#define A3_CASE 2
 #endif
 #endif
 
@@ -566,8 +593,14 @@ static void draw3D(void)
 	transScene();
 	return;
 #endif
+#if A3_ZBUF
+	// 41-45: inside the view volume (no clipping) with flat colours, GxAccurate's scope
+	glScalef(0.6f, 0.6f, 0.6f);
+#define glColor3b(r, g, b) glColor3b(A3_FLAT)
+#endif
 #if A3_CASE != 25
 	// big gradient quad (covers most of the screen), polygon id 1
+#define A3_FLAT 200, 80, 40
 		glPolyFmt(POLY_ALPHA(polyAlpha) | POLY_CULL_NONE | POLY_ID(1));
 	glBegin(GL_TRIANGLES);
 		glColor3b(255,   0,   0); glVertex3f(-2.0f,  1.4f, 0.0f);
@@ -579,6 +612,8 @@ static void draw3D(void)
 		glColor3b(255,   0,   0); glVertex3f(-2.0f,  1.4f, 0.0f);
 	glEnd();
 	// a smaller triangle in front, polygon id 2, its own alpha
+#undef A3_FLAT
+#define A3_FLAT 40, 200, 160
 	glPolyFmt(POLY_ALPHA(polyAlpha) | POLY_CULL_NONE | POLY_ID(2));
 	glBegin(GL_TRIANGLES);
 		glColor3b(255, 255,   0); glVertex3f(-1.4f,  1.1f, 0.4f);
@@ -586,10 +621,11 @@ static void draw3D(void)
 		glColor3b(255,   0, 255); glVertex3f( 1.7f, -0.6f, 0.4f);
 	glEnd();
 #endif
+#undef glColor3b
 	// case 25: matrices/material state set up identically above, but zero triangles submitted --
 	// BG0's 3D slot is enabled in DISPCNT/BG0CNT and takes part in the frame exactly like every
 	// other case, it just never has any content (equivalent to an all-holes, alpha=0 3D layer).
-	glFlush(GL_TRANS_MANUALSORT | GL_WBUFFERING);
+	glFlush(GL_TRANS_MANUALSORT | (A3_ZBUF ? 0 : GL_WBUFFERING));
 }
 
 static int f;

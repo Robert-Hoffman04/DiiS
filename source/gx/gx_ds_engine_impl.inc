@@ -112,6 +112,7 @@ static u64 s_dsbTlutOnlyTicks;
 // format), which this file's own gxDsBSetup2DState() necessarily clobbers.
 // See gx_ds_engineb_render.h's "GX present state" deviation note.
 extern void GxRestorePresentState(void);
+extern GXRModeObj *rmode;   // main.cpp (EFB pixel format choice)
 // main.cpp: the mutex already serializing Draw() (emulation thread) against
 // draw_thread (video thread). Held across this file's whole GX sequence so
 // draw_thread cannot interleave its present quads into the same FIFO while
@@ -314,6 +315,12 @@ struct GxDsA3dTex {
 	u16 cfgFx;
 };
 static GxDsA3dTex s_3d, s_3dFx;
+// gx-remaining-work.md section 1 ("3D at its real priority"): the GX geometry pass's own
+// output, EFB-copied (RGB5A3, same 256x256 layout as s_3d) and drawn in BG0's slot like s_3d
+// when the 3D layer is not frontmost/untargeted (gxDsA3dRenderGeomTex). texData is the copy
+// target (memalign'd, never CPU-written after init); only texObj/texData are used.
+static GxDsA3dTex s_3dGx;
+static bool s_3dTexMode;   // this frame draws s_3dGx in BG0's slot
 static u16 *s_3dLinear;            // 256*192: bit15 = present, low 15 = R6G6B6TORGB15 colour
 static u16 *s_3dScratch;
 static u8  s_3dLineTrans[192];     // line has a texel with alpha 1..30
@@ -781,6 +788,7 @@ void GXDS_API(RenderShutdown)()
 	free(s_3d.texData); s_3d.texData = NULL; s_3d.texDataCap = 0; s_3d.valid = false;
 	free(s_3dFx.texData); s_3dFx.texData = NULL; s_3dFx.texDataCap = 0; s_3dFx.valid = false;
 	free(s_3dLinear); s_3dLinear = NULL; free(s_3dScratch); s_3dScratch = NULL; s_3dScanValid = false;
+	free(s_3dGx.texData); s_3dGx.texData = NULL; s_3dGx.valid = false;
 #endif
 	s_bankMapCopyValid = false;
 	s_initDone = false;
@@ -2233,7 +2241,7 @@ static void gxDsA3dEnsureTex(GxDsA3dTex &t, int fadeMode, int fadeLvl)
 	const u32 needed = (u32)k3dW * k3dTexH * sizeof(u16);
 	if (!gxDsBEnsureCap(&t.texData, &t.texDataCap, needed))
 		return;
-	if (!s_3dScratch) s_3dScratch = (u16 *)malloc(needed);
+	if (!s_3dScratch) s_3dScratch = (u16 *)memalign(32, needed);   // 32-aligned: also gxDsA3dRenderGeomTex's copy target
 	if (!s_3dScratch) return;
 	memset(s_3dScratch + (size_t)k3dW * k3dH, 0, (size_t)k3dW * (k3dTexH - k3dH) * sizeof(u16));   // padding rows: transparent
 	s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
@@ -2284,7 +2292,7 @@ static void gxDsA3dEnsureAlphaTex()
 	const u32 needed = (u32)k3dW * k3dTexH * sizeof(u8);
 	if (!gxDsBEnsureCap(&s_3dAlphaTexData, &s_3dAlphaTexDataCap, needed))
 		return;
-	if (!s_3dScratch) s_3dScratch = (u16 *)malloc((size_t)k3dW * k3dTexH * sizeof(u16));
+	if (!s_3dScratch) s_3dScratch = (u16 *)memalign(32, (size_t)k3dW * k3dTexH * sizeof(u16));
 	if (!s_3dScratch) return;
 	u8 *lin = (u8 *)s_3dScratch;   // reuse the scratch buffer's storage, byte-sized here
 	for (int y = 0; y < k3dH; ++y) {
@@ -2825,7 +2833,7 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 #endif
 					continue;
 				}
-				const GxDsA3dTex &t3 = ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
+				const GxDsA3dTex &t3 = s_3dTexMode ? s_3dGx : ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
 				if (!t3.valid) continue;
 				gxDsBTevReplace();
 				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
@@ -3367,6 +3375,110 @@ static bool gxDsA3dOverlaySafe(int bandCount)
 	}
 	return true;
 }
+
+// gx-remaining-work.md section 1: the geometry pass drawn at the 3D layer's real priority.
+// Frames that fail gxDsA3dOverlaySafe (a BG/OBJ above BG0, a window, a scroll, BG0 targeted)
+// render the pass first into the EFB corner the bands later use, on top of the same BG0
+// texture the overlay would have had beneath it (s_3d: the clear colour, or the CPU raster in
+// GxAccurate / a resolved frame), copy that out as s_3dGx and draw it in BG0's slot like s_3d.
+// Per pixel it is exactly the overlay's BG0 result, so the band plan's rules for s_3d carry
+// over, with the scan's per-line flags (s_3dLineTrans/Hole, from the same s_3d source) as the
+// layer's: GX polygons only add opaque coverage (translucent ones exist only with clear alpha
+// 31, i.e. no hole anywhere), so a line the scan calls covered stays covered. What the texture
+// can't carry is the CPU-side fade bake (s_3dFx) and the 13d two-pass draw (s_3dAlphaTex from
+// the scan), so the caller drops back to s_3d if the plan wants either, or a translucent line.
+// Coverage: the EFB here is RGB8 (or RGB565) with no alpha, which is fine when s_3d has no
+// alpha-0 texel (copied alpha is 255); with holes the pass runs in GX_PF_RGBA6_Z24 so the hole
+// texels keep alpha 0 through the copy. RGBA6 truncates colour to 6 bits, which keeps the top
+// 5 the RGB5A3 copy takes, and no blending happens in that case (translucent polygons need a
+// hole-free clear). nds-wii-render-pipeline.md deviation: Stage 3 renders to texture, but the
+// target is the Engine A EFB corner itself, copied before the 2D bands overwrite it.
+static bool gxDsA3dEnsureGeomTex()
+{
+	const u32 bytes = (u32)k3dW * k3dTexH * sizeof(u16);
+	if (!s_3dScratch) s_3dScratch = (u16 *)memalign(32, bytes);   // the copy's staging buffer
+	if (!s_3dScratch) return false;
+	if (s_3dGx.texData) return true;
+	s_3dGx.texData = memalign(32, bytes);
+	if (!s_3dGx.texData) return false;
+	memset(s_3dGx.texData, 0, bytes);   // rows 192.. stay transparent padding (never copied into)
+	DCFlushRange(s_3dGx.texData, bytes);
+	GX_InitTexObj(&s_3dGx.texObj, s_3dGx.texData, k3dW, k3dTexH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_3dGx.texObj, GX_NEAR, GX_NEAR);
+	s_3dGx.valid = true;
+	return true;
+}
+
+// The geometry pass itself (overlay and texture forms). Leaves the 2D state set up.
+static void gxDsA3dGeomDraw()
+{
+	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+	if (gxRenderModeIsFast()) {
+		gxDs3dRenderFast();
+		// Task 13f-fog: GxFast-only post-process (gxDs3dGeomFrameSupported() has
+		// already confirmed fog is on, every in-scope polygon has it enabled, and
+		// we're in Fast mode -- see gx_ds_3d_render.h's comment on this function).
+		if (gfx3d.enableFog)
+			gxDs3dApplyFogFast();
+	} else {
+		gxDs3dRenderAccurate();
+	}
+	// The 3D pass leaves a perspective projection, a POS+CLR vertex format, Z on and
+	// blending off; everything after this (TevReplace, the GxFast alpha stamp, the
+	// copy) assumes the 2D pass's state.
+	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+	gxDsBSetup2DState();
+	s_tevK = -2;
+}
+
+// Under vidmutex, before the bands. See gxDsA3dEnsureGeomTex's comment.
+static void gxDsA3dRenderGeomTex()
+{
+	bool holes = false;
+	for (int y = 0; y < k3dH && !holes; ++y) holes = s_3dLineHole[y] != 0;
+#ifdef DSA_GXTEX_MUTATE_RGB8
+	holes = false;   // mutation: hole texels come out opaque, must fail a hole fixture
+#endif
+	if (holes) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+	// s_3d as the pass's background, alpha included (no blend: an alpha-0 texel writes alpha 0).
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	s_tevK = -1;
+	gxDsA3dDrawBand(s_3d, 0, 0, k3dH);
+	gxDsA3dGeomDraw();
+	GX_DrawDone();
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
+	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
+	// Dolphin serves a texture overlapping an EFB copy from its own GPU-side copy, which keeps
+	// the EFB's 8-bit colour instead of the RGB5A3 quantization (measured: a3_c42 GxAccurate,
+	// 1097 px of BG3-over-3D blend off by 1 step against the identical CPU-baked texture). Real
+	// hardware reads the quantized RAM, but everything here is verified in Dolphin, so the copy
+	// lands in s_3dScratch (free again once s_3d is baked; fade and 13d, its other users,
+	// never run in texture mode) and the CPU moves it into the texture: exact in both, at the
+	// cost of a GX_DrawDone and a 96 KB copy. -DDSA_GXTEX_DIRECTCOPY copies straight into the
+	// texture instead (right on hardware, not in Dolphin).
+#ifdef DSA_GXTEX_DIRECTCOPY
+	GX_CopyTex(s_3dGx.texData, GX_FALSE);   // the bands' backdrop quads repaint every pixel
+	GX_PixModeSync();
+#else
+	{
+		const u32 cb = (u32)k3dW * k3dH * sizeof(u16);
+		DCFlushRange(s_3dScratch, cb);   // no dirty bake line may be written back over the copy
+		GX_CopyTex(s_3dScratch, GX_FALSE);   // the bands' backdrop quads repaint every pixel
+		GX_PixModeSync();
+		GX_DrawDone();
+		DCInvalidateRange(s_3dScratch, cb);
+		memcpy(s_3dGx.texData, s_3dScratch, cb);
+		DCFlushRange(s_3dGx.texData, cb);
+	}
+#endif
+	if (holes) GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
+	GX_InvalidateTexAll();
+}
 #endif
 
 static bool gxDsBRenderFrameImpl()
@@ -3557,24 +3669,58 @@ static bool gxDsBRenderFrameImpl()
 	// rasterizer's render counter).
 	// gx-remaining-work.md section 1: decided here, before the scan, because a frame the
 	// geometry pass draws scans a clear-colour layer and never runs the deferred raster.
-	const bool geomPass = any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported();
-	// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
-	// A frame with translucent polygons (GxFast) always takes the clear-only layer: the GX pass
-	// blends them over it, and a raster resolved early (e.g. a bail's GetLineData) has them in already.
-	if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
-	                             (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()))) { DSB_WHY("3dscan"); return false; }
-#endif
-	for (int b = 0; b < bandCount; ++b) {
-		if (!gxDsBPlanBand(GXDS_REGS[b], bandStarts[b], bandEnds[b], s_bandPlan[b]))
-			return false;
-		const GxDsBBandPlan &pl = s_bandPlan[b];
-		if (pl.fadeBg || pl.fadeObj || pl.fade3d) {
-			if (fadeMode && (fadeMode != pl.mode || fadeLvl != pl.evy)) { DSB_WHY("fadekeys"); return false; }
-			fadeMode = pl.mode; fadeLvl = pl.evy;
-			fadeBgAny |= pl.fadeBg; fadeObjAny |= pl.fadeObj;
-			if (pl.fade3d) fade3dAny = true;
-		}
+	bool geomPass = false, geomOverlay = false;
+	s_3dTexMode = false;
+	if (any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported()) {
+		geomOverlay = gxDsA3dOverlaySafe(bandCount);
+		// Not frontmost/untargeted: the pass is drawn to a texture in BG0's slot instead
+		// (gxDsA3dRenderGeomTex), unless the plan below needs what only s_3d can give.
+		s_3dTexMode = !geomOverlay && gxDsA3dEnsureGeomTex();
+		geomPass = geomOverlay || s_3dTexMode;
 	}
+#endif
+	for (;;) {
+#if GXDS_CORE == 0
+		// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
+		// A frame with translucent polygons (GxFast) always takes the clear-only layer: the GX pass
+		// blends them over it, and a raster resolved early (e.g. a bail's GetLineData) has them in already.
+		if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
+		                             (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()))) { DSB_WHY("3dscan"); return false; }
+#endif
+		fadeBgAny = fadeObjAny = 0; fade3dAny = false; fadeMode = fadeLvl = 0;
+		bool texModeOk = true;
+		(void)texModeOk;
+		for (int b = 0; b < bandCount; ++b) {
+			if (!gxDsBPlanBand(GXDS_REGS[b], bandStarts[b], bandEnds[b], s_bandPlan[b]))
+				return false;
+			const GxDsBBandPlan &pl = s_bandPlan[b];
+#if GXDS_CORE == 0
+			if (pl.fade3d || pl.mask3dCfg) texModeOk = false;
+#endif
+			if (pl.fadeBg || pl.fadeObj || pl.fade3d) {
+				if (fadeMode && (fadeMode != pl.mode || fadeLvl != pl.evy)) { DSB_WHY("fadekeys"); return false; }
+				fadeMode = pl.mode; fadeLvl = pl.evy;
+				fadeBgAny |= pl.fadeBg; fadeObjAny |= pl.fadeObj;
+				if (pl.fade3d) fade3dAny = true;
+			}
+		}
+#if GXDS_CORE == 0
+		if (s_3dTexMode)
+			for (int y = 0; y < k3dH && texModeOk; ++y) if (s_3dLineTrans[y]) texModeOk = false;
+		if (s_3dTexMode && !texModeOk) {
+			// s_3dGx can't stand in for s_3d here (see gxDsA3dEnsureGeomTex): plain CPU 3D
+			// layer, re-scanned from the real raster if the first scan was clear-only.
+			s_3dTexMode = false; geomPass = false;
+			continue;
+		}
+#endif
+		break;
+	}
+#if GXDS_CORE == 0
+#ifdef DSA_GXGEOM_DEBUGWHY
+	if (any3dBand) harness_profile_emitf("gxds3dmode overlay=%d tex=%d", (int)geomOverlay, (int)s_3dTexMode);
+#endif
+#endif
 	// A fade/alpha item is only ever drawn if its layer is enabled in the band
 	// (gxDsBPlanBand walked enabled layers only), so no extra gating is needed.
 
@@ -3656,6 +3802,9 @@ static bool gxDsBRenderFrameImpl()
 #if GXDS_CORE == 0
 	s_3dMaskBand = -1; s_3dMaskCfg = -1;   // task 13d: this frame's mask cache is empty
 #endif
+#if GXDS_CORE == 0
+	if (s_3dTexMode) gxDsA3dRenderGeomTex();   // the pass first, as BG0's texture (s_3dGx)
+#endif
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 
@@ -3693,19 +3842,8 @@ static bool gxDsBRenderFrameImpl()
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dgate any3dBand=%d sw=%d", (int)any3dBand, (int)gxRenderModeIsSoftware());
 #endif
-	if (geomPass) {
-		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
-		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
-		if (gxRenderModeIsFast()) {
-			gxDs3dRenderFast();
-			// Task 13f-fog: GxFast-only post-process (gxDs3dGeomFrameSupported() has
-			// already confirmed fog is on, every in-scope polygon has it enabled, and
-			// we're in Fast mode -- see gx_ds_3d_render.h's comment on this function).
-			if (gfx3d.enableFog)
-				gxDs3dApplyFogFast();
-		} else {
-			gxDs3dRenderAccurate();
-		}
+	if (geomOverlay) {
+		gxDsA3dGeomDraw();
 #ifdef DSA_GXGEOM_DEBUGWHY
 		{
 			GX_DrawDone();
@@ -3716,12 +3854,6 @@ static bool gxDsBRenderFrameImpl()
 			harness_profile_emitf("gxds3dPEEK (10,10) argb=%d,%d,%d,%d", peek.a, peek.r, peek.g, peek.b);
 		}
 #endif
-		// The 3D pass leaves a perspective projection, a POS+CLR vertex format, Z on and
-		// blending off; everything after this (TevReplace, the GxFast alpha stamp, the
-		// copy) assumes the 2D pass's state.
-		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
-		gxDsBSetup2DState();
-		s_tevK = -2;
 	}
 #endif
 
