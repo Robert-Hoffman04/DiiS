@@ -891,8 +891,13 @@ static void gfx3d_glLoadMatrix4x4(u32 v){
 
 	GFX_DELAY(19);
 	
-	if (!mode) vector_fix2float<4>(mtxCurrent[mode], (mtxCurrent[mode][15] ? mtxCurrent[mode][15] : -mtxCurrent[mode][10]));
-	else  vector_fix2float<4>(mtxCurrent[mode], 4096.f); 
+	// Task bgfix: every matrix mode is plain 20.12 fixed point, projection included. The port used to
+	// divide a loaded projection by m[15] (or -m[10] for a perspective one), a leftover of the removed GX
+	// 3D core that normalised the projection for GX. That scales every clip coordinate by 4096/-m[10]:
+	// harmless for x/w, y/w, z/w and clipping, but W-buffer depth (4096*w) and fog read w directly.
+	// SM64DS's letter-scene sky has w=1945; scaled 16x (31119) it passed 0xFFFFFF and failed the depth
+	// test against the clear depth, so the scene showed the black clear colour instead of the sky.
+	vector_fix2float<4>(mtxCurrent[mode], 4096.f);
 	
 	if (mode == 2){
 		MatrixCopy (mtxCurrent[1], mtxCurrent[2]);
