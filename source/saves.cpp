@@ -1114,6 +1114,7 @@ static void writechunks(EMUFILE* os) {
 	WC(savestate_WriteChunk(os,7,gpu_savestate));
 	WC(savestate_WriteChunk(os,8,spu_savestate));
 	WC(savestate_WriteChunk(os,81,mic_savestate));
+	gfx3d_ensureRendered();   // SF_GFX3D carries gfx3d_convertedScreen (G3CX); resolve a deferred raster
 	WC(savestate_WriteChunk(os,90,SF_GFX3D));
 	WC(savestate_WriteChunk(os,91,gfx3d_savestate));
 	WC(savestate_WriteChunk(os,110,SF_WIFI));

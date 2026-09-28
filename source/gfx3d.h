@@ -403,8 +403,14 @@ s32 gfx3d_GetDirectionalMatrix (u32 index);
 void gfx3d_glAlphaFunc(u32 v);
 u32 gfx3d_glGetPosRes(u32 index);
 u16 gfx3d_glGetVecRes(u32 index);
-void gfx3d_VBlankSignal();
+// next3DSkip: the coming gfx3d_VBlankEndSignal will be a skipped 3D frame (frameskip).
+void gfx3d_VBlankSignal(bool next3DSkip);
 void gfx3d_VBlankEndSignal(bool skipFrame);
+// The software raster of a frame the GX geometry pass can draw is deferred (see
+// gfx3d_VBlankEndSignal). Anything reading gfx3d_convertedScreen directly calls
+// gfx3d_ensureRendered() first; gfx3d_GetLineData*() already do.
+void gfx3d_ensureRendered();
+bool gfx3d_renderDeferred();
 void gfx3d_Control(u32 v);
 void gfx3d_execute3D();
 void gfx3d_sendCommandToFIFO(u32 val);

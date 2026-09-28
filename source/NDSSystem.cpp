@@ -1519,7 +1519,7 @@ static void execHardware_hstart_vblankStart()
 	if(T1ReadWord(MMU.ARM7_REG, 4) & 0x8) NDS_makeIrq(ARMCPU_ARM7,IRQ_BIT_LCD_VBLANK);
 
 	//some emulation housekeeping
-	gfx3d_VBlankSignal();
+	gfx3d_VBlankSignal(frameSkipper.ShouldSkip3D());
 
 	//trigger vblank dmas
 	triggerDma(EDMAMode_VBlank);

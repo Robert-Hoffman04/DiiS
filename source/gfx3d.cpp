@@ -44,6 +44,11 @@
 #include "FIFO.h"
 #include "GPU.h"
 #include "perf_zones.h"
+#include "gx/gx_ds_3d_render.h"   // gxDs3dGeomFrameSupported (deferred-raster gate)
+#include "gx/gx_rendermode.h"
+#ifdef DSA_RASTERSKIP_STATS
+#include "harness/harness_profile.h"
+#endif
 #include <queue>
 
 /*
@@ -62,6 +67,9 @@ resolved since then by deferring actual rendering to the next vcount=0 (giving t
 But since we're not sure how we'll eventually want this, I am leaving it sort of reconfigurable, doing all the work
 in this function: */
 static void gfx3d_doFlush();
+static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
+static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
+static bool s_flushFromVBlank = false;
 
 #define GFX_NOARG_COMMAND 0x00
 #define GFX_INVALID_COMMAND 0xFF
@@ -540,6 +548,7 @@ void gfx3d_reset(){
 	viewport = 0xBFFF0000;
 	
 	memset(gfx3d_convertedScreen,0,sizeof(gfx3d_convertedScreen));
+	s_rasterDeferred = false;
 
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(0x7FFF);
 	
@@ -1498,18 +1507,22 @@ void VIEWPORT::decode(u32 v){
 }
 
 void gfx3d_glClearColor(u32 v){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.clearColor = v;
 }
 
 void gfx3d_glFogColor(u32 v){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.fogColor = v;
 }
 
 void gfx3d_glFogOffset (u32 v){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.fogOffset = (v&0x7fff);
 }
 
 void gfx3d_glClearDepth(u32 v){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	v &= 0x7FFF;
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(v);
 }
@@ -1529,10 +1542,12 @@ int gfx3d_GetNumVertex(){
 }
 
 void gfx3d_UpdateToonTable(u8 offset, u16 val){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.u16ToonTable[offset] =  val;
 }
 
 void gfx3d_UpdateToonTable(u8 offset, u32 val){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	//C.O.P. sets toon table via this method
 	gfx3d.u16ToonTable[offset] = val & 0xFFFF;
 	gfx3d.u16ToonTable[offset+1] = val >> 16;
@@ -1554,6 +1569,7 @@ s32 gfx3d_GetDirectionalMatrix (u32 index){
 }
 
 void gfx3d_glAlphaFunc(u32 v){
+	gfx3d_ensureRendered();   // a deferred raster must see the value it would have seen at VBlank end
 	gfx3d.alphaTestRef = v&31;
 }
 
@@ -1767,6 +1783,8 @@ static bool gfx3d_ysort_compare(int num1, int num2){
 }
 
 static void gfx3d_doFlush(){
+	// The lists/state below are the deferred raster's inputs: resolve it first (see gfx3d_VBlankEndSignal).
+	gfx3d_resolveDeferredRender(s_flushFromVBlank);
 
 	//the renderer will get the lists we just built
 	gfx3d.polylist = polylist;
@@ -1846,11 +1864,13 @@ static void gfx3d_doFlush(){
 	drawPending = TRUE;
 }
 
-void gfx3d_VBlankSignal(){
+void gfx3d_VBlankSignal(bool next3DSkip){
 	if (isSwapBuffers){
 		PZ_SCOPE(PZ_GPU_GE);
 #ifndef FLUSHMODE_HACK
+		s_flushFromVBlank = !next3DSkip;
 		gfx3d_doFlush();
+		s_flushFromVBlank = false;
 #endif
 		GFX_DELAY(392);
 		isSwapBuffers = FALSE;
@@ -1858,6 +1878,50 @@ void gfx3d_VBlankSignal(){
 }
 
 u32 g_gfx3dRenderSeq = 0;
+
+// gx-remaining-work.md section 1 ("skip the CPU software rasterizer on frames GX draws"):
+// the raster is DEFERRED, not skipped, and it runs the first time anything needs
+// gfx3d_convertedScreen (gfx3d_ensureRendered). Only GxFast frames the GX geometry pass
+// could draw are deferred (gxDs3dGeomFrameSupported(): untextured, no fog / edge
+// marking / clear image), which reads no VRAM or MMU registers. Every other input
+// it reads is either latched at flush (control bits, lists, indexlist) or goes
+// through one of the gfx3d_gl* / toon-table writers, and each of those resolves
+// the deferred raster first. A late raster therefore produces the same bytes the
+// eager one would have. Nothing reads convertedScreen between the VBlank-start
+// flush and VBlank end (no visible lines, the GX compositor runs at line 191, and
+// savestates are taken at VCount 0), so a raster nobody asked for by the flush is
+// dropped there unless the next VBlank end will skip the 3D frame and keep showing
+// it. GX Engine A draws such a frame's 3D as the geometry-pass overlay over a
+// clear-colour-only BG0 texture (gxDsA3dScan) and never asks for it.
+#ifdef DSA_RASTERSKIP_STATS
+static u32 s_rsDeferred, s_rsDropped, s_rsResolved;
+#endif
+
+void gfx3d_ensureRendered(){
+	if (!s_rasterDeferred) return;
+	s_rasterDeferred = false;
+#ifdef DSA_RASTERSKIP_STATS
+	++s_rsResolved;
+#endif
+	{ PZ_SCOPE(PZ_GPU_RENDER); gpu3D->NDS_3D_Render(); }
+}
+
+bool gfx3d_renderDeferred(){
+	return s_rasterDeferred;
+}
+
+static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush){
+	if (!s_rasterDeferred) return;
+	if (beforeVBlankFlush) {
+		// VBlank-start flush, and the coming VBlank end re-renders: this raster is dead.
+		s_rasterDeferred = false;
+#ifdef DSA_RASTERSKIP_STATS
+		++s_rsDropped;
+#endif
+		return;
+	}
+	gfx3d_ensureRendered();
+}
 
 void gfx3d_VBlankEndSignal(bool skipFrame){
 	if (!drawPending) return;
@@ -1868,11 +1932,24 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 	// from gfx3d_convertedScreen only when this counter moved (both writers below/in the
 	// rasterizer run only after this point).
 	++g_gfx3dRenderSeq;
+	s_rasterDeferred = false;
 
 	//if the null 3d core is chosen, then we need to clear out the 3d buffers to keep old data from being rendered
 	if(gpu3D == &gpu3DNull || !CommonSettings.showGpu.main)
 	{
 		memset(gfx3d_convertedScreen,0,sizeof(gfx3d_convertedScreen));
+		return;
+	}
+
+	// GxFast only: see gxDsA3dScan() for the bounded edge-pixel inexactness this carries.
+	if (gxRenderModeIsFast() && gxDs3dGeomFrameSupported()) {
+		s_rasterDeferred = true;
+#ifdef DSA_RASTERSKIP_STATS
+		++s_rsDeferred;
+		if ((g_gfx3dRenderSeq & 63) == 0)
+			harness_profile_emitf("rasterskip seq=%u deferred=%u dropped=%u resolved=%u",
+			                      (unsigned)g_gfx3dRenderSeq, (unsigned)s_rsDeferred, (unsigned)s_rsDropped, (unsigned)s_rsResolved);
+#endif
 		return;
 	}
 
@@ -1984,6 +2061,7 @@ void gfx3d_glGetLightColor(unsigned int index, unsigned int* dest){
 }
 
 void gfx3d_GetLineData(int line, u8** dst){
+	gfx3d_ensureRendered();
 	*dst = gfx3d_convertedScreen+((line)<<(8+2));
 }
 

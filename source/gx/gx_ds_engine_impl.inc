@@ -318,8 +318,12 @@ static u16 *s_3dLinear;            // 256*192: bit15 = present, low 15 = R6G6B6T
 static u16 *s_3dScratch;
 static u8  s_3dLineTrans[192];     // line has a texel with alpha 1..30
 static u8  s_3dLineHole[192];      // line has a texel with alpha 0 (the 3D layer does not cover the whole line)
-static u32 s_3dScanSeq;
+static u32 s_3dScanSeq;             // (g_gfx3dRenderSeq << 1) | clear-only: the key every 3D texture is baked against
 static bool s_3dScanValid;
+// Deferred-raster frames (gfx3d_VBlankEndSignal / gxDsA3dScan): when set, the 3D layer
+// is read as a uniform clear-colour texel line instead of gfx3d_convertedScreen.
+static bool s_3dClearOnly;
+static u8 s_3dClearLine[256 * 4];
 static const int k3dW = 256, k3dH = 192;
 // The texture is 256 x 256 (rows 192.. transparent padding), NOT 256 x 192: Dolphin's GX_NEAR sampling of a
 // non-power-of-two texture through interpolated UVs picks a neighbouring texel on scattered pixels (measured on
@@ -2158,18 +2162,44 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 // SWAP_BUFFERS was pending (g_gfx3dRenderSeq bumps), so the linear copy, the
 // translucency scan and both textures are keyed on that counter (+ the fade key);
 // gxDsEngineAInvalidateAll() (reset / savestate load) drops them.
-static bool gxDsA3dScan()
+//
+// gx-remaining-work.md section 1: `clearOnly` (the caller has established that this frame's
+// 3D is drawn by the GX geometry pass on top, and the software raster is still deferred)
+// scans a uniform clear-colour layer instead of gfx3d_convertedScreen, so the raster never
+// runs. The deferred raster's buffer is the clear fragment everywhere except under the
+// opaque polygons (gxDs3dGeomFrameSupported: no fog, edge marking, clear image or
+// translucency), and those are exactly the pixels the geometry overlay then overwrites
+// with opaque colour, BG0/3D being frontmost and untargeted (gxDsA3dOverlaySafe). The one
+// difference is a pixel the CPU covers and GX does not (edge tie rules): it shows the
+// clear colour instead of the CPU's polygon colour (a3_c28: 6 silhouette-edge pixels on
+// top of the overlay's own 15; a3_c27: none; see the log's Task 1a-rasterskip section).
+// That is a characterized, edge-bounded inexactness, so this is GxFast only: GxAccurate
+// keeps the eager raster underneath the overlay. Every other consumer (a bail to the CPU compositor, savestates, capture) goes
+// through gfx3d_ensureRendered() and gets the real raster.
+static bool gxDsA3dScan(bool clearOnly = false)
 {
-	if (s_3dScanValid && s_3dScanSeq == g_gfx3dRenderSeq)
+	const u32 key = (g_gfx3dRenderSeq << 1) | (clearOnly ? 1u : 0u);
+	if (s_3dScanValid && s_3dScanSeq == key)
 		return true;
 	if (!s_3dLinear) {
 		s_3dLinear = (u16 *)malloc((size_t)k3dW * k3dH * sizeof(u16));
 		if (!s_3dLinear) return false;
 	}
-	const u8 *c = gfx3d_convertedScreen;
+	s_3dClearOnly = clearOnly;
+	if (clearOnly) {
+		// rasterize.cpp SoftRastRender's clearFragmentColor, in gfx3d_convertedScreen's byte
+		// order (big-endian FragmentColor: a, b, g, r).
+		const u32 cc = gfx3d.clearColor;
+		const u8 t[4] = { (u8)((cc >> 16) & 0x1F), (u8)GFX3D_5TO6((cc >> 10) & 0x1F),
+		                  (u8)GFX3D_5TO6((cc >> 5) & 0x1F), (u8)GFX3D_5TO6(cc & 0x1F) };
+		for (int x = 0; x < k3dW; ++x) memcpy(s_3dClearLine + x * 4, t, 4);
+	} else {
+		gfx3d_ensureRendered();
+	}
 	u16 *o = s_3dLinear;
 	for (int y = 0; y < k3dH; ++y) {
 		u8 trans = 0, hole = 0;
+		const u8 *c = clearOnly ? s_3dClearLine : gfx3d_convertedScreen + (size_t)y * k3dW * 4;
 		for (int x = 0; x < k3dW; ++x, c += 4, ++o) {
 			const u8 a = c[0];
 			if (a == 0) { *o = 0; hole = 1; continue; }
@@ -2180,10 +2210,10 @@ static bool gxDsA3dScan()
 		s_3dLineTrans[y] = trans;
 		s_3dLineHole[y] = hole;
 	}
-	s_3dScanSeq = g_gfx3dRenderSeq;
+	s_3dScanSeq = key;
 	s_3dScanValid = true;
 #ifdef DSB_STATS
-	{
+	if (!clearOnly) {
 		u32 nonzeroA = 0;
 		const u8 *cc = gfx3d_convertedScreen;
 		for (int i = 0; i < k3dW * k3dH; ++i, cc += 4) if (cc[0]) ++nonzeroA;
@@ -2247,7 +2277,7 @@ static void gxDsA3dDrawBand(const GxDsA3dTex &t, int hofs, int y0, int y1)
 // g_gfx3dRenderSeq as everything else derived from gfx3d_convertedScreen.
 static void gxDsA3dEnsureAlphaTex()
 {
-	if (!gxDsA3dScan()) return;
+	if (!gxDsA3dScan(s_3dClearOnly)) return;   // same source as this frame's scan
 	if (s_3dAlphaValid && s_3dAlphaSeq == s_3dScanSeq)
 		return;
 	s_3dAlphaValid = false;
@@ -2257,8 +2287,9 @@ static void gxDsA3dEnsureAlphaTex()
 	if (!s_3dScratch) s_3dScratch = (u16 *)malloc((size_t)k3dW * k3dTexH * sizeof(u16));
 	if (!s_3dScratch) return;
 	u8 *lin = (u8 *)s_3dScratch;   // reuse the scratch buffer's storage, byte-sized here
-	const u8 *c = gfx3d_convertedScreen;
-	for (int y = 0; y < k3dH; ++y)
+	for (int y = 0; y < k3dH; ++y) {
+		// Same source gxDsA3dScan() read (its key is s_3dScanSeq): the real raster or the clear line.
+		const u8 *c = s_3dClearOnly ? s_3dClearLine : gfx3d_convertedScreen + (size_t)y * k3dW * 4;
 		for (int x = 0; x < k3dW; ++x, c += 4)
 			// CPU blend weight for texel alpha a (1..31, a==0 is "absent", never
 			// blended) is (a+1)/32 (GPU.cpp _master_setFinal3dColor:
@@ -2269,6 +2300,7 @@ static void gxDsA3dEnsureAlphaTex()
 			// a==0 (absent) must stay exactly 0, not (0+1)*255/32 -- the formula
 			// only models a present, blendable texel.
 			lin[y * k3dW + x] = c[0] ? (u8)(((unsigned)c[0] + 1) * 255 / 32) : 0;
+	}
 	memset(lin + (size_t)k3dW * k3dH, 0, (size_t)k3dW * (k3dTexH - k3dH));   // padding rows: alpha 0
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_I8);
 	gxSwizzle8bpp(lin, (u8 *)s_3dAlphaTexData, blk.texelsWide, blk.texelsTall, k3dW, k3dTexH);
@@ -3523,7 +3555,11 @@ static bool gxDsBRenderFrameImpl()
 	// The 3D layer's translucency map (per line) feeds gxDsBPlanBand's exactness check, so
 	// the scan runs first; it is a pure read of gfx3d_convertedScreen (cached on the
 	// rasterizer's render counter).
-	if (any3dBand && !gxDsA3dScan()) { DSB_WHY("3dscan"); return false; }
+	// gx-remaining-work.md section 1: decided here, before the scan, because a frame the
+	// geometry pass draws scans a clear-colour layer and never runs the deferred raster.
+	const bool geomPass = any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported();
+	// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
+	if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() && gfx3d_renderDeferred())) { DSB_WHY("3dscan"); return false; }
 #endif
 	for (int b = 0; b < bandCount; ++b) {
 		if (!gxDsBPlanBand(GXDS_REGS[b], bandStarts[b], bandEnds[b], s_bandPlan[b]))
@@ -3654,7 +3690,7 @@ static bool gxDsBRenderFrameImpl()
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dgate any3dBand=%d sw=%d", (int)any3dBand, (int)gxRenderModeIsSoftware());
 #endif
-	if (any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported()) {
+	if (geomPass) {
 		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 		if (gxRenderModeIsFast()) {
