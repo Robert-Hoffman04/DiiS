@@ -48,7 +48,7 @@ cp "$HERE"/.gen/fxrom_a/fxa_c*.nds "$HERE"/.gen/cirom_a/cia_c*.nds "$HERE"/.gen/
 
 docker run --rm -v "$HERE/a3drom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
 docker run --rm -v "$HERE/a3drom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
-	for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33; do build a3_c$c "-DA3_CASE=$c"; done
+	for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do build a3_c$c "-DA3_CASE=$c"; done
 '
-for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33; do cp "$HERE"/a3drom/a3_c$c.nds "$OUT"/; done
+for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do cp "$HERE"/a3drom/a3_c$c.nds "$OUT"/; done
 echo "Engine A ROMs in $OUT : fxa_c* cia_c* afa_c* a3_c*"

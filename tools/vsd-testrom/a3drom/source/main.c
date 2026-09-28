@@ -71,6 +71,17 @@
 //  31  case 30 with arbitrary per-vertex (Gouraud) colours: modulate precision (GxFast only).
 //  32  case 28 in W-buffer mode (GL_WBUFFERING): intersecting untextured geometry, W depth.
 //  33  case 30 in W-buffer mode: textured + intersecting, W depth (GxFast; GxAccurate bails).
+//  34  translucent polygons (gx-remaining-work.md section 1): cover (clear alpha 31), blending +
+//      alpha test (ref 5) on, one opaque Gouraud quad submitted between translucent ones (sorting),
+//      untextured translucent triangles with depth-write (POLYGON_ATTR bit 11) on and off crossing
+//      each other and the opaque quad in depth, an A3I5 quad of alpha 31 without depth write
+//      (opaque texels write depth, translucent ones don't), an A5I3 quad of alpha 20 with depth
+//      write, a direct-colour quad of alpha 16; all translucent IDs distinct. Z-buffer, manual sort.
+//  35  case 34 in W-buffer mode.
+//  36  case 34 plus two overlapping translucent quads with the SAME polygon ID (the second is
+//      dropped where the first drew): GxFast bails `transid`.
+//  37  diagnostic: case 34's opaque quad alone with four different vertex colours (a Gouraud
+//      quad; the DS interpolates quads natively, GX splits them into two triangles).
 
 #include <nds.h>
 #include <stdio.h>
@@ -80,6 +91,26 @@
 #endif
 // 32/33: cases 28/30 with GL_WBUFFERING (gx-remaining-work.md section 1, W-buffer depth mode).
 #define A3_WBUF 0
+#if A3_CASE == 35
+#undef A3_WBUF
+#define A3_WBUF GL_WBUFFERING
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+#define A3_SAMEID 0
+#define A3_QUADPROBE 0
+#if A3_CASE == 37
+#undef A3_QUADPROBE
+#define A3_QUADPROBE 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+#if A3_CASE == 36
+#undef A3_SAMEID
+#define A3_SAMEID 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
 #if A3_CASE == 32 || A3_CASE == 33
 #undef A3_WBUF
 #define A3_WBUF GL_WBUFFERING
@@ -258,6 +289,117 @@ static void texScene(void)
 }
 #endif
 
+#if A3_CASE == 34
+// Translucent-polygon fixture (see the header, cases 34-36). Textures straight to LCDC VRAM
+// like case 30: bank C = texture slot 0, bank E = palettes.
+#define TEXP(addr, sz, tz, fmt) ((u32)((addr) >> 3) | ((u32)(sz) << 20) | ((u32)(tz) << 23) | ((u32)(fmt) << 26))
+#define T_ZW (1u << 11)   // POLYGON_ATTR: translucent polygons update depth
+static const u32 texA3I5 = TEXP(0x0000, 1, 1, 1) | (1u << 16) | (1u << 17);   // 16x16, repeat
+static const u32 texA5I3 = TEXP(0x0400, 1, 1, 6);                              // 16x16, clamp
+static const u32 texDir  = TEXP(0x0800, 1, 1, 7);                              // 16x16 direct, alpha-bit holes
+
+static void texSetup34(void)
+{
+	vramSetBankC(VRAM_C_LCD);
+	vramSetBankE(VRAM_E_LCD);
+	u8 *c = (u8 *)VRAM_C;
+	u16 *e = (u16 *)VRAM_E;
+	for (int i = 0; i < 32; i++) e[i] = RGB15(hashb(i, 13) & 31, hashb(i, 14) & 31, hashb(i, 15) & 31);
+	for (int i = 0; i < 256; i++) c[0x0000 + i] = (u8)((hashb(i, 71) & 31) | ((hashb(i, 72) & 7) << 5));   // A3I5
+	for (int i = 0; i < 256; i++) c[0x0400 + i] = (u8)((hashb(i, 73) & 7) | ((hashb(i, 74) & 31) << 3));   // A5I3
+	for (int i = 0; i < 256; i++)
+		((u16 *)(c + 0x0800))[i] = (u16)((hashb(i, 75) | (hashb(i, 76) << 8)) & 0x7FFF) | ((hashb(i, 77) & 3) ? 0x8000 : 0);
+	vramSetBankC(VRAM_C_TEXTURE_SLOT0);
+	vramSetBankE(VRAM_E_TEX_PALETTE);
+}
+
+static void tQuad(u32 tex, float x0, float y0, float x1, float y1, float zl, float zr, int s1, int t1)
+{
+	GFX_TEX_FORMAT = tex;
+	GFX_PAL_FORMAT = 0;
+	glBegin(GL_QUADS);
+		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(x0, y1, zl);
+		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(0),  inttot16(t1)); glVertex3f(x0, y0, zl);
+		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(s1), inttot16(t1)); glVertex3f(x1, y0, zr);
+		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(s1), inttot16(0));  glVertex3f(x1, y1, zr);
+	glEnd();
+}
+
+static void transScene(void)
+{
+	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
+	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
+	GFX_TEX_FORMAT = 0;
+#if !A3_QUADPROBE
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(10));
+	glBegin(GL_TRIANGLES);
+		glColor3b(250, 40, 40);  glVertex3f(-1.2f,  0.9f,  0.3f);
+		glColor3b(40, 250, 40);  glVertex3f(-1.2f, -0.9f, -0.3f);
+		glColor3b(40, 40, 250);  glVertex3f( 0.9f,  0.0f,  0.3f);
+	glEnd();
+#endif
+	// opaque quad (list position 2; drawn first by the rasterizer's sort). Flat colour: a
+	// 4-colour Gouraud quad is not reproduced by GX's two-triangle split (case 37).
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_QUADS);
+#if A3_QUADPROBE
+		glColor3b(200, 200, 60); glVertex3f(-1.4f,  0.6f, 0.0f);
+		glColor3b(60, 200, 200); glVertex3f(-1.4f, -0.7f, 0.0f);
+		glColor3b(200, 60, 200); glVertex3f( 0.2f, -0.7f, 0.0f);
+		glColor3b(220, 220, 220); glVertex3f( 0.2f,  0.6f, 0.0f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+	return;
+#else
+		glColor3b(200, 190, 70); glVertex3f(-1.4f,  0.6f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f, -0.7f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f( 0.2f, -0.7f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f( 0.2f,  0.6f, 0.0f);
+	glEnd();
+#endif
+	// B: translucent, alpha 20, depth write on, in front of A on the right
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(11) | T_ZW);
+	glBegin(GL_TRIANGLES);
+		glColor3b(250, 250, 40); glVertex3f(-0.2f,  0.8f, 0.5f);
+		glColor3b(40, 250, 250); glVertex3f(-0.2f, -0.5f, 0.5f);
+		glColor3b(250, 40, 250); glVertex3f( 1.3f,  0.2f, 0.4f);
+	glEnd();
+	// C: translucent, alpha 16, no depth write, behind B (rejected where B wrote depth) and
+	// partly behind A (blended over it, A wrote no depth)
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(12));
+	glBegin(GL_TRIANGLES);
+		glColor3b(120, 250, 120); glVertex3f(-1.0f,  0.3f, 0.15f);
+		glColor3b(250, 120, 60);  glVertex3f( 1.2f,  0.9f, 0.15f);
+		glColor3b(60, 120, 250);  glVertex3f( 0.8f, -0.6f, 0.15f);
+	glEnd();
+	// A3I5, alpha 31, no depth write: opaque texels (alpha 7) write colour + depth
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13));
+	tQuad(texA3I5, 0.1f, -1.0f, 1.4f, -0.1f, 0.2f, 0.25f, 24, 24);
+	// A5I3, alpha 20, depth write on
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(14) | T_ZW);
+	tQuad(texA5I3, 0.3f, -0.3f, 1.45f, 0.95f, -0.2f, 0.35f, 16, 16);
+	// direct colour (opaque format), polygon alpha 16
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(15));
+	tQuad(texDir, -1.45f, -1.0f, -0.2f, -0.2f, 0.35f, 0.1f, 16, 16);
+#if A3_SAMEID
+	// two overlapping translucent quads, same ID 20: the second is dropped where the first drew
+	glPolyFmt(POLY_ALPHA(10) | POLY_CULL_NONE | POLY_ID(20));
+	GFX_TEX_FORMAT = 0;
+	glBegin(GL_QUADS);
+		glColor3b(255, 255, 255); glVertex3f(-1.3f, 1.0f, 0.45f);
+		glColor3b(255, 255, 255); glVertex3f(-1.3f, 0.2f, 0.45f);
+		glColor3b(255, 255, 255); glVertex3f(-0.3f, 0.2f, 0.45f);
+		glColor3b(255, 255, 255); glVertex3f(-0.3f, 1.0f, 0.45f);
+		glColor3b(40, 40, 40);    glVertex3f(-0.8f, 0.7f, 0.45f);
+		glColor3b(40, 40, 40);    glVertex3f(-0.8f, -0.1f, 0.45f);
+		glColor3b(40, 40, 40);    glVertex3f( 0.2f, -0.1f, 0.45f);
+		glColor3b(40, 40, 40);    glVertex3f( 0.2f, 0.7f, 0.45f);
+	glEnd();
+#endif
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+}
+#endif
+
 // --- the 3D scene ---
 static int polyAlpha = 31;
 static void draw3D(void)
@@ -352,6 +494,10 @@ static void draw3D(void)
 #endif
 #if A3_CASE == 30 || A3_CASE == 31
 	texScene();
+	return;
+#endif
+#if A3_CASE == 34
+	transScene();
 	return;
 #endif
 #if A3_CASE != 25
@@ -490,6 +636,10 @@ int main(void)
 #elif A3_CASE == 30 || A3_CASE == 31
 	// textured fixture: same isolation as 27/28 (backdrop + BG0/3D only).
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
+#elif A3_CASE == 34
+	// translucent fixture: same isolation, clear colour alpha 31 (GxFast's translucent scope).
+	cover = 1;
+	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #endif
 
 	setupObjs(semi);
@@ -524,6 +674,10 @@ int main(void)
 #elif A3_CASE == 30 || A3_CASE == 31
 	glEnable(GL_TEXTURE_2D);
 	texSetup();
+#elif A3_CASE == 34
+	glEnable(GL_TEXTURE_2D | GL_BLEND | GL_ALPHA_TEST);
+	glAlphaFunc(5);
+	texSetup34();
 #else
 	glEnable(GL_ANTIALIAS);
 #endif

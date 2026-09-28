@@ -3559,7 +3559,10 @@ static bool gxDsBRenderFrameImpl()
 	// geometry pass draws scans a clear-colour layer and never runs the deferred raster.
 	const bool geomPass = any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported();
 	// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
-	if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() && gfx3d_renderDeferred())) { DSB_WHY("3dscan"); return false; }
+	// A frame with translucent polygons (GxFast) always takes the clear-only layer: the GX pass
+	// blends them over it, and a raster resolved early (a gfx3d_gl* write) has them in already.
+	if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
+	                             (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()))) { DSB_WHY("3dscan"); return false; }
 #endif
 	for (int b = 0; b < bandCount; ++b) {
 		if (!gxDsBPlanBand(GXDS_REGS[b], bandStarts[b], bandEnds[b], s_bandPlan[b]))
