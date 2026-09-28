@@ -1882,8 +1882,10 @@ u32 g_gfx3dRenderSeq = 0;
 // gx-remaining-work.md section 1 ("skip the CPU software rasterizer on frames GX draws"):
 // the raster is DEFERRED, not skipped, and it runs the first time anything needs
 // gfx3d_convertedScreen (gfx3d_ensureRendered). Only GxFast frames the GX geometry pass
-// could draw are deferred (gxDs3dGeomFrameSupported(): untextured, no fog / edge
-// marking / clear image), which reads no VRAM or MMU registers. Every other input
+// could draw are deferred (gxDs3dGeomFramePrepare(): opaque, no fog / edge marking /
+// clear image). Such a raster reads no MMU registers, and its only VRAM input
+// (textures, palettes) can change only through a VRAMCNT remap, which resolves it first
+// (gfx3d_vramRemapBarrier). Every other input
 // it reads is either latched at flush (control bits, lists, indexlist) or goes
 // through one of the gfx3d_gl* / toon-table writers, and each of those resolves
 // the deferred raster first. A late raster therefore produces the same bytes the
@@ -1908,6 +1910,13 @@ void gfx3d_ensureRendered(){
 
 bool gfx3d_renderDeferred(){
 	return s_rasterDeferred;
+}
+
+// Texture and palette VRAM can only change under the raster through a bank remap
+// (texture-mapped VRAM is not CPU-writable), so resolving here keeps a deferred
+// textured raster reading what the eager one at VBlank end would have read.
+void gfx3d_vramRemapBarrier(){
+	gfx3d_ensureRendered();
 }
 
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush){
@@ -1941,8 +1950,12 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 		return;
 	}
 
+	// Textured polygons: the GX geometry pass snapshots its textures now, when the raster
+	// samples texture VRAM (gxDs3dGeomFramePrepare), so both see the same texels.
+	const bool geomPass = !gxRenderModeIsSoftware() && gxDs3dGeomFramePrepare();
+
 	// GxFast only: see gxDsA3dScan() for the bounded edge-pixel inexactness this carries.
-	if (gxRenderModeIsFast() && gxDs3dGeomFrameSupported()) {
+	if (gxRenderModeIsFast() && geomPass) {
 		s_rasterDeferred = true;
 #ifdef DSA_RASTERSKIP_STATS
 		++s_rsDeferred;

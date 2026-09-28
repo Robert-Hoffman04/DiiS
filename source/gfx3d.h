@@ -411,6 +411,9 @@ void gfx3d_VBlankEndSignal(bool skipFrame);
 // gfx3d_ensureRendered() first; gfx3d_GetLineData*() already do.
 void gfx3d_ensureRendered();
 bool gfx3d_renderDeferred();
+// A VRAMCNT write is about to change what texture/palette VRAM the raster would read:
+// resolves a deferred raster of a textured frame first.
+void gfx3d_vramRemapBarrier();
 void gfx3d_Control(u32 v);
 void gfx3d_execute3D();
 void gfx3d_sendCommandToFIFO(u32 val);

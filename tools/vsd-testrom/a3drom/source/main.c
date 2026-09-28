@@ -63,6 +63,12 @@
 //      transform against the CPU fixed-point reference, since case 27's single small axis-aligned
 //      triangle was proven too simple to expose any drift. Also exercises multi-polygon submission
 //      (item 13e-slice's known gap: only ever tested with N=1). holes (clear alpha 0), no effects.
+//  29  item 13f fog fixture (see the case body).
+//  30  textured polygons (gx-remaining-work.md section 1): four textured quads + one textured
+//      triangle, every opaque format (I4 colour-0 transparent, direct 16bpp with alpha-bit holes,
+//      4x4 compressed in all four modes, I8, I2), clamp / repeat / repeat+flip / flip-only,
+//      white vertex colour, Z-buffer mode, perspective tilt, isolated like 27/28.
+//  31  case 30 with arbitrary per-vertex (Gouraud) colours: modulate precision (GxFast only).
 
 #include <nds.h>
 #include <stdio.h>
@@ -151,6 +157,91 @@ static void setupObjs(int semiMask)
 	}
 	for (int i = 4; i < 128; i++) oamMain.oamMemory[i].isHidden = true;
 }
+
+#if A3_CASE == 30 || A3_CASE == 31
+// Textured-polygon fixture (gx-remaining-work.md section 1, "Textured polygons"): every
+// opaque texture format, noisy texels so any texel mis-selection shows, colour-0 and
+// alpha-bit holes, clamp / repeat / flip, Z-buffer mode with one overlapping triangle.
+// Textures are written straight to LCDC VRAM and selected with raw TEXIMAGE_PARAM /
+// PLTT_BASE writes (libnds's allocator left every texture blank on DeSmuME).
+// Bank C = texture slot 0, bank D = slot 1 (4x4 index data), bank E = palettes.
+#define TEXP(addr, sz, tz, fmt) ((u32)((addr) >> 3) | ((u32)(sz) << 20) | ((u32)(tz) << 23) | ((u32)(fmt) << 26))
+#define T_RS (1u << 16)
+#define T_RT (1u << 17)
+#define T_FS (1u << 18)
+#define T_FT (1u << 19)
+#define T_C0 (1u << 29)
+static const u32 texI4   = TEXP(0x1000, 2, 2, 3) | T_C0;                        // 32x32 I4, colour 0 transparent, clamp
+static const u32 texRGBA = TEXP(0x2000, 1, 1, 7) | T_RS | T_RT;                 // 16x16 direct, alpha-bit holes, repeat
+static const u32 tex4x4  = TEXP(0x0000, 2, 2, 5);                               // 32x32 4x4-compressed, all 4 modes, clamp
+static const u32 texI8   = TEXP(0x3000, 1, 2, 4) | T_RS | T_RT | T_FS | T_FT;   // 16x32 I8, repeat + flip
+static const u32 texI2   = TEXP(0x4000, 0, 0, 2) | T_RS | T_FT;                 // 8x8 I2, repeat S, flip-only T (= clamp)
+static const u32 palMain = 0x0000 >> 4, palI2 = 0x1000 >> 3;
+
+static void texSetup(void)
+{
+	vramSetBankC(VRAM_C_LCD);
+	vramSetBankD(VRAM_D_LCD);
+	vramSetBankE(VRAM_E_LCD);
+	u8 *c = (u8 *)VRAM_C, *d = (u8 *)VRAM_D;
+	u16 *e = (u16 *)VRAM_E;
+	for (int i = 0; i < 256; i++) e[i] = RGB15(hashb(i, 3) & 31, hashb(i, 4) & 31, hashb(i, 5) & 31);
+	for (int i = 0; i < 4; i++) e[0x800 + i] = RGB15(hashb(i, 6) & 31, hashb(i, 7) & 31, hashb(i, 8) & 31);
+	for (int i = 0; i < 64 * 4; i++) c[i] = hashb(i, 31);                                   // 4x4 texels
+	for (int i = 0; i < 64; i++) ((u16 *)d)[i] = (u16)(((i & 3) << 14) | ((i * 3) & 0x7F));  // mode, pal offset
+	for (int i = 0; i < 32 * 32 / 2; i++) c[0x1000 + i] = hashb(i, 11);
+	for (int i = 0; i < 16 * 16; i++)
+		((u16 *)(c + 0x2000))[i] = (u16)((hashb(i, 21) | (hashb(i, 22) << 8)) & 0x7FFF) | ((hashb(i, 23) & 3) ? 0x8000 : 0);
+	for (int i = 0; i < 16 * 32; i++) c[0x3000 + i] = hashb(i, 41);
+	for (int i = 0; i < 8 * 8 / 4; i++) c[0x4000 + i] = hashb(i, 51);
+	vramSetBankC(VRAM_C_TEXTURE_SLOT0);
+	vramSetBankD(VRAM_D_TEXTURE_SLOT1);
+	vramSetBankE(VRAM_E_TEX_PALETTE);
+}
+
+static int vcol;
+static void tcol(void)
+{
+#if A3_CASE == 31
+	++vcol;
+	glColor3b(hashb(vcol, 61), hashb(vcol, 62), hashb(vcol, 63));   // Gouraud, arbitrary colours
+#else
+	glColor3b(255, 255, 255);
+#endif
+}
+
+static void texQuad(u32 tex, float x0, float y0, float x1, float y1, float z, int s0, int t0, int s1, int t1)
+{
+	GFX_TEX_FORMAT = tex;
+	GFX_PAL_FORMAT = palMain;
+	glBegin(GL_QUADS);
+		tcol(); glTexCoord2t16(inttot16(s0), inttot16(t0)); glVertex3f(x0, y1, z);
+		tcol(); glTexCoord2t16(inttot16(s0), inttot16(t1)); glVertex3f(x0, y0, z);
+		tcol(); glTexCoord2t16(inttot16(s1), inttot16(t1)); glVertex3f(x1, y0, z);
+		tcol(); glTexCoord2t16(inttot16(s1), inttot16(t0)); glVertex3f(x1, y1, z);
+	glEnd();
+}
+
+static void texScene(void)
+{
+	vcol = 0;
+	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	texQuad(texI4,   -1.5f,  0.05f, -0.05f, 1.0f, 0.0f,   0,   0, 32, 32);   // clamp, 1 texel ~ 1.5 px
+	texQuad(texRGBA,  0.05f, 0.05f,  1.5f,  1.0f, 0.0f,   0,   0, 40, 28);   // repeat
+	texQuad(tex4x4,  -1.5f, -1.0f,  -0.05f, -0.05f, 0.0f, -3,  -2, 35, 36);  // clamp beyond both edges
+	texQuad(texI8,    0.05f, -1.0f,  1.5f, -0.05f, 0.0f, -16, -8, 40, 56);  // repeat + mirror
+	// in front, crossing all four quads' depth (tilted in z): depth test between textured polys
+	GFX_TEX_FORMAT = texI2;
+	GFX_PAL_FORMAT = palI2;
+	glBegin(GL_TRIANGLES);
+		tcol(); glTexCoord2t16(inttot16(0),  inttot16(-4)); glVertex3f(-0.6f,  0.6f, 0.3f);
+		tcol(); glTexCoord2t16(inttot16(0),  inttot16(12)); glVertex3f(-0.6f, -0.6f, -0.3f);
+		tcol(); glTexCoord2t16(inttot16(29), inttot16(4));  glVertex3f( 0.8f,  0.0f, 0.3f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+}
+#endif
 
 // --- the 3D scene ---
 static int polyAlpha = 31;
@@ -242,6 +333,10 @@ static void draw3D(void)
 		glColor3b(180, 180, 180); glVertex3f(-1.4f,  1.0f,  0.9f);
 	glEnd();
 	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	return;
+#endif
+#if A3_CASE == 30 || A3_CASE == 31
+	texScene();
 	return;
 #endif
 #if A3_CASE != 25
@@ -377,6 +472,9 @@ int main(void)
 	// quad doesn't cover, same as case 1/27.
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 	fog = 1;
+#elif A3_CASE == 30 || A3_CASE == 31
+	// textured fixture: same isolation as 27/28 (backdrop + BG0/3D only).
+	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #endif
 
 	setupObjs(semi);
@@ -408,6 +506,9 @@ int main(void)
 	glFogShift(0);
 	glFogOffset(0);
 	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
+#elif A3_CASE == 30 || A3_CASE == 31
+	glEnable(GL_TEXTURE_2D);
+	texSetup();
 #else
 	glEnable(GL_ANTIALIAS);
 #endif

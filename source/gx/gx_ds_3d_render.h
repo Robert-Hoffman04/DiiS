@@ -95,12 +95,23 @@
 
 // True iff the current gfx3d.polylist/vertlist content (the just-flushed frame) is
 // fully within this pass's supported scope: all polygons opaque (indexlist's opaque
-// count == polylist->count), untextured (texParam's format field == 0), Z-buffer mode
+// count == polylist->count), untextured or textured with a texture gxDs3dGeomFramePrepare()
+// snapshotted this frame (see below), modulate mode, no wireframe-only concern (alpha-0
+// polygons are skipped, as rasterize.cpp writes none of their fragments), Z-buffer mode
 // (!gfx3d.wbuffer), no shadow-mode polygons (POLYGON_ATTR mode bits != 3), and the
 // polygon/vertex counts are small enough to submit in one GX_Begin/End run per batch
 // without exceeding GX's FIFO in a single frame (no real DS scene gets close to that
 // limit for opaque-only geometry, but the check is cheap so it's included).
 bool gxDs3dGeomFrameSupported();
+
+// Textured polygons (gx-remaining-work.md section 1): called at VBlank end, when the
+// CPU raster samples texture VRAM. True iff the frame is in scope and every texture it
+// uses has been snapshotted into a GX RGB5A3 texture (texcache.cpp decoder), which is
+// what gxDs3dGeomFrameSupported() later requires of textured polygons. GxAccurate takes
+// a textured polygon only with a flat vertex colour whose channels are 0 or 63 (exact
+// modulate); GxFast takes any colour (<= 1 LSB of the 5-bit output). Opaque formats
+// only (2 I2, 3 I4, 4 I8, 5 4x4, 7 direct); A3I5/A5I3 are translucent and bail.
+bool gxDs3dGeomFramePrepare();
 
 // Draws every opaque polygon in gfx3d.polylist (up to the translucent boundary) into
 // whatever EFB region GX_SetViewport/GX_SetScissor currently target, GxAccurate style

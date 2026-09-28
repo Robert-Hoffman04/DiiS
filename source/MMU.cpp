@@ -731,6 +731,10 @@ static inline void MMU_VRAMmapControl(u8 block, u8 VRAMBankCnt)
 		return;
 	}
 
+	// A deferred 3D raster (GxFast, gfx3d_VBlankEndSignal) must read texture VRAM as it
+	// was at VBlank end.
+	gfx3d_vramRemapBarrier();
+
 	//first, save the texture info so we can check it for changes and trigger purges of the texcache
 	MMU_struct::TextureInfo oldTexInfo = MMU.texInfo;
 
