@@ -218,6 +218,32 @@ static void draw3D(void)
 	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
 	return;
 #endif
+#if A3_CASE == 29
+	// item 13f minimal fog fixture: one flat mid-grey quad (under the same unconditional
+	// 27-degree Y rotation every case gets), tilted steeply in Z so its
+	// near edge (bottom of screen) sits close to the camera and its far edge (top of screen)
+	// sits deep in the frustum -- z spans -0.6 (near, same sign convention as case 28's "near"
+	// triangles) to 0.9 (far, matching case 28's "far" triangle), covering most of the DS's
+	// 15-bit fog index range across the fixture's own visible rows. Flat grey colour so any
+	// fog-colour contamination is maximally visible against it (no per-channel colour of its
+	// own to mask a wrong blend). POLY_FOG is required per-polygon (glPolyFmt's raw
+	// GFX_POLY_FORMAT write has no default fog-enable bit -- found this pass: case 12's
+	// own gradient-quad glPolyFmt call is missing it too, so that fixture's fog test
+	// coverage was never actually exercising fogged polygons either; not fixed here,
+	// out of scope, flagged in the log).
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | POLY_FOG);
+	glBegin(GL_TRIANGLES);
+		glColor3b(180, 180, 180); glVertex3f(-1.4f,  1.0f,  0.9f);
+		glColor3b(180, 180, 180); glVertex3f(-1.4f, -1.0f, -0.6f);
+		glColor3b(180, 180, 180); glVertex3f( 1.4f, -1.0f, -0.6f);
+
+		glColor3b(180, 180, 180); glVertex3f( 1.4f, -1.0f, -0.6f);
+		glColor3b(180, 180, 180); glVertex3f( 1.4f,  1.0f,  0.9f);
+		glColor3b(180, 180, 180); glVertex3f(-1.4f,  1.0f,  0.9f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	return;
+#endif
 #if A3_CASE != 25
 	// big gradient quad (covers most of the screen), polygon id 1
 		glPolyFmt(POLY_ALPHA(polyAlpha) | POLY_CULL_NONE | POLY_ID(1));
@@ -343,6 +369,14 @@ int main(void)
 	// same isolation as case 27 -- nothing but the backdrop + BG0/3D visible, so the GX
 	// overlay draw is position-correct with nothing else able to occlude it.
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
+#elif A3_CASE == 29
+	// item 13f minimal fog fixture: same isolation as 27/28 (nothing but backdrop + BG0/3D
+	// visible), one flat-shaded opaque untextured quad tilted steeply in Z so its depth
+	// sweeps a wide range across the screen -- a real, non-degenerate fog gradient, not a
+	// flat all-0/all-max case. holes (clear alpha 0) so the backdrop is visible where the
+	// quad doesn't cover, same as case 1/27.
+	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
+	fog = 1;
 #endif
 
 	setupObjs(semi);
@@ -357,6 +391,22 @@ int main(void)
 	glFogColor(4, 8, 20, 12);
 	glFogShift(3);
 	glFogOffset(0x2000);
+	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
+#elif A3_CASE == 29
+	// fog-only, simplified from case 12 (no antialiasing/outline -- item 13e's own fixture
+	// philosophy: case 27 was deliberately simpler than case 0, this is the same idea for
+	// fog). Distinct fog colour (deep blue-green) so a wrong blend is easy to see by eye.
+	// fogShift=0 / fogOffset=0 spreads the 32 density control points across the FULL
+	// 0..32767 index range (32 * (1024>>0) == 32768) -- found this pass: case 12's own
+	// fogShift(3)/fogOffset(0x2000) values only cover a narrow index band, and this
+	// fixture's first attempt at similar values saturated to near-max fog across the
+	// whole quad (not visibly degenerate by eye, but not the real gradient the task
+	// asked for either) -- spanning the whole index space guarantees whatever depth
+	// range the quad's vertices actually produce lands inside a real, non-flat slope.
+	glEnable(GL_FOG);
+	glFogColor(2, 6, 24, 24);
+	glFogShift(0);
+	glFogOffset(0);
 	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
 #else
 	glEnable(GL_ANTIALIAS);

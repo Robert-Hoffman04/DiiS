@@ -3657,10 +3657,16 @@ static bool gxDsBRenderFrameImpl()
 	if (any3dBand && !gxRenderModeIsSoftware() && gxDsA3dOverlaySafe(bandCount) && gxDs3dGeomFrameSupported()) {
 		GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 		GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
-		if (gxRenderModeIsFast())
+		if (gxRenderModeIsFast()) {
 			gxDs3dRenderFast();
-		else
+			// Task 13f-fog: GxFast-only post-process (gxDs3dGeomFrameSupported() has
+			// already confirmed fog is on, every in-scope polygon has it enabled, and
+			// we're in Fast mode -- see gx_ds_3d_render.h's comment on this function).
+			if (gfx3d.enableFog)
+				gxDs3dApplyFogFast();
+		} else {
 			gxDs3dRenderAccurate();
+		}
 #ifdef DSA_GXGEOM_DEBUGWHY
 		{
 			GX_DrawDone();
