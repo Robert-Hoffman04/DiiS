@@ -82,6 +82,13 @@
 //      dropped where the first drew): GxFast bails `transid`.
 //  37  diagnostic: case 34's opaque quad alone with four different vertex colours (a Gouraud
 //      quad; the DS interpolates quads natively, GX splits them into two triangles).
+//  38  clipped polygons (gx-remaining-work.md section 1): identity modelview, a textured floor
+//      quad (direct, repeat) from behind the eye (w < 0) to beyond the far plane, also crossing
+//      the left and bottom planes; a textured 4x4 quad (clamp) crossing the near, right and top
+//      planes; a large flat untextured triangle crossing far, right, top and bottom, behind the
+//      near floor and in front of the far floor (intersects it in depth). White/flat colours (GxAccurate's scope). Z-buffer.
+//  39  case 38 in W-buffer mode.
+//  40  case 38 with Gouraud colours on every vertex (GxFast: clipper-interpolated colours).
 
 #include <nds.h>
 #include <stdio.h>
@@ -110,6 +117,18 @@
 #define A3_SAMEID 1
 #undef A3_CASE
 #define A3_CASE 34
+#endif
+#define A3_CLIPGOURAUD 0
+#if A3_CASE == 39 || A3_CASE == 40
+#if A3_CASE == 39
+#undef A3_WBUF
+#define A3_WBUF GL_WBUFFERING
+#else
+#undef A3_CLIPGOURAUD
+#define A3_CLIPGOURAUD 1
+#endif
+#undef A3_CASE
+#define A3_CASE 38
 #endif
 #if A3_CASE == 32 || A3_CASE == 33
 #undef A3_WBUF
@@ -204,7 +223,7 @@ static void setupObjs(int semiMask)
 	for (int i = 4; i < 128; i++) oamMain.oamMemory[i].isHidden = true;
 }
 
-#if A3_CASE == 30 || A3_CASE == 31
+#if A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
 // Textured-polygon fixture (gx-remaining-work.md section 1, "Textured polygons"): every
 // opaque texture format, noisy texels so any texel mis-selection shows, colour-0 and
 // alpha-bit holes, clamp / repeat / flip, Z-buffer mode with one overlapping triangle.
@@ -248,7 +267,7 @@ static void texSetup(void)
 static int vcol;
 static void tcol(void)
 {
-#if A3_CASE == 31
+#if A3_CASE == 31 || A3_CLIPGOURAUD
 	++vcol;
 	glColor3b(hashb(vcol, 61), hashb(vcol, 62), hashb(vcol, 63));   // Gouraud, arbitrary colours
 #else
@@ -286,6 +305,49 @@ static void texScene(void)
 		tcol(); glTexCoord2t16(inttot16(29), inttot16(4));  glVertex3f( 0.8f,  0.0f, 0.3f);
 	glEnd();
 	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 33)
+}
+
+#define CV(x, y, z) glVertex3f((x) / 8.0f, (y) / 8.0f, (z) / 8.0f)
+// Clipped-polygon fixture (case 38-40, see the header). Eye space: identity modelview under
+// gluPerspective(70, 4:3, 0.1, 40), so near is z = -0.1, far z = -40, and |x| <= 0.93|z|,
+// |y| <= 0.70|z| is inside.
+static void clipScene(void)
+{
+	vcol = 0;
+	glLoadIdentity();
+	glScalef(8.0f, 8.0f, 8.0f);   // vertices are 4.12 (|v| < 8): CV() divides by 8
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	// floor: behind the eye (z = +0.3, w < 0) to beyond far (z = -45); left and bottom planes
+	GFX_TEX_FORMAT = texRGBA;
+	GFX_PAL_FORMAT = palMain;
+	glBegin(GL_QUADS);
+		tcol(); glTexCoord2t16(inttot16(0),  inttot16(0));   CV(-2.5f, -0.6f,  0.3f);
+		tcol(); glTexCoord2t16(inttot16(48), inttot16(0));   CV( 0.6f, -0.6f,  0.3f);
+		tcol(); glTexCoord2t16(inttot16(48), inttot16(720)); CV( 0.6f, -0.6f, -45.0f);
+		tcol(); glTexCoord2t16(inttot16(0),  inttot16(720)); CV(-2.5f, -0.6f, -45.0f);
+	glEnd();
+	// wall: crosses the near plane (z = -0.05), the right and top planes; clamp beyond edges
+	GFX_TEX_FORMAT = tex4x4;
+	glBegin(GL_QUADS);
+		tcol(); glTexCoord2t16(inttot16(-3), inttot16(36)); CV(0.2f, -0.2f, -2.0f);
+		tcol(); glTexCoord2t16(inttot16(-3), inttot16(-2)); CV(0.2f,  1.5f, -2.0f);
+		tcol(); glTexCoord2t16(inttot16(35), inttot16(-2)); CV(2.0f,  1.5f, -0.05f);
+		tcol(); glTexCoord2t16(inttot16(35), inttot16(36)); CV(2.0f, -0.2f, -0.05f);
+	glEnd();
+	// big untextured triangle: beyond far (top-left), outside right + top, outside bottom
+	GFX_TEX_FORMAT = 0;
+	glBegin(GL_TRIANGLES);
+#if A3_CLIPGOURAUD
+		glColor3b(240, 60, 30);  CV(-30.0f, 20.0f, -60.0f);
+		glColor3b(30, 200, 90);  CV( 40.0f, 25.0f, -30.0f);
+		glColor3b(60, 70, 250);  CV(  2.0f,-20.0f,  -8.0f);
+#else
+		glColor3b(200, 150, 40); CV(-30.0f, 20.0f, -60.0f);
+		glColor3b(200, 150, 40); CV( 40.0f, 25.0f, -30.0f);
+		glColor3b(200, 150, 40); CV(  2.0f,-20.0f,  -8.0f);
+#endif
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 39)
 }
 #endif
 
@@ -496,6 +558,10 @@ static void draw3D(void)
 	texScene();
 	return;
 #endif
+#if A3_CASE == 38
+	clipScene();
+	return;
+#endif
 #if A3_CASE == 34
 	transScene();
 	return;
@@ -633,7 +699,7 @@ int main(void)
 	// quad doesn't cover, same as case 1/27.
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 	fog = 1;
-#elif A3_CASE == 30 || A3_CASE == 31
+#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
 	// textured fixture: same isolation as 27/28 (backdrop + BG0/3D only).
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #elif A3_CASE == 34
@@ -671,7 +737,7 @@ int main(void)
 	glFogShift(0);
 	glFogOffset(0);
 	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
-#elif A3_CASE == 30 || A3_CASE == 31
+#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
 	glEnable(GL_TEXTURE_2D);
 	texSetup();
 #elif A3_CASE == 34

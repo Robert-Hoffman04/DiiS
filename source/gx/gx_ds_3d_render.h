@@ -87,6 +87,9 @@
     17's Engine B alpha bias already ships by default. Fixing it for real needs
     GxAccurate's depth write to reproduce rasterize.cpp's 15-bit `floor(z*0x7FFF)<<9`
     quantization instead of GX's native 24-bit depth -- not attempted.
+    ADDED 2026-09-28 (Task clip): polygons crossing the clip volume are no longer bailed on;
+    both producers draw GFX3D_Clipper's own N-gon (see the .cpp's clipped-polygons section).
+
 */
 #ifndef GX_DS_3D_RENDER_H
 #define GX_DS_3D_RENDER_H

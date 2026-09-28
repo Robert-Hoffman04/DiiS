@@ -338,37 +338,114 @@ static bool gxDs3dTexColorExact(const POLY &p)
 	return true;
 }
 
+// ---------------------------------------------------------------------------------
+// Clipped polygons (gx-remaining-work.md section 1, "Clipped polygons").
+//
+// rasterize.cpp draws GFX3D_Clipper's output, not the polygon: Sutherland-Hodgman against
+// the six planes (strict |coord| > w test, gfx3d.cpp), new vertices linearly interpolated in
+// clip space (coords, texcoords, fcolor), the clipped coordinate snapped to +-w. Both
+// producers take that same N-gon (up to MAX_CLIPPED_VERTS) from the same clipper code, so
+// the vertices and attributes are the CPU's by construction:
+//  - GxAccurate draws a clipped polygon through the span replay (gxDs3dDrawSpansAccurate,
+//    textured or not): the CPU's edge walker over the CPU's N-gon. Flat colour only.
+//  - GxFast draws it as a GX_TRIANGLEFAN in clip space: identity position matrix, position
+//    (X, Y, -W) under the polygon's own canonical projection (gxDs3dFastXformBuild; a
+//    clipped vertex still has Z = alpha*W + beta, so the depth row stays valid), or
+//    (X, Y, Z)/W for an orthographic P. Unclipped polygons keep the hardware transform.
+// Vertices behind the camera (w <= 0) are always outside (near plane), so they no longer
+// bail. Only polygons with a vertex outside are clipped; others keep their own vertex
+// order (the clipper would rotate it by one, which the existing paths never did).
+// ---------------------------------------------------------------------------------
+static GFX3D_Clipper s_clipper;
+static GFX3D_Clipper::TClippedPoly s_clipOut;
+
+static inline bool gxDs3dVertOutside(const VERT &v)
+{
+	const float w = v.coord[3];
+	return v.coord[0] < -w || v.coord[0] > w || v.coord[1] < -w || v.coord[1] > w ||
+	       v.coord[2] < -w || v.coord[2] > w;
+}
+
+// The polygon as rasterize.cpp draws it, in clip space, into out[MAX_CLIPPED_VERTS]:
+// its own vertices when none is outside, else the clipper's N-gon. Returns the vertex
+// count (< 3: clipped away, draws nothing). fcolor is set in both cases.
+static int gxDs3dPolyVerts(POLY &p, VERT *out, bool &clipped)
+{
+	const int n = p.type;
+	clipped = false;
+	for (int j = 0; j < n; ++j) {
+		out[j] = gfx3d.vertlist->list[p.vertIndexes[j]];
+		out[j].color_to_float();   // rasterize.cpp does this to every vertex before clipping
+		clipped |= gxDs3dVertOutside(out[j]);
+	}
+	if (!clipped) return n;
+	VERT in[4];
+	VERT *pin[4];
+	for (int j = 0; j < n; ++j) { in[j] = out[j]; pin[j] = &in[j]; }
+	if (n == 3) pin[3] = NULL;
+	s_clipper.clippedPolys = &s_clipOut;
+	s_clipper.clippedPolyCounter = 0;
+	s_clipper.clipPoly(&p, pin);
+	if (s_clipper.clippedPolyCounter == 0) return 0;
+	const int m = s_clipOut.type;
+	for (int j = 0; j < m; ++j) {
+		out[j] = s_clipOut.clipVerts[j];
+#ifdef DSA_GXGEOM_MUTATE_CLIPUV
+		// mutation: a clipper-made vertex's texcoord one texel off, must fail a3_c38/39
+		bool orig = false;
+		for (int k = 0; k < n; ++k) orig |= memcmp(in[k].coord, out[j].coord, sizeof(in[k].coord)) == 0;
+		if (!orig) { out[j].texcoord[0] += 1.0f; out[j].texcoord[1] += 1.0f; }
+#endif
+	}
+	return m;
+}
+
+// rasterize.cpp's homogeneous divide + viewport + Y flip + screen clamp for x, y.
+static inline void gxDs3dScreenXY(const VERT &v, const VIEWPORT &vp, float &x, float &y)
+{
+	x = (v.coord[0] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.width + (float)vp.x;
+	y = 192.0f - ((v.coord[1] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.height + (float)vp.y);
+	x = fmaxf(0.0f, fminf(256.0f, x));
+	y = fmaxf(0.0f, fminf(192.0f, y));
+}
+
+// fcolor (0-63, fractional at clipper-made vertices) to 8 bits, = gxDs3d6To8Tex on integers.
+static inline u8 gxDs3dF6To8(float f)
+{
+	f = fmaxf(0.0f, fminf(63.0f, f));
+	const int lo = (int)f;
+	const float a = gxDs3d6To8Tex((u8)lo), b = gxDs3d6To8Tex((u8)(lo < 63 ? lo + 1 : 63));
+	return (u8)(a + (f - (float)lo) * (b - a) + 0.5f);
+}
+
 // Reason codes for gxDs3dFrameGate (first failing gate); names for DEBUGWHY/TEXSTATS.
 enum {
 	kGateOk = 0, kGateNoList, kGateEmpty, kGateWbuffer, kGateClearImage, kGateEdge, kGateFog,
-	kGateTranslucent, kGatePolyMode, kGateTexNotReady, kGateTexColor, kGateType, kGateW, kGateNdc,
+	kGateTranslucent, kGatePolyMode, kGateTexNotReady, kGateTexColor, kGateType, kGateW, kGateClipColor,
 	kGateFastProj, kGateDepthEqual, kGateTransClear, kGateTransBlend, kGateTransId, kGateQuadColor, kGateCount
 };
 static const char *const kGateNames[kGateCount] = {
 	"OK", "nolist", "empty", "wbuffer", "clearimage", "edge", "fog", "translucent", "polymode",
-	"texnotready", "texcolor", "type", "w<=0", "ndc", "fastproj", "depthequal", "transclear",
+	"texnotready", "texcolor", "type", "w<=0", "clipcolor", "fastproj", "depthequal", "transclear",
 	"transblend", "transid", "quadcolor"
 };
 
 // Set by the last gxDs3dFrameGate: the frame has translucent polygons that will be drawn.
 static bool s_gateHasTrans = false;
 
-// A translucent polygon's screen outline for the polygon-ID check: rasterize.cpp's divide +
-// viewport (as gxDs3dRenderAccurate) and 28.4 truncation (as gxDs3dDrawSpansAccurate), in
-// 1/16 px units. False if its facing culls it (rasterize.cpp's backface test and
-// PolyAttr::isVisible, as gxDs3dPolyVisible): it draws nothing.
-struct GxDs3dTransShape { double x[4], y[4], x0, y0, x1, y1; int n; u8 id; };
-static bool gxDs3dTransShapeBuild(const POLY &p, GxDs3dTransShape &sh)
+// A polygon's screen outline for the polygon-ID check and GxFast culling: rasterize.cpp's
+// divide + viewport + clamp (gxDs3dScreenXY) of the vertices it draws (gxDs3dPolyVerts) and
+// 28.4 truncation (as gxDs3dDrawSpansAccurate), in 1/16 px units. False if it draws nothing:
+// clipped away, or culled by its facing (rasterize.cpp's backface test on the clipped
+// outline and PolyAttr::isVisible, as gxDs3dPolyVisible).
+struct GxDs3dTransShape { float x[MAX_CLIPPED_VERTS], y[MAX_CLIPPED_VERTS], x0, y0, x1, y1; int n; u8 id; };
+static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *cv, int n, GxDs3dTransShape &sh)
 {
+	if (n < 3) return false;
 	VIEWPORT vp;
 	vp.decode(p.viewport);
-	float fx[4], fy[4];
-	const int n = p.type;
-	for (int j = 0; j < n; ++j) {
-		const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
-		fx[j] = (v.coord[0] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.width + (float)vp.x;
-		fy[j] = 192.0f - ((v.coord[1] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.height + (float)vp.y);
-	}
+	float fx[MAX_CLIPPED_VERTS], fy[MAX_CLIPPED_VERTS];
+	for (int j = 0; j < n; ++j) gxDs3dScreenXY(cv[j], vp, fx[j], fy[j]);
 	float facing = (fy[0] + fy[n - 1]) * (fx[0] - fx[n - 1]);
 	for (int j = 0; j < n - 1; ++j) facing += (fy[j + 1] + fy[j]) * (fx[j + 1] - fx[j]);
 	const bool back = facing < 0;
@@ -380,12 +457,12 @@ static bool gxDs3dTransShapeBuild(const POLY &p, GxDs3dTransShape &sh)
 	}
 	sh.n = n;
 	sh.id = (u8)((p.polyAttr >> 24) & 0x3F);
-	sh.x0 = sh.y0 = 1e30; sh.x1 = sh.y1 = -1e30;
+	sh.x0 = sh.y0 = 1e30f; sh.x1 = sh.y1 = -1e30f;
 	for (int j = 0; j < n; ++j) {
-		sh.x[j] = floor(16.0 * fx[j]);
-		sh.y[j] = floor(16.0 * fy[j]);
-		sh.x0 = fmin(sh.x0, sh.x[j]); sh.x1 = fmax(sh.x1, sh.x[j]);
-		sh.y0 = fmin(sh.y0, sh.y[j]); sh.y1 = fmax(sh.y1, sh.y[j]);
+		sh.x[j] = floorf(16.0f * fx[j]);
+		sh.y[j] = floorf(16.0f * fy[j]);
+		sh.x0 = fminf(sh.x0, sh.x[j]); sh.x1 = fmaxf(sh.x1, sh.x[j]);
+		sh.y0 = fminf(sh.y0, sh.y[j]); sh.y1 = fmaxf(sh.y1, sh.y[j]);
 	}
 	return true;
 }
@@ -424,31 +501,38 @@ static bool gxDs3dTransDraws(const POLY &p)
 // whenever two drawing translucent polygons with the same ID could share a pixel (their
 // outlines' interiors overlap, gxDs3dTransShapesDisjoint; conservative: the first one's
 // fragment may have failed depth or alpha there), else the number of drawing translucent
-// polygons. Adjacent triangles of one mesh (shared edge) pass. skipBehind: ignore polygons
-// with a vertex at w <= 0 (TEXSTATS only; the gate has already rejected those).
-static int gxDs3dTransIdClash(bool skipBehind)
+// polygons. Adjacent triangles of one mesh (shared edge) pass. Clipped polygons use their
+// clipped outline.
+static int gxDs3dTransIdClash()
 {
 	static const int kMaxTrans = 2048;   // the DS's own per-frame polygon limit
 	static GxDs3dTransShape s_sh[kMaxTrans];
+	static s16 s_next[kMaxTrans];        // per-ID chains: only same-ID shapes are compared
+	s16 head[64];
+	for (int k = 0; k < 64; ++k) head[k] = -1;
 	int nt = 0;
 	const int polycount = gfx3d.polylist->count;
+	// Two passes, unclipped polygons first: whether some pair overlaps doesn't depend on the
+	// order, and a clash among those returns before the (costlier) clipper runs.
+	for (int pass = 0; pass < 2; ++pass)
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];
 		if (!p.isTranslucent() || !gxDs3dTransDraws(p)) continue;
-		if (skipBehind) {
-			bool behind = false;
-			for (int j = 0; j < p.type; ++j) behind |= gfx3d.vertlist->list[p.vertIndexes[j]].coord[3] <= 0.0f;
-			if (behind) continue;
-		}
+		bool out = false;
+		for (int j = 0; j < p.type; ++j) out |= gxDs3dVertOutside(gfx3d.vertlist->list[p.vertIndexes[j]]);
+		if (out != (pass == 1)) continue;
 		if (nt == kMaxTrans) return -1;
 		GxDs3dTransShape &sh = s_sh[nt];
-		if (!gxDs3dTransShapeBuild(p, sh)) continue;
-		if (sh.x1 <= 0 || sh.x0 >= 16.0 * kScreenW || sh.y1 <= 0 || sh.y0 >= 16.0 * kScreenH) continue;   // off screen
-		for (int k = 0; k < nt; ++k)
-			if (s_sh[k].id == sh.id && !gxDs3dTransShapesDisjoint(s_sh[k], sh)) {
+		VERT cv[MAX_CLIPPED_VERTS];
+		bool clipped;
+		const int n = gxDs3dPolyVerts(p, cv, clipped);
+		if (!gxDs3dTransShapeBuild(p, cv, n, sh)) continue;
+		if (sh.x1 <= 0 || sh.x0 >= 16.0f * kScreenW || sh.y1 <= 0 || sh.y0 >= 16.0f * kScreenH) continue;   // off screen
+		for (int k = head[sh.id]; k >= 0; k = s_next[k])
+			if (!gxDs3dTransShapesDisjoint(s_sh[k], sh)) {
 #ifdef DSA_GXGEOM_TRANSIDDBG
 				static u32 s_dbg;
-				if (skipBehind && (s_dbg++ & 31) == 0)
+				if ((s_dbg++ & 31) == 0)
 					harness_profile_emitf("transiddbg id=%d i=%d n=%d attr=%08x tex=%08x box=%d,%d,%d,%d prev box=%d,%d,%d,%d ntrans=%d",
 					                      sh.id, i, sh.n, (unsigned)p.polyAttr, (unsigned)p.texParam,
 					                      (int)sh.x0 / 16, (int)sh.y0 / 16, (int)sh.x1 / 16, (int)sh.y1 / 16,
@@ -456,6 +540,8 @@ static int gxDs3dTransIdClash(bool skipBehind)
 #endif
 				return -1;
 			}
+		s_next[nt] = head[sh.id];
+		head[sh.id] = (s16)nt;
 		++nt;
 	}
 	return nt;
@@ -528,40 +614,66 @@ static int gxDs3dFrameGate(bool requireTex)
 		}
 	}
 
-	// Every vertex must land inside [-1,1] on all three axes after the homogeneous
-	// divide -- a sufficient condition for "the DS clipper would not have touched this
-	// polygon" (see gx_ds_3d_render.h). Bail conservatively otherwise; clipped N-gons
-	// are out of scope this pass.
-	for (int i = 0; i < polycount; ++i) {
-		const POLY &p = gfx3d.polylist->list[i];
-		for (int j = 0; j < p.type; ++j) {
-			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
-			if (v.coord[3] <= 0.0f) return kGateW;
-			const float nx = v.coord[0] / v.coord[3];
-			const float ny = v.coord[1] / v.coord[3];
-			const float nz = v.coord[2] / v.coord[3];
-			if (nx < -1.0f || nx > 1.0f || ny < -1.0f || ny > 1.0f || nz < -1.0f || nz > 1.0f)
-				return kGateNdc;
-		}
-		if (fast) {
-			GxDs3dFastXform x;
-			if (!gxDs3dFastXformBuild(p, x, gfx3d.wbuffer != 0, 1.0f)) return kGateFastProj;
-		}
-	}
-
-	// Translucent polygon-ID rule (gxDs3dTransIdClash).
+	// Translucent polygon-ID rule (gxDs3dTransIdClash). Checked before the per-vertex loop
+	// below: it is what rejects SM64DS's frames, and that loop is the gate's biggest cost.
 	if (anyTrans) {
-		const int nt = gxDs3dTransIdClash(false);
+		const int nt = gxDs3dTransIdClash();
 		if (nt < 0) return kGateTransId;
 		s_gateHasTrans = nt > 0;
 	}
+
+	// Clipping (see the clipped-polygons section): every polygon is taken as the CPU clipper
+	// leaves it. A clipped vertex has w >= |x|, |y|, |z|, so w > 0 unless it is degenerate
+	// (the polygon passes exactly through the eye). GxAccurate clips here to rule that out;
+	// GxFast doesn't (SM64DS clips ~1500 polygons a frame, and the gate runs on every frame):
+	// gxDs3dRenderFast skips such a polygon, where the CPU would divide by zero.
+	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
+	for (int i = 0; i < polycount; ++i) {
+		POLY &p = gfx3d.polylist->list[i];
+		bool clipped = false;
+		for (int j = 0; j < p.type; ++j) {
+			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+			clipped |= gxDs3dVertOutside(v);
+		}
+		if (!clipped) {
+			for (int j = 0; j < p.type; ++j)
+				if (gfx3d.vertlist->list[p.vertIndexes[j]].coord[3] <= 0.0f) return kGateW;
+		} else if (!fast) {
+			VERT cv[MAX_CLIPPED_VERTS];
+			const int n = gxDs3dPolyVerts(p, cv, clipped);
+			for (int j = 0; j < n; ++j)
+				if (cv[j].coord[3] <= 0.0f) return kGateW;
+			// GxAccurate spans carry one flat colour (textured polygons: gxDs3dTexColorExact).
+			if (n >= 3 && gxDs3dTexFormat(p) == 0) {
+				const VERT &v0 = gfx3d.vertlist->list[p.vertIndexes[0]];
+				for (int j = 1; j < p.type; ++j) {
+					const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+					if (v.color[0] != v0.color[0] || v.color[1] != v0.color[1] || v.color[2] != v0.color[2])
+						return kGateClipColor;
+				}
+			}
+		}
+		if (fast && (!lastP || memcmp(lastP->mvMatrix, p.mvMatrix, sizeof(p.mvMatrix)) != 0 ||
+		             memcmp(lastP->projMatrix, p.projMatrix, sizeof(p.projMatrix)) != 0)) {
+			GxDs3dFastXform x;
+			if (!gxDs3dFastXformBuild(p, x, gfx3d.wbuffer != 0, 1.0f)) return kGateFastProj;
+			lastP = &p;
+		}
+	}
+
 	return kGateOk;
 }
 
 bool gxDs3dGeomFrameHasTranslucent() { return s_gateHasTrans; }
 
+// Result of this frame's gxDs3dGeomFramePrepare(). The line-191 call can only be stricter
+// (requireTex), so a frame prepare rejected is rejected again without re-running the gate.
+static u32 s_prepSeq = 0xFFFFFFFF;
+static bool s_prepOk = false;
+
 bool gxDs3dGeomFrameSupported()
 {
+	if (s_prepSeq == g_gfx3dRenderSeq && !s_prepOk) return false;
 	const int g = gxDs3dFrameGate(true);
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dwhy %s polycount=%d", kGateNames[g], gfx3d.polylist ? gfx3d.polylist->count : -1);
@@ -575,29 +687,37 @@ bool gxDs3dGeomFramePrepare()
 	const int g = gxDs3dFrameGate(false);
 #ifdef DSA_GXGEOM_TEXSTATS
 	// Per-3D-frame first failing gate, plus per-format polygon counts, every 32 frames.
-	// transidclash: the ID-rule check on every 3D frame regardless of earlier gates, ignoring
-	// polygons behind the camera (what the translucent path would face once clipping lands).
-	static u32 s_gate[kGateCount], s_fmt[8], s_frames, s_tidClash, s_tidPolys;
+	// transidclash: the ID-rule check on every 3D frame regardless of earlier gates.
+	// clippolys: polygons with a vertex outside the clip volume (clipped by the CPU clipper).
+	static u32 s_gate[kGateCount], s_fmt[8], s_frames, s_tidClash, s_tidPolys, s_clipPolys;
 	++s_gate[g];
 	++s_frames;
 	if (gfx3d.polylist && gfx3d.vertlist && gfx3d.polylist->count > 0) {
-		const int nt = gxDs3dTransIdClash(true);
+		const int nt = gxDs3dTransIdClash();
 		if (nt < 0) ++s_tidClash; else s_tidPolys += (u32)nt;
 	}
-	if (gfx3d.polylist)
-		for (int i = 0; i < gfx3d.polylist->count; ++i) ++s_fmt[gxDs3dTexFormat(gfx3d.polylist->list[i])];
+	if (gfx3d.polylist && gfx3d.vertlist)
+		for (int i = 0; i < gfx3d.polylist->count; ++i) {
+			const POLY &p = gfx3d.polylist->list[i];
+			++s_fmt[gxDs3dTexFormat(p)];
+			bool out = false;
+			for (int j = 0; j < p.type; ++j) out |= gxDs3dVertOutside(gfx3d.vertlist->list[p.vertIndexes[j]]);
+			s_clipPolys += out;
+		}
 	if ((s_frames & 31) == 0) {
 		char buf[256];
 		int n = 0;
 		for (int k = 0; k < kGateCount; ++k)
 			if (s_gate[k]) n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kGateNames[k], (unsigned)s_gate[k]);
-		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u transidclash=%u transpolys_ok=%u gates:%s",
+		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u gates:%s",
 		                      (unsigned)s_frames, (unsigned)s_fmt[0], (unsigned)s_fmt[1], (unsigned)s_fmt[2],
 		                      (unsigned)s_fmt[3], (unsigned)s_fmt[4], (unsigned)s_fmt[5], (unsigned)s_fmt[6],
-		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_tidClash, (unsigned)s_tidPolys, buf);
+		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_clipPolys, (unsigned)s_tidClash, (unsigned)s_tidPolys, buf);
 	}
 #endif
-	return g == kGateOk && gxDs3dPrepareTextures();
+	s_prepSeq = g_gfx3dRenderSeq;
+	s_prepOk = g == kGateOk && gxDs3dPrepareTextures();
+	return s_prepOk;
 }
 
 // Shared vertex-color / no-texture TEV+channel setup for both producers.
@@ -606,7 +726,8 @@ static void gxDs3dSetupCommonState()
 	GX_SetCullMode(GX_CULL_NONE);
 	// GX's clipper stays on: it only appeared to reject everything while Z was fed
 	// the wrong way round (verified: enabling/disabling it gives identical output on
-	// a3_c27/a3_c28 now), and gxDs3dGeomFrameSupported() keeps every vertex in-frustum.
+	// a3_c27/a3_c28 now), and every vertex it gets is in-frustum (polygons crossing the
+	// clip volume come pre-clipped by GFX3D_Clipper, see the clipped-polygons section).
 	GX_SetClipMode(GX_CLIP_ENABLE);
 	// Both producers write depth = (nz+1)/2 * 0xFFFFFF: near 0, far max (the ortho
 	// matrix's -z_eye cancels gxDs3dRenderAccurate()'s negation; see
@@ -773,10 +894,28 @@ static void gxDs3dWSetup()
 	bool any = false;
 	const int polycount = gfx3d.polylist->count;
 	for (int i = 0; i < polycount; ++i) {
-		const POLY &p = gfx3d.polylist->list[i];
+		POLY &p = gfx3d.polylist->list[i];
+		// The vertices it draws. A clipped polygon lies inside its own vertices' hull, so its
+		// w >= their min unless the near plane cut it (a vertex with z < -w, which includes
+		// every one behind the eye): only then does it need the clipper's own vertices.
+		bool nearCut = false;
 		for (int j = 0; j < p.type; ++j) {
-			const float w = gfx3d.vertlist->list[p.vertIndexes[j]].coord[3];
-			if (!any || w < k) { k = w; any = true; }
+			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+			nearCut |= v.coord[2] < -v.coord[3] || v.coord[3] <= 0.0f;
+		}
+		if (!nearCut) {
+			for (int j = 0; j < p.type; ++j) {
+				const float w = gfx3d.vertlist->list[p.vertIndexes[j]].coord[3];
+				if (!any || w < k) { k = w; any = true; }
+			}
+			continue;
+		}
+		VERT cv[MAX_CLIPPED_VERTS];
+		bool clipped;
+		const int n = gxDs3dPolyVerts(p, cv, clipped);
+		for (int j = 0; j < (n >= 3 ? n : 0); ++j) {
+			const float w = cv[j].coord[3];
+			if (w > 0.0f && (!any || w < k)) { k = w; any = true; }
 		}
 	}
 	// 1% margin: the nearest vertex would otherwise sit exactly on GX's near clip plane
@@ -902,7 +1041,7 @@ struct GxDs3dEdge {
 	}
 };
 
-static void gxDs3dEmitSpan(const GxDs3dEdge &l, const GxDs3dEdge &r, const VERT &cv)
+static void gxDs3dEmitSpan(const GxDs3dEdge &l, const GxDs3dEdge &r, const VERT &cv, bool textured)
 {
 	const int x0 = (int)l.X;
 	const int width = (int)(r.X - l.X);
@@ -921,11 +1060,12 @@ static void gxDs3dEmitSpan(const GxDs3dEdge &l, const GxDs3dEdge &r, const VERT 
 	float e[4];
 	for (int k = 0; k < 4; ++k) e[k] = a[k] + (float)width * d[k];
 	// NRM = (u/w, v/w, 1/w); position z = -z (see gxDs3dRenderAccurate's gxz note).
+	// Untextured spans (clipped polygons) have no NRM in the vertex descriptor.
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-		GX_Position3f32((float)x0, y0, -a[1]); GX_Normal3f32(a[2], a[3], a[0]); gxDs3dSendColor(cv);
-		GX_Position3f32(x1, y0, -e[1]);        GX_Normal3f32(e[2], e[3], e[0]); gxDs3dSendColor(cv);
-		GX_Position3f32(x1, y1, -e[1]);        GX_Normal3f32(e[2], e[3], e[0]); gxDs3dSendColor(cv);
-		GX_Position3f32((float)x0, y1, -a[1]); GX_Normal3f32(a[2], a[3], a[0]); gxDs3dSendColor(cv);
+		GX_Position3f32((float)x0, y0, -a[1]); if (textured) GX_Normal3f32(a[2], a[3], a[0]); gxDs3dSendColor(cv);
+		GX_Position3f32(x1, y0, -e[1]);        if (textured) GX_Normal3f32(e[2], e[3], e[0]); gxDs3dSendColor(cv);
+		GX_Position3f32(x1, y1, -e[1]);        if (textured) GX_Normal3f32(e[2], e[3], e[0]); gxDs3dSendColor(cv);
+		GX_Position3f32((float)x0, y1, -a[1]); if (textured) GX_Normal3f32(a[2], a[3], a[0]); gxDs3dSendColor(cv);
 	GX_End();
 }
 
@@ -948,12 +1088,12 @@ static bool gxDs3dPolyVisible(const POLY &p, const GxDs3dSpanVert *v, int type, 
 	}
 }
 
-static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp)
+// cv/type: the polygon as rasterize.cpp draws it (gxDs3dPolyVerts, clipped or not).
+static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp, const VERT *cv, int type, bool textured)
 {
-	const int type = p.type;
-	GxDs3dSpanVert sv[4];
+	GxDs3dSpanVert sv[MAX_CLIPPED_VERTS];
 	for (int j = 0; j < type; ++j) {
-		const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+		const VERT &v = cv[j];
 		const float w = v.coord[3];
 		GxDs3dSpanVert &o = sv[j];
 		o.x = (v.coord[0] + w) / (2 * w);
@@ -976,7 +1116,7 @@ static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp)
 			sv[j].y = (float)(int)(16.0f * sv[j].y);
 		}
 		// shape_engine(type, !backfacing): sort_verts reverses when "backwards".
-		const GxDs3dSpanVert *verts[4];
+		const GxDs3dSpanVert *verts[MAX_CLIPPED_VERTS];
 		for (int j = 0; j < type; ++j) verts[j] = &sv[j];
 		if (!backfacing)
 			for (int j = 0; j < type / 2; ++j) { const GxDs3dSpanVert *t = verts[j]; verts[j] = verts[type - j - 1]; verts[type - j - 1] = t; }
@@ -989,7 +1129,7 @@ static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp)
 		while (verts[0]->y == verts[1]->y && verts[0]->x > verts[1]->x)
 			for (int j = 1; j < type; ++j) { const GxDs3dSpanVert *t = verts[j - 1]; verts[j - 1] = verts[j]; verts[j] = t; }
 
-		const VERT &cv = gfx3d.vertlist->list[p.vertIndexes[0]];   // flat colour (gxDs3dTexColorExact)
+		const VERT &fv = gfx3d.vertlist->list[p.vertIndexes[0]];   // flat colour (gxDs3dTexColorExact / clipcolor gate)
 		bool failure = false;
 		int lv = type, rv = 0;
 		GxDs3dEdge left, right;
@@ -1002,7 +1142,7 @@ static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp)
 			if (failure) return;
 			int h = left.Height < right.Height ? left.Height : right.Height;
 			while (h--) {
-				gxDs3dEmitSpan(left, right, cv);
+				gxDs3dEmitSpan(left, right, fv, textured);
 				left.doStep();
 				right.doStep();
 			}
@@ -1046,10 +1186,14 @@ void gxDs3dRenderAccurate()
 #endif
 
 		if (gxDs3dPolyInvisible(p)) continue;
+		VERT cv[MAX_CLIPPED_VERTS];
+		bool clipped;
+		const int nv = gxDs3dPolyVerts(gfx3d.polylist->list[i], cv, clipped);
+		if (nv < 3) continue;   // clipped away
 		gxDs3dBindPoly(p, true, st, first);
 		first = false;
-		if (st.textured) {
-			gxDs3dDrawSpansAccurate(p, vp);
+		if (st.textured || clipped) {
+			gxDs3dDrawSpansAccurate(p, vp, cv, nv, st.textured);
 			continue;
 		}
 		GX_Begin(p.type == 4 ? GX_QUADS : GX_TRIANGLES, GX_VTXFMT0, p.type);
@@ -1122,15 +1266,30 @@ void gxDs3dRenderFast()
 	bool haveLast = false;
 
 	GxDs3dTexState st = {};
-	bool first = true, blendOn = false;
+	bool first = true, blendOn = false, ortho = false;
+	int curMtx = -1;   // 0: PNMTX0 (the polygon's transform), 1: PNMTX1 (identity, clipped)
+	{
+		Mtx id;
+		guMtxIdentity(id);
+		GX_LoadPosMtxImm(id, GX_PNMTX1);
+	}
 	for (int n = 0; n < polycount; ++n) {
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
 		// rasterize.cpp draws them (see the translucent section).
 		POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 		if (gxDs3dPolyInvisible(p)) continue;
-		// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own screen outline.
+		VERT cv[MAX_CLIPPED_VERTS];
+		bool clipped;
+		const int nv = gxDs3dPolyVerts(p, cv, clipped);
+		if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
+			bool bad = false;
+			for (int j = 0; j < nv; ++j) bad |= cv[j].coord[3] <= 0.0f;
+			if (bad) continue;
+		}
+		// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
+		// outline; false also when clipped away.
 		GxDs3dTransShape shape;
-		if (!gxDs3dTransShapeBuild(p, shape)) continue;
+		if (!gxDs3dTransShapeBuild(p, cv, nv, shape)) continue;
 		const bool trans = p.isTranslucent();
 		u8 va = 255;
 		bool zw = true, twoPass = false;
@@ -1163,12 +1322,18 @@ void gxDs3dRenderFast()
 			if (!gxDs3dFastXformBuild(p, x, wbuf, s_wK))
 				continue;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
 			GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
-			GX_SetCurrentMtx(GX_PNMTX0);
 			GX_LoadProjectionMtx(x.proj, x.projType);
+			ortho = x.projType == GX_ORTHOGRAPHIC;
 
 			memcpy(lastMv, p.mvMatrix, sizeof(lastMv));
 			memcpy(lastProj, p.projMatrix, sizeof(lastProj));
 			haveLast = true;
+			curMtx = -1;
+		}
+		// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section).
+		if (curMtx != (int)clipped) {
+			GX_SetCurrentMtx(clipped ? GX_PNMTX1 : GX_PNMTX0);
+			curMtx = clipped;
 		}
 
 		gxDs3dBindPoly(p, false, st, first);
@@ -1181,6 +1346,23 @@ void gxDs3dRenderFast()
 				if (pass == 0)    GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
 				else if (twoPass) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_LESS, 255);
 				else              GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+			}
+			if (clipped) {
+				GX_Begin(GX_TRIANGLEFAN, GX_VTXFMT0, nv);
+				for (int j = 0; j < nv; ++j) {
+					const VERT &v = cv[j];
+					const float w = v.coord[3];
+					if (ortho) GX_Position3f32(v.coord[0] / w, v.coord[1] / w, v.coord[2] / w);
+					else       GX_Position3f32(v.coord[0], v.coord[1], -w);
+#ifdef DSA_GXGEOM_PROBE
+					gxDs3dSendColor(v, va);
+#else
+					GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
+#endif
+					if (st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+				}
+				GX_End();
+				continue;
 			}
 			GX_Begin(p.type == 4 ? GX_QUADS : GX_TRIANGLES, GX_VTXFMT0, p.type);
 			for (int j = 0; j < p.type; ++j) {
