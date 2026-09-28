@@ -1250,14 +1250,35 @@ bool savestate_load(EMUFILE* is)
 		//without libz, we can't decompress this savestate
 		return false;
 #endif
-		std::vector<char> cbuf(comprlen);
-		is->fread(&cbuf[0],comprlen);
-		if(is->fail()) return false;
-
 #ifdef HAVE_LIBZ
-		uLongf uncomprlen = len;
-		int error = uncompress((uint8*)&buf[0],&uncomprlen,(uint8*)&cbuf[0],comprlen);
-		if(error != Z_OK || uncomprlen != len)
+		// Inflate straight from the stream in small chunks instead of reading
+		// the whole compressed payload into a second buffer first: on the Wii
+		// the full `buf` (~5.8MB for SM64DS) plus a whole-file `cbuf` (~2.4MB)
+		// no longer fit in the heap once the GX geometry pass grew VERT
+		// (Task 13e's objcoord: +2.4MB across the two VERTLISTs), and a failed
+		// std::vector allocation with -fno-exceptions aborts silently -- the
+		// autoload "hang". Same zlib stream format as compress2()/uncompress().
+		z_stream zs;
+		memset(&zs, 0, sizeof zs);
+		if(inflateInit(&zs) != Z_OK) return false;
+		std::vector<u8> chunk(16 * 1024);
+		u32 remaining = comprlen;
+		int zerr = Z_OK;
+		zs.next_out = &buf[0];
+		zs.avail_out = len;
+		while(remaining > 0 && zerr == Z_OK) {
+			u32 n = remaining < (u32)chunk.size() ? remaining : (u32)chunk.size();
+			is->fread((char*)&chunk[0], n);
+			if(is->fail()) { inflateEnd(&zs); return false; }
+			remaining -= n;
+			zs.next_in = &chunk[0];
+			zs.avail_in = n;
+			zerr = inflate(&zs, Z_NO_FLUSH);
+			if(zerr == Z_BUF_ERROR) zerr = Z_OK;   // no progress possible this round; more input follows
+		}
+		uLong uncomprlen = zs.total_out;
+		inflateEnd(&zs);
+		if(zerr != Z_STREAM_END || uncomprlen != len)
 			return false;
 #endif
 	} else {
