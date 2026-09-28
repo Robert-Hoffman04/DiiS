@@ -37,6 +37,11 @@ static inline int gxDs3dTexFormat(const POLY &p) { return (int)((p.texParam >> 2
 // remaps depth: z_gx/w = (z_ds/w - 1)/2, which makes GX's depth equal the DS's
 // (nz+1)/2, i.e. the same value gxDs3dRenderAccurate() feeds. Works for any
 // P = perspective * affine; anything else is not representable and bails.
+//
+// W-buffer frames (gfx3d.wbuffer, GxFast only) don't use P's depth row at all: depth is
+// gxDs3dWDepthInv(1/w) (see s_wK below), which GX gets from a constant
+// z_clip = -K (perspective, depth = z_clip/w + 1 = 1 - K/w) or -K/w (orthographic, w
+// constant per polygon). So in W mode any P whose w row is affine is representable.
 struct GxDs3dFastXform {
 	Mtx pos;
 	Mtx44 proj;
@@ -46,7 +51,7 @@ struct GxDs3dFastXform {
 // DS matrices are column-major: element (row r, col c) = m[4*c + r].
 static inline float gxDs3dM(const float *m, int r, int c) { return m[4 * c + r]; }
 
-static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x)
+static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, float wK)
 {
 	const float *P = p.projMatrix, *MV = p.mvMatrix;
 	const float eps = 1e-4f;
@@ -68,8 +73,22 @@ static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x)
 		}
 		x.proj[0][0] = 1; x.proj[1][1] = 1;
 		x.proj[2][2] = 0.5f; x.proj[2][3] = -0.5f;
+		if (wbuf) { x.proj[2][2] = 0; x.proj[2][3] = -wK / w; }
 		x.proj[3][3] = 1;
 		x.projType = GX_ORTHOGRAPHIC;
+	} else if (wbuf) {
+		for (int c = 0; c < 4; ++c) {
+			M[0][c] = gxDs3dM(P, 0, c);
+			M[1][c] = gxDs3dM(P, 1, c);
+			M[2][c] = -gxDs3dM(P, 3, c);
+		}
+		x.proj[0][0] = 1; x.proj[1][1] = 1;
+		x.proj[2][3] = -wK;
+#ifdef DSA_GXGEOM_MUTATE_WREV
+		x.proj[2][2] = 1; x.proj[2][3] = wK;   // mutation: depth K/w, far wins
+#endif
+		x.proj[3][2] = -1;
+		x.projType = GX_PERSPECTIVE;
 	} else {
 		// P2 must equal alpha*P3 + beta*e_w (depth affine in w).
 		int k = 0;
@@ -250,11 +269,11 @@ static bool gxDs3dTexColorExact(const POLY &p)
 enum {
 	kGateOk = 0, kGateNoList, kGateEmpty, kGateWbuffer, kGateClearImage, kGateEdge, kGateFog,
 	kGateTranslucent, kGatePolyMode, kGateTexNotReady, kGateTexColor, kGateType, kGateW, kGateNdc,
-	kGateFastProj, kGateCount
+	kGateFastProj, kGateDepthEqual, kGateCount
 };
 static const char *const kGateNames[kGateCount] = {
 	"OK", "nolist", "empty", "wbuffer", "clearimage", "edge", "fog", "translucent", "polymode",
-	"texnotready", "texcolor", "type", "w<=0", "ndc", "fastproj"
+	"texnotready", "texcolor", "type", "w<=0", "ndc", "fastproj", "depthequal"
 };
 
 // requireTex: textured polygons need a texture prepared for this frame (false only
@@ -264,7 +283,11 @@ static int gxDs3dFrameGate(bool requireTex)
 	if (!gfx3d.polylist || !gfx3d.vertlist) return kGateNoList;
 	const int polycount = gfx3d.polylist->count;
 	if (polycount <= 0) return kGateEmpty;
-	if (gfx3d.wbuffer) return kGateWbuffer;            // Z-buffer mode only (see header comment)
+	const bool fast = gxRenderModeIsFast();
+	// W-buffer mode: GxFast only, drawn with the depth mapping of gxDs3dWDepthInv()
+	// (see s_wK). GX's 24-bit D = 1 - K/w buckets w differently from the CPU's
+	// floor(4096*w), so near-ties can resolve differently: not exact, GxAccurate bails.
+	if (gfx3d.wbuffer && !fast) return kGateWbuffer;
 	if (gfx3d.enableClearImage) return kGateClearImage;  // rear-plane per-pixel clear depth (Stage 2) not modelled
 	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
 	if (gfx3d.enableEdgeMarking) return kGateEdge;     // no polygon-ID infra yet (13f handoff item)
@@ -279,10 +302,12 @@ static int gxDs3dFrameGate(bool requireTex)
 		return kGateFog;
 	}
 
-	const bool fast = gxRenderModeIsFast();
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
 		if (p.isTranslucent()) return kGateTranslucent;
+		// POLYGON_ATTR bit 14: depth test EQUAL (rasterize.cpp's decalMode). Not modelled
+		// (GX_EQUAL on GX's own depth would not match the CPU's quantized equality).
+		if (p.polyAttr & (1 << 14)) return kGateDepthEqual;
 		// modulate only: decal/toon/highlight need their own TEV, shadow is 13g
 		if (gxDs3dPolyMode(p) != 0) return kGatePolyMode;
 		if (gxDs3dTexFormat(p) != 0) {
@@ -315,7 +340,7 @@ static int gxDs3dFrameGate(bool requireTex)
 		}
 		if (fast) {
 			GxDs3dFastXform x;
-			if (!gxDs3dFastXformBuild(p, x)) return kGateFastProj;
+			if (!gxDs3dFastXformBuild(p, x, gfx3d.wbuffer != 0, 1.0f)) return kGateFastProj;
 		}
 	}
 	return kGateOk;
@@ -498,12 +523,66 @@ static void gxDs3dLoadScreenOrtho()
 	GX_SetCurrentMtx(GX_PNMTX0);
 }
 
+// ---------------------------------------------------------------------------------
+// W-buffer depth (gfx3d.wbuffer; gx-remaining-work.md section 1, "W-buffer depth mode").
+// GxFast only.
+//
+// The CPU tests depth = u32floor(4096*w) per pixel (LESS), with w = 1/invw and invw
+// interpolated linearly in screen space. GX has no W buffer: its depth is post-divide
+// z/w, interpolated linearly in screen space, so any GX depth is affine in 1/w. GxFast
+// gives it D = 1 - K/w (z_clip = -K): strictly increasing in w, so GX picks the same
+// winner as the CPU wherever neither side's quantization ties. K is the frame's smallest
+// vertex w less 1% (w over a polygon lies between its vertices' w, so D stays in (0,1);
+// GX clips at D = 0), which gives D the most resolution. What differs is the tie set:
+// the CPU buckets w in steps of 1/4096, GX in steps of w^2/(K*2^24) -- finer than the
+// CPU's for w < 64*sqrt(K), coarser beyond. Near-coplanar surfaces far from the camera
+// can therefore z-fight on GX where the CPU separates them (and vice versa near it);
+// that is the bounded GxFast inexactness, and why GxAccurate bails W-buffer frames.
+// The CLEAR_DEPTH compare maps exactly: the CPU fails iff 4096*w >= clearDepth, i.e.
+// D >= 1 - 4096*K/clearDepth. Orthographic polygons (w constant) tie everywhere on both
+// sides (later fragment fails), which LESS reproduces.
+// ---------------------------------------------------------------------------------
+static float s_wK = 1.0f;
+
+static void gxDs3dWSetup()
+{
+	float k = 0;
+	bool any = false;
+	const int polycount = gfx3d.polylist->count;
+	for (int i = 0; i < polycount; ++i) {
+		const POLY &p = gfx3d.polylist->list[i];
+		for (int j = 0; j < p.type; ++j) {
+			const float w = gfx3d.vertlist->list[p.vertIndexes[j]].coord[3];
+			if (!any || w < k) { k = w; any = true; }
+		}
+	}
+	// 1% margin: the nearest vertex would otherwise sit exactly on GX's near clip plane
+	// (D = 0), and GxFast's own float transform can put it a hair outside.
+	s_wK = (any && k > 0) ? k * 0.99f : 1.0f;   // gxDs3dFrameGate guarantees every w > 0
+}
+
+#ifdef DSA_GXGEOM_MUTATE_WREV
+// mutation: W depth order reversed (far wins), must fail a3_c32/a3_c33
+static inline float gxDs3dWDepthInv(float invw) { return invw > 0.0f ? s_wK * invw : 1.0f; }
+#else
+static inline float gxDs3dWDepthInv(float invw) { return 1.0f - s_wK * invw; }
+#endif
+
 // Seeds the EFB's Z with the DS CLEAR_DEPTH value (the CPU rasterizer's
 // clearFragment.depth), independent of whatever GX_SetCopyClear or the 2D pass left
 // there. Needs gxDs3dLoadScreenOrtho() bound; colour untouched.
 static void gxDs3dClearDepth()
 {
-	const float z = -(float)(gfx3d.clearDepth & 0xFFFFFF) / 16777215.0f;
+	float z = -(float)(gfx3d.clearDepth & 0xFFFFFF) / 16777215.0f;
+	if (gfx3d.wbuffer) {
+		const u32 cd = gfx3d.clearDepth & 0xFFFFFF;
+#ifdef DSA_GXGEOM_MUTATE_WREV
+		const float d = 1.0f; (void)cd;
+#else
+		const float d = cd ? gxDs3dWDepthInv(4096.0f / (float)cd) : 0.0f;
+#endif
+		z = -(d < 0.0f ? 0.0f : d);
+	}
 	GX_SetColorUpdate(GX_FALSE);
 	GX_SetAlphaUpdate(GX_FALSE);
 	GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
@@ -807,6 +886,8 @@ void gxDs3dRenderAccurate()
 // ---------------------------------------------------------------------------------
 void gxDs3dRenderFast()
 {
+	gxDs3dWSetup();
+	const bool wbuf = gfx3d.wbuffer != 0;
 	gxDs3dSetupCommonState();
 	gxDs3dLoadScreenOrtho();
 	gxDs3dClearDepth();
@@ -833,7 +914,7 @@ void gxDs3dRenderFast()
 		if (!haveLast || memcmp(lastMv, p.mvMatrix, sizeof(lastMv)) != 0 ||
 		    memcmp(lastProj, p.projMatrix, sizeof(lastProj)) != 0) {
 			GxDs3dFastXform x;
-			if (!gxDs3dFastXformBuild(p, x))
+			if (!gxDs3dFastXformBuild(p, x, wbuf, s_wK))
 				continue;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
 			GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
 			GX_SetCurrentMtx(GX_PNMTX0);

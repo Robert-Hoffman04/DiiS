@@ -69,12 +69,27 @@
 //      4x4 compressed in all four modes, I8, I2), clamp / repeat / repeat+flip / flip-only,
 //      white vertex colour, Z-buffer mode, perspective tilt, isolated like 27/28.
 //  31  case 30 with arbitrary per-vertex (Gouraud) colours: modulate precision (GxFast only).
+//  32  case 28 in W-buffer mode (GL_WBUFFERING): intersecting untextured geometry, W depth.
+//  33  case 30 in W-buffer mode: textured + intersecting, W depth (GxFast; GxAccurate bails).
 
 #include <nds.h>
 #include <stdio.h>
 
 #ifndef A3_CASE
 #define A3_CASE 0
+#endif
+// 32/33: cases 28/30 with GL_WBUFFERING (gx-remaining-work.md section 1, W-buffer depth mode).
+#define A3_WBUF 0
+#if A3_CASE == 32 || A3_CASE == 33
+#undef A3_WBUF
+#define A3_WBUF GL_WBUFFERING
+#if A3_CASE == 32
+#undef A3_CASE
+#define A3_CASE 28
+#else
+#undef A3_CASE
+#define A3_CASE 30
+#endif
 #endif
 
 #define R16(a) (*(volatile u16 *)(a))
@@ -239,7 +254,7 @@ static void texScene(void)
 		tcol(); glTexCoord2t16(inttot16(0),  inttot16(12)); glVertex3f(-0.6f, -0.6f, -0.3f);
 		tcol(); glTexCoord2t16(inttot16(29), inttot16(4));  glVertex3f( 0.8f,  0.0f, 0.3f);
 	glEnd();
-	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 33)
 }
 #endif
 
@@ -306,7 +321,7 @@ static void draw3D(void)
 		glVertex3f( 0.75f, 0.1f,  0.4f);
 		glVertex3f( 0.3f, -0.65f, 0.05f);
 	glEnd();
-	glFlush(GL_TRANS_MANUALSORT);   // no GL_WBUFFERING -- Z-buffer mode
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 32)
 	return;
 #endif
 #if A3_CASE == 29
