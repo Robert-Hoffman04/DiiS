@@ -90,9 +90,16 @@
 //  39  case 38 in W-buffer mode.
 //  40  case 38 with Gouraud colours on every vertex (GxFast: clipper-interpolated colours).
 //  41-45  cases 1, 0, 11, 10, 2 in Z-buffer mode (3D below BG3/sprites: the GX pass as a texture).
+//  46  translucent polygon-ID rule (the GxFast tag pass): case 34's setup with same-ID runs only.
+//      Run of ID 21: a far triangle partly behind an opaque quad, a NEARER overlapping one with
+//      depth write (dropped where the first drew, drawn where the first failed depth), an A5I3
+//      quad (alpha-0 texels neither draw nor stamp); then ID 22 on top of them; then ID 21 again,
+//      disjoint from its first run (two overlapping quads); then ID 23, a 300-triangle fan whose
+//      k-th triangle only wins the sliver it adds (tags past 255).
 
 #include <nds.h>
 #include <stdio.h>
+#include <math.h>
 
 #ifndef A3_CASE
 #define A3_CASE 0
@@ -110,6 +117,13 @@
 #if A3_CASE == 37
 #undef A3_QUADPROBE
 #define A3_QUADPROBE 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+#define A3_TAGRUN 0
+#if A3_CASE == 46
+#undef A3_TAGRUN
+#define A3_TAGRUN 1
 #undef A3_CASE
 #define A3_CASE 34
 #endif
@@ -414,9 +428,64 @@ static void tQuad(u32 tex, float x0, float y0, float x1, float y1, float zl, flo
 	glEnd();
 }
 
+#if A3_TAGRUN
+static void tagTri(float x0, float y0, float x1, float y1, float x2, float y2, float z, int r, int g, int b)
+{
+	glBegin(GL_TRIANGLES);
+		glColor3b(r, g, b);         glVertex3f(x0, y0, z);
+		glColor3b(g, b, r);         glVertex3f(x1, y1, z);
+		glColor3b(b, r, g);         glVertex3f(x2, y2, z);
+	glEnd();
+}
+
+static void tagScene(void)
+{
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_QUADS);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f,  0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f,  0.9f, 0.0f);
+	glEnd();
+	// run of ID 21
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.2f, 0.8f, -1.2f, -0.6f, 0.6f, 0.1f, -0.2f, 250, 40, 40);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21) | T_ZW);
+	tagTri(-0.9f, 0.3f, 0.9f, 0.9f, 0.5f, -0.7f, 0.4f, 40, 250, 120);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21));
+	tQuad(texA5I3, -0.6f, -0.8f, 0.8f, 0.5f, 0.2f, 0.3f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	// ID 22 over it
+	glPolyFmt(POLY_ALPHA(14) | POLY_CULL_NONE | POLY_ID(22));
+	tagTri(-0.5f, 0.6f, -0.3f, -0.5f, 0.4f, 0.0f, 0.5f, 60, 60, 250);
+	// ID 21 again, disjoint from its first run
+	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(1.15f, 0.9f, 1.15f, -0.2f, 1.45f, 0.4f, 0.1f, 250, 250, 40);
+	tagTri(1.15f, 0.6f, 1.45f, -0.5f, 1.45f, 0.9f, 0.3f, 250, 120, 250);
+	// ID 23: 300-triangle fan
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(23));
+	for (int k = 0; k < 300; k++) {
+		const float a = k * 1.2f * 3.14159265f / 180.0f, b = a + 25.0f * 3.14159265f / 180.0f;
+		const float cx = 0.9f, cy = -0.6f, r = 0.35f;
+		const int cr = (k * 7) & 255, cg = (k * 13) & 255, cb = (k * 29) & 255;
+		glBegin(GL_TRIANGLES);
+			glColor3b(cr, cg, cb); glVertex3f(cx, cy, 0.45f);
+			glColor3b(cr, cg, cb); glVertex3f(cx + r * cosf(a), cy + r * sinf(a), 0.45f);
+			glColor3b(cr, cg, cb); glVertex3f(cx + r * cosf(b), cy + r * sinf(b), 0.45f);
+		glEnd();
+	}
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+}
+#endif
+
 static void transScene(void)
 {
 	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
+#if A3_TAGRUN
+	tagScene();
+	return;
+#endif
 	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
 	GFX_TEX_FORMAT = 0;
 #if !A3_QUADPROBE

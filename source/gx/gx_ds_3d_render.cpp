@@ -15,6 +15,7 @@
 #endif
 
 extern MMU_struct MMU;
+extern GXRModeObj *rmode;   // main.cpp (EFB pixel format choice: the polygon-ID tag pass needs RGB8)
 
 // DS screen dimensions -- duplicated from gx_ds_engine_impl.inc's kDsBScreenW/H (not
 // visible from here; both are just the fixed 256x192 DS screen size, not expected to
@@ -184,8 +185,9 @@ static inline u32 gxDs3dTexKey(u32 texParam) { return texParam & 0x3FF0FFFF; }
 //    dst-alpha-0 "plain write" case can't happen, and the 2D compositor shows the result
 //    opaque, like the overlay (a 3D pixel with alpha < 31 would blend with a 2nd target).
 //  - alpha blending on (DISP3DCNT bit 3; `transblend`), for the same reason.
-//  - the polygon-ID rule has no GX equivalent (no dst compare), so two translucent polygons
-//    with the same ID whose screen bounding boxes overlap bail (`transid`); conservative.
+//  - the polygon-ID rule has no GX dst compare: runs of same-ID polygons that overlap go
+//    through a tag pass (gxDs3dTransIdPlan, gxDs3dTagRunPrepass); overlap with a same-ID
+//    polygon of an earlier run, or an alpha-31 polygon in a tagged run, bails (`transid`).
 // Fragment alpha: untextured and opaque-format textures -> the polygon alpha as vertex
 // alpha (texel alpha is 255 or 0, the TEV multiply by 255 is exact). A3I5/A5I3 -> the
 // per-texel modulated alpha (modulate_table[5to6(tA)][5to6(pA)] >> 1), alpha test
@@ -496,52 +498,96 @@ static bool gxDs3dTransDraws(const POLY &p)
 	return gxDs3dTexFmtTrans(gxDs3dTexFormat(p)) || a >= (int)s_atRef;
 }
 
-// Translucent polygon-ID rule: a translucent fragment is dropped where the pixel's last
-// translucent write had the same polygon ID. Not reproducible on GX, so this returns -1
-// whenever two drawing translucent polygons with the same ID could share a pixel (their
-// outlines' interiors overlap, gxDs3dTransShapesDisjoint; conservative: the first one's
-// fragment may have failed depth or alpha there), else the number of drawing translucent
-// polygons. Adjacent triangles of one mesh (shared edge) pass. Clipped polygons use their
-// clipped outline.
-static int gxDs3dTransIdClash()
+// Translucent polygon-ID rule: a translucent fragment (0 < a < 31) is dropped, with no
+// colour or depth write, where the pixel's last translucent write had the same polygon ID;
+// one that draws stamps its ID (rasterize.cpp; a == 31 fragments neither test nor stamp,
+// opaque polygons only set the opaque ID). GX has no destination compare, so GxFast
+// reproduces it per "run" (a maximal sequence of consecutive drawing translucent polygons
+// in indexlist order with one ID) with a tag pass (see gxDs3dTagRunPrepass): per pixel the
+// first polygon of the run whose fragment passes depth and alpha draws, the rest are dropped.
+// That is exact for a run as long as nothing before it stamped the same ID on its pixels,
+// so this returns -1 (bail) when a polygon's outline overlaps one of the same ID in an
+// EARLIER run (conservative: another ID may have restamped the pixel in between), or when
+// a run that needs tags contains an alpha-31 polygon (A3I5/A5I3 a == 31 texels: opaque
+// writes, whose depth writes would change later run polygons' winners). Runs whose outlines
+// are interior-disjoint (gxDs3dTransShapesDisjoint; mesh neighbours sharing an edge) need no
+// tags. Else returns the number of drawing translucent polygons and fills s_tagRun/s_tagIdx.
+// Clipped polygons use their clipped outline.
+struct GxDs3dTagRun { int n0, n1; int x0, y0, x1, y1; int count; };   // indexlist range, 1/16 px box
+static const int kMaxTrans = 2048;       // the DS's own per-frame polygon limit
+static u16 s_tagRun[POLYLIST_SIZE];      // per polylist index: tagged run (1-based), 0 = plain draw
+static u16 s_tagIdx[POLYLIST_SIZE];      // its 1-based position in that run (the tag it writes)
+static GxDs3dTagRun s_tagRuns[kMaxTrans + 1];
+static int s_tagRunCount = 0;
+static int gxDs3dTransIdPlan()
 {
-	static const int kMaxTrans = 2048;   // the DS's own per-frame polygon limit
 	static GxDs3dTransShape s_sh[kMaxTrans];
-	static s16 s_next[kMaxTrans];        // per-ID chains: only same-ID shapes are compared
+	static s16 s_next[kMaxTrans];        // per-ID chains of shapes from closed runs
+	static u16 s_shPoly[kMaxTrans];
+	static int s_shN[kMaxTrans];
 	s16 head[64];
 	for (int k = 0; k < 64; ++k) head[k] = -1;
-	int nt = 0;
+	int nt = 0, runStart = 0, curId = -1;
+	bool runTag = false, runA31 = false;
+	s_tagRunCount = 0;
 	const int polycount = gfx3d.polylist->count;
-	// Two passes, unclipped polygons first: whether some pair overlaps doesn't depend on the
-	// order, and a clash among those returns before the (costlier) clipper runs.
-	for (int pass = 0; pass < 2; ++pass)
-	for (int i = 0; i < polycount; ++i) {
-		POLY &p = gfx3d.polylist->list[i];
-		if (!p.isTranslucent() || !gxDs3dTransDraws(p)) continue;
-		bool out = false;
-		for (int j = 0; j < p.type; ++j) out |= gxDs3dVertOutside(gfx3d.vertlist->list[p.vertIndexes[j]]);
-		if (out != (pass == 1)) continue;
-		if (nt == kMaxTrans) return -1;
-		GxDs3dTransShape &sh = s_sh[nt];
-		VERT cv[MAX_CLIPPED_VERTS];
-		bool clipped;
-		const int n = gxDs3dPolyVerts(p, cv, clipped);
-		if (!gxDs3dTransShapeBuild(p, cv, n, sh)) continue;
-		if (sh.x1 <= 0 || sh.x0 >= 16.0f * kScreenW || sh.y1 <= 0 || sh.y0 >= 16.0f * kScreenH) continue;   // off screen
-		for (int k = head[sh.id]; k >= 0; k = s_next[k])
-			if (!gxDs3dTransShapesDisjoint(s_sh[k], sh)) {
+	for (int n = 0; n <= polycount; ++n) {
+		POLY *pp = NULL;
+		GxDs3dTransShape *sh = NULL;
+		if (n < polycount) {
+			const int i = gfx3d.indexlist[n];
+			POLY &p = gfx3d.polylist->list[i];
+			s_tagRun[i] = 0;
+			if (!p.isTranslucent() || !gxDs3dTransDraws(p)) continue;
+			if (nt == kMaxTrans) return -1;
+			sh = &s_sh[nt];
+			VERT cv[MAX_CLIPPED_VERTS];
+			bool clipped;
+			const int nv = gxDs3dPolyVerts(p, cv, clipped);
+			if (!gxDs3dTransShapeBuild(p, cv, nv, *sh)) continue;
+			if (sh->x1 <= 0 || sh->x0 >= 16.0f * kScreenW || sh->y1 <= 0 || sh->y0 >= 16.0f * kScreenH) continue;   // off screen
+			pp = &p;
+			s_shPoly[nt] = (u16)i;
+			s_shN[nt] = n;
+		}
+		if (!pp || sh->id != curId) {
+			// close the current run [runStart, nt)
+			if (runTag && s_tagRunCount < kMaxTrans) {
+				GxDs3dTagRun &r = s_tagRuns[++s_tagRunCount];
+				r.n0 = s_shN[runStart]; r.n1 = s_shN[nt - 1]; r.count = nt - runStart;
+				float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+				for (int k = runStart; k < nt; ++k) {
+					s_tagRun[s_shPoly[k]] = (u16)s_tagRunCount;
+					s_tagIdx[s_shPoly[k]] = (u16)(k - runStart + 1);
+					x0 = fminf(x0, s_sh[k].x0); y0 = fminf(y0, s_sh[k].y0);
+					x1 = fmaxf(x1, s_sh[k].x1); y1 = fmaxf(y1, s_sh[k].y1);
+				}
+				r.x0 = (int)x0; r.y0 = (int)y0; r.x1 = (int)x1; r.y1 = (int)y1;
+			}
+			for (int k = runStart; k < nt; ++k) {
+				s_next[k] = head[s_sh[k].id];
+				head[s_sh[k].id] = (s16)k;
+			}
+			if (!pp) break;
+			runStart = nt; curId = sh->id; runTag = false; runA31 = false;
+		}
+		for (int k = head[sh->id]; k >= 0; k = s_next[k])
+			if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
 #ifdef DSA_GXGEOM_TRANSIDDBG
 				static u32 s_dbg;
 				if ((s_dbg++ & 31) == 0)
-					harness_profile_emitf("transiddbg id=%d i=%d n=%d attr=%08x tex=%08x box=%d,%d,%d,%d prev box=%d,%d,%d,%d ntrans=%d",
-					                      sh.id, i, sh.n, (unsigned)p.polyAttr, (unsigned)p.texParam,
-					                      (int)sh.x0 / 16, (int)sh.y0 / 16, (int)sh.x1 / 16, (int)sh.y1 / 16,
+					harness_profile_emitf("transiddbg id=%d n=%d nv=%d attr=%08x tex=%08x box=%d,%d,%d,%d prev box=%d,%d,%d,%d ntrans=%d",
+					                      sh->id, n, sh->n, (unsigned)pp->polyAttr, (unsigned)pp->texParam,
+					                      (int)sh->x0 / 16, (int)sh->y0 / 16, (int)sh->x1 / 16, (int)sh->y1 / 16,
 					                      (int)s_sh[k].x0 / 16, (int)s_sh[k].y0 / 16, (int)s_sh[k].x1 / 16, (int)s_sh[k].y1 / 16, nt);
 #endif
 				return -1;
 			}
-		s_next[nt] = head[sh.id];
-		head[sh.id] = (s16)nt;
+		if (!runTag)
+			for (int k = runStart; k < nt; ++k)
+				if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) { runTag = true; break; }
+		runA31 |= gxDs3dPolyAlpha(*pp) == 31;
+		if (runTag && (runA31 || (rmode && rmode->aa))) return -1;
 		++nt;
 	}
 	return nt;
@@ -614,10 +660,10 @@ static int gxDs3dFrameGate(bool requireTex)
 		}
 	}
 
-	// Translucent polygon-ID rule (gxDs3dTransIdClash). Checked before the per-vertex loop
+	// Translucent polygon-ID rule (gxDs3dTransIdPlan). Checked before the per-vertex loop
 	// below: it is what rejects SM64DS's frames, and that loop is the gate's biggest cost.
 	if (anyTrans) {
-		const int nt = gxDs3dTransIdClash();
+		const int nt = gxDs3dTransIdPlan();
 		if (nt < 0) return kGateTransId;
 		s_gateHasTrans = nt > 0;
 	}
@@ -689,12 +735,22 @@ bool gxDs3dGeomFramePrepare()
 	// Per-3D-frame first failing gate, plus per-format polygon counts, every 32 frames.
 	// transidclash: the ID-rule check on every 3D frame regardless of earlier gates.
 	// clippolys: polygons with a vertex outside the clip volume (clipped by the CPU clipper).
+	// tagruns: runs needing the tag pass (gxDs3dTransIdPlan), tagmax their largest polygon
+	// count, tagarea their summed box area in px.
 	static u32 s_gate[kGateCount], s_fmt[8], s_frames, s_tidClash, s_tidPolys, s_clipPolys;
+	static u32 s_tagRunsSum, s_tagMax, s_tagArea;
 	++s_gate[g];
 	++s_frames;
 	if (gfx3d.polylist && gfx3d.vertlist && gfx3d.polylist->count > 0) {
-		const int nt = gxDs3dTransIdClash();
+		const int nt = gxDs3dTransIdPlan();
 		if (nt < 0) ++s_tidClash; else s_tidPolys += (u32)nt;
+		if (nt >= 0)
+			for (int r = 1; r <= s_tagRunCount; ++r) {
+				const GxDs3dTagRun &t = s_tagRuns[r];
+				++s_tagRunsSum;
+				if ((u32)t.count > s_tagMax) s_tagMax = (u32)t.count;
+				s_tagArea += (u32)(((t.x1 - t.x0) >> 4) * ((t.y1 - t.y0) >> 4));
+			}
 	}
 	if (gfx3d.polylist && gfx3d.vertlist)
 		for (int i = 0; i < gfx3d.polylist->count; ++i) {
@@ -709,10 +765,11 @@ bool gxDs3dGeomFramePrepare()
 		int n = 0;
 		for (int k = 0; k < kGateCount; ++k)
 			if (s_gate[k]) n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kGateNames[k], (unsigned)s_gate[k]);
-		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u gates:%s",
+		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u tagruns=%u tagmax=%u tagarea=%u gates:%s",
 		                      (unsigned)s_frames, (unsigned)s_fmt[0], (unsigned)s_fmt[1], (unsigned)s_fmt[2],
 		                      (unsigned)s_fmt[3], (unsigned)s_fmt[4], (unsigned)s_fmt[5], (unsigned)s_fmt[6],
-		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_clipPolys, (unsigned)s_tidClash, (unsigned)s_tidPolys, buf);
+		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_clipPolys, (unsigned)s_tidClash, (unsigned)s_tidPolys,
+		                      (unsigned)s_tagRunsSum, (unsigned)s_tagMax, (unsigned)s_tagArea, buf);
 	}
 #endif
 	s_prepSeq = g_gfx3dRenderSeq;
@@ -1251,133 +1308,370 @@ void gxDs3dRenderAccurate()
 // polygon can have different matrices) folded per gxDs3dFastXformBuild(). No Y flip:
 // GX and the DS both put NDC y=+1 at the top of the viewport. The DS viewport
 // (bottom-left origin) becomes a GX viewport (top-left origin).
+//
+// Polygon-ID tag pass (gxDs3dTransIdPlan's runs). For a tagged run of ID X (nothing before
+// it stamped X on its pixels, the plan guarantees that), rasterize.cpp draws a pixel from
+// the FIRST run polygon whose fragment there passes depth (against the depth before the
+// run: the only earlier writer at that pixel would be that same first polygon) and alpha
+// (0 < a; the plan excludes a == 31), and drops every later one. So before the run:
+//  1. copy the EFB colour out (RGBA8, exact for the RGB8 EFB), clear it to tag 0;
+//  2. draw the run in REVERSE order, no blend, depth test LESS without update, writing the
+//     polygon's 1-based position as colour (R = low byte, B = high byte), same alpha
+//     compare as its real draw: each pixel ends with the lowest winning position;
+//  3. copy R and B out as I8 tag textures, draw the saved colour back;
+// then draw the run normally, with a TEV stage per tag byte that zeroes the alpha unless
+// the tag texel (sampled at the fragment's own screen position: TEXMTX1 maps the position
+// the polygon submits to screen pixel centres) equals the polygon's position, so the alpha
+// compare drops the fragment's colour and depth exactly where the DS would. Same geometry,
+// same state, so coverage and depth results of the two draws are identical. Needs an 8-bit
+// R/B EFB (RGB8_Z24): RGB565 (rmode->aa) bails `transid`, RGBA6 only runs with holes, and a
+// frame with translucent polygons has none. Buffers (288 KB) live only for the render.
 // ---------------------------------------------------------------------------------
+struct GxDs3dFastCtx {
+	float lastMv[16], lastProj[16];
+	u32 lastVp;
+	bool haveLast, first, blendOn, ortho, wbuf;
+	int curMtx;            // 0: PNMTX0 (the polygon's transform), 1: PNMTX1 (identity, clipped)
+	GxDs3dTexState st;
+	Mtx pos;               // PNMTX0's matrix (tag texgen)
+	VIEWPORT vp;
+	int tagMode;           // TEV/texgen set up for: 0 plain, 1 tag write, 2 tag test; -1 unknown
+	bool tagTextured, tagTwo;
+};
+
+static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
+static GXTexObj s_tagSaveTex, s_tagLoTex, s_tagHiTex;
+
+static bool gxDs3dTagBuffers()
+{
+	if (s_tagSaveBuf) return true;
+	const u32 cb = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_RGBA8, GX_FALSE, 0);
+	const u32 ib = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0);
+	s_tagSaveBuf = memalign(32, cb);
+	s_tagLoBuf = memalign(32, ib);
+	s_tagHiBuf = memalign(32, ib);
+	if (!s_tagSaveBuf || !s_tagLoBuf || !s_tagHiBuf) {
+		free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf);
+		s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = nullptr;
+		return false;
+	}
+	// EFB copy targets: no dirty line of the heap's previous user may be written back over them.
+	DCInvalidateRange(s_tagSaveBuf, cb);
+	DCInvalidateRange(s_tagLoBuf, ib);
+	DCInvalidateRange(s_tagHiBuf, ib);
+	GX_InitTexObj(&s_tagSaveTex, s_tagSaveBuf, kScreenW, kScreenH, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&s_tagLoTex, s_tagLoBuf, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&s_tagHiTex, s_tagHiBuf, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_tagSaveTex, GX_NEAR, GX_NEAR);
+	GX_InitTexObjFilterMode(&s_tagLoTex, GX_NEAR, GX_NEAR);
+	GX_InitTexObjFilterMode(&s_tagHiTex, GX_NEAR, GX_NEAR);
+	return true;
+}
+
+static void gxDs3dTagBuffersFree()
+{
+	if (!s_tagSaveBuf) return;
+	GX_DrawDone();   // the FIFO may still read them
+	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf);
+	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = nullptr;
+	GX_InvalidateTexAll();
+}
+
+// TEV stage 1 (and 2) after gxDs3dBindPoly's stage 0, per tagMode (see the section comment).
+static void gxDs3dTagTev(int mode, bool textured, bool two)
+{
+	if (mode == 0) {
+		GX_SetNumTevStages(1);
+		GX_SetNumTexGens(textured ? 1 : 0);
+		return;
+	}
+	if (mode == 1) {
+		GX_SetNumTexGens(textured ? 1 : 0);
+		GX_SetNumTevStages(2);
+		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+		GX_SetTevKColorSel(GX_TEVSTAGE1, GX_TEV_KCSEL_K0);
+		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST);
+		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+		GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		return;
+	}
+	const u8 tc = textured ? GX_TEXCOORD1 : GX_TEXCOORD0;
+	GX_SetNumTexGens(textured ? 2 : 1);
+	GX_SetTexCoordGen(tc, GX_TG_MTX3x4, GX_TG_POS, GX_TEXMTX1);
+	GX_SetNumTevStages(two ? 3 : 2);
+	for (int k = 0; k < (two ? 2 : 1); ++k) {
+		const u8 stage = k ? GX_TEVSTAGE2 : GX_TEVSTAGE1;
+		GX_SetTevOrder(stage, tc, k ? GX_TEXMAP2 : GX_TEXMAP1, GX_COLORNULL);
+		GX_SetTevKAlphaSel(stage, k ? GX_TEV_KASEL_K1_A : GX_TEV_KASEL_K0_A);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		// alpha = (tag texel == this polygon's tag byte) ? alpha : 0
+		GX_SetTevAlphaIn(stage, GX_CA_TEXA, GX_CA_KONST, GX_CA_APREV, GX_CA_ZERO);
+		GX_SetTevAlphaOp(stage, GX_TEV_COMP_A8_EQ, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	}
+}
+
+// TEXMTX1: the position a polygon submits -> (s*q, t*q, q) with s, t its screen pixel centre
+// in the 256x192 tag texture (gxDs3dScreenXY's mapping, which GX's viewport, offset by
+// kGxDs3dSampleOffset, puts at the pixel centre).
+static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
+{
+	float C[3][4];
+	memset(C, 0, sizeof(C));
+	if (clipped) {
+		C[0][0] = 1; C[1][1] = 1;
+		if (c.ortho) C[2][3] = 1; else C[2][2] = -1;   // submitted (X, Y, -W) or (X/W, Y/W, Z/W)
+	} else {
+		for (int k = 0; k < 4; ++k) {
+			C[0][k] = c.pos[0][k];
+			C[1][k] = c.pos[1][k];
+			C[2][k] = c.ortho ? (k == 3 ? 1.0f : 0.0f) : -c.pos[2][k];
+		}
+	}
+	const float hw = 0.5f * (float)c.vp.width, hh = 0.5f * (float)c.vp.height;
+	const float ox = (float)c.vp.x + hw + 0.5f, oy = (float)(kScreenH - c.vp.y) - hh + 0.5f;
+	Mtx T;
+	for (int k = 0; k < 4; ++k) {
+		T[0][k] = (ox * C[2][k] + hw * C[0][k]) / (float)kScreenW;
+		T[1][k] = (oy * C[2][k] - hh * C[1][k]) / (float)kScreenH;
+		T[2][k] = C[2][k];
+	}
+	GX_LoadTexMtxImm(T, GX_TEXMTX1, GX_MTX3x4);
+}
+
+// tag: 0 plain draw; > 0 test this tag (the run's real draw); < 0 write tag -tag (pass 2).
+static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
+{
+	if (gxDs3dPolyInvisible(p)) return;
+	VERT cv[MAX_CLIPPED_VERTS];
+	bool clipped;
+	const int nv = gxDs3dPolyVerts(p, cv, clipped);
+	if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
+		bool bad = false;
+		for (int j = 0; j < nv; ++j) bad |= cv[j].coord[3] <= 0.0f;
+		if (bad) return;
+	}
+	// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
+	// outline; false also when clipped away.
+	GxDs3dTransShape shape;
+	if (!gxDs3dTransShapeBuild(p, cv, nv, shape)) return;
+	const bool trans = p.isTranslucent();
+	const bool tagWrite = tag < 0;
+	u8 va = 255;
+	bool zw = true, twoPass = false;
+	if (trans) {
+		if (!gxDs3dTransDraws(p)) return;
+		const bool texTrans = gxDs3dTexFmtTrans(gxDs3dTexFormat(p));
+		if (!texTrans) va = gxDs3dGxAlpha(gxDs3dPolyAlpha(p));
+		zw = (p.polyAttr >> 11) & 1;
+#ifdef DSA_GXGEOM_MUTATE_TRANSZW
+		zw = true;   // mutation: translucent polygons always write depth, must fail a3_c34
+#endif
+		twoPass = !zw && texTrans && gxDs3dPolyAlpha(p) == 31;
+		if (!c.blendOn) {
+			GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+			c.blendOn = true;
+		}
+	}
+
+	if (!c.haveLast || p.viewport != c.lastVp) {
+		c.vp.decode(p.viewport);
+		GX_SetViewport((f32)c.vp.x + kGxDs3dSampleOffset,
+		               (f32)(kScreenH - c.vp.y - c.vp.height) + kGxDs3dSampleOffset,
+		               (f32)c.vp.width, (f32)c.vp.height, 0, 1);
+		c.lastVp = p.viewport;
+	}
+	if (!c.haveLast || memcmp(c.lastMv, p.mvMatrix, sizeof(c.lastMv)) != 0 ||
+	    memcmp(c.lastProj, p.projMatrix, sizeof(c.lastProj)) != 0) {
+		GxDs3dFastXform x;
+		if (!gxDs3dFastXformBuild(p, x, c.wbuf, s_wK))
+			return;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
+		GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
+		GX_LoadProjectionMtx(x.proj, x.projType);
+		c.ortho = x.projType == GX_ORTHOGRAPHIC;
+		memcpy(c.pos, x.pos, sizeof(c.pos));
+
+		memcpy(c.lastMv, p.mvMatrix, sizeof(c.lastMv));
+		memcpy(c.lastProj, p.projMatrix, sizeof(c.lastProj));
+		c.haveLast = true;
+		c.curMtx = -1;
+	}
+	// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section).
+	if (c.curMtx != (int)clipped) {
+		GX_SetCurrentMtx(clipped ? GX_PNMTX1 : GX_PNMTX0);
+		c.curMtx = clipped;
+	}
+
+	const bool textured = gxDs3dTexFormat(p) != 0;
+	const bool rebound = c.first || textured != c.st.textured;
+	gxDs3dBindPoly(p, false, c.st, c.first);
+	c.first = false;
+	const int mode = tag == 0 ? 0 : (tagWrite ? 1 : 2);
+	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured)) {
+		gxDs3dTagTev(mode, textured, c.tagTwo);
+		c.tagMode = mode;
+		c.tagTextured = textured;
+	}
+	if (mode) {
+		const int t = tagWrite ? -tag : tag;
+		const GXColor k0 = { (u8)(t & 255), 0, (u8)(t >> 8), (u8)(t & 255) };
+		const GXColor k1 = { 0, 0, 0, (u8)(t >> 8) };
+		GX_SetTevKColor(GX_KCOLOR0, k0);
+		GX_SetTevKColor(GX_KCOLOR1, k1);
+		if (mode == 2) gxDs3dTagTexMtx(c, clipped);
+	}
+	for (int pass = twoPass ? 0 : 1; pass < 2; ++pass) {
+		if (trans) {
+			// pass 0: the a == 31 fragments of a non-depth-writing polygon (opaque
+			// writes, with depth); pass 1: everything else it draws.
+			GX_SetZMode(GX_TRUE, GX_LESS, (!tagWrite && (pass == 0 || zw)) ? GX_TRUE : GX_FALSE);
+			if (pass == 0)    GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
+			else if (twoPass) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_LESS, 255);
+			else              GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+		}
+		if (clipped) {
+			GX_Begin(GX_TRIANGLEFAN, GX_VTXFMT0, nv);
+			for (int j = 0; j < nv; ++j) {
+				const VERT &v = cv[j];
+				const float w = v.coord[3];
+				if (c.ortho) GX_Position3f32(v.coord[0] / w, v.coord[1] / w, v.coord[2] / w);
+				else         GX_Position3f32(v.coord[0], v.coord[1], -w);
+#ifdef DSA_GXGEOM_PROBE
+				gxDs3dSendColor(v, va);
+#else
+				GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
+#endif
+				if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+			}
+			GX_End();
+			continue;
+		}
+		GX_Begin(p.type == 4 ? GX_QUADS : GX_TRIANGLES, GX_VTXFMT0, p.type);
+		for (int j = 0; j < p.type; ++j) {
+			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+			GX_Position3f32(v.objcoord[0], v.objcoord[1], v.objcoord[2]);
+			gxDs3dSendColor(v, va);
+			if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+		}
+		GX_End();
+	}
+}
+
+// A full-screen quad at the pass's EFB origin: the clear colour (tex NULL) or tex, no Z, no blend.
+static void gxDs3dTagScreenQuad(GXTexObj *tex)
+{
+	gxDs3dLoadScreenOrtho();
+	GX_SetViewport(0, 0, (f32)kScreenW, (f32)kScreenH, 0, 1);
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	GX_SetNumTevStages(1);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	if (tex) {
+		GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+		GX_SetNumTexGens(1);
+		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+		GX_LoadTexObj(tex, GX_TEXMAP3);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP3, GX_COLORNULL);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+	} else {
+		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+		GX_SetNumTexGens(0);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	}
+	static const float xy[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+	for (int j = 0; j < 4; ++j) {
+		GX_Position3f32(xy[j][0] * kScreenW, xy[j][1] * kScreenH, 0);
+		if (tex) GX_TexCoord2f32(xy[j][0], xy[j][1]);
+		else     GX_Color4u8(0, 0, 0, 255);
+	}
+	GX_End();
+}
+
+static void gxDs3dTagCopy(void *dst, u32 fmt)
+{
+	GX_SetTexCopySrc(0, 0, kScreenW, kScreenH);
+	GX_SetTexCopyDst(kScreenW, kScreenH, fmt, GX_FALSE);
+	GX_CopyTex(dst, GX_FALSE);
+}
+
+// Steps 1-3 of the section comment for tagged run r; leaves c forcing a full rebind.
+static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
+{
+	const GxDs3dTagRun &run = s_tagRuns[r];
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
+	gxDs3dTagScreenQuad(NULL);
+
+	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
+	c.tagTwo = run.count > 255;
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	c.blendOn = true;   // i.e. "blend state owned here": gxDs3dFastPoly must not turn it on
+#ifdef DSA_GXGEOM_MUTATE_TAGFWD
+	for (int n = run.n0; n <= run.n1; ++n) {   // mutation: the LAST winning polygon keeps the pixel
+#else
+	for (int n = run.n1; n >= run.n0; --n) {
+#endif
+		const int i = gfx3d.indexlist[n];
+		if (s_tagRun[i] == r) gxDs3dFastPoly(c, gfx3d.polylist->list[i], -(int)s_tagIdx[i]);
+	}
+	gxDs3dTagCopy(s_tagLoBuf, GX_CTF_R8);
+	if (c.tagTwo) gxDs3dTagCopy(s_tagHiBuf, GX_CTF_B8);
+	GX_PixModeSync();
+	GX_InvalidateTexAll();
+	gxDs3dTagScreenQuad(&s_tagSaveTex);
+	GX_LoadTexObj(&s_tagLoTex, GX_TEXMAP1);
+	GX_LoadTexObj(&s_tagHiTex, GX_TEXMAP2);
+
+	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
+}
+
 void gxDs3dRenderFast()
 {
 	gxDs3dWSetup();
-	const bool wbuf = gfx3d.wbuffer != 0;
 	gxDs3dSetupCommonState();
 	gxDs3dLoadScreenOrtho();
 	gxDs3dClearDepth();
 
-	const int polycount = gfx3d.polylist->count;
-	float lastMv[16], lastProj[16];
-	u32 lastVp = 0;
-	bool haveLast = false;
-
-	GxDs3dTexState st = {};
-	bool first = true, blendOn = false, ortho = false;
-	int curMtx = -1;   // 0: PNMTX0 (the polygon's transform), 1: PNMTX1 (identity, clipped)
+	GxDs3dFastCtx c;
+	memset(&c, 0, sizeof(c));
+	c.first = true;
+	c.curMtx = -1;
+	c.tagMode = -1;
+	c.wbuf = gfx3d.wbuffer != 0;
 	{
 		Mtx id;
 		guMtxIdentity(id);
 		GX_LoadPosMtxImm(id, GX_PNMTX1);
 	}
+	int curRun = 0;
+	bool tags = s_tagRunCount > 0 && gxDs3dTagBuffers();
+#ifdef DSA_GXGEOM_MUTATE_TAGOFF
+	tags = false;   // mutation: tagged runs drawn plainly (every same-ID layer blends), must fail a3_c36/46
+#endif
+	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n < polycount; ++n) {
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
 		// rasterize.cpp draws them (see the translucent section).
-		POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
-		if (gxDs3dPolyInvisible(p)) continue;
-		VERT cv[MAX_CLIPPED_VERTS];
-		bool clipped;
-		const int nv = gxDs3dPolyVerts(p, cv, clipped);
-		if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
-			bool bad = false;
-			for (int j = 0; j < nv; ++j) bad |= cv[j].coord[3] <= 0.0f;
-			if (bad) continue;
+		const int i = gfx3d.indexlist[n];
+		POLY &p = gfx3d.polylist->list[i];
+		const int r = (tags && p.isTranslucent()) ? s_tagRun[i] : 0;
+		if (r && r != curRun) {
+			gxDs3dTagRunPrepass(c, r);
+			curRun = r;
 		}
-		// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
-		// outline; false also when clipped away.
-		GxDs3dTransShape shape;
-		if (!gxDs3dTransShapeBuild(p, cv, nv, shape)) continue;
-		const bool trans = p.isTranslucent();
-		u8 va = 255;
-		bool zw = true, twoPass = false;
-		if (trans) {
-			if (!gxDs3dTransDraws(p)) continue;
-			const bool texTrans = gxDs3dTexFmtTrans(gxDs3dTexFormat(p));
-			if (!texTrans) va = gxDs3dGxAlpha(gxDs3dPolyAlpha(p));
-			zw = (p.polyAttr >> 11) & 1;
-#ifdef DSA_GXGEOM_MUTATE_TRANSZW
-			zw = true;   // mutation: translucent polygons always write depth, must fail a3_c34
-#endif
-			twoPass = !zw && texTrans && gxDs3dPolyAlpha(p) == 31;
-			if (!blendOn) {
-				GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
-				blendOn = true;
-			}
-		}
-
-		if (!haveLast || p.viewport != lastVp) {
-			VIEWPORT vp;
-			vp.decode(p.viewport);
-			GX_SetViewport((f32)vp.x + kGxDs3dSampleOffset,
-			               (f32)(kScreenH - vp.y - vp.height) + kGxDs3dSampleOffset,
-			               (f32)vp.width, (f32)vp.height, 0, 1);
-			lastVp = p.viewport;
-		}
-		if (!haveLast || memcmp(lastMv, p.mvMatrix, sizeof(lastMv)) != 0 ||
-		    memcmp(lastProj, p.projMatrix, sizeof(lastProj)) != 0) {
-			GxDs3dFastXform x;
-			if (!gxDs3dFastXformBuild(p, x, wbuf, s_wK))
-				continue;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
-			GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
-			GX_LoadProjectionMtx(x.proj, x.projType);
-			ortho = x.projType == GX_ORTHOGRAPHIC;
-
-			memcpy(lastMv, p.mvMatrix, sizeof(lastMv));
-			memcpy(lastProj, p.projMatrix, sizeof(lastProj));
-			haveLast = true;
-			curMtx = -1;
-		}
-		// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section).
-		if (curMtx != (int)clipped) {
-			GX_SetCurrentMtx(clipped ? GX_PNMTX1 : GX_PNMTX0);
-			curMtx = clipped;
-		}
-
-		gxDs3dBindPoly(p, false, st, first);
-		first = false;
-		for (int pass = twoPass ? 0 : 1; pass < 2; ++pass) {
-			if (trans) {
-				// pass 0: the a == 31 fragments of a non-depth-writing polygon (opaque
-				// writes, with depth); pass 1: everything else it draws.
-				GX_SetZMode(GX_TRUE, GX_LESS, (pass == 0 || zw) ? GX_TRUE : GX_FALSE);
-				if (pass == 0)    GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
-				else if (twoPass) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_LESS, 255);
-				else              GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
-			}
-			if (clipped) {
-				GX_Begin(GX_TRIANGLEFAN, GX_VTXFMT0, nv);
-				for (int j = 0; j < nv; ++j) {
-					const VERT &v = cv[j];
-					const float w = v.coord[3];
-					if (ortho) GX_Position3f32(v.coord[0] / w, v.coord[1] / w, v.coord[2] / w);
-					else       GX_Position3f32(v.coord[0], v.coord[1], -w);
-#ifdef DSA_GXGEOM_PROBE
-					gxDs3dSendColor(v, va);
-#else
-					GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
-#endif
-					if (st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
-				}
-				GX_End();
-				continue;
-			}
-			GX_Begin(p.type == 4 ? GX_QUADS : GX_TRIANGLES, GX_VTXFMT0, p.type);
-			for (int j = 0; j < p.type; ++j) {
-				const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
-				GX_Position3f32(v.objcoord[0], v.objcoord[1], v.objcoord[2]);
-				gxDs3dSendColor(v, va);
-				if (st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
-			}
-			GX_End();
-		}
+		gxDs3dFastPoly(c, p, r ? (int)s_tagIdx[i] : 0);
 	}
-	if (blendOn) {
+	if (c.blendOn) {
 		GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 		GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
 	}
+	if (c.tagMode > 0) GX_SetNumTevStages(1);
+	gxDs3dTagBuffersFree();
 	gxDs3dRestoreState();
 }
 
