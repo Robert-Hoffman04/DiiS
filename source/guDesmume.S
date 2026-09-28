@@ -18,6 +18,8 @@ texCoordTrans:
 	psq_st       f3,0(r3),0,0
 	blr
 
+	// Only volatile FPRs (f0-f13): f14-f31 are callee-saved in the PPC EABI, and these
+	// routines don't save anything (they used to clobber f14-f19; see gx-next-steps-log.md Task rslatch).
 	.globl ps_MatrixMultVec4x4
 	//r3 = mtx, r4= vec
 ps_MatrixMultVec4x4:
@@ -53,17 +55,17 @@ ps_MatrixMultVec4x4:
 		//f13(0) = mtx2  * x     , f13(1) = mtx3  * x
 	ps_mul       f13,f1,f8									//free: f1/f8
 		// + y
-	ps_madd      f14,f2,f9,f12								//free: f2/f12
-	ps_madd      f15,f3,f9,f13								//free: f3/f9/f13
+	ps_madd      f0,f2,f9,f12								//free: f2/f12
+	ps_madd      f1,f3,f9,f13								//free: f3/f9/f13
 		// + z
-	ps_madd      f16,f4,f10,f14								//free: f4/f14
-	ps_madd      f17,f5,f10,f15								//free: f5/f10/f15
+	ps_madd      f2,f4,f10,f0								//free: f4/f14
+	ps_madd      f3,f5,f10,f1								//free: f5/f10/f15
 		// + w
-	ps_madd      f18,f6,f11,f16								//free: f6/f16
-	ps_madd      f19,f7,f11,f17								//free: f7/f11/f17
+	ps_madd      f12,f6,f11,f2								//free: f6/f16
+	ps_madd      f13,f7,f11,f3								//free: f7/f11/f17
 
-	psq_st       f18,0(r4),0,0
-	psq_st       f19,8(r4),0,0
+	psq_st       f12,0(r4),0,0
+	psq_st       f13,8(r4),0,0
 	blr
 
 	.globl ps_MatrixMultVec3x3
@@ -93,14 +95,14 @@ ps_MatrixMultVec3x3:
 		//f13(0) = mtx2  * x     , f13(1) = x
 	ps_muls0     f13,f1,f8									//free: f1
 		// + y
-	ps_madds1    f14,f2,f8,f12								//free: f2/f12
-	ps_madds1    f15,f3,f8,f13								//free: f3/f8/f13
+	ps_madds1    f0,f2,f8,f12								//free: f2/f12
+	ps_madds1    f1,f3,f8,f13								//free: f3/f8/f13
 		// + z
-	ps_madds0    f16,f4,f9,f14								//free: f4/f14
-	ps_madds0    f17,f5,f9,f15								//free: f5/f9/f15
+	ps_madds0    f2,f4,f9,f0								//free: f4/f14
+	ps_madds0    f3,f5,f9,f1								//free: f5/f9/f15
 
-	psq_st       f16,0(r4),0,0
-	stfs         f17,8(r4)
+	psq_st       f2,0(r4),0,0
+	stfs         f3,8(r4)
 	blr
 
 	.globl ps_MatrixCopy
@@ -155,17 +157,17 @@ ps_MatrixTranslate:
 		//f13(0) = mtx2  * x     , f13(1) = mtx3  * x
 	ps_muls0     f13,f1,f8								//free: f1
 		// + y
-	ps_madds1    f14,f2,f8,f12							//free: f2/f12
-	ps_madds1    f15,f3,f8,f13							//free: f3/f9/f13
+	ps_madds1    f0,f2,f8,f12							//free: f2/f12
+	ps_madds1    f1,f3,f8,f13							//free: f3/f9/f13
 		// + z
-	ps_madds0    f16,f4,f9,f14							//free: f4/f14
-	ps_madds0    f17,f5,f9,f15							//free: f5/f9/f15
+	ps_madds0    f2,f4,f9,f0							//free: f4/f14
+	ps_madds0    f3,f5,f9,f1							//free: f5/f9/f15
 		// mtx +=
-	ps_add       f18,f6,f16								//free: f6/f16
-	ps_add       f19,f7,f17								//free: f7/f17
+	ps_add       f12,f6,f2								//free: f6/f16
+	ps_add       f13,f7,f3								//free: f7/f17
 
-	psq_st       f18,48(r3),0,0
-	psq_st       f19,56(r3),0,0
+	psq_st       f12,48(r3),0,0
+	psq_st       f13,56(r3),0,0
 	blr
 
 	.globl ps_MatrixScale
@@ -195,18 +197,18 @@ ps_MatrixScale:
 		//f13(0) = mtx2  * x     , f13(1) = mtx3  * x
 	ps_muls0     f13,f1,f8							//free: f1
 		// + y
-	ps_muls1     f14,f2,f8							//free: f2/f12
-	ps_muls1     f15,f3,f8							//free: f3/f8/f13
+	ps_muls1     f0,f2,f8							//free: f2/f12
+	ps_muls1     f1,f3,f8							//free: f3/f8/f13
 		// + z
-	ps_muls0     f16,f4,f9							//free: f4/f14
-	ps_muls0     f17,f5,f9							//free: f5/f9/f15
+	ps_muls0     f2,f4,f9							//free: f4/f14
+	ps_muls0     f3,f5,f9							//free: f5/f9/f15
 
 	psq_st       f12,0(r3),0,0
 	psq_st       f13,8(r3),0,0
-	psq_st       f14,16(r3),0,0
-	psq_st       f15,24(r3),0,0
-	psq_st       f16,32(r3),0,0
-	psq_st       f17,40(r3),0,0
+	psq_st       f0,16(r3),0,0
+	psq_st       f1,24(r3),0,0
+	psq_st       f2,32(r3),0,0
+	psq_st       f3,40(r3),0,0
 	blr
 
 	.globl ps_MatrixMultiply
@@ -240,11 +242,11 @@ ps_MatrixMultiply:
 		// f13(0) = rtx2  , f13(1) = rtx3
 	psq_l        f13,8(r4),0,0
 		//+ matrix[8-11]*rightMatrix[2]
-	ps_madds0    f14,f4,f13,f11		// Free: f11
-	ps_madds0    f15,f5,f13,f12		// Free: f12		
+	ps_madds0    f10,f4,f13,f11		// Used: f10 Free: f11
+	ps_madds0    f11,f5,f13,f12		// Used: f11 Free: f12
 		//+ matrix[12-15]*rightMatrix[3]	
-	ps_madds1    f8,f6,f13,f14		// Used: f8  Free: f14
-	ps_madds1    f9,f7,f13,f15		// Used: f9  Free: f15,f13
+	ps_madds1    f8,f6,f13,f10		// Used: f8  Free: f10
+	ps_madds1    f9,f7,f13,f11		// Used: f9  Free: f11,f13
 	//STORE IT
 	psq_st       f8,0(r3),0,0		//           Free: f8
 	psq_st       f9,8(r3),0,0		//           Free: f9
@@ -260,14 +262,14 @@ ps_MatrixMultiply:
 		// f13(0) = rtx6  , f13(1) = rtx7
 	psq_l        f13,24(r4),0,0
 		//+ matrix[8-11]*rightMatrix[6]
-	ps_madds0    f14,f4,f13,f8		// Free: f8
-	ps_madds0    f15,f5,f13,f9		// Free: f9		
+	ps_madds0    f10,f4,f13,f8		// Used: f10 Free: f8
+	ps_madds0    f11,f5,f13,f9		// Used: f11 Free: f9
 		//+ matrix[12-15]*rightMatrix[7]	
-	ps_madds1    f10,f6,f13,f14		// Used: f10 Free: f14
-	ps_madds1    f11,f7,f13,f15		// Used: f11 Free: f15,f13
+	ps_madds1    f12,f6,f13,f10		// Used: f12 Free: f10
+	ps_madds1    f8,f7,f13,f11		// Used: f8  Free: f11,f13
 	//STORE IT
-	psq_st       f10,16(r3),0,0		//           Free: f10
-	psq_st       f11,24(r3),0,0		//           Free: f11
+	psq_st       f12,16(r3),0,0		//           Free: f12
+	psq_st       f8,24(r3),0,0		//           Free: f8
 	//////////////////////////////////////////////////////
 		// f8(0) = rtx8  , f8(1) = rtx9
 	psq_l        f8,32(r4),0,0
@@ -276,18 +278,18 @@ ps_MatrixMultiply:
 	ps_muls0     f12,f1,f8					
 		//+ matrix[4-7]*rightMatrix[9]	
 	ps_madds1    f13,f2,f8,f11		//           Free: f11
-	ps_madds1    f14,f3,f8,f12		//           Free: f8,f12
-		// f13(0) = rtx10  , f13(1) = rtx11
+	ps_madds1    f10,f3,f8,f12		// Used: f10 Free: f8,f12
+		// f11(0) = rtx10  , f11(1) = rtx11
 	psq_l        f11,40(r4),0,0		// Used: f11
 		//+ matrix[8-11]*rightMatrix[10]
 	ps_madds0    f9,f4,f11,f13		//           Free: f13
-	ps_madds0    f10,f5,f11,f14		//           Free: f14		
+	ps_madds0    f12,f5,f11,f10		// Used: f12 Free: f10
 		//+ matrix[12-15]*rightMatrix[11]	
 	ps_madds1    f8,f6,f11,f9		// Used: f8  Free: f9
-	ps_madds1    f12,f7,f11,f10		// Used: f12 Free: f10,f11
+	ps_madds1    f13,f7,f11,f12		// Used: f13 Free: f12,f11
 	//STORE IT
 	psq_st       f8,32(r3),0,0		//           Free: f8
-	psq_st       f12,40(r3),0,0		//           Free: f12
+	psq_st       f13,40(r3),0,0		//           Free: f13
 	
 	//////////////////////////////////////////////////////
 		// f9(0) = rtx12  , f9(1) = rtx13

@@ -360,6 +360,13 @@ struct GFX3D{
 		enableFog, enableFogAlphaOnly;
 	
 	bool wbuffer, sortmode;
+	// The savestate SFORMAT entries for the bools above (GSET..GSEO, GSWB, GSSM in
+	// gfx3d.cpp) are 4 bytes wide (upstream had BOOL), so loading GSSM writes 3 bytes from
+	// &sortmode. Without this slack that ran past the struct into the next .bss object,
+	// whichever the linker put there: float16table[0] in some LTO layouts, which turned
+	// every 0.0 vertex coordinate into 8.0 after an SM64DS savestate load (Task rslatch).
+	// The earlier entries only overwrite bools that the following entries then restore.
+	u8 sfLoadSlack[3];
 };
 extern GFX3D gfx3d;
 
