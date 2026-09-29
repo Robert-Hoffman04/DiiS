@@ -1,17 +1,16 @@
 /****************************************************************************
- * DeSmuMEWii ARM7 JIT
+ * DeSmuMEWii ARM JIT
  *
  * jit.h
  *
- * Top-level interface for the ARM7 trace JIT. Derived from Visual Boy Advance
- * GX's source/vba/gba/JIT.h (c) Daryl Borth, GPL v2+ -- see
- * jit/upstream/PROVENANCE.md and desmumewii-arm7-jit-plan.md.
+ * Top-level interface for the ARM-to-PowerPC trace JIT (ARM9 and ARM7, ARM and
+ * THUMB). Derived from Visual Boy Advance GX's source/vba/gba/JIT.h (c) Daryl
+ * Borth, GPL v2+ -- see jit/upstream/PROVENANCE.md.
  *
- * Phase P1: the CPU-agnostic infrastructure is present and wired to an ARM7
- * JitCpuProfile, but no opcode front-end exists yet -- jitCompileTrace()
- * always produces a "don't JIT this" fallback block, so execution is
- * unchanged. jitSelfTest() round-trips a hand-emitted block through the
- * trampoline + linker stub to prove the ABI on real hardware.
+ * Built in by default (make NOJIT=1 drops it); whether it runs is a runtime
+ * choice, Interpreter or JIT for both cores (jitSetEnabled/jitRequestMode).
+ * Opcodes without a front-end are run through the interpreter from inside the
+ * trace (jitInterpFallback) instead of ending the block.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_H
