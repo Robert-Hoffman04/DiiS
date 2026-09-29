@@ -591,8 +591,9 @@ static void patchMissSlots(u32* const* missSlots, int nMiss, const u32* target)
 		*missSlots[i] |= (u32)((target - missSlots[i]) * 4) & 0xFFFC;
 }
 
-// P16: ARM9 two-region inline guard. See jit_trace.h. EA in PPC_R12.
-int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots)
+// P16: ARM9 two-region inline guard (plus ITCM for loads, PERF_LOG Step 6).
+// See jit_trace.h. EA in PPC_R12.
+int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm)
 {
 	(void)size;
 	u32*& p = emitPtr;
@@ -608,6 +609,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	const bool dtcmReach   = (dtcmRegion & 0x3FFFu) == 0;
 	const s32 dtcmTag      = (s32)(dtcmRegion >> 14);
 	const bool dtcmInMain  = dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u;
+	const bool dtcmInItcm  = dtcmReach && dtcmRegion < 0x02000000u;
 	const u32 mainMb       = (u32)__builtin_clz(cpu.arm9MainMask); // top set bit of the mirror mask
 	const u32 dtcmBase     = cpu.arm9DtcmBase;
 	const u32 mainBase     = cpu.mainMemBase;
@@ -635,7 +637,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	// ---- main RAM: (EA >> 24) & 0xF == 2 ----
 	*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);
 	*p++ = PPC_CMPWI(0, PPC_R10, 2);
-	slow[nSlow++] = p++;                                           // BNE -> slow
+	u32* notMain = p++;                                            // BNE -> ITCM test / slow
 	if (spanBytes) {
 		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
 		*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
@@ -655,6 +657,51 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);       // EA & mirrorMask, cleared to align
 	fastSlots[nFast++] = p++;                                      // B -> caller inline block
 
+	// ---- ITCM (loads only, PERF_LOG Step 6): EA < 0x02000000 ----
+	// Tested after main RAM, on main RAM's miss branch, so the common main-RAM
+	// hit pays nothing for it. The rule is exactly the interpreter's
+	// (_MMU_ARM9_read*, reached once the DTCM and main-RAM checks in _MMU_read*
+	// have missed): every address below 0x02000000 is the 32 KB ITCM, mirrored
+	// by `addr & 0x7FFF`. That decode ignores the CP15 ITCM size/enable
+	// register (cp15.cpp pins MMU.ITCMRegion to 0 and nothing reads the size),
+	// so there is nothing CP15-dependent to bake: the only emit-time constant is
+	// MMU.ARM9_ITCM, allocated with MAIN_MEM / ARM9_DTCM and never moved. DTCM
+	// keeps priority because its test above runs first; the span test below
+	// keeps a run inside one 32 KB mirror (the interpreter wraps each word
+	// separately at the edge, the inline lwbrx run would not -- and the last
+	// mirror's edge is 0x02000000 itself) and, when DTCM sits in the ITCM
+	// range, out of the DTCM window -- the same shape as the main-RAM span
+	// tests. Stores do not take this path: ITCM holds JIT code, and the
+	// measured ITCM store rate on the benchmark scene was zero, so they stay on
+	// slowWrite (whose _MMU_ARM9_write* does the SMC invalidate itself).
+	if (!withItcm) {
+		slow[nSlow++] = notMain;                                   // not main RAM -> slow
+	} else {
+		const u32 itcmBase = cpu.arm9ItcmBase;
+		*notMain = PPC_BNE((u32)((p - notMain) * 4));              // not main RAM -> here
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);
+		*p++ = PPC_CMPWI(0, PPC_R10, 0);
+		slow[nSlow++] = p++;                                       // BNE -> slow (not ITCM)
+		if (spanBytes) {
+			*p++ = PPC_SRWI(PPC_R10, PPC_R12, 15);
+			*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
+			*p++ = PPC_SRWI(PPC_R11, PPC_R11, 15);
+			*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+			slow[nSlow++] = p++;                                   // BNE -> slow (crosses a 32 KB mirror)
+			if (dtcmInItcm) {                                      // ...and not into the DTCM window
+				*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
+				*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
+				*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
+				slowIsBeq[nSlow] = true;
+				slow[nSlow++] = p++;                               // BEQ -> slow
+			}
+		}
+		*p++ = PPC_LIS(PPC_R10, itcmBase >> 16);
+		if (itcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, itcmBase & 0xFFFF);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, alignMe);       // EA & 0x7FFF, cleared to align
+		fastSlots[nFast++] = p++;                                  // B -> caller inline block
+	}
+
 	// slow fall-through starts here; retarget every miss branch to it
 	for (int i = 0; i < nSlow; i++) {
 		const u32 off = (u32)((p - slow[i]) * 4);
@@ -672,9 +719,9 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 	// paths all see coherent registers with nothing to flush.
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA for the slow path
 
-	u32* fast[2];
+	u32* fast[3];
 	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast);
+	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast, /*withItcm=*/true);
 
 	// ---- slow: slowRead C call ----
 	emitMemPrologue();
@@ -791,8 +838,8 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
 
-	u32* fast[2];
-	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast);
+	u32* fast[3];
+	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast, /*withItcm=*/true);
 
 	// ---- slow: per-word slowRead C loop, straight into the pinned regs ----
 	emitMemPrologue();
@@ -887,7 +934,7 @@ void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn)
 
 	u32* fast[2];
 	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast);
+	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast, /*withItcm=*/false);
 
 	// ---- slow: SMC guard + slowWrite C call (no interpreter round-trip) ----
 	emitMemPrologue();
@@ -939,7 +986,7 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
 
 	u32* fast[2];
-	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/span, fast);
+	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/span, fast, /*withItcm=*/false);
 
 	// ---- slow: SMC guard (whole span) + per-word slowWrite C loop ----
 	emitMemPrologue();

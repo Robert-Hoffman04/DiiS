@@ -304,11 +304,15 @@ struct JitTraceCtx {
 	// (returned in fastSlots[0..count-1]) to its inline-load block. A miss (or,
 	// for spanBytes > 0, a run that straddles a region edge / 1 MB page) falls
 	// through -- the caller emits the slowRead C path there. Clobbers r10, r11;
-	// EA stays in r12. Returns the number of fast-branch slots written (2).
-	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots);
+	// EA stays in r12. Returns the number of fast-branch slots written (1-3).
+	// withItcm (loads only, PERF_LOG Step 6) adds a third region, the 32 KB
+	// ITCM mirrored over 0x00000000-0x01FFFFFF, tested on main RAM's miss
+	// branch so a main-RAM hit costs the same as before; its fast slot comes
+	// last. Stores pass false (ITCM holds JIT code; they keep slowWrite).
+	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm);
 
 	// Full ARM9 single load: EA in PPC_R12. Unconditional dirty flush, then the
-	// region guard -> inline lwbrx (main RAM / DTCM) or the slowRead C call
+	// region guard -> inline lwbrx (main RAM / DTCM / ITCM) or the slowRead C call
 	// (every other region, no interpreter round-trip); result -> gpr[rd] and the
 	// register cache is invalidated. When `writeback`, the caller has stashed the
 	// new base value at 104(r1) and it is committed to gpr[rn] afterwards. Does
