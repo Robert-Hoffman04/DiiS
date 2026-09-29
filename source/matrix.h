@@ -80,9 +80,13 @@ FORCEINLINE void mtx_fix2float3x4(float* matrix, const float divisor);
 
 FORCEINLINE void MatrixMultVec4x4_M2(const float *matrix, float *vecPtr)
 {
+#ifdef ENABLE_PAIRED_SINGLE
+	ps_MatrixMultVec4x4_M2(matrix, vecPtr);   // Task gespeed: both multiplies in one call
+#else
 	//there are hardly any gains from merging these manually
 	MatrixMultVec4x4(matrix+16,vecPtr);
 	MatrixMultVec4x4(matrix,vecPtr);
+#endif
 }
 
 template<int NUM_ROWS>

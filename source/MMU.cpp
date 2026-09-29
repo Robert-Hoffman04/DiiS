@@ -2244,17 +2244,10 @@ void DmaController::doCopy()
 		// immediate-DMA words per block, ~10k words a frame). Same reads and writes as the
 		// generic loop below, minus the per-word address decode, and the FIFO's per-word
 		// event checks folded into one (GFX_FIFObatchBegin/End, FIFO.cpp).
-		u32 *io = (u32 *)MMU.MMU_MEM[ARMCPU_ARM9][0x40];
-		GFX_FIFObatchBegin();
-		for(s32 i=(s32)todo; i>0; i--)
-		{
-			u32 temp = T1ReadLong_guaranteedAligned(MMU.MAIN_MEM, src & _MMU_MAIN_MEM_MASK32);
-			io[(dst & 0xFFF) >> 2] = temp;
-			gfx3d_sendCommandToFIFO(temp);
-			dst += dstinc;
-			src += srcinc;
-		}
-		GFX_FIFObatchEnd();
+		// (Task gespeed: the loop is gfx3d_sendCommandBlockToFIFO(), gfx3d.cpp.)
+		gfx3d_sendCommandBlockToFIFO(src, srcinc, dst, dstinc, (s32)todo);
+		dst += todo*dstinc;
+		src += todo*srcinc;
 	} else if(sz==4) {
 		for(s32 i=(s32)todo; i>0; i--)
 		{

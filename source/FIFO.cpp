@@ -181,28 +181,30 @@ static void GXF_FIFO_handleEvents()
 // fixed and the FIFO only grows, so those calls are idempotent except for the cost sum:
 // the half-IRQ / GXFIFO-DMA trigger fires iff any push left size <= 127 (the empty case
 // can't follow a push), and the reschedule adds 1 per push. End replays exactly that.
+// (Task gespeed: as the FIFO only grows, the pushes are the size gained and the first push
+// left the smallest size, so End works both out from the size at Begin, with no per-push
+// bookkeeping.)
 static bool s_gxfBatch = false;
-static bool s_gxfBatchHalf;
-static u32  s_gxfBatchPushes;
+static u32  s_gxfBatchSize0;
 
 void GFX_FIFObatchBegin()
 {
 	s_gxfBatch = true;
-	s_gxfBatchHalf = false;
-	s_gxfBatchPushes = 0;
+	s_gxfBatchSize0 = gxFIFO.size;
 }
 
 void GFX_FIFObatchEnd()
 {
 	s_gxfBatch = false;
-	if (s_gxfBatchPushes == 0) return;
-	if (s_gxfBatchHalf)
+	const u32 pushes = gxFIFO.size - s_gxfBatchSize0;
+	if (pushes == 0) return;
+	if (s_gxfBatchSize0 + 1 <= 127)   // some push left size <= 127
 	{
 		if(MMU_new.gxstat.gxfifo_irq == 1)
 			setIF(0, (1<<21)); //the half gxfifo irq
 		triggerDma(EDMAMode_GXFifo);
 	}
-	NDS_RescheduleGXFIFO(s_gxfBatchPushes);
+	NDS_RescheduleGXFIFO(pushes);
 }
 
 void GFX_FIFOhandleEvents()
@@ -226,12 +228,7 @@ void GFX_FIFOsend(u8 cmd, u32 param)
 	
 	//gxstat |= 0x08000000;		// set busy flag
 
-	if (s_gxfBatch)
-	{
-		++s_gxfBatchPushes;
-		if (gxFIFO.size <= 127) s_gxfBatchHalf = true;
-		return;
-	}
+	if (s_gxfBatch) return;   // GFX_FIFObatchEnd() does the events
 
 	GXF_FIFO_handleEvents();
 

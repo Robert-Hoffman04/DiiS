@@ -72,6 +72,7 @@ static inline float gxDs3dM(const float *m, int r, int c) { return m[4 * c + r];
 // (Task recordcost: the gate and the draw compare every polygon's two matrices).
 static inline bool gxDs3dMtxEq(const float *a, const float *b)
 {
+	if (a == b) return true;   // Task gespeed: polygons share their POLYLIST's POLYMTX entries
 	for (int k = 0; k < 16; ++k) {
 		u32 x, y;
 		memcpy(&x, a + k, 4); memcpy(&y, b + k, 4);
@@ -489,12 +490,12 @@ static inline u8 gxDs3dF6To8(float f)
 enum {
 	kGateOk = 0, kGateNoList, kGateEmpty, kGateWbuffer, kGateClearImage, kGateEdge, kGateFog,
 	kGateTranslucent, kGatePolyMode, kGateTexNotReady, kGateTexColor, kGateType, kGateW, kGateClipColor,
-	kGateFastProj, kGateDepthEqual, kGateTransClear, kGateTransBlend, kGateTransId, kGateQuadColor, kGateCount
+	kGateFastProj, kGateDepthEqual, kGateTransClear, kGateTransBlend, kGateTransId, kGateQuadColor, kGatePolyMtx, kGateCount
 };
 static const char *const kGateNames[kGateCount] = {
 	"OK", "nolist", "empty", "wbuffer", "clearimage", "edge", "fog", "translucent", "polymode",
 	"texnotready", "texcolor", "type", "w<=0", "clipcolor", "fastproj", "depthequal", "transclear",
-	"transblend", "transid", "quadcolor"
+	"transblend", "transid", "quadcolor", "polymtx"
 };
 
 // Set by the last gxDs3dFrameGate: the frame has translucent polygons that will be drawn.
@@ -726,6 +727,7 @@ static int gxDs3dFrameGate(bool requireTex)
 	if (!gfx3d.polylist || !gfx3d.vertlist) return kGateNoList;
 	const int polycount = gfx3d.polylist->count;
 	if (polycount <= 0) return kGateEmpty;
+	if (gfx3d.polylist->mtxOverflow) return kGatePolyMtx;   // POLYMTX pool full: zero matrices (gfx3d.h)
 	const bool fast = gxRenderModeIsFast();
 	// W-buffer mode: GxFast only, drawn with the depth mapping of gxDs3dWDepthInv()
 	// (see s_wK). GX's 24-bit D = 1 - K/w buckets w differently from the CPU's

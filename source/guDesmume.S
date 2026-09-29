@@ -68,6 +68,58 @@ ps_MatrixMultVec4x4:
 	psq_st       f13,8(r4),0,0
 	blr
 
+	// Task gespeed: ps_MatrixMultVec4x4(mtx+16, vec) then ps_MatrixMultVec4x4(mtx, vec) in one
+	// call (SetVertex's clip transform). The same instructions on the same operands; the first
+	// result goes to the second multiply by ps_merge instead of a psq_st / lfs round trip
+	// (both give the single-precision values the first multiply produced).
+	.globl ps_MatrixMultVec4x4_M2
+	//r3 = mtx (two 4x4s), r4 = vec
+ps_MatrixMultVec4x4_M2:
+	psq_l        f0,64(r3),0,0
+	psq_l        f1,72(r3),0,0
+	psq_l        f2,80(r3),0,0
+	psq_l        f3,88(r3),0,0
+	psq_l        f4,96(r3),0,0
+	psq_l        f5,104(r3),0,0
+	psq_l        f6,112(r3),0,0
+	psq_l        f7,120(r3),0,0
+	lfs          f8,0(r4)
+	lfs          f9,4(r4)
+	lfs          f10,8(r4)
+	lfs          f11,12(r4)
+	ps_mul       f12,f0,f8
+	ps_mul       f13,f1,f8
+	ps_madd      f0,f2,f9,f12
+	ps_madd      f1,f3,f9,f13
+	ps_madd      f2,f4,f10,f0
+	ps_madd      f3,f5,f10,f1
+	ps_madd      f12,f6,f11,f2
+	ps_madd      f13,f7,f11,f3
+		// x,y,z,w of the first product, each in both halves (what lfs gives)
+	ps_merge00   f8,f12,f12
+	ps_merge11   f9,f12,f12
+	ps_merge00   f10,f13,f13
+	ps_merge11   f11,f13,f13
+	psq_l        f0,0(r3),0,0
+	psq_l        f1,8(r3),0,0
+	psq_l        f2,16(r3),0,0
+	psq_l        f3,24(r3),0,0
+	psq_l        f4,32(r3),0,0
+	psq_l        f5,40(r3),0,0
+	psq_l        f6,48(r3),0,0
+	psq_l        f7,56(r3),0,0
+	ps_mul       f12,f0,f8
+	ps_mul       f13,f1,f8
+	ps_madd      f0,f2,f9,f12
+	ps_madd      f1,f3,f9,f13
+	ps_madd      f2,f4,f10,f0
+	ps_madd      f3,f5,f10,f1
+	ps_madd      f12,f6,f11,f2
+	ps_madd      f13,f7,f11,f3
+	psq_st       f12,0(r4),0,0
+	psq_st       f13,8(r4),0,0
+	blr
+
 	.globl ps_MatrixMultVec3x3
 	//r3 = mtx, r4= vec
 ps_MatrixMultVec3x3:

@@ -8,6 +8,7 @@
 
 extern "C" {
 	void ps_MatrixMultVec4x4(register const float *matrix, register float *vecPtr);
+	void ps_MatrixMultVec4x4_M2(register const float *matrix, register float *vecPtr);
 	void ps_MatrixMultVec3x3(register float *matrix, register float *vecPtr);
 	void ps_MatrixCopy(register float* matrixDST, register const float* matrixSRC);
 	void ps_MatrixTranslate(register float *matrix, register float *ptr);

@@ -118,28 +118,44 @@ public:
 		size = 0;
 	}
 
-	void receive(u32 val){
+	// Task gespeed: the parameter-word path stays inline; the packed-command unpack is
+	// out of line (unpack()) so the common path doesn't pay its register saves. BATCHED:
+	// the caller has a GFX_FIFObatchBegin() section open (gfx3d_sendCommandBlockToFIFO).
+	template<bool BATCHED>
+	FORCEINLINE void receive(u32 val){
 		if (size > 0)
 		{
-			GFX_FIFOsend(front().command, val);
+			if (BATCHED) GFX_FIFOsendBatched(front().command, val);
+			else GFX_FIFOsend(front().command, val);
 			front().countdown--;
 			if (front().countdown == 0) 
-			{
-				size--; 
-				if (size == 0) return;
-				dequeue();
-
-				while (gfx3d_commandTypes[front().command] == GFX_NOARG_COMMAND)
-				{
-					GFX_FIFOsend(front().command, 0);
-					size--; 
-					if (size == 0) break;
-					dequeue();
-				}
-			}
+				frontDone<BATCHED>();
 		} else {
 			if (val == 0) return;	// nop
+			unpack(val);
+		}
+	}
 
+	// The front command got its last parameter: move on, pushing the no-parameter commands
+	// that follow it in the packed word.
+	template<bool BATCHED>
+	FORCEINLINE void frontDone(){
+		size--; 
+		if (size == 0) return;
+		dequeue();
+
+		while (gfx3d_commandTypes[front().command] == GFX_NOARG_COMMAND)
+		{
+			if (BATCHED) GFX_FIFOsendBatched(front().command, 0);
+			else GFX_FIFOsend(front().command, 0);
+			size--; 
+			if (size == 0) break;
+			dequeue();
+		}
+	}
+
+	__attribute__((noinline)) void unpack(u32 val){
+		{
 			const u8 commands[] = { val&0xFF, (val>>8)&0xFF, (val>>16)&0xFF, (val>>24)&0xFF };
 			const u8 commandTypes[] = { gfx3d_commandTypes[commands[0]], gfx3d_commandTypes[commands[1]], gfx3d_commandTypes[commands[2]], gfx3d_commandTypes[commands[3]] };
 
@@ -172,7 +188,9 @@ public:
 				{
 					GFX_FIFOsend(commands[i], 0);
 
-					while ((i < 4) && commands[i+1] != 0 && gfx3d_commandTypes[commands[i+1]] == GFX_NOARG_COMMAND)
+					// Task gespeed: was (i < 4), which read commands[4] (past the array, a stack byte)
+					// when the word's last command was a lone no-arg one.
+					while ((i < 3) && commands[i+1] != 0 && gfx3d_commandTypes[commands[i+1]] == GFX_NOARG_COMMAND)
 						GFX_FIFOsend(commands[++i], 0);
 				}
 				else
@@ -241,11 +259,22 @@ public:
 //while the fifo was full, apparently expecting the fifo not to be full by that time.
 //in general we are finding that 3d takes less time than we think....
 //although maybe the true culprit was charging the cpu less time for the dma.
-#define GFX_DELAY(x) NDS_RescheduleGXFIFO(1);
-#define GFX_DELAY_M2(x) NDS_RescheduleGXFIFO(1);
+//
+// Task gespeed: every command handler runs only from gfx3d_execute3D(), which sets
+// MMU.gfx3dCycles = nds_timer+1 after each command, and nothing in between reads
+// gfx3dCycles or the gxfifo sequencer state. So each handler's NDS_RescheduleGXFIFO(1)
+// only ever contributed "enable the gxfifo event + reschedule", which execute3D now
+// does once per batch (same final state). GFX_DELAY is a no-op in the handlers.
+#define GFX_DELAY(x)
+#define GFX_DELAY_M2(x)
 
 using std::max;
 using std::min;
+
+// Task gespeed: the command handlers with any real body stay out of line, so gfx3d_execute()
+// is a bare jump table of tail calls. Inlined, their combined register/stack needs gave it a
+// ~1KB frame and 11 saved GPRs, paid on every command word.
+#define GE_NOINLINE __attribute__((noinline))
 
 GFX3D gfx3d;
 static GFX3D_Clipper boxtestClipper;
@@ -426,6 +455,13 @@ struct tmpVertInfo {
 } tempVertInfo;
 
 
+// Task gespeed: the POLYMTX the next polygon points at, and whether a matrix command ran
+// since it was taken (then the next polygon appends a fresh one). A new list always starts
+// dirty: its polygons must point into its own pool.
+static const POLYMTX *s_polyMtx = NULL;
+static bool s_polyMtxDirty = true;
+static const POLYMTX s_polyMtxZero = {};
+
 static void twiddleLists() {
 	listTwiddle++;
 	listTwiddle &= 1;
@@ -433,6 +469,9 @@ static void twiddleLists() {
 	vertlist = &vertlists[listTwiddle];
 	polylist->count = 0;
 	vertlist->count = 0;
+	polylist->mtxCount = 0;
+	polylist->mtxOverflow = false;
+	s_polyMtxDirty = true;
 }
 
 static BOOL flushPending = FALSE;
@@ -725,8 +764,20 @@ static void SetVertex(){
 		if(polygonListCompleted == 1){
 			POLY &poly = polylist->list[polylist->count];
 
-			MatrixCopy(poly.projMatrix,mtxCurrent[0]); 
-			MatrixCopy(poly.mvMatrix,mtxCurrent[1]); 
+			if (s_polyMtxDirty) {
+				if (polylist->mtxCount < POLYMTX_SIZE) {
+					POLYMTX &m = polylist->mtx[polylist->mtxCount++];
+					MatrixCopy(m.proj, mtxCurrent[0]);
+					MatrixCopy(m.mv, mtxCurrent[1]);
+					s_polyMtx = &m;
+					s_polyMtxDirty = false;
+				} else {
+					polylist->mtxOverflow = true;
+					s_polyMtx = &s_polyMtxZero;
+				}
+			}
+			poly.projMatrix = s_polyMtx->proj;
+			poly.mvMatrix = s_polyMtx->mv;
 
 			poly.polyAttr = polyAttr;
 			poly.texParam = textureFormat;
@@ -784,7 +835,7 @@ static void gfx3d_glMatrixMode(u32 v){
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glPushMatrix(){
+static GE_NOINLINE void gfx3d_glPushMatrix(){
 	//u32 gxstat = T1ReadLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x600);
 	//this command always works on both pos and vector when either pos or pos-vector are the current mtx mode
 	short mymode = (mode==1?2:mode);
@@ -807,7 +858,7 @@ static void gfx3d_glPushMatrix(){
 	//gxstat |= ((mtxStack[0].position << 13) | (mtxStack[1].position << 8));
 }
 
-static void gfx3d_glPopMatrix(u32 _i){
+static GE_NOINLINE void gfx3d_glPopMatrix(u32 _i){
 	s32 i = _i;
 	//this command always works on both pos and vector when either pos or pos-vector are the current mtx mode
 	short mymode = (mode==1?2:mode);
@@ -825,7 +876,7 @@ static void gfx3d_glPopMatrix(u32 _i){
 
 }
 
-static void gfx3d_glStoreMatrix(u32 v){
+static GE_NOINLINE void gfx3d_glStoreMatrix(u32 v){
 	//this command always works on both pos and vector when either pos or pos-vector are the current mtx mode
 	short mymode = (mode==1?2:mode);
 	
@@ -851,7 +902,7 @@ static void gfx3d_glStoreMatrix(u32 v){
 		MatrixStackLoadMatrix (&mtxStack[1], v, mtxCurrent[1]);
 }
 
-static void gfx3d_glRestoreMatrix(u32 v){
+static GE_NOINLINE void gfx3d_glRestoreMatrix(u32 v){
 	//this command always works on both pos and vector when either pos or pos-vector are the current mtx mode
 	short mymode = (mode==1?2:mode);
 	
@@ -877,7 +928,7 @@ static void gfx3d_glRestoreMatrix(u32 v){
 		MatrixCopy (mtxCurrent[1], MatrixStackGetPos(&mtxStack[1], v));
 }
 
-static void gfx3d_glLoadIdentity(){
+static GE_NOINLINE void gfx3d_glLoadIdentity(){
 
 	MatrixIdentity (mtxCurrent[mode]);
 
@@ -889,7 +940,7 @@ static void gfx3d_glLoadIdentity(){
 	//printf("identity: %d to: \n",mode); MatrixPrint(mtxCurrent[1]);
 }
 
-static void gfx3d_glLoadMatrix4x4(u32 v){
+static GE_NOINLINE void gfx3d_glLoadMatrix4x4(u32 v){
 
 	// Zeromus says that this is garbage, and will be replaced in "Vanilla" eventually
 	//*
@@ -918,7 +969,7 @@ static void gfx3d_glLoadMatrix4x4(u32 v){
 	return;
 }
 
-static void gfx3d_glLoadMatrix4x3(u32 v){
+static GE_NOINLINE void gfx3d_glLoadMatrix4x3(u32 v){
 
 	mtxCurrent[mode][ML4x3ind] = (float)((s32)v);
 
@@ -942,7 +993,7 @@ static void gfx3d_glLoadMatrix4x3(u32 v){
 	return;
 }
 
-static void gfx3d_glMultMatrix4x4(u32 v){
+static GE_NOINLINE void gfx3d_glMultMatrix4x4(u32 v){
 
 	mtxTemporal[MM4x4ind] = (float)((s32)v);
 
@@ -964,7 +1015,7 @@ static void gfx3d_glMultMatrix4x4(u32 v){
 	return;
 }
 
-static void gfx3d_glMultMatrix4x3(u32 v){
+static GE_NOINLINE void gfx3d_glMultMatrix4x3(u32 v){
 
 	mtxTemporal[MM4x3ind] = (float)((s32)v);
 
@@ -994,7 +1045,7 @@ static void gfx3d_glMultMatrix4x3(u32 v){
 	return;
 }
 
-static void gfx3d_glMultMatrix3x3(u32 v){ 
+static GE_NOINLINE void gfx3d_glMultMatrix3x3(u32 v){ 
 
 	mtxTemporal[MM3x3ind] = (float)((s32)v);
 
@@ -1023,7 +1074,7 @@ static void gfx3d_glMultMatrix3x3(u32 v){
 	return;
 }
 
-static void gfx3d_glScale(u32 v){
+static GE_NOINLINE void gfx3d_glScale(u32 v){
 	//--DCN: This is just weird, we only scale one value at a time.
 	// I bet that this is called three times for each x,y,z value. 
 
@@ -1048,7 +1099,7 @@ static void gfx3d_glScale(u32 v){
 	return;
 }
 
-static void gfx3d_glTranslate(u32 v){
+static GE_NOINLINE void gfx3d_glTranslate(u32 v){
 	//--DCN: Just like glScale above, why is this happening?
 	// Can we combine three of these into one? Please please please?
 
@@ -1080,7 +1131,36 @@ static void gfx3d_glColor3b(u32 v){
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glNormal(u32 v){
+// Task gespeed: the material x light colour products of the lighting formula below, as the
+// floats it converted them to per channel per light per normal (the products are at most 31*31,
+// so exact), rebuilt when a material or light colour register differs from the cached one.
+static struct {
+	u32 lightColor[4];
+	u16 diffuse, ambient, specular;
+	bool valid;
+	float spe[4][3], dif[4][3], amb[4][3];
+} s_lightProd;
+
+static void gfx3d_lightProductsUpdate(){
+	if (s_lightProd.valid && s_lightProd.diffuse == dsDiffuse && s_lightProd.ambient == dsAmbient &&
+	    s_lightProd.specular == dsSpecular && s_lightProd.lightColor[0] == lightColor[0] &&
+	    s_lightProd.lightColor[1] == lightColor[1] && s_lightProd.lightColor[2] == lightColor[2] &&
+	    s_lightProd.lightColor[3] == lightColor[3])
+		return;
+	s_lightProd.diffuse = dsDiffuse; s_lightProd.ambient = dsAmbient; s_lightProd.specular = dsSpecular;
+	for(int i=0; i<4; i++){
+		s_lightProd.lightColor[i] = lightColor[i];
+		for(int c=0; c<3; c++){
+			const int l = (lightColor[i]>>(5*c))&0x1F;
+			s_lightProd.spe[i][c] = (float)(((dsSpecular>>(5*c))&0x1F) * l);
+			s_lightProd.dif[i][c] = (float)(((dsDiffuse>>(5*c))&0x1F) * l);
+			s_lightProd.amb[i][c] = (float)(((dsAmbient>>(5*c))&0x1F) * l);
+		}
+	}
+	s_lightProd.valid = true;
+}
+
+static GE_NOINLINE void gfx3d_glNormal(u32 v){
 
 	DS_ALIGN(16) float normal[4] = { normalTable[v&1023],
 									normalTable[(v>>10)&1023],
@@ -1098,26 +1178,12 @@ static void gfx3d_glNormal(u32 v){
 	MatrixMultVec3x3 (mtxCurrent[2], normal);
 
 	//apply lighting model
-	u8 diffuse[3] = {
-		(dsDiffuse)&0x1F,
-		(dsDiffuse>>5)&0x1F,
-		(dsDiffuse>>10)&0x1F };
-
-	u8 ambient[3] = {
-		(dsAmbient)&0x1F,
-		(dsAmbient>>5)&0x1F,
-		(dsAmbient>>10)&0x1F };
-
 	u8 emission[3] = {
 		(dsEmission)&0x1F,
 		(dsEmission>>5)&0x1F,
 		(dsEmission>>10)&0x1F };
 
-	u8 specular[3] = {
-		(dsSpecular)&0x1F,
-		(dsSpecular>>5)&0x1F,
-		(dsSpecular>>10)&0x1F };
-
+	gfx3d_lightProductsUpdate();
 
 	int vertexColor[3] = { emission[0], emission[1], emission[2] };
 
@@ -1127,15 +1193,13 @@ static void gfx3d_glNormal(u32 v){
 	
 		if(!((lightMask>>i)&1)) continue;
 
-		u8 _lightColor[3] = {
-			(lightColor[i])&0x1F,
-			(lightColor[i]>>5)&0x1F,
-			(lightColor[i]>>10)&0x1F };
-		
 		// This formula is the one used by the DS
 		// Reference : http://nocash.emubase.de/gbatek.htm#ds3dpolygonlightparameters
 		float diffuseLevel = std::max(0.0f, -vec3dot(cacheLightDirection[i], normal));
-		float shininessLevel = pow(std::max(0.0f, vec3dot(-cacheHalfVector[i], normal)), 2);
+		// Task gespeed: was pow(m, 2) (double pow); the double square of a float is exact and pow()
+		// returns exact results exactly, so this is the same value without the libm call.
+		const float shininessDot = std::max(0.0f, vec3dot(-cacheHalfVector[i], normal));
+		float shininessLevel = (float)((double)shininessDot * (double)shininessDot);
 		if(dsSpecular & 0x8000){
 			int shininessIndex = (int)(shininessLevel * 128);
 			if(shininessIndex >= shininessTable_size) {
@@ -1154,9 +1218,9 @@ static void gfx3d_glNormal(u32 v){
 		}
 
 		for(int c = 0; c < 3; c++){
-			vertexColor[c] += (int)(((specular[c] * _lightColor[c] * shininessLevel)
-					+ (diffuse[c] * _lightColor[c] * diffuseLevel)
-					+ (ambient[c] * _lightColor[c])) / 31.0f);
+			vertexColor[c] += (int)(((s_lightProd.spe[i][c] * shininessLevel)
+					+ (s_lightProd.dif[i][c] * diffuseLevel)
+					+ s_lightProd.amb[i][c]) / 31.0f);
 		}
 	}
 
@@ -1171,7 +1235,7 @@ static void gfx3d_glNormal(u32 v){
 	GFX_DELAY_M2((lightMask>>3) & 0x01);
 }
 
-static void gfx3d_glTexCoord(u32 val){
+static GE_NOINLINE void gfx3d_glTexCoord(u32 val){
 
 	currentTexCoord.t = (s16)(val>>16);
 	currentTexCoord.s = (s16)(val&0xFFFF);
@@ -1195,7 +1259,7 @@ static void gfx3d_glTexCoord(u32 val){
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glVertex16b(u32 v){
+static GE_NOINLINE void gfx3d_glVertex16b(u32 v){
 	if(coordind==0){
 		u16coord[0] = v&0xFFFF;
 		u16coord[1] = (v>>16)&0xFFFF;
@@ -1213,7 +1277,7 @@ static void gfx3d_glVertex16b(u32 v){
 	return;
 }
 
-static void gfx3d_glVertex10b(u32 v){
+static GE_NOINLINE void gfx3d_glVertex10b(u32 v){
 	
 	u16coord[0] = (v&1023)<<6;
 	u16coord[1] = ((v>>10)&1023)<<6;
@@ -1224,7 +1288,7 @@ static void gfx3d_glVertex10b(u32 v){
 }
 
 template<u32 ONE, u32 TWO>
-static void gfx3d_glVertex3_cord(u32 v){
+static GE_NOINLINE void gfx3d_glVertex3_cord(u32 v){
 	u16coord[ONE] = v&0xffff;
 	u16coord[TWO] = (v>>16)&0xFFFF;
 
@@ -1233,7 +1297,7 @@ static void gfx3d_glVertex3_cord(u32 v){
 	GFX_DELAY(8);
 }
 
-static void gfx3d_glVertex_rel(u32 v){
+static GE_NOINLINE void gfx3d_glVertex_rel(u32 v){
 	//coord[0]              += float10RelTable[v&1023];
 	//coord[1]              += float10RelTable[(v>>10)&1023];
 	//coord[2]              += float10RelTable[(v>>20)&1023];
@@ -1277,7 +1341,7 @@ static void gfx3d_glTexPalette(u32 val){
 	21-25 Ambient Reflection Green
 	26-30 Ambient Reflection Blue
 */
-static void gfx3d_glMaterial0(u32 val){
+static GE_NOINLINE void gfx3d_glMaterial0(u32 val){
 	dsDiffuse = val&0xFFFF;
 	dsAmbient = val>>16;
 
@@ -1289,7 +1353,7 @@ static void gfx3d_glMaterial0(u32 val){
 	GFX_DELAY(4);
 }
 
-static void gfx3d_glMaterial1(u32 val){
+static GE_NOINLINE void gfx3d_glMaterial1(u32 val){
 	dsSpecular = val&0xFFFF;
 	dsEmission = val>>16;
 	GFX_DELAY(4);
@@ -1301,7 +1365,7 @@ static void gfx3d_glMaterial1(u32 val){
 	20-29 Directional Vector's Z component (1bit sign + 9bit fractional part)
 	30-31 Light Number                     (0..3)
 */
-static void gfx3d_glLightDirection (u32 v){
+static GE_NOINLINE void gfx3d_glLightDirection (u32 v){
 	int index = v>>30;
 
 	lightDirection[index] = v;
@@ -1309,13 +1373,13 @@ static void gfx3d_glLightDirection (u32 v){
 	GFX_DELAY(6);
 }
 
-static void gfx3d_glLightColor (u32 v){
+static GE_NOINLINE void gfx3d_glLightColor (u32 v){
 	int index = v>>30;
 	lightColor[index] = v;
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glShininess (u32 val){
+static GE_NOINLINE void gfx3d_glShininess (u32 val){
 	shininessTable[shininessInd++] = ((val & 0xFF) / 256.0f);
 	shininessTable[shininessInd++] = (((val >> 8) & 0xFF) / 256.0f);
 	shininessTable[shininessInd++] = (((val >> 16) & 0xFF) / 256.0f);
@@ -1327,7 +1391,7 @@ static void gfx3d_glShininess (u32 val){
 	return;
 }
 
-static void gfx3d_glBegin(u32 v){
+static GE_NOINLINE void gfx3d_glBegin(u32 v){
 	inBegin = TRUE;
 	vtxFormat = v&0x03;
 	triStripToggle = 0;
@@ -1338,7 +1402,7 @@ static void gfx3d_glBegin(u32 v){
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glEnd(){
+static GE_NOINLINE void gfx3d_glEnd(){
 	inBegin = FALSE;
 	tempVertInfo.count = 0;
 	GFX_DELAY(1);
@@ -1346,12 +1410,12 @@ static void gfx3d_glEnd(){
 
 // swap buffers - skipped
 
-static void gfx3d_glViewPort(u32 v){
+static GE_NOINLINE void gfx3d_glViewPort(u32 v){
 	viewport = v;
 	GFX_DELAY(1);
 }
 
-static void gfx3d_glBoxTest(u32 v){
+static GE_NOINLINE void gfx3d_glBoxTest(u32 v){
 	MMU_new.gxstat.tr = 0;		// clear boxtest bit
 	MMU_new.gxstat.tb = 1;		// busy
 
@@ -1467,7 +1531,7 @@ static void gfx3d_glBoxTest(u32 v){
 	return;
 }
 
-static void gfx3d_glPosTest(u32 v){
+static GE_NOINLINE void gfx3d_glPosTest(u32 v){
 	//this is apparently tested by transformers decepticons and ultimate spiderman
 
 	//printf("POSTEST\n");
@@ -1491,7 +1555,7 @@ static void gfx3d_glPosTest(u32 v){
 	return;
 }
 
-static void gfx3d_glVecTest(u32 v){
+static GE_NOINLINE void gfx3d_glVecTest(u32 v){
 	//printf("vectest\n");
 	GFX_DELAY(5);
 
@@ -1593,6 +1657,10 @@ static void gfx3d_execute(u8 cmd, u32 param){
 #ifdef _3D_LOG_EXEC
 	u32 gxstat2 = T1ReadLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x600);
 #endif
+
+	// Task gespeed: MTX_POP .. MTX_TRANS may change mtxCurrent[0]/[1] (see s_polyMtx).
+	if ((u8)(cmd - 0x12) <= 0x1C - 0x12)
+		s_polyMtxDirty = true;
 
 	switch (cmd)
 	{
@@ -1730,35 +1798,36 @@ void gfx3d_execute3D(){
 	// Task fifobatch: pop without the per-word FIFO event check, run it once after the
 	// loop (GFX_PIPErecvNoEvents, FIFO.cpp). No CPU runs in between and the loop only
 	// shrinks the FIFO, so the half/empty IRQ and GXFIFO-DMA trigger come out the same.
-	for(int i=0;i<HACK_FIFO_BATCH_SIZE;i++) {
+	int i;
+	for(i=0;i<HACK_FIFO_BATCH_SIZE;i++) {
 		if(GFX_PIPErecvNoEvents(&cmd, &param)){
 			//if (isSwapBuffers) printf("Executing while swapbuffers is pending: %d:%08X\n",cmd,param);
 
 			//since we did anything at all, incur a pipeline motion cost.
 			//also, we can't let gxfifo sequencer stall until the fifo is empty.
-			//see...
-			GFX_DELAY(1);
-
-			//..these guys will ordinarily set a delay, but multi-param operations won't
-			//for the earlier params.
+			//(Task gespeed: that GFX_DELAY and the handlers' own ones are folded into
+			//the one NDS_RescheduleGXFIFO() after the loop; see GFX_DELAY.)
 			//printf("%05d:%03d:%12lld: executed 3d: %02X %08X\n",currFrameCounter, nds.VCount, nds_timer , cmd, param);
 			gfx3d_execute(cmd, param);
-
-			//this is a COMPATIBILITY HACK.
-			//this causes 3d to take virtually no time whatsoever to execute.
-			//this was done for marvel nemesis, but a similar family of
-			//hacks for ridiculously fast 3d execution has proven necessary for a number of games.
-			//the true answer is probably dma bus blocking.. but lets go ahead and try this and
-			//check the compatibility, at the very least it will be nice to know if any games suffer from
-			//3d running too fast
-			MMU.gfx3dCycles = nds_timer+1;
 		} else break;
+	}
+	if (i > 0) {
+		NDS_RescheduleGXFIFO(1);
+
+		//this is a COMPATIBILITY HACK.
+		//this causes 3d to take virtually no time whatsoever to execute.
+		//this was done for marvel nemesis, but a similar family of
+		//hacks for ridiculously fast 3d execution has proven necessary for a number of games.
+		//the true answer is probably dma bus blocking.. but lets go ahead and try this and
+		//check the compatibility, at the very least it will be nice to know if any games suffer from
+		//3d running too fast
+		MMU.gfx3dCycles = nds_timer+1;
 	}
 	GFX_FIFOhandleEvents();
 
 }
 
-void gfx3d_glFlush(u32 v){
+GE_NOINLINE void gfx3d_glFlush(u32 v){
 	//printf("-------------FLUSH------------- (vcount=%d\n",nds.VCount);
 	gfx3d.pendingFlushCommand = v;
 	
@@ -1773,7 +1842,7 @@ void gfx3d_glFlush(u32 v){
 	GFX_DELAY(1);
 }
 
-static bool gfx3d_ysort_compare(int num1, int num2){
+static FORCEINLINE bool gfx3d_ysort_compare(int num1, int num2){
 	const POLY &poly1 = polylist->list[num1];
 	const POLY &poly2 = polylist->list[num2];
 
@@ -1794,6 +1863,13 @@ static bool gfx3d_ysort_compare(int num1, int num2){
 	if (num1 < num2) return true;
 	else return false;
 }
+
+// Task gespeed: gfx3d_ysort_compare() as a functor, so std::sort inlines it (a function
+// pointer comparator was an out-of-line call per comparison). Same comparisons, so the
+// same permutation.
+struct YSortCompare {
+	FORCEINLINE bool operator()(int num1, int num2) const { return gfx3d_ysort_compare(num1, num2); }
+};
 
 static void gfx3d_doFlush(){
 	// The lists/state below are the deferred raster's inputs: resolve it first (see gfx3d_VBlankEndSignal).
@@ -1822,13 +1898,30 @@ static void gfx3d_doFlush(){
 
 	int polycount = polylist->count;
 	
+	//we need to sort the poly list with alpha polys last
+	//first, look for opaque polys
+	//(Task gespeed: one pass. The translucent ones fill the list from the back, then that
+	//tail is reversed back into submission order.)
+	int ctr=0, back=polycount;
+	for(int i=0;i<polycount;i++) {
+		POLY &poly = polylist->list[i];
+		if(!poly.isTranslucent())
+			gfx3d.indexlist[ctr++] = i;
+		else
+			gfx3d.indexlist[--back] = i;
+	}
+	int opaqueCount = ctr;
+	//then the translucent polys
+	std::reverse(gfx3d.indexlist + opaqueCount, gfx3d.indexlist + polycount);
+
 	//find the min and max y values for each poly.
-	//TODO - this could be a small waste of time if we are manual sorting the translucent polys
+	//(Task gespeed: only for the polys sorted below: miny/maxy are read by nothing else.)
 	//TODO - this _MUST_ be moved later in the pipeline, after clipping.
 	//the w-division here is just an approximation to fix the shop in harvest moon island of happiness
 	//also the buttons in the knights in the nightmare frontend depend on this
-	for(int i=0; i<polycount; i++){
-		POLY &poly = polylist->list[i];
+	const int sortCount = gfx3d.sortmode ? opaqueCount : polycount;
+	for(int k=0; k<sortCount; k++){
+		POLY &poly = polylist->list[gfx3d.indexlist[k]];
 		float verty = vertlist->list[poly.vertIndexes[0]].y;
 		float vertw = vertlist->list[poly.vertIndexes[0]].w;
 		verty = (verty+vertw)/(2*vertw);
@@ -1843,32 +1936,16 @@ static void gfx3d_doFlush(){
 		}
 	}
 
-	//we need to sort the poly list with alpha polys last
-	//first, look for opaque polys
-	int ctr=0;
-	for(int i=0;i<polycount;i++) {
-		POLY &poly = polylist->list[i];
-		if(!poly.isTranslucent())
-			gfx3d.indexlist[ctr++] = i;
-	}
-	int opaqueCount = ctr;
-	//then look for translucent polys
-	for(int i=0;i<polycount;i++) {
-		POLY &poly = polylist->list[i];
-		if(poly.isTranslucent())
-			gfx3d.indexlist[ctr++] = i;
-	}
-
 	//now we have to sort the opaque polys by y-value.
 	//(test case: harvest moon island of happiness character cretor UI)
 	//should this be done after clipping??
-	std::sort(gfx3d.indexlist, gfx3d.indexlist + opaqueCount, gfx3d_ysort_compare);
+	std::sort(gfx3d.indexlist, gfx3d.indexlist + opaqueCount, YSortCompare());
 	
 	if(!gfx3d.sortmode)
 	{
 		//if we are autosorting translucent polys, we need to do this also
 		//TODO - this is unverified behavior. need a test case
-		std::sort(gfx3d.indexlist + opaqueCount, gfx3d.indexlist + polycount, gfx3d_ysort_compare);
+		std::sort(gfx3d.indexlist + opaqueCount, gfx3d.indexlist + polycount, YSortCompare());
 	}
 
 	//switch to the new lists
@@ -1885,7 +1962,7 @@ void gfx3d_VBlankSignal(bool next3DSkip){
 		gfx3d_doFlush();
 		s_flushFromVBlank = false;
 #endif
-		GFX_DELAY(392);
+		NDS_RescheduleGXFIFO(1); // GFX_DELAY(392), which always charged 1 (see GFX_DELAY)
 		isSwapBuffers = FALSE;
 	}
 }
@@ -2025,7 +2102,24 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 //#define _3D_LOG
 
 void gfx3d_sendCommandToFIFO(u32 val){
-	gxf_hardware.receive(val);
+	gxf_hardware.receive<false>(val);
+}
+
+// Task gespeed: DmaController::doCopy()'s GXFIFO fast path (Task fifobatch), moved here so the
+// per-word unpack and FIFO push inline into the copy loop. Same reads, I/O page stores and
+// FIFO pushes, in the same order, as calling gfx3d_sendCommandToFIFO() per word.
+void gfx3d_sendCommandBlockToFIFO(u32 src, u32 srcinc, u32 dst, u32 dstinc, s32 todo){
+	u32 *io = (u32 *)MMU.MMU_MEM[ARMCPU_ARM9][0x40];
+	GFX_FIFObatchBegin();
+	for(s32 i=todo; i>0; i--)
+	{
+		u32 temp = T1ReadLong_guaranteedAligned(MMU.MAIN_MEM, src & _MMU_MAIN_MEM_MASK32);
+		io[(dst & 0xFFF) >> 2] = temp;
+		gxf_hardware.receive<true>(temp);
+		dst += dstinc;
+		src += srcinc;
+	}
+	GFX_FIFObatchEnd();
 }
 
 void gfx3d_sendCommand(u32 cmd, u32 param){
@@ -2297,7 +2391,13 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 		}
 		OSREAD(polylist->count);
 		for(int i=0;i<polylist->count;i++)
+		{
 			polylist->list[i].load(is);
+			// Task gespeed: the matrices aren't in the state (they never were: a loaded
+			// polygon kept whatever its slot held). Zero, as in a fresh list.
+			polylist->list[i].projMatrix = s_polyMtxZero.proj;
+			polylist->list[i].mvMatrix = s_polyMtxZero.mv;
+		}
 		if(vertOverflow)
 			vertlist->count = polylist->count = 0;
 	}
@@ -2319,6 +2419,9 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 	gfx3d.vertlist = &vertlists[listTwiddle^1];
 	gfx3d.polylist->count=0;
 	gfx3d.vertlist->count=0;
+	polylist->mtxCount = 0;
+	polylist->mtxOverflow = false;
+	s_polyMtxDirty = true;
 
 	if(version >= 4)
 	{

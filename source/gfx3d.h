@@ -139,8 +139,10 @@ struct POLY {
 	u32 polyAttr, texParam, texPalette; //the hardware rendering params
 	u32 viewport;
 	float miny, maxy;
-	float projMatrix[16]; // current 3D projection mtx
-	float mvMatrix[16]; // current 3D modelview mtx
+	// current 3D projection / modelview mtx. Task gespeed: pointers into the owning POLYLIST's
+	// matrix pool (POLYMTX), one entry per matrix change instead of 128 bytes per polygon.
+	const float *projMatrix;
+	const float *mvMatrix;
 	
 	void setVertIndexes(int a, int b, int c, int d=-1)
 	{
@@ -190,9 +192,22 @@ struct POLY {
 };
 
 #define POLYLIST_SIZE 40000
+// Task gespeed: the projection/modelview pair a run of polygons was built with. SetVertex()
+// appends one when a matrix command ran since the last polygon. POLYMTX_SIZE is headroom over
+// the hardware's 2048 polygons a frame (see SOFTRAST_MAX_CLIPPED_POLYS); past it the polygons
+// get a zero pair and mtxOverflow, and the GX geometry pass rejects the frame (kGatePolyMtx),
+// which then takes the CPU rasterizer (it never reads these matrices).
+struct POLYMTX {
+	float proj[16];
+	float mv[16];
+};
+#define POLYMTX_SIZE 4096
 struct POLYLIST {
 	POLY list[POLYLIST_SIZE];
 	int count;
+	POLYMTX mtx[POLYMTX_SIZE];
+	int mtxCount;
+	bool mtxOverflow;
 };
 
 struct VERT {
@@ -435,6 +450,7 @@ void gfx3d_vramRemapBarrier();
 void gfx3d_Control(u32 v);
 void gfx3d_execute3D();
 void gfx3d_sendCommandToFIFO(u32 val);
+void gfx3d_sendCommandBlockToFIFO(u32 src, u32 srcinc, u32 dst, u32 dstinc, s32 todo);
 void gfx3d_sendCommand(u32 cmd, u32 param);
 
 

@@ -24,6 +24,7 @@
 #ifndef FIFO_H
 #define FIFO_H
 
+#include <stdio.h>
 #include "types.h"
 
 //=================================================== IPC FIFO
@@ -84,6 +85,22 @@ extern void GFX_FIFObatchEnd();
 extern bool GFX_PIPErecvNoEvents(u8 *cmd, u32 *param);
 extern void GFX_FIFOhandleEvents();
 extern void GFX_FIFOcnt(u32 val);
+
+// Task gespeed: GFX_FIFOsend() inside a GFX_FIFObatchBegin/End section, inline (the
+// caller knows the batch is open): the same push; End does the rest.
+static FORCEINLINE void GFX_FIFOsendBatched(u8 cmd, u32 param)
+{
+	gxFIFO.cmd[gxFIFO.tail] = cmd;
+	gxFIFO.param[gxFIFO.tail] = param;
+	gxFIFO.tail++;
+	gxFIFO.size++;
+	if (gxFIFO.tail > HACK_GXIFO_SIZE-1) gxFIFO.tail = 0;
+
+	if(gxFIFO.size>=HACK_GXIFO_SIZE) {
+		printf("--FIFO FULL-- : %d\n",gxFIFO.size);
+	}
+
+}
 
 //=================================================== Display memory FIFO
 typedef struct
