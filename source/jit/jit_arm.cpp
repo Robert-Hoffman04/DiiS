@@ -68,7 +68,7 @@
 
 #include "jit_trace.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "jit_ppc_emitter.h"
 
@@ -1768,6 +1768,15 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 		return;
 	}
 
+	// MCR p15, 0, Rd, c7, CRm, op2 -- the ARM9's cache / write-buffer
+	// maintenance ops. DeSmuME models no caches, so armcp15_moveARM2CP()
+	// ignores all of them except c7,c0,4 (wait for interrupt): emit nothing
+	// and let the block keep compiling (cost 2, arm9_cyclesForArm). Everything
+	// else in coprocessor space ends the block / goes through the fallback.
+	if (v5 && cond == COND_AL && (op & 0x0FFF0F10u) == 0x0E070F10u &&
+	    !((op & 0x0Fu) == 0 && ((op >> 5) & 7) == 4))
+		return;
+
 	// B / BL : bits 27..25 == 101
 	if ((op & 0x0E000000u) == 0x0A000000u) { emitBranch(ctx, op, cond); return; }
 
@@ -1862,4 +1871,4 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	ctx.endBlock = true;   // everything else -> interpreter (later B-groups)
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

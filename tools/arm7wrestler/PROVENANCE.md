@@ -100,4 +100,4 @@ slot-2 for the sentinel once per frame; on completion it writes
 `sd:/arm7wrestler.log` (ARM + THUMB pass/fail counts, plus each failing
 test's name and raw bitmask) and quits. Stage `out/arm7wrestler.nds` as
 `sd:/DS/ROMS/test.nds` and boot with `-DDESMUME_FORCE_ROM
--DDESMUME_FORCE_CORE=2` for a fully headless run.
+-DDESMUME_FORCE_CORE=1` for a fully headless run.

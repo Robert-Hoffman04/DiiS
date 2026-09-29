@@ -51,7 +51,7 @@
 #include "gx/gx_ds_present.h"
 #include "firmware.h"
 #include "path.h"
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 #include "jit/jit.h"
 #endif
 #include "perf_zones.h"   // no-op macros unless -DDESMUME_PERFZONES
@@ -193,12 +193,12 @@ int NDS_Init( void) {
 	armcpu_new(&NDS_ARM7,1);
 	armcpu_new(&NDS_ARM9,0);
 
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	jitInit();
 #ifdef DESMUME_JIT_SELFTEST_BOOT
 	// P1 JIT-bringup smoke test (trampoline/arena/cache/linker-stub round
 	// trip) - stale scaffolding once P2+ landed, so no longer run on every
-	// DESMUME_JIT_ARM7 boot (that includes normal/production JIT builds,
+	// DESMUME_JIT boot (that includes normal/production JIT builds,
 	// not just test builds). Opt in explicitly if this is ever needed again.
 	jitSelfTest();
 #endif
@@ -233,7 +233,7 @@ int NDS_Init( void) {
 }
 
 void NDS_DeInit(void) {
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	jitShutdown();
 #endif
 	if(MMU.CART_ROM != MMU.UNUSED_RAM)
@@ -1789,7 +1789,7 @@ FORCEINLINE void arm9log()
 #ifdef LOG_ARM9
 	if(dolog)
 	{
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 		jitSyncPipeline(JIT_ARM9);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 		char dasmbuf[4096];
@@ -1812,7 +1812,7 @@ FORCEINLINE void arm7log()
 #ifdef LOG_ARM7
 	if(dolog)
 	{
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 		jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 		char dasmbuf[4096];
@@ -1851,7 +1851,8 @@ static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
 // P5 diagnostic: split armInnerLoop's wall time between the two cores to
 // figure out whether an ARM7-JIT-enabled build's boot-window slowdown is
 // coming from the ARM7 side at all, or from something else entirely.
-// Independent of DESMUME_JIT_ARM7 so a jitoff build can be compared 1:1.
+// Independent of DESMUME_JIT so Interpreter mode / a NOJIT=1 build can be
+// compared 1:1.
 // gettime() is a cheap timebase read (a couple of mfspr's under libogc), but
 // calling it twice per dispatched guest instruction still perturbs the very
 // timing being measured -- treat absolute numbers as approximate, the
@@ -1895,7 +1896,7 @@ static void arm7TraceRecordAndCheck()
 	e.r4  = NDS_ARM7.R[4];
 	e.r13 = NDS_ARM7.R[13];
 	e.r14 = NDS_ARM7.R[14];
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 	e.op  = NDS_ARM7.instruction;
@@ -1918,7 +1919,13 @@ static void arm7TraceRecordAndCheck()
 }
 #endif
 
-template<bool doarm9, bool doarm7>
+// `jit` (F1 runtime CPU mode, jit.h) is a template parameter rather than a
+// runtime test so Interpreter mode compiles to exactly the pre-JIT loop: no
+// jitRunArm*() call and no jitSyncPipeline() check per interpreter step, and
+// the JIT mode pays no extra per-step mode test either. NDS_exec() picks the
+// instantiation once per frame from g_jitOn (see there). Always false in a
+// NOJIT=1 build, where the JIT branches below don't exist.
+template<bool doarm9, bool doarm7, bool jit>
 static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 	const u64 nds_timer_base, const s32 s32next, s32 arm9, s32 arm7)
 {
@@ -1933,20 +1940,23 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 #ifdef DESMUME_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 #endif
-#ifdef DESMUME_JIT_ARM7
-				// Budget = ARM9 cycles until the next scheduled hardware event;
-				// jitRunArm9() caps it (JIT_ARM9_QUOTA_CAP) so the lockstep
-				// interleave with ARM7 stays tight. arm9 <= timer < s32next
-				// here, so it is always >= 1.
-				// A 0 return hands this instruction to the interpreter, which
-				// needs the opcode fetch the JIT defers (jitSyncPipeline(),
-				// jit.h -- a no-op load+branch unless a JIT run came last).
-				u32 jit9Cycles = jitRunArm9(s32next - arm9);
-				if (jit9Cycles) { arm9 += jit9Cycles; }
-				else { jitSyncPipeline(JIT_ARM9); PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
-#else
-				{ PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
+#ifdef DESMUME_JIT
+				if (jit)
+				{
+					// Budget = ARM9 cycles until the next scheduled hardware event;
+					// jitRunArm9() caps it (JIT_ARM9_QUOTA_CAP) so the lockstep
+					// interleave with ARM7 stays tight. arm9 <= timer < s32next
+					// here, so it is always >= 1.
+					// A 0 return hands this instruction to the interpreter, which
+					// needs the opcode fetch the JIT defers (jitSyncPipeline(),
+					// jit.h -- a no-op load+branch unless a JIT run came last).
+					u32 jit9Cycles = jitRunArm9(s32next - arm9);
+					if (jit9Cycles) { arm9 += jit9Cycles; }
+					else { jitSyncPipeline(JIT_ARM9); PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
+				}
+				else
 #endif
+				{ PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #ifdef DESMUME_ARM_TIME_SPLIT
 				g_arm9Ticks += gettime() - _t0;
 				splitMaybeReport();
@@ -1967,16 +1977,19 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				g_arm7RunHits++;
 				arm7TraceRecordAndCheck();
 #endif
-#ifdef DESMUME_JIT_ARM7
-				// Same budget in ARM7 cycles: ARM7 time is doubled onto the
-				// shared timeline below, so halve the ticks left to s32next
-				// (jitQuotaClamp() lifts a 0 from the rounding back to 1).
-				u32 jitCycles = jitRunArm7((s32next - arm7) >> 1);
-				if (jitCycles) { arm7 += jitCycles << 1; }
-				else { jitSyncPipeline(JIT_ARM7); PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
-#else
-				{ PZ_SCOPE(PZ_ARM7_INTERP); arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1); }
+#ifdef DESMUME_JIT
+				if (jit)
+				{
+					// Same budget in ARM7 cycles: ARM7 time is doubled onto the
+					// shared timeline below, so halve the ticks left to s32next
+					// (jitQuotaClamp() lifts a 0 from the rounding back to 1).
+					u32 jitCycles = jitRunArm7((s32next - arm7) >> 1);
+					if (jitCycles) { arm7 += jitCycles << 1; }
+					else { jitSyncPipeline(JIT_ARM7); PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
+				}
+				else
 #endif
+				{ PZ_SCOPE(PZ_ARM7_INTERP); arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1); }
 #ifdef DESMUME_ARM_TIME_SPLIT
 				g_arm7Ticks += gettime() - _t0;
 				splitMaybeReport();
@@ -1991,7 +2004,7 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				if(arm7 == s32next)
 				{
 					nds_timer = nds_timer_base + minarmtime<doarm9,false>(arm9,arm7);
-					return armInnerLoop<doarm9,false>(nds_timer_base, s32next, arm9, arm7);
+					return armInnerLoop<doarm9,false,jit>(nds_timer_base, s32next, arm9, arm7);
 				}
 			}
 		}
@@ -2032,7 +2045,9 @@ static const int GBA_LINES_TOTAL  = 228;
 // its own -- it's driven entirely by gbaTimersStep's timer-overflow calls
 // (DirectSound FIFO latching) and pulled independently by SPU.cpp's
 // SPU_Emulate_user() at the host audio callback's own rate.
-static void gbaExecFrame()
+// `jit` is NDS_exec()'s once-per-frame read of the runtime CPU mode (F1) --
+// see armInnerLoop's comment.
+static void gbaExecFrame(bool jit)
 {
 	gbaPpuBeginFrame();
 	gbaKeypadCheckIrq();
@@ -2059,7 +2074,8 @@ static void gbaExecFrame()
 		u64 base = nds_timer;
 		s32 arm7in = (s32)(nds_arm7_timer - nds_timer);
 		s32 target = arm7in + GBA_HDRAW_TICKS;
-		s32 arm7out = armInnerLoop<false,true>(base, target, 0, arm7in).second;
+		s32 arm7out = (jit ? armInnerLoop<false,true,true>(base, target, 0, arm7in)
+		                   : armInnerLoop<false,true,false>(base, target, 0, arm7in)).second;
 		nds_arm7_timer = base + arm7out;
 
 		// §4.3 item 1: real ARM-level IRQ dispatch, deferred to exactly
@@ -2076,7 +2092,8 @@ static void gbaExecFrame()
 		base = nds_timer;
 		arm7in = (s32)(nds_arm7_timer - nds_timer);
 		target = arm7in + GBA_HBLANK_TICKS;
-		arm7out = armInnerLoop<false,true>(base, target, 0, arm7in).second;
+		arm7out = (jit ? armInnerLoop<false,true,true>(base, target, 0, arm7in)
+		               : armInnerLoop<false,true,false>(base, target, 0, arm7in)).second;
 		nds_arm7_timer = base + arm7out;
 
 		gbaIrqDispatchIfPending();
@@ -2124,6 +2141,18 @@ void NDS_exec(s32 nb)
 
 	pzSet(PZ_OTHER);   // perf_zones: anchor the frame; ARM/GPU hooks nest under this
 
+	// F1 runtime CPU mode (jit.h): the top of NDS_exec() is a frame boundary --
+	// neither core is inside a JIT dispatch -- so a mode change requested
+	// since the last frame (harness "cpumode", main.cpp) is applied here, and
+	// the mode is then read once for the whole frame. It picks which
+	// armInnerLoop instantiation runs, so a change can never land mid-frame.
+#ifdef DESMUME_JIT
+	jitApplyPendingMode();
+	const bool jit = g_jitOn;
+#else
+	const bool jit = false;
+#endif
+
 	sequencer.nds_vblankEnded = false;
 
 	IF_DEVELOPER(for(int i=0;i<32;i++) DEBUG_statistics.sequencerExecutionCounters[i] = 0);
@@ -2142,7 +2171,7 @@ void NDS_exec(s32 nb)
 		// scanline boundaries gbaExecFrame() hits are the only timing that
 		// exists to schedule around. One call renders exactly one frame,
 		// matching sequencer.nds_vblankEnded's role for the DS loop below.
-		gbaExecFrame();
+		gbaExecFrame(jit);
 	}
 	else
 	{
@@ -2228,9 +2257,14 @@ void NDS_exec(s32 nb)
 			// gameInfo.isGBA is false on every real ROM load today (nothing sets
 			// it yet -- see NDS_DebugForceGBAMode), so this is the same call as
 			// before unless that debug hook is used.
+			// F1: `jit` then picks the JIT or pure-interpreter instantiation
+			// (see armInnerLoop's comment) -- one well-predicted branch per
+			// scheduler event instead of a jitRunArm*() call per instruction.
 			std::pair<s32,s32> arm9arm7 = gameInfo.isGBA
-				? armInnerLoop<false,true>(nds_timer_base,s32next,arm9,arm7)
-				: armInnerLoop<true,true>(nds_timer_base,s32next,arm9,arm7);
+				? (jit ? armInnerLoop<false,true,true>(nds_timer_base,s32next,arm9,arm7)
+				       : armInnerLoop<false,true,false>(nds_timer_base,s32next,arm9,arm7))
+				: (jit ? armInnerLoop<true,true,true>(nds_timer_base,s32next,arm9,arm7)
+				       : armInnerLoop<true,true,false>(nds_timer_base,s32next,arm9,arm7));
 
 			arm9 = arm9arm7.first;
 			arm7 = arm9arm7.second;
@@ -2689,7 +2723,7 @@ void NDS_DebugForceGBAMode(bool enable)
 	// MMU.isGBA's comment in MMU.h. Any future code that sets
 	// gameInfo.isGBA from real ROMTYPE_GBA detection must set this too.
 	MMU.isGBA = enable;
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	// roadmap #20 (GBA compat), §12.3 step 5: swap which JitCpuProfile
 	// jitRunArm7() sees -- see jitSetArm7GBAMode()'s comment in jit.h. A
 	// third mirror of this same flag, for the same "MMU.h/jit_trace.cpp

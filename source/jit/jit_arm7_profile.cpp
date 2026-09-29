@@ -16,7 +16,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "../MMU.h"
 #include "../armcpu.h"
@@ -47,6 +47,7 @@ static void arm7_slowWrite(u32 addr, u32 val, u32 size)
 static void arm7_smcInvalidate(u32 addr) { jitCacheArm7.invalidateSMCTarget(addr); }
 
 static u32  arm7_swiHandler(u32 comment) { (void)comment; return 0; }   // P2/P3
+// Always true, so jitRunArm7() skips the call; make it check if this changes.
 static bool arm7_canEnterThumb(u32 pc)   { (void)pc; return true; }
 // P11: ARM-mode entry. Same unconditional rule as canEnterThumb -- the ARM7
 // executes from main RAM / WRAM (and, with an external BIOS, low BIOS), all of
@@ -245,4 +246,4 @@ JitCpuProfile* jitBuildArm7Profile()
 	return &s_arm7Profile;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

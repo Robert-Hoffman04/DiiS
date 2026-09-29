@@ -7,22 +7,22 @@
  * jitRunArm7() when the ARM7 is due to step: it compiles/looks up a block at
  * the current PC, runs it, points the interpreter's pipeline at the resume
  * PC (the opcode fetch is deferred until the interpreter actually needs it --
- * jitSyncPipeline(), PERF_LOG Step 5) and returns the cycles consumed (0 => "not handled, use the interpreter
+ * jitSyncPipeline()) and returns the cycles consumed (0 => "not handled, use the interpreter
  * for one instruction").
  *
  * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
  * of blocks (up to the runtime quota -- min(scheduler budget, JIT_ARM*_QUOTA_CAP)
- * guest cycles, PERF_LOG Step 1) before returning, not just
+ * guest cycles) before returning, not just
  * one. IRQ delivery still goes through the interpreter (a chain only runs
  * compiled static-exit edges plus guarded dynamic ones; any bailout or quota
  * trip returns here first). Instructions the front end can't compile no
- * longer end the chain: since PERF_LOG Step 2 they run in place through the
+ * longer end the chain: now they run in place through the
  * interpreter's handler (jitInterpFallback() below).
  ***************************************************************************/
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "jit_trace.h"
 #include "jit_arm9_region.h"
@@ -117,7 +117,7 @@ struct JitCoreCost {
 	u64 freshNoBlk; // noBlock calls that were NOT a clean pre-existing marker
 	                //   (fresh compile -> instrCount 0, or hash-collision slot,
 	                //   or mode flip) -- these paid the compile scan
-	// PERF_LOG Step 2: in-block interpreter fallback (jitInterpFallback()).
+	// In-block interpreter fallback (jitInterpFallback()).
 	u64 fbCalls;    // refused instructions run through their handler from compiled code
 	u64 fbChain;    //   of those, PC redirected -> dynamic-chain exit
 	u64 fbToC;      //   of those, returned to the dispatcher (T/IRQ/halt/SMC/resched)
@@ -256,7 +256,7 @@ static void jit9ProfileReport()
 }
 #endif
 
-// PERF_LOG Step 2 -- in-block interpreter fallback: the C half of
+// In-block interpreter fallback: the C half of
 // JitTraceCtx::emitInterpFallback() (jit_trace.cpp). Compiled code has just
 // stored the pinned guest registers + CPSR to cpu.R[]/CPSR and calls this for
 // one instruction the front end refused. This is armcpu_exec<>() for a single
@@ -286,7 +286,7 @@ static void jit9ProfileReport()
 //            changeCPSR() requests a reschedule on *every* CPSR write, but
 //            one that doesn't unmask IRQs has nothing to deliver, and
 //            deferring it to the chain's end is the same bounded delay
-//            compiled code already has (PERF_LOG Step 1 caveat 2).
+//            compiled code already has.
 //   CHAIN -- none of the above, but PC left the fall-through (a branch, a PC
 //            load, an exception return, SWI/undef entry into ARM mode from
 //            ARM mode): leave through the guarded dynamic stub at
@@ -338,7 +338,7 @@ u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc) { return jitInterpFallback<AR
 u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc)   { return jitInterpFallback<ARMCPU_ARM7, false>(opcode, pc); }
 u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc) { return jitInterpFallback<ARMCPU_ARM7, true >(opcode, pc); }
 
-// PERF_LOG Step 5 -- per-dispatch fixed cost.
+// Per-dispatch fixed cost.
 //
 // JITResult: the trampoline always writes cycles/nextPC/instructions on
 // return, and emitted exits store bailedOut/smcHit only when nonzero
@@ -392,13 +392,53 @@ void jitSyncPipelineSlow(int core)
 	}
 }
 
-// Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
+// F1 runtime CPU mode -- see jit.h. Default JIT: a build that never touches
+// the setting (forced-boot test builds skip the startup picker) runs both
+// JITs, exactly like the old -DDESMUME_JIT_ARM9_ON default.
+bool g_jitOn = true;
+s8   g_jitModePending = -1;
+
+// Per-core switches, driven from the mode by jitSetEnabled(). Kept separate
+// so the wrestler probes (main.cpp) can interpret one core on purpose.
 bool jitArm7Enabled = true;
+bool jitArm9Enabled = true;
+
+void jitSetEnabled(bool jit)
+{
+	// JIT -> interpreter: the interpreter-mode armInnerLoop never calls
+	// jitSyncPipeline(), so a core the JIT last ran must have its deferred
+	// opcode fetch materialised now, while instruct_adr still describes it.
+	// Harmless (nothing stale) in the other direction or before boot.
+	jitSyncPipeline(JIT_ARM9);
+	jitSyncPipeline(JIT_ARM7);
+	// Interpreter mode skips every SMC invalidation (the g_jitOn test in the
+	// MMU hooks), so anything compiled before this point may be stale by the
+	// time the JIT runs again: drop both caches on every switch. Null-safe on
+	// a slot that was never allocated, and cheap next to a mode switch.
+	jitFlushAllCaches();
+	jitArm7Enabled = jitArm9Enabled = jit;
+	g_jitOn = jit;
+}
+
+void jitRequestMode(bool jit)
+{
+	g_jitModePending = jit ? 1 : 0;
+}
 
 u32 jitRunArm7(s32 budget)
 {
+	if (!jitArm7Enabled) return 0;
+
+	// Lazy allocation, same as ARM9 below (jit_trace.cpp): the ARM7 slot is
+	// only reserved once the ARM7 JIT is really asked to run, so interpreter
+	// mode -- and a probe that interprets ARM7 -- never pays for it.
 	JitCpuProfile* prof = jitProfile[JIT_ARM7];
-	if (!jitArm7Enabled || !prof) return 0;
+	if (!prof)
+	{
+		if (!jitEnsureArm7()) return 0;
+		prof = jitProfile[JIT_ARM7];
+		if (!prof) return 0;
+	}
 
 	// perf_zones: everything below (dispatch, compile, trampoline, resume) is
 	// ARM7 JIT time; jitCompileTrace() re-tags its own interval as ARM7_BUILD.
@@ -421,9 +461,9 @@ u32 jitRunArm7(s32 budget)
 	armcpu_t& cpu = NDS_ARM7;
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);     // P11: ARM mode is JITted too
-	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
+	// No region check: both ARM7 profiles (DS and GBA) accept every PC, so the
+	// indirect prof->canEnter*() call would only ever return true.
 	JCC_CALL(0);
-	if (!canEnter) { JCC_NOENTER(0); return 0; }   // uncompilable region -> interpreter
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
 #ifdef JIT_CORE_COST_HISTO
@@ -432,8 +472,11 @@ u32 jitRunArm7(s32 budget)
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0, _preMarker7); return 0; } // uncompilable / "don't JIT" -> interpreter
+	// Entry-block length, read now: a flush inside the run (arena change via an
+	// in-block interpreter fallback) can recycle *b before the stats below.
+	const u32 entryLen = b->insnCount();
 
-	// PERF_LOG Step 1: runtime chain quota. Seed r3 so the (fixed) entry
+	// Runtime chain quota. Seed r3 so the (fixed) entry
 	// guard trips after `quota` cycles, then take the seed back out of the
 	// result so everything below sees plain elapsed cycles as before.
 	const s32 quota = jitQuotaClamp(budget, JIT_ARM7_QUOTA_CAP);
@@ -463,13 +506,13 @@ u32 jitRunArm7(s32 budget)
 		if (f) { fprintf(f, "[jit] blk %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
 		                 thumb ? "T" : "A", (unsigned)pc,
 		                 (unsigned)(thumb ? prof->fetch16(pc & ~1u) : prof->fetch32(pc & ~3u)),
-		                 (unsigned)b->insnCount(), (unsigned)r.instructions,
+		                 (unsigned)entryLen, (unsigned)r.instructions,
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
 	}
 	// TODO item 5: ARM7 counterpart of the ARM9 "why didn't this chain?"
 	// classification below (jitRunArm9(), same #ifdef). ARM7 chains are
-	// shorter than ARM9's (NOTES.md Step 5): this answers whether that's
+	// shorter than ARM9's: this answers whether that's
 	// dynamic-exit-heavy control flow (BX/POP{pc}/hi-reg branches -- nothing
 	// to fix, the target genuinely isn't known at compile time), quota
 	// trips (the runtime quota -- chains are fine, just capped), or the same
@@ -520,10 +563,10 @@ u32 jitRunArm7(s32 budget)
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		const bool len1 = (b->insnCount() == 1);
+		const bool len1 = (entryLen == 1);
 		if (len1 || trackRepeatedBail(s_bailTrack7, pc))
 			jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(0, len1, pc, b->insnCount());
+		JCC_BAIL0(0, len1, pc, entryLen);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
 		jitMaybeReport();
@@ -537,12 +580,12 @@ u32 jitRunArm7(s32 budget)
 	// assuming THUMB: landing an ARM-mode target through a 16-bit THUMB
 	// fetch misdecodes the real first opcode and sends ARM7's PC off into
 	// unmapped memory. The opcode fetch into cpu.instruction is deferred to
-	// jitSyncPipeline() (PERF_LOG Step 5), which re-checks CPSR.T the same way.
+	// jitSyncPipeline(), which re-checks CPSR.T the same way.
 	jitPointPipeline(cpu, r.nextPC, JIT_ARM7);
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
-	JCC_RAN(0, r.cycles, r.instructions, b->insnCount());
+	JCC_RAN(0, r.cycles, r.instructions, entryLen);
 	jitMaybeReport();
 
 	return r.cycles ? r.cycles : 1;
@@ -556,22 +599,12 @@ u32 jitRunArm7(s32 budget)
 // every ARM9 THUMB block through jitRunArm9Checked() against the hardened
 // harness.
 //
-// Default OFF -- the ARM9 JIT's blast radius is the whole game, so it stays
-// opt-in pending a benchmark + soak sign-off. -DDESMUME_JIT_ARM9_ON starts it
-// enabled without touching the production default (mirrors the jitoff/jiton
-// renderer A/B used for ARM7). This flag only picks the runtime default --
-// it no longer decides whether the ~17 MB ARM9 slot gets allocated (see
-// jitRunArm9()'s jitEnsureArm9() call and jit_trace.cpp's jitInit()): that
-// slot is lazily allocated on first real dispatch through here regardless of
-// this flag's value, so a DS session pays for it only once actually needed
-// and a GBA session (which never reaches this function at all) never pays
-// for it either way. One build now serves both.
-#ifdef DESMUME_JIT_ARM9_ON
-bool jitArm9Enabled = true;
-#else
-bool jitArm9Enabled = false;
-#endif
-
+// jitArm9Enabled (defined above, next to jitArm7Enabled) follows the runtime
+// CPU mode -- the old -DDESMUME_JIT_ARM9_ON opt-in is gone now that the ARM9
+// JIT is the default. The ~17 MB ARM9 slot is lazily allocated on the first
+// real dispatch through here (jitEnsureArm9(), jit_trace.cpp), so a DS
+// session pays for it only once actually needed and a GBA session (which
+// never reaches this function at all) never pays for it.
 u32 jitRunArm9(s32 budget)
 {
 #if !defined(JIT_DIFFERENTIAL_TESTING)
@@ -614,7 +647,7 @@ u32 jitRunArm9(s32 budget)
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);
 	// Direct inline region check instead of prof->canEnter*() -- the ARM9 has
-	// exactly one profile, whose canEnter* wrap this same rule (PERF_LOG Step 5).
+	// exactly one profile, whose canEnter* wrap this same rule.
 	const bool canEnter = jitArm9CanEnter(pc, thumb);
 	JCC_CALL(1);
 
@@ -638,6 +671,9 @@ u32 jitRunArm9(s32 budget)
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1, _preMarker9); return 0; }
+	// Entry-block length, read now: a flush inside the run (arena change via an
+	// in-block interpreter fallback) can recycle *b before the stats below.
+	const u32 entryLen = b->insnCount();
 
 	// Runtime chain quota -- see jitRunArm7().
 	const s32 quota = jitQuotaClamp(budget, JIT_ARM9_QUOTA_CAP);
@@ -669,10 +705,10 @@ u32 jitRunArm9(s32 budget)
 		if (!thumb) { s_arm++; if (r.instructions == 0) s_armbail0++; }
 		// chain-length picture: r.instructions is the whole chained-dispatch's
 		// guest-instruction count (the trampoline accumulates it in r31 across
-		// every statically-chained block); b->insnCount() is just the entry
+		// every statically-chained block); entryLen is just the entry
 		// block. s_insns/s_entries == guest instructions per trampoline
 		// round-trip; s_insns/s_blk0 == blocks per round-trip (approx chain len).
-		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += b->insnCount(); }
+		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += entryLen; }
 		// Why did this non-bail chain exit pay a full trampoline round-trip
 		// instead of chaining on? Classify by what sits in the resume PC's
 		// direct-mapped block-table slot:
@@ -709,7 +745,7 @@ u32 jitRunArm9(s32 budget)
 			FILE* f = fopen("sd:/jit.log", "a");
 			if (f) { fprintf(f, "[jit] a9 %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
 			                 wasMiss ? "MISS" : "hit", (unsigned)pc, (unsigned)prof->fetch32(pc),
-			                 (unsigned)b->insnCount(), (unsigned)r.instructions, (unsigned)r.bailedOut,
+			                 (unsigned)entryLen, (unsigned)r.instructions, (unsigned)r.bailedOut,
 			                 (unsigned)r.smcHit, (unsigned)r.cycles, (unsigned)r.nextPC); fclose(f); }
 		}
 		if (s_disp - s_lastRep >= 500000) {
@@ -742,10 +778,10 @@ u32 jitRunArm9(s32 budget)
 		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
-		const bool len1 = (b->insnCount() == 1);
+		const bool len1 = (entryLen == 1);
 		if (len1 || trackRepeatedBail(s_bailTrack9, pc))
 			jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(1, len1, pc, b->insnCount());
+		JCC_BAIL0(1, len1, pc, entryLen);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
 	}
@@ -768,8 +804,8 @@ u32 jitRunArm9(s32 budget)
 			if (f) {
 				fprintf(f, "[jit] !!! ARM9 bad resume pc=%08x npc=%08x thumb=%d ins=%u cyc=%u len=%u ops:",
 				        (unsigned)pc, (unsigned)npc, (int)thumb,
-				        (unsigned)r.instructions, (unsigned)r.cycles, (unsigned)b->insnCount());
-				for (u32 i = 0; i < b->insnCount() && i < 34; i++)
+				        (unsigned)r.instructions, (unsigned)r.cycles, (unsigned)entryLen);
+				for (u32 i = 0; i < entryLen && i < 34; i++)
 					fprintf(f, " %08x", (unsigned)(thumb ? prof->fetch16(pc + i * 2)
 					                                      : prof->fetch32(pc + i * 4)));
 				fprintf(f, "\n");
@@ -781,8 +817,8 @@ u32 jitRunArm9(s32 budget)
 
 	jitPointPipeline(cpu, npc, JIT_ARM9);   // see jitRunArm7()
 
-	JCC_RAN(1, r.cycles, r.instructions, b->insnCount());
+	JCC_RAN(1, r.cycles, r.instructions, entryLen);
 	return r.cycles ? r.cycles : 1;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

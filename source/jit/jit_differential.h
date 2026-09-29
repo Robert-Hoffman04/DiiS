@@ -35,7 +35,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 
 struct armcpu_t;
 

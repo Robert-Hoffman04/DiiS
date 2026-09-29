@@ -18,17 +18,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODES="sw gxa gxf"
 SCENE_FILTER="" WRESTLER_FILTER=""
 DO_BUILD=1 DO_CLEAN=0 COMPARE_ARG="" DO_PERF=1 DO_WRESTLERS=1
+PROBE_CPUMODE=""
 TIMEOUT_DEFAULT=180
 
 usage() {
 	cat <<'EOF'
 Usage: tools/benchmark/run.sh [options]
-  --modes "sw gxa gxf" render modes to sweep (default all three, all on
-                       full JIT). sw = RenderMode::Software, gxa = GxAccurate,
-                       gxf = GxFast (gx = alias for gxa). All share ONE dol;
-                       the mode is switched at connect via PKT_CTRL
-                       "rendermode ...". Also available (CPU-config A/B,
-                       software render): jitoff jiton jit9off jit9on jitfull
+  --modes "sw gxa gxf" render modes to sweep (default all three, all with
+                       the JIT on). sw = RenderMode::Software, gxa =
+                       GxAccurate, gxf = GxFast (gx = alias for gxa). Also
+                       available (CPU A/B, software render): interp (both
+                       cores interpreted) and jit (both cores JITted; same
+                       run as sw). ALL modes share ONE dol; the mode is
+                       switched at connect via PKT_CTRL "rendermode ..." +
+                       "cpumode interp|jit"
   --scenes "vsd ph"    subset of scene ids from scenes.conf
   --wrestlers "id id"  subset of ids from wrestlers.conf
   --no-build           reuse tools/benchmark/dols/*.dol
@@ -38,6 +41,11 @@ Usage: tools/benchmark/run.sh [options]
   --no-perf            skip the fps matrix, run correctness probes only
   --no-wrestlers        skip the correctness probes, run the fps matrix only
   --no-compare         skip the diff against the previous run
+  --probe-cpumode interp
+                       run the correctness probes in Interpreter mode (sends
+                       "cpumode interp" at connect). Default: leave the
+                       probes' own JIT setup alone (JIT on, with the
+                       armwrestler/arm7wrestler single-core overrides)
 Env overrides: DOLPHIN_DATA, DOLPHIN_SD, DEVKITPRO, DEVKITPPC, HARNESS_HOST, HARNESS_PORT
 EOF
 }
@@ -53,6 +61,7 @@ while [ $# -gt 0 ]; do
 		--no-perf)     DO_PERF=0 ;;
 		--no-wrestlers) DO_WRESTLERS=0 ;;
 		--no-compare)  COMPARE_ARG="--no-compare" ;;
+		--probe-cpumode) PROBE_CPUMODE="$2"; shift ;;
 		-h|--help)     usage; exit 0 ;;
 		*)             echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -68,37 +77,25 @@ bench_preflight
 perf_defs_for() {
 	local base="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -DDESMUME_FORCE_CORE=1"
 	case "$1" in
-		sw|gx|gxa|gxf|jitoff|jiton|jit9off|jit9on|jitfull) echo "$base" ;;
-		*) die "unknown mode '$1'" ;;
+		sw|gx|gxa|gxf|interp|jit) echo "$base" ;;
+		*) die "unknown mode '$1' (want sw gx gxa gxf interp jit)" ;;
 	esac
 }
-# Modes that differ only in runtime render mode share one dol (build once).
-dol_for_mode() {
-	case "$1" in
-		sw|gx|gxa|gxf) echo perf_gx ;;
-		*)             echo "perf_$1" ;;
-	esac
-}
-# PKT_CTRL rendermode to send after connect (empty = leave the default).
+# Every mode differs only in runtime state (render mode, CPU mode), so they
+# all share one dol (build once). The JIT is always compiled in (plain make);
+# JITDEFS stays empty - it only carries debug defines now (see ab.sh).
+dol_for_mode() { echo perf; }
+# PKT_CTRL commands to send after connect, one per line. The device applies
+# them before its first frame (main.cpp harness_poll_host), so an interp run
+# never emulates a single frame on the JIT. Render modes always say "cpumode
+# jit" explicitly: they are the renderer comparison at the emulator's actual
+# fastest CPU config, not an interpreter-only baseline.
 ctrl_for_mode() {
 	case "$1" in
-		sw|jitoff|jiton|jit9off|jit9on) echo "rendermode software" ;;
-		gx|gxa|jitfull)                 echo "rendermode accurate" ;;
-		gxf)                            echo "rendermode fast" ;;
-	esac
-}
-perf_jitdefs_for() {
-	case "$1" in
-		# sw/gx are the renderer comparison at the emulator's actual fastest
-		# CPU config (both JITs on) - not an interpreter-only isolation
-		# baseline. jitoff/jit9off stay interpreter-only on purpose: they are
-		# the dedicated A/B baseline for jiton/jit9on's single-core-JIT delta.
-		sw|gxa|gxf) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		gx)      echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		jiton)   echo "-DDESMUME_JIT_ARM7" ;;
-		jit9on)  echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		jitfull) echo "-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
-		*)       echo "" ;;
+		sw|jit)  echo "rendermode software"; echo "cpumode jit" ;;
+		interp)  echo "rendermode software"; echo "cpumode interp" ;;
+		gx|gxa)  echo "rendermode accurate"; echo "cpumode jit" ;;
+		gxf)     echo "rendermode fast";     echo "cpumode jit" ;;
 	esac
 }
 
@@ -126,7 +123,7 @@ if [ "$DO_PERF" = 1 ]; then
 		case "$BUILT" in *" $d "*) continue ;; esac
 		BUILT="$BUILT$d "
 		if [ "$DO_BUILD" = 1 ]; then
-			build_dol "$d" "$(perf_defs_for "$m")" "$(perf_jitdefs_for "$m")"
+			build_dol "$d" "$(perf_defs_for "$m")" ""
 		else
 			[ -f "$DOLDIR/$d.dol" ] || die "--no-build but $DOLDIR/$d.dol is missing"
 		fi
@@ -157,8 +154,10 @@ if [ "$DO_PERF" = 1 ]; then
 			echo ">> perf $id / $m   $(basename "$rom")"
 			dolphin_kill; sleep 2
 			stage_rom "$rom" "$state"
-			ctrl="$(ctrl_for_mode "$m")"
-			ctrl_args=(); [ -n "$ctrl" ] && ctrl_args=(--ctrl-cmd "$ctrl")
+			ctrl_args=()
+			while IFS= read -r c; do
+				[ -n "$c" ] && ctrl_args+=(--ctrl-cmd "$c")
+			done < <(ctrl_for_mode "$m")
 			capture_run "$(dol_for_mode "$m")" "$outdir" \
 				"${ctrl_args[@]}" \
 				"${stop_args[@]}" \
@@ -186,14 +185,17 @@ if [ "$DO_WRESTLERS" = 1 ]; then
 
 		if [ "$DO_BUILD" = 1 ]; then
 			build_dol "wrestler_$id" \
-				"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=2" \
-				"-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON"
+				"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=1" \
+				""
 		fi
 
 		outdir="$RUNDIR/raw/wrestler_${id}"
 		dolphin_kill; sleep 2
 		stage_rom "$rom"
+		probe_args=()
+		[ -n "$PROBE_CPUMODE" ] && probe_args=(--ctrl-cmd "cpumode $PROBE_CPUMODE")
 		capture_run "wrestler_$id" "$outdir" \
+			"${probe_args[@]}" \
 			--settle-frame "${settle:-300}" --capture-frame "$id" \
 			--timeout "$TIMEOUT_DEFAULT"
 		rc=$?

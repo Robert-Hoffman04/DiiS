@@ -40,7 +40,7 @@
 // P0: retargeted includes + build guard. Body unchanged.
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include <ogc/cache.h>
 #if defined(DESMUME_JIT_TRACE_FIRST) || defined(DESMUME_ARM_TIME_SPLIT)
@@ -721,4 +721,4 @@ void JITCache::ccBlockLenReport(const char* tag) {
 }
 #endif
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

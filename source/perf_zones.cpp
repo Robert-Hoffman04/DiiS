@@ -16,7 +16,7 @@
 u64 g_pzAcc[PZ_COUNT];
 u64 g_pzHits[PZ_COUNT];
 
-#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT_ARM7)
+#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT)
 extern "C" void jitCoreCostEmit(u32 frame);   // jit/jit_exec.cpp
 #endif
 
@@ -248,7 +248,7 @@ void pzFrameTick(void)
 		pz_emit_row(frame, acc_ticks, acc_hits);
 		pz_emit_percentiles(frame);   // §3.3b
 		pz_cls_emit(frame);
-#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT_ARM7)
+#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT)
 		jitCoreCostEmit(frame);       // -DJIT_CORE_COST_HISTO per-core dispatch accounting
 #endif
 		for (int i = 0; i < PZ_COUNT; i++) { acc_ticks[i] = 0; acc_hits[i] = 0; }

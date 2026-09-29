@@ -3,7 +3,7 @@
 # ab.sh and soak.sh. Sourced, not executed.
 #
 # Every benchmark script rides the same three primitives:
-#   build_dol   <name> <testdefs...>  -DJITDEFS=...   -> dols/<name>.dol
+#   build_dol   <name> <testdefs> <jitdefs> [makevars] -> dols/<name>.dol
 #   stage_rom   <rom-path> [state-path]                -> sd:/DS/ROMS/test.nds
 #   capture_run <dol-name> <out-dir> <capture.py args...>
 #                                                        -> boots it, waits,
@@ -53,22 +53,28 @@ bench_preflight() {
 	mdir -i "$DOLPHIN_SD" ::/DS/BIOS >/dev/null 2>&1 || die "SD image has no DS/BIOS/ - stage the DS bios files first"
 }
 
-# build_dol <name> <testdefs (one string)> <jitdefs (one string)>
+# build_dol <name> <testdefs (one string)> <jitdefs (one string)> [makevars]
+# The JIT is always compiled in and picked at runtime (PKT_CTRL "cpumode
+# interp|jit"), so jitdefs is only for JIT debug/diagnostic defines
+# (-DJIT_DIFFERENTIAL_TESTING, -DJIT_CORE_COST_HISTO, ...) - usually "".
+# makevars: extra make variables, e.g. "NOJIT=1" for a build with the JIT
+# compiled out entirely (the Makefile's one compile-time escape hatch).
 # Only rebuilds main.o + relinks when testdefs changes; forces a full `make
-# clean` when jitdefs changes (JITDEFS touches every jit/*.cpp TU and
+# clean` when jitdefs or makevars changes (both touch every jit/*.cpp TU and
 # depfiles don't track flag changes). Result: $DOLDIR/<name>.dol
 _BENCH_LAST_JITDEFS="__unset__"
 build_dol() {
-	local name="$1" testdefs="$2" jitdefs="$3"
-	echo ">> build $name.dol   (TESTDEFS: $testdefs${jitdefs:+   JITDEFS: $jitdefs})"
+	local name="$1" testdefs="$2" jitdefs="$3" makevars="${4:-}"
+	echo ">> build $name.dol   (TESTDEFS: $testdefs${jitdefs:+   JITDEFS: $jitdefs}${makevars:+   $makevars})"
 	local log="$DOLDIR/build_$name.log"; : > "$log"
-	if [ "$jitdefs" != "$_BENCH_LAST_JITDEFS" ]; then
+	if [ "$jitdefs|$makevars" != "$_BENCH_LAST_JITDEFS" ]; then
 		( cd "$BENCH_ROOT" && make clean ) >>"$log" 2>&1
-		_BENCH_LAST_JITDEFS="$jitdefs"
+		_BENCH_LAST_JITDEFS="$jitdefs|$makevars"
 	fi
+	# $makevars is deliberately unquoted: zero or more VAR=value words.
 	( cd "$BENCH_ROOT" \
 	  && rm -f build/main.o "$BENCH_TARGET.elf" "$BENCH_TARGET.dol" \
-	  && make -j"$(nproc)" JITDEFS="$jitdefs" TESTDEFS="$testdefs" ) >>"$log" 2>&1 \
+	  && make -j"$(nproc)" JITDEFS="$jitdefs" TESTDEFS="$testdefs" $makevars ) >>"$log" 2>&1 \
 		|| { echo "   BUILD FAILED:"; tail -n 20 "$log"; exit 1; }
 	cp "$BENCH_ROOT/$BENCH_TARGET.dol" "$DOLDIR/$name.dol"
 	echo "   -> $DOLDIR/$name.dol"

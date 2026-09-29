@@ -8,7 +8,7 @@
 
 #include "jit_differential.h"
 
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 
 #include "jit_trace.h"
 #include "../armcpu.h"
@@ -245,7 +245,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	const u32  step  = thumb ? 2u : 4u;
 
 	// Snapshot the block's entry point and length now: with the in-block
-	// interpreter fallback (PERF_LOG Step 2) a block can contain an MCR that
+	// interpreter fallback, a block can contain an MCR that
 	// moves the DTCM/ITCM, and cp15 then flushCache()s the whole ARM9 table --
 	// during the reference pass below, i.e. before the trial and real runs.
 	// The BasicBlock slot is zeroed by that (a null execute -> ISI at PC 0),
@@ -536,4 +536,4 @@ u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start)
 	                     &armcpu_exec<ARMCPU_ARM9>, cpu, block, pc, start, s_c9);
 }
 
-#endif // DESMUME_JIT_ARM7 && JIT_DIFFERENTIAL_TESTING
+#endif // DESMUME_JIT && JIT_DIFFERENTIAL_TESTING

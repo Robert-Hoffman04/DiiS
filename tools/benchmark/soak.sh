@@ -16,14 +16,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DUR=210
 ROM="$BENCH_ROOT/testdata/Super Mario 64 DS (USA, Australia) (Rev 1).nds"
-JITDEFS="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON -DJIT_DIFFERENTIAL_TESTING"
+# The JIT is always compiled in and defaults to on (runtime CPU mode JIT, both
+# cores), so only the differential-testing debug define is needed here.
+JITDEFS="-DJIT_DIFFERENTIAL_TESTING"
 
 usage() {
 	cat <<'EOF'
 Usage: tools/benchmark/soak.sh [--duration N] [--rom PATH] [--jitdefs "..."]
   --duration N   seconds to run (default 210)
   --rom PATH     ROM to boot (default: SM64DS)
-  --jitdefs "..." override JITDEFS (default enables both JITs + differential testing)
+  --jitdefs "..." override JITDEFS (default: -DJIT_DIFFERENTIAL_TESTING; both
+                  JITs run in the default runtime CPU mode)
 EOF
 }
 while [ $# -gt 0 ]; do
@@ -44,7 +47,7 @@ RESDIR="$HERE/results/_soak_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RESDIR"
 OUT="$RESDIR/jit.log"
 
-build_dol "soak" "-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_FORCE_CORE=2" "$JITDEFS"
+build_dol "soak" "-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_FORCE_CORE=1" "$JITDEFS"
 
 bench_sd_snapshot "$RESDIR"
 trap bench_sd_restore EXIT

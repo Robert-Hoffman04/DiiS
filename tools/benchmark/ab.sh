@@ -20,8 +20,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LABEL_A=before LABEL_B=after
 STASH=0
 TESTDEFS="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -DDESMUME_FORCE_CORE=1"
-JITDEFS_A="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON"
-JITDEFS_B="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON"
+# JITDEFS now only carries JIT debug/diagnostic defines (e.g.
+# -DJIT_CORE_COST_HISTO): the JIT itself is always compiled in and both legs
+# run in the default runtime CPU mode (JIT). The Interpreter-vs-JIT A/B is
+# run.sh --modes "interp jit" (one dol, PKT_CTRL "cpumode ...").
+JITDEFS_A=""
+JITDEFS_B=""
 ROM="$BENCH_ROOT/testdata/Super Mario 64 DS (USA, Australia) (Rev 1).nds"
 STATE="$HERE/states/sm64.ds0"
 TIMEOUT=150
@@ -36,8 +40,8 @@ Usage: tools/benchmark/ab.sh [options]
                         pop them back for the "after" leg (so "before" is
                         HEAD and "after" is the working tree)
   --testdefs "..."     TESTDEFS shared by both legs
-  --jitdefs-a "..."    JITDEFS for the "before" leg
-  --jitdefs-b "..."    JITDEFS for the "after" leg
+  --jitdefs-a "..."    JITDEFS (JIT debug defines) for the "before" leg
+  --jitdefs-b "..."    JITDEFS (JIT debug defines) for the "after" leg
   --rom PATH           ROM to boot (default: SM64DS)
   --state PATH         savestate to autoload (default: tools/benchmark/states/sm64.ds0;
                         pass "" for none)

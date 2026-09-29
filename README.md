@@ -55,9 +55,11 @@ DiiS is a homebrew DS emulator based on the original port of [DeSmuMEWii](https:
  
 ### Starting a game
  
-On launch, DiiS asks whether to use the SD card or USB storage, then opens a
-file browser rooted at `DS/ROMS` on whichever device you picked. The browser
-only lists folders and `.nds` files.
+On launch, DiiS asks whether to use the SD card or USB storage (Left / Right)
+and which CPU emulation to use (Up / Down): **JIT** (the default, fastest) or
+**Interpreter** (slower, for troubleshooting a game the JIT gets wrong). Press
+A to continue; it then opens a file browser rooted at `DS/ROMS` on whichever
+device you picked. The browser only lists folders and `.nds` files.
  
 | Action | Control |
 |---|---|

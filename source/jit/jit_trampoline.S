@@ -19,7 +19,7 @@
  *   - Flags: VBA faulted four separate flag words from a base pointer; here a
  *     single guest CPSR word pointer sits at 84(r1) and the emitter (P2)
  *     masks/inserts the N/Z/C/V nibble (CPSR bits 31..28).
- *   - startCycles (PERF_LOG Step 1) seeds the r3 cycle accumulator instead
+ *   - startCycles seeds the r3 cycle accumulator instead
  *     of 0, turning the fixed JIT_YIELD_NUMBER entry guard into a runtime
  *     quota -- see jitQuotaStart() in jit_trace.h. out->cycles is returned
  *     raw (start included); callers subtract startCycles.
@@ -47,7 +47,7 @@
  *   r3       cycle accumulator (out); r4  next PC (out) / scratch
  ***************************************************************************/
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 .global ExecuteJITTrace
 .type ExecuteJITTrace, @function
@@ -110,4 +110,4 @@ ExecuteJITTrace_Return:
     addi 1, 1, 128
     blr
 
-#endif /* DESMUME_JIT_ARM7 */
+#endif /* DESMUME_JIT */

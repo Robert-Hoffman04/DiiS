@@ -24,7 +24,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "../MMU.h"
 #include "../armcpu.h"
@@ -178,6 +178,8 @@ static u8 arm9_cyclesForArm(u32 op)
 	// (the Rd == 15 PC-write path, which returns 3, bails in the emitter).
 	if ((op & 0x0F900FF0u) == 0x01000050u) return 2;
 	if ((op & 0x0F900090u) == 0x01000080u) return 2;
+	// MCR (coprocessor register transfer, L=0): OP_MCR returns 2.
+	if ((op & 0x0F100010u) == 0x0E000010u) return 2;
 
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;
@@ -272,7 +274,7 @@ JitCpuProfile* jitBuildArm9Profile()
 	s_arm9Profile.arm9MainMask      = _MMU_MAIN_MEM_MASK;
 	s_arm9Profile.arm9DtcmBase      = (u32)(uintptr_t)MMU.ARM9_DTCM;
 	s_arm9Profile.arm9DtcmRegionPtr = (u32)(uintptr_t)&MMU.DTCMRegion;
-	// PERF_LOG Step 6: ITCM loads inline too (allocated with MAIN_MEM /
+	// ITCM loads inline too (allocated with MAIN_MEM /
 	// ARM9_DTCM, same lifetime). Stores still use slowWrite.
 	s_arm9Profile.arm9ItcmBase      = (u32)(uintptr_t)MMU.ARM9_ITCM;
 
@@ -285,4 +287,4 @@ JitCpuProfile* jitBuildArm9Profile()
 	return &s_arm9Profile;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

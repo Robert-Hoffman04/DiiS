@@ -19,7 +19,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 // Lazily allocates the ARM9 JIT slot (arena/block table/SMC tables) on first
 // real ARM9 JIT dispatch instead of unconditionally in jitInit() -- see
@@ -29,11 +29,18 @@
 // hasn't run yet or the allocation itself fails.
 bool jitEnsureArm9();
 
+// ARM7 counterpart (F1): the ~3.5 MB ARM7 slot is lazy too, allocated from
+// jitRunArm7() on the first dispatch with jitArm7Enabled set, so Interpreter
+// mode allocates no JIT memory. Publishes the DS or GBA ARM7 profile per the
+// last jitSetArm7GBAMode(). Same return contract as jitEnsureArm9(); a failed
+// allocation is latched until jitShutdown().
+bool jitEnsureArm7();
+
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
 // JIT_YIELD_NUMBER is the constant every block's entry guard compares r3
 // against (ensureArena(): `cmpwi r3, JIT_YIELD_NUMBER; bge yield`). Since the
-// dynamic quota (PERF_LOG Step 1) it is only the guard's fixed *zero point*,
+// dynamic quota, it is only the guard's fixed *zero point*,
 // not the chain length: the trampoline starts r3 at (JIT_YIELD_NUMBER -
 // quota) instead of 0 (ExecuteJITTrace's 4th arg, see jitQuotaStart()), so a
 // chain yields after ~quota guest cycles with the emitted code unchanged, and
@@ -49,12 +56,12 @@ bool jitEnsureArm9();
 // past an event/IRQ boundary by more than the one block it overshoots with
 // anyway, but also isn't cut at a fixed 64 cycles when the scheduler has
 // thousands to spare (the old fixed quota yielded ~8K times/frame on ARM9
-// back to C for nothing -- PERF_LOG "Probe -- cycle quota 64 vs 256").
+// back to C for nothing).
 // The cap still bounds how far one core can get ahead of the other in the
 // lockstep interleave (whichever core is behind runs next), which is what
 // IPC/shared-RAM handshakes see. ARM7 cycles are doubled onto the shared
 // timeline, so an ARM7 cap of N is 2N ticks of ARM9-clock time. ARM9's 512
-// was picked by measurement (PERF_LOG Step 1: 128/256/512/1024 swept, 512
+// was picked by measurement (128/256/512/1024 swept, 512
 // keeps nearly all of 1024's win at half the inter-core drift); ARM7's 256 is
 // the same 512 ticks of timeline, not yet tuned on an ARM7-heavy scene. Must
 // stay < 32768 - 64 (the seed is a signed value compared by cmpwi).
@@ -134,7 +141,7 @@ static inline u32 jitQuotaStart(s32 quota)
 // with zero trampoline round trips, before yielding back to jitRunArm9()/
 // jitRunArm7() and the armInnerLoop interleave. No new scheduler code needed;
 // armcpu_exec_block(quota) was already this mechanism, just gated off.
-// (PERF_LOG Step 1 replaced the fixed ~64-cycle quota with a runtime one
+// (The fixed ~64-cycle quota has since been replaced by a runtime one
 // seeded per dispatch -- see JIT_ARM9_QUOTA_CAP above.)
 #ifndef JIT_ENABLE_CHAINING
 #define JIT_ENABLE_CHAINING 1
@@ -160,7 +167,7 @@ static inline u32 jitQuotaStart(s32 quota)
 #define JIT_ENABLE_DYNAMIC_CHAINING 1
 #endif
 
-// PERF_LOG Step 2: in-block interpreter fallback. When the front end refuses
+// In-block interpreter fallback. When the front end refuses
 // an instruction (sets endBlock without emitting a terminator), the scanner
 // used to end the block there -- and a PC whose *first* instruction is refused
 // got a length-1 "don't JIT" marker, so every visit paid a full dispatch round
@@ -305,7 +312,7 @@ struct JitTraceCtx {
 	// for spanBytes > 0, a run that straddles a region edge / 1 MB page) falls
 	// through -- the caller emits the slowRead C path there. Clobbers r10, r11;
 	// EA stays in r12. Returns the number of fast-branch slots written (1-3).
-	// withItcm (loads only, PERF_LOG Step 6) adds a third region, the 32 KB
+	// withItcm (loads only) adds a third region, the 32 KB
 	// ITCM mirrored over 0x00000000-0x01FFFFFF, tested on main RAM's miss
 	// branch so a main-RAM hit costs the same as before; its fast slot comes
 	// last. Stores pass false (ITCM holds JIT code; they keep slowWrite).
@@ -353,7 +360,7 @@ struct JitTraceCtx {
 	// emitSlowLoad's byte-swap / sign-extend / unaligned-word-rotate semantics.
 	// No memory prologue, no C call on a hit. Out of window (I/O, VRAM, ...)
 	// does the same access through the slowRead C call in place and the block
-	// continues (PERF_LOG Step 3; was an interpreter bail). Returns false without emitting
+	// continues (was an interpreter bail). Returns false without emitting
 	// anything when the profile has no descriptor table -- the caller then emits
 	// its own slow path. wordRotate applies OP_LDR's unaligned-word ROR (ARM
 	// callers pass true for a word load; THUMB callers pass false to match
@@ -367,8 +374,8 @@ struct JitTraceCtx {
 	// length (>= 1). Emits a single page-window guard covering the whole run,
 	// one descriptor resolve, then n sequential lwbrx into the registers' host
 	// slots. Out of window, or a run that straddles a 1 MB page, takes a
-	// per-word slowRead C loop instead and the block continues (PERF_LOG
-	// Step 3; was one interpreter bail for the whole instruction). The low EA
+	// per-word slowRead C loop instead and the block continues (was one
+	// interpreter bail for the whole instruction). The low EA
 	// is back in r12 on return either way. LDM/LDMIA word loads do NOT rotate
 	// an unaligned base (matches OP_L_IA). Returns false without emitting when
 	// disabled. Clobbers r10, r11.
@@ -413,6 +420,6 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 opcode);     // jit_arm.cpp
 
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb);
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT
 
 #endif // DESMUME_JIT_TRACE_H

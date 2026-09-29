@@ -49,6 +49,11 @@
 #include "gx/gx_gba_render.h"
 #include "gx/gx_rendermode.h"
 #include "gx/gx_ds_present.h"
+#ifdef DESMUME_JIT
+// F1 runtime CPU mode (Interpreter / JIT): the startup picker's CPU line, the
+// harness "cpumode" command, and the wrestler probes' per-core overrides.
+#include "jit/jit.h"
+#endif
 
 #ifdef DESMUME_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
@@ -60,16 +65,10 @@
 
 #ifdef DESMUME_ARMWRESTLER_PROBE
 #include "addons.h"
-#if defined(DESMUME_JIT_ARM7)
-#include "jit/jit.h"
-#endif
 #endif
 
 #ifdef DESMUME_ARM7WRESTLER_PROBE
 #include "addons.h"
-#if defined(DESMUME_JIT_ARM7)
-#include "jit/jit.h"
-#endif
 #endif
 
 #ifdef DESMUME_ROCKWRESTLER_PROBE
@@ -389,8 +388,9 @@ int main(int argc, char **argv){
 	addonsChangePak(NDS_ADDON_EXPMEMORY);
 	// ExpMemory_reset() allocates expMemSize with `new` every NDS_Reset();
 	// left at its 8MB default, a build with the JIT subsystem compiled in
-	// (-DDESMUME_JIT_ARM7 -- the master flag, regardless of whether either
-	// core's JIT is runtime-enabled) reliably freezes very early, before
+	// (-DDESMUME_JIT, i.e. any build without NOJIT=1 -- at the time this was
+	// found the ARM7 slot was allocated at boot regardless of whether either
+	// core's JIT was runtime-enabled) reliably freezes very early, before
 	// even the first SMC-tracked memory access -- confirmed to be memory
 	// exhaustion (the JIT's own arena/table allocations plus this 8MB
 	// together overrun the Wii's MEM1), not a JIT execution bug: shrinking
@@ -400,7 +400,7 @@ int main(int argc, char **argv){
 	// there is no reason for this probe to ever want 8MB of slot-2 RAM.
 	extern u32 expMemSize;
 	expMemSize = 64 * 1024;
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 	// armwrestler's ARM7 side (armwrestler-arm7.asm) is a one-instruction
 	// stub -- `arm7_main: b arm7_main`, an intentional idle spin -- ARM7 is
 	// never used for anything real here, so there is nothing for its JIT to
@@ -417,15 +417,16 @@ int main(int argc, char **argv){
 	addonsChangePak(NDS_ADDON_EXPMEMORY);
 	extern u32 expMemSize;
 	expMemSize = 64 * 1024;
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 	// Opposite of §17's armwrestler probe: here the ARM7 side is the real
 	// test content and the ARM9 side (armwrestler-arm9.asm) is upstream's
 	// own trivial idle/vram-copy stub -- nothing for the ARM9 JIT to
 	// usefully compile, so turn that off. jitArm7Enabled is deliberately
-	// left alone (defaults true whenever -DDESMUME_JIT_ARM7 is compiled
-	// in) -- exercising the ARM7 JIT is the entire point of this probe; an
-	// interpreter-only baseline run means building without
-	// -DDESMUME_JIT_ARM7 at all, not forcing this flag off here.
+	// left alone (the runtime CPU mode defaults to JIT, and this forced-boot
+	// probe skips the picker) -- exercising the ARM7 JIT is the entire point
+	// of this probe; an interpreter-only baseline run means Interpreter mode
+	// (jitSetEnabled(false)) or a NOJIT=1 build, not forcing this flag off
+	// here.
 	jitArm9Enabled = false;
 #endif
 #endif
@@ -439,8 +440,9 @@ int main(int argc, char **argv){
 	// Unlike §17/§18: both CPUs are real content here (IPCSYNC/IPCFIFO/
 	// WRAMCNT/VRAMCNT/TCM genuinely exercise ARM7+ARM9 together), so
 	// jitArm7Enabled/jitArm9Enabled are deliberately left at their
-	// defaults -- an interpreter-only baseline run means building without
-	// -DDESMUME_JIT_ARM7 at all, not forcing either flag off here.
+	// defaults (runtime CPU mode JIT) -- an interpreter-only baseline run
+	// means Interpreter mode or a NOJIT=1 build, not forcing either flag off
+	// here.
 #endif
 
 	printf("Initializing virtual Nintendo DS...\n");
@@ -1514,7 +1516,76 @@ static void frameLimiterTick()
 }
 #endif // !DESMUME_HARNESS && !DESMUME_BENCH
 
+#ifdef DESMUME_HARNESS
+// Drain any host -> device packets (§3.4 playlist control, §3.5 input). Called
+// once per frame from the end of DSExec(), and once more before the very
+// first frame (see the top of DSExec()) so commands the host sends right at
+// connect -- capture.py --ctrl-cmd -- are in force from frame 1 instead of
+// frame 2. That matters for "cpumode": a run meant to be pure Interpreter (or
+// pure JIT) must not emulate its first frame in the other mode.
+static void harness_poll_host()
+{
+	u8 _pt;
+	char _rx[128];
+	u32 _rn;
+	while ((_rn = harness_recv(&_pt, _rx, sizeof(_rx) - 1)) != 0) {
+		if (_pt == HARNESS_PKT_CTRL) {
+			_rx[_rn] = 0;
+			if (!strncmp(_rx, "next_rom", 8)) {
+				harness_boot_request_next();
+			} else if (!strncmp(_rx, "capture_frame", 13)) {
+				const char *_a = _rx + 13;
+				while (*_a == ' ') _a++;
+				harness_frame_request(*_a ? _a : 0);
+			} else if (!strncmp(_rx, "movie", 5)) {
+				harness_input_movie_cmd(_rx + 5);
+			} else if (!strncmp(_rx, "rendermode", 10)) {
+				// nds-wii-render-pipeline.md "three runtime-switchable render modes":
+				// test/bench-only switch (no on-screen UI exists yet). Same PKT_CTRL
+				// dispatch pattern as "movie ..." above -- see gx_rendermode.h.
+				const char *_m = _rx + 10;
+				while (*_m == ' ') _m++;
+				if (!strncmp(_m, "software", 8))
+					gxSetRenderMode(RenderMode::Software);
+				else if (!strncmp(_m, "accurate", 8))
+					gxSetRenderMode(RenderMode::GxAccurate);
+				else if (!strncmp(_m, "fast", 4))
+					gxSetRenderMode(RenderMode::GxFast);
+			} else if (!strncmp(_rx, "cpumode", 7)) {
+				// F1 runtime CPU mode: "cpumode interp" / "cpumode jit" -- the
+				// harness twin of the startup picker's CPU line. Only requested
+				// here; NDS_exec() applies it at the top of the next frame
+				// (jitRequestMode(), jit.h), so it is safe mid-game. Echoed back
+				// as a LOG line so a capture shows when it landed.
+				const char *_m = _rx + 7;
+				while (*_m == ' ') _m++;
+				int _on = !strncmp(_m, "interp", 6) ? 0 : !strncmp(_m, "jit", 3) ? 1 : -1;
+#ifdef DESMUME_JIT
+				if (_on >= 0) jitRequestMode(_on != 0);
+#else
+				if (_on == 1) _on = -2;   // NOJIT=1 build: JIT not available
+#endif
+				char _l[80];
+				snprintf(_l, sizeof(_l), "cpumode %s",
+					_on == 1 ? "jit (applies next frame)" : _on == 0 ? "interp (applies next frame)"
+					: _on == -2 ? "jit UNAVAILABLE (NOJIT=1 build)" : "?? (want interp|jit)");
+				harness_send(HARNESS_PKT_LOG, _l, strlen(_l));
+			}
+		} else if (_pt == HARNESS_PKT_INPUT) {
+			// §3.5: drive the shared transport-agnostic input core.
+			harness_input_feed_bytes(_rx, (int)_rn);
+		}
+	}
+}
+#endif
+
 void DSExec(){
+#ifdef DESMUME_HARNESS
+	{
+		static bool s_polledBeforeFirstFrame = false;
+		if (!s_polledBeforeFirstFrame) { s_polledBeforeFirstFrame = true; harness_poll_host(); }
+	}
+#endif
 
 	PAD_ScanPads();
 	WPAD_ScanPads();
@@ -1856,39 +1927,7 @@ void DSExec(){
 
 #ifdef DESMUME_HARNESS
 	{
-		// Drain any host -> device packets (§3.4 playlist control, §3.5 input).
-		u8 _pt;
-		char _rx[128];
-		u32 _rn;
-		while ((_rn = harness_recv(&_pt, _rx, sizeof(_rx) - 1)) != 0) {
-			if (_pt == HARNESS_PKT_CTRL) {
-				_rx[_rn] = 0;
-				if (!strncmp(_rx, "next_rom", 8)) {
-					harness_boot_request_next();
-				} else if (!strncmp(_rx, "capture_frame", 13)) {
-					const char *_a = _rx + 13;
-					while (*_a == ' ') _a++;
-					harness_frame_request(*_a ? _a : 0);
-				} else if (!strncmp(_rx, "movie", 5)) {
-					harness_input_movie_cmd(_rx + 5);
-				} else if (!strncmp(_rx, "rendermode", 10)) {
-					// nds-wii-render-pipeline.md "three runtime-switchable render modes":
-					// test/bench-only switch (no on-screen UI exists yet). Same PKT_CTRL
-					// dispatch pattern as "movie ..." above -- see gx_rendermode.h.
-					const char *_m = _rx + 10;
-					while (*_m == ' ') _m++;
-					if (!strncmp(_m, "software", 8))
-						gxSetRenderMode(RenderMode::Software);
-					else if (!strncmp(_m, "accurate", 8))
-						gxSetRenderMode(RenderMode::GxAccurate);
-					else if (!strncmp(_m, "fast", 4))
-						gxSetRenderMode(RenderMode::GxFast);
-				}
-			} else if (_pt == HARNESS_PKT_INPUT) {
-				// §3.5: drive the shared transport-agnostic input core.
-				harness_input_feed_bytes(_rx, (int)_rn);
-			}
-		}
+		harness_poll_host();
 
 		// One heartbeat/sec, tagged with the current playlist ROM so the desktop
 		// watchdog (§3.4) knows which ROM a stall belongs to.
@@ -1976,12 +2015,25 @@ bool PickDevice(){
 	// Hardcoded selection for automated testing (see Makefile TESTDEFS).
 	// DESMUME_FORCE_CORE: 1 = software raster (only option; see core3DList)
 	// DESMUME_FORCE_USB:  0 = SD, 1 = USB
+	// The CPU line below is skipped too, so the runtime CPU mode keeps its
+	// default (JIT, g_jitOn in jit_exec.cpp); a test that wants Interpreter
+	// sends the harness command "cpumode interp" instead.
 	current3Dcore = DESMUME_FORCE_CORE;
 #ifdef DESMUME_FORCE_USB
 	return DESMUME_FORCE_USB;
 #else
 	return false;
 #endif
+#endif
+
+	// F1 runtime CPU mode: Interpreter (both cores interpreted) or JIT (both
+	// cores JITted, the default). Same toggle idiom the old renderer line
+	// used: Left/Right flips the device, Up/Down flips the CPU. A NOJIT=1
+	// build has only the interpreter, so it shows that and ignores Up/Down.
+#ifdef DESMUME_JIT
+	bool useJit = true;
+#else
+	const bool useJit = false;
 #endif
 
 	while(true){
@@ -1993,13 +2045,27 @@ bool PickDevice(){
 		printf("Welcome to DeSmuME Wii!!!\n\n");
 		printf("Select Device: << ");
 		printf("%s", device ? "USB >>" : "SD >>");
+		printf("\nSelect CPU \\/ ");
+		printf("%s", useJit ? "JIT /\\" : "Interpreter /\\");
 		printf("\n\nPress B to see the credits.");
 
 		if(GetInput(LEFT, LEFT, LEFT) || GetInput(RIGHT, RIGHT, RIGHT)) {
 			device = !device;
 		}
 
+#ifdef DESMUME_JIT
+		if(GetInput(UP, UP, UP) || GetInput(DOWN, DOWN, DOWN)) {
+			useJit = !useJit;
+		}
+#endif
+
 		if(GetInput(A, A, A)){
+#ifdef DESMUME_JIT
+			// Pre-boot (NDS_Init() hasn't run), so apply at once rather than
+			// via jitRequestMode(): nothing is running, and the wrestler
+			// probes' per-core overrides further down main() still win.
+			jitSetEnabled(useJit);
+#endif
 			break;
 		}
 

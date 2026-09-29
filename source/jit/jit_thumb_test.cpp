@@ -16,7 +16,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7) && defined(DESMUME_JIT_SELFTEST)
+#if defined(DESMUME_JIT) && defined(DESMUME_JIT_SELFTEST)
 
 #include "jit_trace.h"
 #include "../armcpu.h"
@@ -123,7 +123,8 @@ static void loadState(const ThumbVec& v)
 
 int jitThumbSelfTest()
 {
-	if (!jitProfile[JIT_ARM7]) { printf("[jit] thumb selftest: no profile\n"); return -1; }
+	// The ARM7 slot is allocated lazily (F1) -- make sure it exists.
+	if (!jitEnsureArm7()) { printf("[jit] thumb selftest: no profile\n"); return -1; }
 
 	FILE* f = fopen("sd:/jit.log", "a");
 	int pass = 0, fail = 0, skip = 0;
@@ -200,4 +201,4 @@ int jitThumbSelfTest()
 	return fail;
 }
 
-#endif // DESMUME_JIT_ARM7 && DESMUME_JIT_SELFTEST
+#endif // DESMUME_JIT && DESMUME_JIT_SELFTEST

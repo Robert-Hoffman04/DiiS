@@ -95,7 +95,8 @@ selects the `ExpMemory` slot-2 addon and polls it once per frame; on
 completion it writes `sd:/rockwrestler.log` (total run/failed, plus each
 failing test's name and detail number) and quits. Stage
 `out/rockwrestler.nds` as `sd:/DS/ROMS/test.nds` and boot with
-`-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=2` for a fully headless run (add
-`-DDESMUME_JIT_ARM7` to `JITDEFS` for the JIT path; omit for the interpreter
-baseline). Predicated Bcc/BLcc compile unconditionally now -- the old
+`-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1` for a fully headless run. The
+JIT is compiled in and on by default; for the interpreter baseline send the
+harness command `cpumode interp` (`tools/benchmark/run.sh --probe-cpumode
+interp`) or build with `make NOJIT=1`. Predicated Bcc/BLcc compile unconditionally now -- the old
 `-DJIT_ARM_PRED_BRANCH` gate was removed once this gate cleared.

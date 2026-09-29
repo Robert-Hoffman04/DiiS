@@ -26,7 +26,7 @@
  *
  * JIT_ARENA_SIZE (2 MB ARM7), JIT_ARENA_SIZE_ARM9 (12 MB), HASH_TABLE_SIZE
  * (65536, indexed by the multiplicative jitHashPC()), and SMC_MAP_SIZE are the
- * tuning constants -- see jit/NOTES.md for the measurements behind them.
+ * tuning constants.
  ***************************************************************************/
 
 #ifndef JIT_CACHE_H
@@ -63,14 +63,14 @@
 // ~38k (bound by the 64K direct-mapped block table, independent of arena
 // size), so SM64DS's ARM9 working set still outgrows 12 MB - this buys the
 // latency tail, not saturation headroom. Which pool the arena lands in
-// (MEM1 vs MEM2) is tracked in jit/NOTES.md.
+// (MEM1 vs MEM2) can be checked with a -DJIT_MEM_ACCOUNT build.
 #ifndef JIT_ARENA_SIZE_ARM9
 #define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 12) // 12 MB (ARM9 is the hot core)
 #endif
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
 
-// 2-way set associativity (NOTES.md "what to try next" #2, fallback once the
+// 2-way set associativity (fallback once the
 // hash experiments stalled -- see the JIT_HASH_MULHWU rejection above). Each
 // of the HASH_TABLE_SIZE *sets* jitHashPC() indexes now holds two physical
 // BasicBlock slots ("ways") instead of one, so two guest PCs that hash to the
@@ -79,12 +79,12 @@
 // jitHashPC() itself is UNCHANGED (still returns a plain set index 0..65535);
 // only the physical array size and the C-/PPC-side indexing that turns a set
 // index into a slot address changed. Doubles the block table's MEM2 footprint
-// (1 MiB -> 2 MiB per core; see jit/NOTES.md Step 2 for the headroom budget).
+// (1 MiB -> 2 MiB per core).
 #define BLOCK_TABLE_WAYS				2
 #define BLOCK_TABLE_SLOTS				(HASH_TABLE_SIZE * BLOCK_TABLE_WAYS)
 
 // Block-table index hash. Was ((pc>>1) ^ (pc>>13)) & (HASH_TABLE_SIZE-1): a
-// -DJIT_HASH_HISTO capture (SM64DS, jit/NOTES.md) showed that shift-xor mix
+// -DJIT_HASH_HISTO capture (SM64DS) showed that shift-xor mix
 // collapsing the hot ARM9 working set into ~55 buckets - one bucket alone took
 // 2700+ evictions in a single run, so the "collision misses" were a hash
 // weakness, not a load-factor / table-size problem. Replaced with a
@@ -93,7 +93,7 @@
 // input bit). The hand-emitted stub in jit_cache.cpp mirrors this exactly
 // (lis/ori/mullw + one rlwinm), so getBlock() and JIT-emitted lookups agree.
 //
-// -DJIT_HASH_MULHWU (NOTES.md "what to try next" #1): the mullw variant above
+// -DJIT_HASH_MULHWU: the mullw variant above
 // keeps the top bits of the *low* 32 bits of pc*GOLDEN; for SM64DS's tightly
 // clustered ARM9 code addresses those top bits are reached only weakly
 // through carry, leaving ~14 hot buckets still hard-colliding after the
@@ -231,7 +231,7 @@ class JITCache {
 #endif
 
 #ifdef JIT_CORE_COST_HISTO
-		// Step 2 of the ARM7-vs-ARM9 execute-cost investigation (jit/NOTES.md):
+		// Step 2 of the ARM7-vs-ARM9 execute-cost investigation:
 		// per-cache compiled-block-length accounting, sampled at registerBlock()
 		// time. Independent of HARNESS_PROFILE. ccBlockLenReport() emits a
 		// cumulative line; jitCoreCostEmit() (jit_exec.cpp) calls it per core.

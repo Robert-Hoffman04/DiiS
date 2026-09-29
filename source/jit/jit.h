@@ -1,17 +1,16 @@
 /****************************************************************************
- * DeSmuMEWii ARM7 JIT
+ * DeSmuMEWii ARM JIT
  *
  * jit.h
  *
- * Top-level interface for the ARM7 trace JIT. Derived from Visual Boy Advance
- * GX's source/vba/gba/JIT.h (c) Daryl Borth, GPL v2+ -- see
- * jit/upstream/PROVENANCE.md and desmumewii-arm7-jit-plan.md.
+ * Top-level interface for the ARM-to-PowerPC trace JIT (ARM9 and ARM7, ARM and
+ * THUMB). Derived from Visual Boy Advance GX's source/vba/gba/JIT.h (c) Daryl
+ * Borth, GPL v2+ -- see jit/upstream/PROVENANCE.md.
  *
- * Phase P1: the CPU-agnostic infrastructure is present and wired to an ARM7
- * JitCpuProfile, but no opcode front-end exists yet -- jitCompileTrace()
- * always produces a "don't JIT this" fallback block, so execution is
- * unchanged. jitSelfTest() round-trips a hand-emitted block through the
- * trampoline + linker stub to prove the ABI on real hardware.
+ * Built in by default (make NOJIT=1 drops it); whether it runs is a runtime
+ * choice, Interpreter or JIT for both cores (jitSetEnabled/jitRequestMode).
+ * Opcodes without a front-end are run through the interpreter from inside the
+ * trace (jitInterpFallback) instead of ending the block.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_H
@@ -39,7 +38,7 @@ struct JITResult {
 	u32 smcAddress;  // written EA when smcHit
 } __attribute__((aligned(32)));
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 // Hand-written PowerPC ABI bridge (jit_trampoline.S). startCycles seeds the
 // r3 cycle accumulator (0 == the old fixed JIT_YIELD_NUMBER quota); the
@@ -56,7 +55,8 @@ void jitShutdown();
 // both are built once by jitInit() and share jitCacheArm7, since only one
 // boot mode is ever live at a time. Called from NDS_DebugForceGBAMode(),
 // alongside that function's other gameInfo.isGBA/MMU.isGBA mirror updates.
-// A no-op before jitInit() has (successfully) run.
+// A no-op before jitInit() has (successfully) run. Safe before the (lazy) ARM7
+// slot exists: the choice is remembered and published by jitEnsureArm7().
 void jitSetArm7GBAMode(bool enable);
 
 // GO-FIX-PH temporary diagnostic (jit_trace.cpp): verifies the canary bytes
@@ -66,26 +66,62 @@ void jitSetArm7GBAMode(bool enable);
 // corruption bug is found.
 void jitCheckCanaries();
 
+// F1 -- the runtime CPU mode. One user-facing setting with two values:
+// Interpreter (both cores interpreted) or JIT (both cores JITted, the
+// default). g_jitOn is the *applied* mode. NDS_exec() reads it once per frame
+// to pick the armInnerLoop<..., jit> instantiation (NDSSystem.cpp), so
+// interpreter mode never calls jitRunArm*() at all, and the MMU SMC hooks
+// (MMU.h / MMU.cpp) test it inline, so interpreter mode pays one load+branch
+// per hooked write instead of a call into jit_cache.cpp. Skipping those
+// invalidations while the JIT is off is safe only because every switch
+// flushes both block caches (jitSetEnabled() below).
+//
+// jitRequestMode() is the mid-game entry point (harness PKT_CTRL "cpumode",
+// main.cpp): it only records the request, and NDS_exec() applies it at the
+// top of the next frame via jitApplyPendingMode() -- a frame boundary, where
+// neither core is inside a JIT dispatch. jitSetEnabled() applies at once and
+// is for callers already at such a point (the startup picker, before
+// NDS_Init()). Applying a mode syncs both cores' lazily-fetched interpreter
+// pipelines (jitSyncPipeline()) and flushes both JIT caches, then drives
+// jitArm7Enabled/jitArm9Enabled from it. Those two per-core flags remain the
+// flags jitRunArm7()/jitRunArm9() actually check, so a caller that wants one
+// core interpreted while the JIT mode is on (the armwrestler/arm7wrestler
+// probes in main.cpp) can still clear one after a mode is applied.
+extern bool g_jitOn;
+extern s8   g_jitModePending;   // -1 = none, else the requested g_jitOn
+void jitSetEnabled(bool jit);
+void jitRequestMode(bool jit);
+static inline void jitApplyPendingMode()
+{
+	if (g_jitModePending >= 0) {
+		const bool jit = (g_jitModePending != 0);
+		g_jitModePending = -1;
+		jitSetEnabled(jit);
+	}
+}
+
 // Live execution. Called from armInnerLoop() when the ARM7 is due to step.
 // Runs one JIT block from NDS_ARM7.instruct_adr and points the interpreter
 // pipeline at the resume PC (the opcode fetch itself is deferred -- see
 // jitSyncPipeline() below); returns cycles consumed, or 0 if the interpreter
 // should handle this instruction (uncompilable region / "don't JIT" /
 // disabled). Both THUMB and ARM mode are compiled (P11). `budget` is how many ARM7 cycles the
-// scheduler can spare before its next event (PERF_LOG Step 1): a chain of
+// scheduler can spare before its next event: a chain of
 // linked blocks runs up to min(budget, JIT_ARM7_QUOTA_CAP) cycles (plus the
-// usual one-block overshoot) before returning.
+// usual one-block overshoot) before returning. The ARM7 slot (~3.5 MB arena +
+// tables) is allocated on the first call that gets past jitArm7Enabled -- see
+// jitEnsureArm7() (jit_trace.h).
 extern bool jitArm7Enabled;
 u32 jitRunArm7(s32 budget);
 
 // ARM9 counterpart. Spliced into armInnerLoop()'s ARM9 arm. jitArm9Enabled
-// defaults false (see jit_exec.cpp), so this compiles nothing and returns 0
-// unless -DDESMUME_JIT_ARM9_ON or JIT_DIFFERENTIAL_TESTING is set. `budget`
-// is in ARM9 cycles, capped by JIT_ARM9_QUOTA_CAP -- see jitRunArm7().
+// follows the runtime mode like jitArm7Enabled (a JIT_DIFFERENTIAL_TESTING
+// build ignores it and always runs the checked path). `budget` is in ARM9
+// cycles, capped by JIT_ARM9_QUOTA_CAP -- see jitRunArm7().
 extern bool jitArm9Enabled;
 u32 jitRunArm9(s32 budget);
 
-// PERF_LOG Step 5 -- lazy interpreter-pipeline re-prime. A compiled run
+// Lazy interpreter-pipeline re-prime. A compiled run
 // leaves instruct_adr / next_instruction / R[15] pointing at the resume PC
 // but no longer fetches the opcode there into cpu.instruction: the next
 // thing to run is almost always the JIT again, which only reads
@@ -142,6 +178,6 @@ bool jitSelfTest();
 int jitThumbSelfTest();
 #endif
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT
 
 #endif // DESMUME_JIT_H
