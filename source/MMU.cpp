@@ -2670,7 +2670,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			case 0x0400039:
 			case 0x040003A:
 			case 0x040003B:
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF)>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_UpdateToonTable((adr & 0x3F) >> 1, val);
 			return;
 		}
@@ -2710,7 +2710,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Alpha test reference value - Parameters:1
 			case eng_3D_ALPHA_TEST_REF:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x340>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x340, val);
 				gfx3d_glAlphaFunc(val);
 				return;
 			}
@@ -2718,7 +2718,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Clear background color setup - Parameters:2
 			case eng_3D_CLEAR_COLOR:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x350>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x350, val);
 				gfx3d_glClearColor(val);
 				return;
 			}
@@ -2726,20 +2726,20 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Clear background depth setup - Parameters:2
 			case eng_3D_CLEAR_DEPTH:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x354>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x354, val);
 				gfx3d_glClearDepth(val);
 				return;
 			}
 			// Fog Color - Parameters:4b
 			case eng_3D_FOG_COLOR:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x358>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x358, val);
 				gfx3d_glFogColor(val);
 				return;
 			}
 			case eng_3D_FOG_OFFSET:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x35C>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x35C, val); // was a u32 store at [0x35C>>1] (byte 0x6B8)
 				gfx3d_glFogOffset(val);
 				return;
 			}
@@ -3177,18 +3177,18 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		switch (adr >> 4)
 		{
 			case 0x400033:		//edge color table
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				return;
 			case 0x400036:		//fog table
 			case 0x400037:
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				return;
 
 			case 0x400038:
 			case 0x400039:
 			case 0x40003A:
 			case 0x40003B:		//toon table
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_UpdateToonTable((adr & 0x3F) >> 1, val);
 				return;
 
@@ -3196,7 +3196,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			case 0x400041:
 			case 0x400042:
 			case 0x400043:		// FIFO Commands
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_sendCommandToFIFO(val);
 				return;
 				
@@ -3225,7 +3225,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			case 0x40005A:
 			case 0x40005B:
 			case 0x40005C:		// Individual Commands
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_sendCommand(adr, val);
 				return;
 
@@ -3271,34 +3271,34 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			// Alpha test reference value - Parameters:1
 			case eng_3D_ALPHA_TEST_REF:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x340>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x340, val);
 				gfx3d_glAlphaFunc(val);
 				return;
 			}
 			// Clear background color setup - Parameters:2
 			case eng_3D_CLEAR_COLOR:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x350>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x350, val);
 				gfx3d_glClearColor(val);
 				return;
 			}
 			// Clear background depth setup - Parameters:2
 			case eng_3D_CLEAR_DEPTH:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x354>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x354, val);
 				gfx3d_glClearDepth(val);
 				return;
 			}
 			// Fog Color - Parameters:4b
 			case 0x04000358:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x358>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x358, val);
 				gfx3d_glFogColor(val);
 				return;
 			}
 			case 0x0400035C:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x35C>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x35C, val);
 				gfx3d_glFogOffset(val);
 				return;
 			}
