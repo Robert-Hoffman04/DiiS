@@ -136,6 +136,8 @@ void gxDs3dRenderAccurate();
 // convention needs relative to the DS's, see the .cpp file), loads them, and submits
 // VERT::objcoord object-space positions -- GX's own transform hardware does the
 // multiply + perspective divide instead of the CPU.
+// Recorded into a display list once per g_gfx3dRenderSeq and replayed on the repeat
+// frames (Task replay, see the .cpp; -DDSA_GXGEOM_NOREPLAY draws directly every time).
 void gxDs3dRenderFast();
 
 // ADDED (Task 13f-fog, see gx-next-steps-log.md): fog post-process, GxFast only. Draws a

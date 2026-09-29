@@ -717,18 +717,42 @@ bool gxDs3dGeomFrameHasTranslucent() { return s_gateHasTrans; }
 static u32 s_prepSeq = 0xFFFFFFFF;
 static bool s_prepOk = false;
 
+// Task replay: the line-191 result per 3D frame. Each g_gfx3dRenderSeq is shown on (at
+// least) two 60 Hz frames and every gate input is fixed for the seq (the lists and control
+// bits latched at flush, the raster latch and texture snapshot taken at VBlank end), so the
+// second frame reuses the first one's verdict along with what the gate left behind
+// (s_gateHasTrans, the tag-run plan). The list pointer/count guard a flush that swapped the
+// lists without a VBlank end bumping the seq (a skipped frame) and a savestate load.
+static struct {
+	u32 seq;
+	const void *list;
+	int count;
+	bool fast, valid, ok;
+} s_suppCache;
+
 bool gxDs3dGeomFrameSupported()
 {
 	if (s_prepSeq == g_gfx3dRenderSeq && !s_prepOk) return false;
+	const bool fast = gxRenderModeIsFast();
+	const int count = gfx3d.polylist ? gfx3d.polylist->count : -1;
+	if (s_suppCache.valid && s_suppCache.seq == g_gfx3dRenderSeq && s_suppCache.list == gfx3d.polylist &&
+	    s_suppCache.count == count && s_suppCache.fast == fast)
+		return s_suppCache.ok;
 	const int g = gxDs3dFrameGate(true);
 #ifdef DSA_GXGEOM_DEBUGWHY
-	harness_profile_emitf("gxds3dwhy %s polycount=%d", kGateNames[g], gfx3d.polylist ? gfx3d.polylist->count : -1);
+	harness_profile_emitf("gxds3dwhy %s polycount=%d", kGateNames[g], count);
 #endif
+	s_suppCache.seq = g_gfx3dRenderSeq; s_suppCache.list = gfx3d.polylist; s_suppCache.count = count;
+	s_suppCache.fast = fast; s_suppCache.ok = g == kGateOk; s_suppCache.valid = true;
 	return g == kGateOk;
 }
 
+static void gxDs3dReplayDrop();
+
 bool gxDs3dGeomFramePrepare()
 {
+	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead (and frees its tag buffers)
+	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
 	const int g = gxDs3dFrameGate(false);
 #ifdef DSA_GXGEOM_TEXSTATS
@@ -1630,7 +1654,7 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
 }
 
-void gxDs3dRenderFast()
+static void gxDs3dRenderFastDraw()
 {
 	gxDs3dWSetup();
 	gxDs3dSetupCommonState();
@@ -1671,8 +1695,90 @@ void gxDs3dRenderFast()
 		GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
 	}
 	if (c.tagMode > 0) GX_SetNumTevStages(1);
-	gxDs3dTagBuffersFree();
 	gxDs3dRestoreState();
+}
+
+// ---------------------------------------------------------------------------------
+// Task replay (gx-remaining-work.md section 1, "Batch draw calls"): each 3D frame
+// (g_gfx3dRenderSeq) is composited on two 60 Hz frames, and the pass's GX stream is a
+// pure function of the seq's inputs (lists, latched raster values, the VBlank-end
+// texture snapshot, whose buffers only gxDs3dGeomFramePrepare rewrites). So the first
+// frame records gxDs3dRenderFastDraw into a GX display list and calls it; later frames
+// of the same seq only call it, skipping the per-polygon CPU work. The tag pass's EFB
+// copies are in the list, so its three buffers stay allocated until the list is dropped
+// (next Prepare, or a re-record). libogc's GX_EndDispList puts its shadow registers back
+// to their pre-list values, so the state after the pass is the same on the recording and
+// the replaying frames; the caller re-sets everything the 2D pass uses either way.
+// Overflow (GX_EndDispList returns 0, nothing reached the GPU): the pass is drawn
+// directly and the next recording gets a buffer twice the size, up to kDlMax.
+// ---------------------------------------------------------------------------------
+static const u32 kDlMin = 256 * 1024, kDlMax = 1024 * 1024;
+static void *s_dl = nullptr;
+static u32 s_dlCap = 0, s_dlWant = kDlMin, s_dlSize = 0;
+static struct {
+	u32 seq;
+	const void *list;
+	int count;
+} s_dlKey;
+
+// No GX calls: runs at VBlank end outside vidmutex. The GPU is done with the list and the
+// tag buffers by then (the compositor GX_DrawDone()s after the pass, before its copy), and
+// whatever reuses the freed memory as a texture invalidates TMEM itself (s_texDirty for
+// ours, and the compositor's GX_InvalidateTexAll after every copy).
+static void gxDs3dReplayDrop()
+{
+	s_dlSize = 0;
+	if (!s_tagSaveBuf) return;
+	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf);
+	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = nullptr;
+}
+
+#ifdef DSA_GXGEOM_REPLAYSTATS
+// Every 64 calls: recorded / replayed / overflowed passes, the last list size and the buffer.
+static u32 s_rpRec, s_rpHit, s_rpOver, s_rpCalls;
+#define GXDS3D_RPSTAT(x) do { ++(x); if ((++s_rpCalls & 63) == 0) \
+	harness_profile_emitf("gxds3dreplay rec=%u hit=%u over=%u size=%u cap=%u", (unsigned)s_rpRec, (unsigned)s_rpHit, \
+	                      (unsigned)s_rpOver, (unsigned)s_dlSize, (unsigned)s_dlCap); } while (0)
+#else
+#define GXDS3D_RPSTAT(x) do {} while (0)
+#endif
+
+void gxDs3dRenderFast()
+{
+	const int count = gfx3d.polylist->count;
+	if (s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == count) {
+		GX_CallDispList(s_dl, s_dlSize);
+		GXDS3D_RPSTAT(s_rpHit);
+		return;
+	}
+	s_dlSize = 0;
+	gxDs3dTagBuffersFree();   // a previous recording's (normally already dropped by Prepare)
+#ifndef DSA_GXGEOM_NOREPLAY
+	if (s_dlCap < s_dlWant) {
+		free(s_dl);
+		s_dl = memalign(32, s_dlWant);
+		s_dlCap = s_dl ? s_dlWant : 0;
+	}
+	if (s_dl) {
+		const bool texDirty = s_texDirty;
+		DCInvalidateRange(s_dl, s_dlCap);
+		GX_BeginDispList(s_dl, s_dlCap);
+		gxDs3dRenderFastDraw();
+		const u32 n = GX_EndDispList();
+		if (n) {
+			s_dlSize = n;
+			s_dlKey.seq = g_gfx3dRenderSeq; s_dlKey.list = gfx3d.polylist; s_dlKey.count = count;
+			GX_CallDispList(s_dl, s_dlSize);
+			GXDS3D_RPSTAT(s_rpRec);
+			return;
+		}
+		s_texDirty = texDirty;   // the recorded GX_InvalidateTexAll never ran
+		if (s_dlWant < kDlMax) s_dlWant *= 2;
+		GXDS3D_RPSTAT(s_rpOver);
+	}
+#endif
+	gxDs3dRenderFastDraw();
+	gxDs3dTagBuffersFree();
 }
 
 // ---------------------------------------------------------------------------------
