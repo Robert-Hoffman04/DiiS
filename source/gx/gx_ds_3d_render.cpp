@@ -14,6 +14,7 @@
 #include "../harness/harness_profile.h"
 #endif
 
+#include "../perf_zones.h"   // Task profile/pzones: GX 3D sub-zones (no-op without -DDESMUME_PERFZONES)
 #ifdef DSA_GXGEOM_TAGPROF
 // Task tagcost: CPU time of the recording frame's pieces, averaged per recorded pass.
 #include <ogc/lwp_watchdog.h>
@@ -308,6 +309,7 @@ static void gxDs3dTexConvertTrans(GxDs3dTex &t, const TexCacheItem *item)
 
 bool gxDs3dPrepareTextures()
 {
+	PZ_SUB_SCOPE(PZ_GX3D_TEX);
 	const u32 seq = g_gfx3dRenderSeq;
 	s_texPrepSeq = 0xFFFFFFFF;
 	const int polycount = gfx3d.polylist->count;
@@ -904,6 +906,7 @@ static void gxDs3dReplayDrop();
 
 bool gxDs3dGeomFramePrepare()
 {
+	PZ_SUB_SCOPE(PZ_GX3D_PREP);
 	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead (and frees its tag buffers)
 	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
@@ -1405,6 +1408,8 @@ static void gxDs3dDrawSpansAccurate(const POLY &p, const VIEWPORT &vp, const VER
 // ---------------------------------------------------------------------------------
 void gxDs3dRenderAccurate()
 {
+	PZ_SUB_SCOPE(PZ_GX3D_ACC);
+	PZ_SUB_CLS(8);
 	gxDs3dSetupCommonState();
 	gxDs3dLoadScreenOrtho();
 	gxDs3dClearDepth();
@@ -1937,6 +1942,11 @@ static u32 s_rpRec, s_rpHit, s_rpOver, s_rpCalls;
 void gxDs3dRenderFast()
 {
 	const int count = gfx3d.polylist->count;
+#ifdef DESMUME_PERFZONES
+	const bool pzHit = s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == count;
+	PZ_SUB_SCOPE(pzHit ? PZ_GX3D_REPLAY : PZ_GX3D_REC);
+	PZ_SUB_CLS(pzHit ? 2 : 1);
+#endif
 	if (s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == count) {
 		GXDS3D_TP_BEGIN(tp0);
 		GX_CallDispList(s_dl, s_dlSize);

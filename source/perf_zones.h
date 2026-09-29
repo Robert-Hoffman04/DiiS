@@ -4,8 +4,9 @@
  * A tiny wall-clock "where does the frame go" accountant, built for
  * optimization work on the trace JIT. It splits each emulated frame's CPU
  * time between a fixed set of zones (interpreter / JIT execute / JIT build /
- * geometry engine / 3D render / 2D compositor / SPU / GX present / other) and
- * -DDESMUME_BENCH's frame loop dumps the running totals to sd:/perfzones.log.
+ * geometry engine / 3D render / the GX 3D and 2D passes piece by piece / SPU /
+ * GX present / sequencer / other) and -DDESMUME_BENCH's frame loop dumps the
+ * running totals to sd:/perfzones.log. tools/benchmark/pztable.py prints them.
  *
  * Model: a single "current zone" plus one save slot per call site. pzSet(z)
  * only reads the Wii timebase when the zone actually *changes*, so a run of a
@@ -32,12 +33,39 @@ enum PerfZone {
 	PZ_ARM7_BUILD,    // jitCompileTrace() for the ARM7 cache
 	PZ_GPU_GE,        // gfx3d_execute3D() - geometry-engine command FIFO
 	PZ_GPU_RENDER,    // gpu3D->NDS_3D_Render() - software rasterizer
-	PZ_GPU_2D,        // GPU_RenderLine() x2 - 2D compositor line walk
+	PZ_GPU_2D,        // hblank 2D residual: DS Stage-0 scanline hooks (CPU lines are a_cpu/b_cpu); GBA PPU
 	PZ_SPU,           // SPU_Emulate_core()
 	PZ_DRAW,          // Draw() residual - VI present / vidmutex (convert+present split out below)
 	PZ_DMA,           // DmaController::exec() - all 8 channels (was folded into 'other')
 	PZ_DRAW_CONVERT,  // Draw() 4x4-swizzle RGB15_REVERSE of both screens + DCFlushRange
 	PZ_DRAW_PRESENT,  // draw_thread() GX present - quad draw calls / TEV / scissor
+	// Task profile / Task pzones: finer split of gpu_2d / the GX passes (every
+	// significant GX-rewrite cost is its own zone; see tools/benchmark/pztable.py).
+	PZ_2DA_CPU,       // GPU_RenderLine(Main) at hblank + Engine A lazy-flush replays
+	PZ_2DB_CPU,       // GPU_RenderLine(Sub)  at hblank + Engine B lazy-flush replays
+	PZ_2DA_GX,        // gxDsEngineARenderFrame() residual: plan, gates, band draw submission
+	PZ_2DB_GX,        // gxDsEngineBRenderFrame() residual
+	PZ_2DA_BAKE_BG,   // Engine A BG plane bakes + TLUT-only rebuilds
+	PZ_2DA_BAKE_OBJ,  // Engine A OBJ bakes + TLUT-only rebuilds
+	PZ_2DB_BAKE_BG,
+	PZ_2DB_BAKE_OBJ,
+	PZ_2D_BAKE_BD,    // backdrop bakes (both engines)
+	PZ_2D_READBACK,   // GPU_screen readback of a GX copy: lazy present resolve + eager MASTER_BRIGHT fallback
+	PZ_GX_WAIT,       // GX_DrawDone() in the compositor (GPU drain, Dolphin-timed)
+	PZ_VIDLOCK,       // LWP_MutexLock(vidmutex) wait in the compositor
+	PZ_GX3D_REC,      // gxDs3dRenderFast() recording (or unrecorded) pass
+	PZ_GX3D_REPLAY,   // gxDs3dRenderFast() display-list replay
+	PZ_GX3D_ACC,      // gxDs3dRenderAccurate()
+	PZ_GX3D_PREP,     // gxDs3dGeomFramePrepare() at VBlank end (gate + plan), textures split out
+	PZ_GX3D_TEX,      // gxDs3dPrepareTextures() texture conversion / upload
+	PZ_GX3D_GATE,     // gxDs3dGeomFrameSupported() line-191 gate
+	PZ_2DA_3DSCAN,    // gxDsA3dScan(): CPU 3D layer scan (line holes / alpha)
+	PZ_2DA_3DTEX,     // gxDsA3dEnsureTex(): the CPU 3D layer's texture bake
+	PZ_EFB_COPY,      // compositor EFB->texture copy + present-state restore
+	PZ_MBRIGHT,       // gxDsPresentMasterBright() GPU MASTER_BRIGHT pass
+	PZ_2DA_3DGEOMTEX, // gxDsA3dRenderGeomTex(): GX 3D pass drawn to a texture (a3 bake)
+	PZ_SCHED,         // NDS_exec() loop: IRQ dispatch, findNext(), hstart/hblank glue, armInnerLoop() residual
+	PZ_HOST,          // frame-loop glue outside NDS_exec()/Draw(): input, harness, bench tick
 	PZ_COUNT
 };
 
@@ -73,6 +101,13 @@ struct PzScope {
 #define PZ_CONCAT(a, b)  PZ_CONCAT_(a, b)
 #define PZ_SCOPE(z)      PzScope PZ_CONCAT(pz_scope_, __LINE__)(z)
 
+// Task profile: which kind of 3D frame this emulated frame was (bits, OR'd by the 3D code);
+// pzFrameTick() buckets each frame's zone time by it. 1 GxFast record, 2 GxFast replay,
+// 4 CPU raster ran, 8 GxAccurate pass.
+extern u32 g_pzFrameCls;
+#define PZ_SUB_SCOPE(z)  PZ_SCOPE(z)
+#define PZ_SUB_CLS(b)    (g_pzFrameCls |= (b))
+
 #else  // !DESMUME_PERFZONES
 
 static inline PerfZone pzGet(void)        { return PZ_OTHER; }
@@ -81,5 +116,10 @@ static inline void     pzFrameTick(void)  {}
 #define PZ_SCOPE(z)     ((void)0)
 
 #endif // DESMUME_PERFZONES
+
+#ifndef PZ_SUB_SCOPE
+#define PZ_SUB_SCOPE(z)  ((void)0)
+#define PZ_SUB_CLS(b)    ((void)0)
+#endif
 
 #endif // DESMUME_PERF_ZONES_H

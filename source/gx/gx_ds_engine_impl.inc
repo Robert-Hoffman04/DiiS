@@ -1091,6 +1091,7 @@ static void gxDsLzFlush(int why)
 	s_lzFlushing = true;
 	{
 		PZ_SCOPE(PZ_GPU_2D);
+		PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_CPU : PZ_2DB_CPU);
 		const int n = s_lzSeen - s_lzRendered;
 #ifdef DSLZ_STATS
 		if (why == 0) s_lzStFlushRegLines += n; else if (why == 1) s_lzStFlushDataLines += n;
@@ -3264,6 +3265,7 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 #ifdef DSB_STATS
 				const u64 t0 = gettime();
 #endif
+				PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_BG : PZ_2DB_BAKE_BG);
 				gxDsBRebuildBgTlut(pc, gxDsBBgSlotFor(bg));
 #ifdef DSB_STATS
 				s_dsbTlutOnlyTicks += gettime() - t0;
@@ -3297,6 +3299,7 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 #ifdef DSB_STATS
 	const u64 t0 = gettime();
 #endif
+	PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_BG : PZ_2DB_BAKE_BG);
 	if (affine) gxDsBBakeAffineBgPlane(bg, pc);
 	else gxDsBBakeBgPlane(bg, pc);
 #ifdef DSB_STATS
@@ -3331,6 +3334,7 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 #ifdef DSB_STATS
 				const u64 t0 = gettime();
 #endif
+				PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_OBJ : PZ_2DB_BAKE_OBJ);
 				gxDsBRebuildObjTlut(slot, gxDsBObjSlotFor());
 #ifdef DSB_STATS
 				s_dsbTlutOnlyTicks += gettime() - t0;
@@ -3362,6 +3366,7 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 #ifdef DSB_STATS
 	const u64 t0 = gettime();
 #endif
+	PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_OBJ : PZ_2DB_BAKE_OBJ);
 	gxDsBBakeObjTexture(d, slot);
 #ifdef DSB_STATS
 	s_dsbBakeTicks += gettime() - t0;
@@ -3463,7 +3468,7 @@ static void gxDsA3dRenderGeomTex()
 	s_tevK = -1;
 	gxDsA3dDrawBand(s_3d, 0, 0, k3dH);
 	gxDsA3dGeomDraw();
-	GX_DrawDone();
+	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
@@ -3484,7 +3489,7 @@ static void gxDsA3dRenderGeomTex()
 		DCFlushRange(s_3dScratch, cb);   // no dirty bake line may be written back over the copy
 		GX_CopyTex(s_3dScratch, GX_FALSE);   // the bands' backdrop quads repaint every pixel
 		GX_PixModeSync();
-		GX_DrawDone();
+		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
 		DCInvalidateRange(s_3dScratch, cb);
 		memcpy(s_3dGx.texData, s_3dScratch, cb);
 		DCFlushRange(s_3dGx.texData, cb);
@@ -3685,7 +3690,9 @@ static bool gxDsBRenderFrameImpl()
 	// geometry pass draws scans a clear-colour layer and never runs the deferred raster.
 	bool geomPass = false, geomOverlay = false;
 	s_3dTexMode = false;
-	if (any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported()) {
+	bool pzGate;
+	{ PZ_SUB_SCOPE(PZ_GX3D_GATE); pzGate = any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported(); }
+	if (pzGate) {
 		geomOverlay = gxDsA3dOverlaySafe(bandCount);
 		// Not frontmost/untargeted: the pass is drawn to a texture in BG0's slot instead
 		// (gxDsA3dRenderGeomTex), unless the plan below needs what only s_3d can give.
@@ -3698,8 +3705,13 @@ static bool gxDsBRenderFrameImpl()
 		// GxFast only (the raster is only ever deferred in GxFast; the mode check covers a switch since).
 		// A frame with translucent polygons (GxFast) always takes the clear-only layer: the GX pass
 		// blends them over it, and a raster resolved early (e.g. a bail's GetLineData) has them in already.
-		if (any3dBand && !gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
-		                             (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()))) { DSB_WHY("3dscan"); return false; }
+		bool pzScanOk;
+		{
+			PZ_SUB_SCOPE(PZ_2DA_3DSCAN);
+			pzScanOk = !any3dBand || gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
+			                                     (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()));
+		}
+		if (!pzScanOk) { DSB_WHY("3dscan"); return false; }
 #endif
 		fadeBgAny = fadeObjAny = 0; fade3dAny = false; fadeMode = fadeLvl = 0;
 		bool texModeOk = true;
@@ -3765,13 +3777,16 @@ static bool gxDsBRenderFrameImpl()
 	}
 #endif
 
-	for (int b = 0; b < bandCount; ++b)
+	for (int b = 0; b < bandCount; ++b) {
+		PZ_SUB_SCOPE(PZ_2D_BAKE_BD);
 		gxDsBBakeBackdrop(b, s_bandPlan[b].backdropFade ? s_bandPlan[b].mode : 0, s_bandPlan[b].evy);
+	}
 
 #if GXDS_CORE == 0
 	// Task 13: the 3D layer's textures (see gxDsA3dEnsureTex). Not dirty-gated against 2D VRAM
 	// (it reads none); a stale variant (unused this frame) is simply re-keyed on its next use.
 	if (any3dBand) {
+		PZ_SUB_SCOPE(PZ_2DA_3DTEX);
 		gxDsA3dEnsureTex(s_3d, 0, 0);
 		if (fade3dAny) gxDsA3dEnsureTex(s_3dFx, fadeMode, fadeLvl);
 	}
@@ -3808,7 +3823,7 @@ static bool gxDsBRenderFrameImpl()
 	// from the video thread and is already serialized against Draw() by this
 	// mutex; taking it here extends that same contract to cover Engine B's
 	// composite pass rather than inventing a new one.
-	LWP_MutexLock(vidmutex);
+	{ PZ_SUB_SCOPE(PZ_VIDLOCK); LWP_MutexLock(vidmutex); }
 
 	gxDsBSetup2DState();
 	gxDsBTlutReset();   // task 11: assume nothing about TMEM's TLUT contents from an earlier frame / another engine
@@ -3817,7 +3832,7 @@ static bool gxDsBRenderFrameImpl()
 	s_3dMaskBand = -1; s_3dMaskCfg = -1;   // task 13d: this frame's mask cache is empty
 #endif
 #if GXDS_CORE == 0
-	if (s_3dTexMode) gxDsA3dRenderGeomTex();   // the pass first, as BG0's texture (s_3dGx)
+	if (s_3dTexMode) { PZ_SUB_SCOPE(PZ_2DA_3DGEOMTEX); gxDsA3dRenderGeomTex(); }   // the pass first, as BG0's texture (s_3dGx)
 #endif
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
@@ -3860,7 +3875,7 @@ static bool gxDsBRenderFrameImpl()
 		gxDsA3dGeomDraw();
 #ifdef DSA_GXGEOM_DEBUGWHY
 		{
-			GX_DrawDone();
+			{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
 			GXColor peek;
 			GX_PeekARGB(132, 107, &peek);
 			harness_profile_emitf("gxds3dPEEK (132,107) argb=%d,%d,%d,%d", peek.a, peek.r, peek.g, peek.b);
@@ -3884,7 +3899,7 @@ static bool gxDsBRenderFrameImpl()
 	if (gxRenderModeIsFast())
 		gxDsA3dStampOpaqueAlpha();
 #endif
-	GX_DrawDone();
+	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
 	// Deflicker OFF for this copy. main.cpp's InitVideo() leaves
 	// GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE,
 	// rmode->vfilter) in force for the TV present; that vertical filter
@@ -3916,6 +3931,7 @@ static bool gxDsBRenderFrameImpl()
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
 	// Task directpresent: a GPU_screen slot may still point at last frame's copy (e.g. the
 	// other slot after a screen swap); read it back before the copy below overwrites it.
+	PZ_SUB_SCOPE(PZ_EFB_COPY);   // to the end of the function; the readbacks below re-zone themselves
 	gxDsPresentReleaseBuffer(s_copyBackBuf);
 	// clear=GX_TRUE (task 12): wipe the 256x192 EFB corner just drawn into so it
 	// does not ghost under draw_thread's present (visible in the live window).
@@ -3946,6 +3962,7 @@ static bool gxDsBRenderFrameImpl()
 	} else
 #endif
 	{
+	PZ_SUB_SCOPE(PZ_2D_READBACK);
 	g_gxDsPresentPending[slot] = NULL;
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);

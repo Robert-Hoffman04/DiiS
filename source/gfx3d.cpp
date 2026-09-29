@@ -1951,7 +1951,7 @@ void gfx3d_ensureRendered(){
 	++s_rsResolved;
 #endif
 	gfx3d_rasterLatchSwap();   // the values the eager raster would have read at VBlank end
-	{ PZ_SCOPE(PZ_GPU_RENDER); gpu3D->NDS_3D_Render(); }
+	{ PZ_SCOPE(PZ_GPU_RENDER); PZ_SUB_CLS(4); gpu3D->NDS_3D_Render(); }
 	gfx3d_rasterLatchSwap();   // and back to the live registers
 }
 
@@ -2015,7 +2015,7 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 		return;
 	}
 
-	{ PZ_SCOPE(PZ_GPU_RENDER); gpu3D->NDS_3D_Render(); }
+	{ PZ_SCOPE(PZ_GPU_RENDER); PZ_SUB_CLS(4); gpu3D->NDS_3D_Render(); }
 }
 
 //#define _3D_LOG

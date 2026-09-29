@@ -3,6 +3,7 @@
 #include "../GPU.h"
 #include <gccore.h>
 #include <malloc.h>
+#include "../perf_zones.h"   // Task pzones: mbright / readback zones (no-op otherwise)
 
 const void *g_gxDsPresentPending[2] = { NULL, NULL };
 
@@ -79,6 +80,7 @@ static bool gxDsPresentMbInit()
 
 bool gxDsPresentMasterBright(const u8 *mode, const u8 *fac)
 {
+	PZ_SCOPE(PZ_MBRIGHT);
 	if (!gxDsPresentMbInit()) return false;
 	static const u32 kCopyFmt[3] = { GX_CTF_R8, GX_CTF_G8, GX_CTF_B8 };
 	GX_SetTexCopySrc(0, 0, kW, kH);
@@ -138,6 +140,7 @@ bool gxDsPresentMasterBright(const u8 *mode, const u8 *fac)
 // into one pass over the 4x4 RGB5A3 tiles; same per-pixel result.
 void gxDsPresentResolveSlotImpl(int slot)
 {
+	PZ_SCOPE(PZ_2D_READBACK);
 	const u16 *src = (const u16 *)g_gxDsPresentPending[slot];
 	g_gxDsPresentPending[slot] = NULL;
 	DCInvalidateRange((void *)src, kW * kH * 2);

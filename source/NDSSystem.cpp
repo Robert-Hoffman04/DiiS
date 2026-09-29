@@ -1425,7 +1425,7 @@ static void execHardware_hblank()
 			// gx_ds_engine_impl.inc), so the late render is byte-identical to this one.
 			const bool deferA = !skip2d && gxDsEngineAScanline(nds.VCount);
 			if (!deferA)
-				GPU_RenderLine(&MainScreen, nds.VCount, skip2d);
+				{ PZ_SUB_SCOPE(PZ_2DA_CPU); GPU_RenderLine(&MainScreen, nds.VCount, skip2d); }
 			// gx-next-steps-log.md task 7: Stage 0 for DS Engine B. Sampled
 			// here, immediately before this scanline's Engine-B CPU render,
 			// so the layout state it records is exactly the state that
@@ -1435,7 +1435,7 @@ static void execHardware_hblank()
 			// to the (equally skipped) CPU result.
 			const bool deferB = !skip2d && gxDsEngineBScanline(nds.VCount);
 			if (!deferB)
-				GPU_RenderLine(&SubScreen, nds.VCount, skip2d);
+				{ PZ_SUB_SCOPE(PZ_2DB_CPU); GPU_RenderLine(&SubScreen, nds.VCount, skip2d); }
 			// The DS analogue of gbaPpuEndFrame()'s gxGbaRenderFrame() call:
 			// Engine B's frame is complete once its last visible scanline has
 			// been rendered, and every register/VRAM/OAM write this frame has
@@ -1446,8 +1446,8 @@ static void execHardware_hblank()
 			// vidmutex, ending with the EFB clear + GxRestorePresentState()), then
 			// Engine B's; the two never overlap in the FIFO.
 			if (nds.VCount == 191) {
-				gxDsEngineARenderFrame();
-				gxDsEngineBRenderFrame();
+				{ PZ_SUB_SCOPE(PZ_2DA_GX); gxDsEngineARenderFrame(); }
+				{ PZ_SUB_SCOPE(PZ_2DB_GX); gxDsEngineBRenderFrame(); }
 #ifdef DSHEAP_STATS
 				{ static u32 s_heapFrame; if ((++s_heapFrame % 60) == 0) dsHeapStats("frame"); }
 #endif
@@ -2173,6 +2173,10 @@ void NDS_exec(s32 nb)
 			//it should be begin to execute execHardware in the next frame,
 			//since there won't be anything for it to do (everything should be scheduled in the future)
 
+			// Task pzones: IRQ dispatch, event scheduling, the hstart/hblank glue and armInnerLoop()'s
+			// own interleave (the cores / GPU / SPU re-zone themselves). A plain pzSet, not a scope:
+			// no extra switch per event.
+			pzSet(PZ_SCHED);
 			execHardware_interrupts();
 
 			//find next work unit:
@@ -2220,6 +2224,8 @@ void NDS_exec(s32 nb)
 	}
 
 	//DEBUG_statistics.printSequencerExecutionCounters();
+
+	pzSet(PZ_OTHER);   // Task pzones: the frame-end housekeeping below is 'other' again
 
 	//end of frame emulation housekeeping
 	if(LagFrameFlag)

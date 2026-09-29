@@ -1641,6 +1641,7 @@ void DSExec(){
 	if (!SkipFrameTracker) { PZ_SCOPE(PZ_DRAW); Draw(); } // only update when !Frame skip tracker
 #endif
 	pzFrameTick();
+	pzSet(PZ_HOST);   // Task pzones: loop glue until the next NDS_exec() re-anchors to PZ_OTHER
 
 #ifdef DESMUME_GBA_IRQ_SOAK
 	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.

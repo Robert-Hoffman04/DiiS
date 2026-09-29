@@ -56,6 +56,10 @@ static const char* k_name[PZ_COUNT] = {
 	"gpu_ge", "gpu_render", "gpu_2d",
 	"spu", "draw",
 	"dma", "draw_convert", "draw_present",
+	"a_cpu", "b_cpu", "a_gx", "b_gx", "a_bakebg", "a_bakeobj", "b_bakebg", "b_bakeobj", "bakebd",
+	"readback", "gxwait", "vidlock", "g3rec", "g3replay", "g3acc", "g3prep", "g3tex",
+	"g3gate", "a_3dscan", "a_3dtex",
+	"efb_copy", "mbright", "a_3dgeomtex", "sched", "host",
 };
 const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 
@@ -124,7 +128,7 @@ static void pz_emit_percentiles(u32 frame)
 
 static void pz_emit_header(void)
 {
-	char line[512];
+	char line[2048];
 	int n = snprintf(line, sizeof(line),
 		"# desmumewii perfzones  block=%d\nframe,wall_us", DESMUME_PERFZONES_BLOCK);
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
@@ -139,7 +143,7 @@ static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_
 	u64 wall_us = 0;
 	for (int i = 0; i < PZ_COUNT; i++) wall_us += ticks_to_microsecs(acc_ticks[i]);
 
-	char line[512];
+	char line[2048];
 	int n = snprintf(line, sizeof(line), "%u,%llu", frame, (unsigned long long)wall_us);
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
 		n += snprintf(line + n, sizeof(line) - n, ",%llu",
@@ -183,6 +187,35 @@ static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_
 
 #endif
 
+// Task profile: per-frame-class zone totals for the block just ended, emitted with the block's
+// CSV row as "pzcls frame=<f> cls=<bits> n=<frames> wall=<us> <zone>=<us>..." (totals, not means).
+u32 g_pzFrameCls;
+static u64 s_clsUs[16][PZ_COUNT];
+static u64 s_clsWall[16];
+static u32 s_clsN[16];
+static void pz_cls_add(u32 frame, const u64 t[PZ_COUNT], u64 frame_us)
+{
+	const u32 c = g_pzFrameCls & 15;
+	g_pzFrameCls = 0;
+	(void)frame;
+	for (int i = 0; i < PZ_COUNT; i++) s_clsUs[c][i] += ticks_to_microsecs(t[i]);
+	s_clsWall[c] += frame_us;
+	++s_clsN[c];
+}
+static void pz_cls_emit(u32 frame)
+{
+	for (int c = 0; c < 16; c++) {
+		if (!s_clsN[c]) continue;
+		char line[1600];
+		int n = snprintf(line, sizeof(line), "pzcls frame=%u cls=%d n=%u wall=%llu", frame, c, s_clsN[c], (unsigned long long)s_clsWall[c]);
+		for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
+			n += snprintf(line + n, sizeof(line) - n, " %s=%llu", pzName(i), (unsigned long long)s_clsUs[c][i]);
+		harness_profile_emit(line);
+		for (int i = 0; i < PZ_COUNT; i++) s_clsUs[c][i] = 0;
+		s_clsWall[c] = 0; s_clsN[c] = 0;
+	}
+}
+
 void pzFrameTick(void)
 {
 	static bool started = false;
@@ -208,11 +241,13 @@ void pzFrameTick(void)
 			frame_us += ticks_to_microsecs(t[i]);
 		}
 		pz_ft_push((u32)frame_us);   // §3.3b
+		pz_cls_add(frame, t, frame_us);
 	}
 
 	if (frame % DESMUME_PERFZONES_BLOCK == 0) {
 		pz_emit_row(frame, acc_ticks, acc_hits);
 		pz_emit_percentiles(frame);   // §3.3b
+		pz_cls_emit(frame);
 #if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT_ARM7)
 		jitCoreCostEmit(frame);       // -DJIT_CORE_COST_HISTO per-core dispatch accounting
 #endif
