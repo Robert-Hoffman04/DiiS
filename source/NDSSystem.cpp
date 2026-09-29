@@ -48,6 +48,7 @@
 #include "GPU.h"
 #include "gx/gx_ds_engineb_render.h"
 #include "gx/gx_ds_enginea_render.h"
+#include "gx/gx_ds_present.h"
 #include "firmware.h"
 #include "path.h"
 #ifdef DESMUME_JIT_ARM7
@@ -766,6 +767,7 @@ int NDS_WritePNG(const char *fname)
 	int height=192*2;
 	u16 * bmp = (u16 *)GPU_screen;
 	FILE *pp=NULL;
+	gxDsPresentResolveAll(); // Task directpresent
 	uint8 *compmem = NULL;
 	uLongf compmemsize = (uLongf)( (height * (width + 1) * 3 * 1.001 + 1) + 12 );
 
@@ -1455,6 +1457,7 @@ static void execHardware_hblank()
 				{
 					static u32 s_fcrcFrame;
 					u32 h = 2166136261u;
+					gxDsPresentResolveAll(); // Task directpresent
 					const u16 *px = (const u16 *)GPU_screen;
 					for (u32 i = 0; i < sizeof(GPU_screen) / 2; ++i) h = (h ^ (u32)(px[i] & 0x7FFF)) * 16777619u;
 					harness_profile_emitf("fcrc %u %08x", (unsigned)s_fcrcFrame++, (unsigned)h);

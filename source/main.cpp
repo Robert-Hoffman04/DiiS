@@ -48,6 +48,7 @@
 #include "harness/harness.h"
 #include "gx/gx_gba_render.h"
 #include "gx/gx_rendermode.h"
+#include "gx/gx_ds_present.h"
 
 #ifdef DESMUME_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
@@ -170,6 +171,12 @@ static GXTexObj GbaTopTex;
 // no new lock, no new race, just one more mutex-protected word alongside
 // data that mutex was already guarding.
 static bool GbaUseDirectTopTex = false;
+
+// Task directpresent (gx_ds_present.h): set by Draw() under vidmutex when a DS engine's
+// GX_CopyTex output is still the current content of that screen; draw_thread then binds
+// DsDirectTex[screen] (pointing at the copy buffer) instead of TopTex/BottomTex.
+static GXTexObj DsDirectTex[2];
+static bool DsUseDirectTex[2] = { false, false };
 
 // TODO: Make this fancier
 static u16 CursorData[16] __attribute__((aligned(32))) = {
@@ -677,7 +684,16 @@ static void Draw(void) {
 	// vidmutex-protected flag to choose GbaTopTex over TopTex.
 	GbaUseDirectTopTex = gameInfo.isGBA && gxGbaBlitNativeTop(GbaTopScreen);
 
-	if (!GbaUseDirectTopTex) {
+	// Task directpresent: a GX-handled DS screen whose readback was deferred is presented
+	// straight from its engine's tiled RGB5A3 copy (bit-identical to what the conversion
+	// below would produce from the deferred readback); see gx_ds_present.h.
+	for (int s = 0; s < 2; ++s) {
+		DsUseDirectTex[s] = !gameInfo.isGBA && g_gxDsPresentPending[s] != NULL;
+		if (DsUseDirectTex[s])
+			GX_InitTexObj(&DsDirectTex[s], (void *)g_gxDsPresentPending[s], 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	}
+
+	if (!GbaUseDirectTopTex && !DsUseDirectTex[0]) {
 		u16 *dTop = TopScreen;
 		for (int y = 0; y < 48; y++) {
 			for (int h = 0; h < 4; h++) {
@@ -694,6 +710,7 @@ static void Draw(void) {
 		DCFlushRange(TopScreen, 256*192*2);
 	}
 
+	if (!DsUseDirectTex[1]) {
 	for (int y = 0; y < 48; y++) {
 		for (int h = 0; h < 4; h++) {
 			for (int x = 0; x < 64; x++) {
@@ -707,6 +724,7 @@ static void Draw(void) {
 		dBottom+=1008;       // next row
 	}
 	DCFlushRange(BottomScreen, 256*192*2);
+	}
 
 	if (GbaUseDirectTopTex)
 		DCFlushRange(GbaTopScreen, 256*192*2);
@@ -839,7 +857,7 @@ static void *draw_thread(void*){
 			// before draw_thread could observe it (Draw() runs on the
 			// emulation thread and always unlocks vidmutex before
 			// draw_thread's next lock can succeed) -- see Draw()'s comment.
-			GX_LoadTexObj(GbaUseDirectTopTex ? &GbaTopTex : &TopTex, GX_TEXMAP0);
+			GX_LoadTexObj(GbaUseDirectTopTex ? &GbaTopTex : DsUseDirectTex[0] ? &DsDirectTex[0] : &TopTex, GX_TEXMAP0);
 			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 				GX_Position2f32(topX, topY);
 				GX_TexCoord2f32(0, 0);
@@ -855,7 +873,7 @@ static void *draw_thread(void*){
 		// BOTTOM SCREEN
 		if (screen_layout != SCREEN_MAIN_NORMAL && (screen_layout != SCREEN_MAIN_STRETCH)){
 			GXDBG_MAIN("draw_thread: bottom screen quad start");
-			GX_LoadTexObj(&BottomTex, GX_TEXMAP0);
+			GX_LoadTexObj(DsUseDirectTex[1] ? &DsDirectTex[1] : &BottomTex, GX_TEXMAP0);
 			GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 				GX_Position2f32(bottomX, bottomY);
 				GX_TexCoord2f32(0, 0);
@@ -1892,6 +1910,7 @@ void DSExec(){
 		static bool _fbhave = false;
 		++_fbframe;
 		if (_fbframe == DESMUME_FBDUMP_FRAME) {
+			gxDsPresentResolveAll(); // Task directpresent
 			memcpy(_fbsnap, GPU_screen, sizeof(_fbsnap));
 			_fbhave = true;
 		}

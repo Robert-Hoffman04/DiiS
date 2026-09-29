@@ -29,6 +29,7 @@
 #include "MMU.h"
 #include "GPU.h"
 #include "perf_zones.h"
+#include "gx/gx_ds_present.h"
 
 // Diagnostic log for the DISPCAPCNT display-capture path + per-engine
 // DisplayMode, used to confirm/deny whether a game's dual-3D-screen trick
@@ -1892,6 +1893,7 @@ int Screen_Init(int coreid)
 	MainScreen.gpu = GPU_Init(0);
 	SubScreen.gpu = GPU_Init(1);
 
+	gxDsPresentDropAll(); // Task directpresent
 	memset(GPU_screen, 0, sizeof(GPU_screen));
 	//				width*height* two screens
 	for(int i = 0; i < (256*192*2); i++)
@@ -1909,6 +1911,7 @@ void Screen_Reset(void)
 	GPU_Reset(MainScreen.gpu, 0);
 	GPU_Reset(SubScreen.gpu, 1);
 
+	gxDsPresentDropAll(); // Task directpresent
 	memset(GPU_screen, 0, sizeof(GPU_screen));
 	for(int i = 0; i < (256*192*2); i++)
 		((u16*)GPU_screen)[i] = 0x7FFF;
@@ -2727,6 +2730,10 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 		return;
 	}
 
+	// Task directpresent: this line is about to be (re)written or faded in place; bring the
+	// slot's GPU_screen up to date first if it is still only in a GX copy buffer.
+	gxDsPresentResolveOffset(screen->offset);
+
 	//blacken the screen if it is turned off by the user
 	if(!CommonSettings.showGpu.screens[gpu->core])
 	{
@@ -2901,6 +2908,7 @@ void gpu_savestate(EMUFILE* os)
 	//version
 	write32le(1,os);
 	
+	gxDsPresentResolveAll(); // Task directpresent
 	os->fwrite((char*)GPU_screen,sizeof(GPU_screen));
 	
 	write32le(MainScreen.gpu->affineInfo[0].x,os);
@@ -2932,6 +2940,7 @@ bool gpu_loadstate(EMUFILE* is, int size)
 
 	if(version<0||version>1) return false;
 
+	gxDsPresentDropAll(); // Task directpresent: GPU_screen replaced wholesale
 	is->fread((char*)GPU_screen,sizeof(GPU_screen));
 
 	if(version==1)

@@ -9,6 +9,7 @@
 
 #include "harness_wire.h"
 #include "../GPU.h"
+#include "../gx/gx_ds_present.h"
 
 #include <ogc/lwp_watchdog.h>   // gettime()
 #include <stdlib.h>
@@ -78,6 +79,7 @@ void harness_frame_capture(const char *label)
 	// GPU_screen is native-endian u16, layout X-B5-G5-R5 (the software/GX
 	// output the RGB15_REVERSE() present path consumes). Repack to RGB565 and
 	// emit little-endian bytes - wii_control.py reads RGB565 low-byte-first.
+	gxDsPresentResolveAll(); // Task directpresent: GPU_screen may still be in a GX copy buffer
 	const u16 *src = (const u16 *)GPU_screen;
 	for (u32 i = 0; i < FRAME_PIX; i++) {
 		u16 px = src[i];

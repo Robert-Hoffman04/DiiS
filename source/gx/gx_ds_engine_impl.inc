@@ -30,6 +30,7 @@
 #include "../gfx3d.h"    // gfx3d_convertedScreen / g_gfx3dRenderSeq (Engine A's 3D layer input)
 #include "gx_ds_3d_render.h"   // task 13e: GX geometry pass
 #endif
+#include "gx_ds_present.h"     // Task directpresent
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
 #include <gccore.h>
@@ -3888,6 +3889,9 @@ static bool gxDsBRenderFrameImpl()
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
+	// Task directpresent: a GPU_screen slot may still point at last frame's copy (e.g. the
+	// other slot after a screen swap); read it back before the copy below overwrites it.
+	gxDsPresentReleaseBuffer(s_copyBackBuf);
 	// clear=GX_TRUE (task 12): wipe the 256x192 EFB corner just drawn into so it
 	// does not ghost under draw_thread's present (visible in the live window).
 	GX_CopyTex(s_copyBackBuf, GX_TRUE);
@@ -3900,17 +3904,31 @@ static bool gxDsBRenderFrameImpl()
 
 	LWP_MutexUnlock(vidmutex);
 
-	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
-	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);
-
 	// Readback + MASTER_BRIGHT. GPU_RenderLine_MasterBrightness() runs on the
 	// finished 15-bit line, so applying the same per-channel tables here (with the
 	// per-line mode/factor sampled by Stage 0) is exact -- no GX pass, no rounding.
+	// Task directpresent: without MASTER_BRIGHT and with an all-opaque copy, the
+	// readback is deferred (gx_ds_present.h): Draw() presents s_copyBackBuf as is and
+	// GPU_screen is converted only if something reads it. The old eager path stays for
+	// MASTER_BRIGHT frames (CPU-exact), non-opaque copies and the in-process A/B.
+	bool anyMb = false;
+	for (int y = 0; y < kDsBScreenH; ++y)
+		if (s_mbMode[y] != 0 && s_mbFac[y] != 0) { anyMb = true; break; }
+	const int slot = GXDS_SCREEN.offset ? 1 : 0;
 	u16 *dst = (u16 *)(GPU_screen + (u32)GXDS_SCREEN.offset * 512);
+#ifndef DSB_ABCMP
+	if (!anyMb && gxDsPresentAllOpaque(s_copyBackBuf)) {
+		gxDsPresentSet(slot, s_copyBackBuf);
+	} else
+#endif
+	{
+	g_gxDsPresentPending[slot] = NULL;
+	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
+	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);
+
 #ifdef DSB_ABCMP
 	memcpy(s_abCpu, dst, sizeof(s_abCpu));
 #endif
-	bool anyMb = false;
 	for (int y = 0; y < kDsBScreenH; ++y) {
 		const u16 *src = s_copyBackLinear + (u32)y * kDsBScreenW;
 		u16 *out = dst + (u32)y * kDsBScreenW;
@@ -3920,7 +3938,6 @@ static bool gxDsBRenderFrameImpl()
 				out[x] = gxDsBRgb5a3ToNds(src[x]);
 			continue;
 		}
-		anyMb = true;
 		if (fac == 16) {
 			const u16 v = (mode == 1) ? 0x7FFF : 0;
 			for (int x = 0; x < kDsBScreenW; ++x) out[x] = v;
@@ -3928,6 +3945,7 @@ static bool gxDsBRenderFrameImpl()
 		}
 		for (int x = 0; x < kDsBScreenW; ++x)
 			out[x] = gxDsBFadeColor(gxDsBRgb5a3ToNds(src[x]) & 0x7FFF, mode + 1 /* 1->2 up, 2->3 down */, fac);
+	}
 	}
 
 #ifdef DSB_ABCMP
