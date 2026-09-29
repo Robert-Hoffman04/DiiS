@@ -528,25 +528,24 @@ void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
 	*p++ = PPC_LWZ(PPC_R3, 1, 92);
 }
 
-// Under GPR + flag residency there is no compile-time dirty bookkeeping to
-// protect: emitInterpreterBail emits no state flush of its own (the trampoline's
-// single landing pad owns that), so a runtime bail on a guarded fast path leaves
-// the fall-through's compile-time model untouched. Kept as a named wrapper so
-// the call sites still read intentionally.
-static void bailPreservingDirty(JitTraceCtx& ctx, u32 metaCount)
-{
-	ctx.emitInterpreterBail(metaCount);
-}
-
 // P14/P15 shared: guard EA (PPC_R12) against the cached-descriptor page window,
-// optionally also that EA + spanBytes stays in the same 1 MB page, bail to the
-// interpreter (at currentPC) on a miss, then resolve the descriptor. On return
-// PPC_R10 = hostBase and PPC_R11 = (EA & mask) with the low bits cleared to
-// `alignMe` (29 => &~3, 30 => &~1, 31 => no clear). EA stays in PPC_R12.
-// Clobbers r10, r11.
-void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
+// optionally also that EA + spanBytes stays in the same 1 MB page, then resolve
+// the descriptor. On the fall-through (hit) PPC_R10 = hostBase and PPC_R11 =
+// (EA & mask) with the low bits cleared to `alignMe` (29 => &~3, 30 => &~1,
+// 31 => no clear). EA stays in PPC_R12. Clobbers r10, r11.
+//
+// PERF_LOG Step 3: a miss no longer bails to the interpreter. Each miss test
+// is a forward conditional branch whose target is left open: the placeholder
+// word already carries the branch condition (BGT for "page outside the window",
+// BNE for "run straddles a 1 MB page") with a zero displacement, and the
+// caller ORs the real displacement in (patchMissSlots) once it has emitted its
+// slowRead C path -- the same "miss falls to a slow C call, no round trip"
+// shape as the ARM9 P16 guard. Returns the number of slots written (1 or 2)
+// into missSlots[].
+int JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots)
 {
 	u32*& p = emitPtr;
+	int nMiss = 0;
 	const u32 lo   = cpu.pageDescLo;
 	const u32 span = cpu.pageDescHi - cpu.pageDescLo;
 
@@ -554,11 +553,8 @@ void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
 	*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
 	*p++ = PPC_ADDI(PPC_R10, PPC_R10, -(s32)lo);        // page - lo
 	*p++ = PPC_CMPLI(0, PPC_R10, span);                 // unsigned > span => out of window
-	{
-		u32* inRange = p++;
-		bailPreservingDirty(*this, instrCount);
-		*inRange = PPC_BLE((u32)((p - inRange) * 4));
-	}
+	missSlots[nMiss++] = p;
+	*p++ = PPC_BGT(0);                                  // -> caller's slow path
 
 	// whole run in one 1 MB page: (EA + spanBytes) >> 20 == EA >> 20
 	if (spanBytes) {
@@ -566,9 +562,8 @@ void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
 		*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
 		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);          // reload page (r10 was page-lo)
 		*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
-		u32* samePage = p++;
-		bailPreservingDirty(*this, instrCount);
-		*samePage = PPC_BEQ((u32)((p - samePage) * 4));
+		missSlots[nMiss++] = p;
+		*p++ = PPC_BNE(0);                              // -> caller's slow path
 		*p++ = PPC_ADDI(PPC_R10, PPC_R10, -(s32)lo);    // back to page - lo
 	}
 
@@ -585,6 +580,15 @@ void JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe)
 	*p++ = PPC_LWZ(PPC_R11, PPC_R11, 4);                // mask
 	*p++ = PPC_AND(PPC_R11, PPC_R12, PPC_R11);          // EA & mask (unaligned)
 	if (alignMe < 31) *p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, alignMe);
+	return nMiss;
+}
+
+// Point every emitPageResolve miss branch at `target` (the caller's slow path).
+// Each placeholder already holds its condition with a zero displacement.
+static void patchMissSlots(u32* const* missSlots, int nMiss, const u32* target)
+{
+	for (int i = 0; i < nMiss; i++)
+		*missSlots[i] |= (u32)((target - missSlots[i]) * 4) & 0xFFFC;
 }
 
 // P16: ARM9 two-region inline guard. See jit_trace.h. EA in PPC_R12.
@@ -724,16 +728,19 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	if (!cpu.pageDescBase) return false;
 	u32*& p = emitPtr;
 
-	emitPageResolve(/*spanBytes=*/0, size == 4 ? 29 : size == 2 ? 30 : 31);
+	u32* miss[2];
+	const int nMiss = emitPageResolve(/*spanBytes=*/0, size == 4 ? 29 : size == 2 ? 30 : 31, miss);
 
-	// destination host reg allocated *after* the guard so a bail never dirties rd
+	// Guest registers are pinned (writeReg just names the fixed host slot), so
+	// the fast and slow paths below both commit into this one register.
 	const u8 hDst = writeReg(rd, /*fullOverwrite=*/true, lockedMask);
 
+	// ---- fast: descriptor hit, inline load ----
 	if (size == 4) {
 		*p++ = PPC_LWBRX(hDst, PPC_R10, PPC_R11);
-		// ARM OP_LDR rotates an unaligned word: ROR(word, 8 * (EA & 3)). THUMB's
-		// load paths in DeSmuME do not (jit_thumb.cpp's slow path skips it), so
-		// the caller passes wordRotate to match its own slow path exactly.
+		// ARM OP_LDR rotates an unaligned word: ROR(word, 8 * (EA & 3)). The
+		// caller passes wordRotate to match its own slow path exactly (THUMB
+		// PC/SP-relative loads have a word-aligned EA and pass false).
 		if (wordRotate) {
 			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31); // x = EA & 3
 			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);         // 4 - x
@@ -747,6 +754,33 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 		*p++ = PPC_LBZX(hDst, PPC_R10, PPC_R11);
 		if (signExt) *p++ = PPC_EXTSB(hDst, hDst);
 	}
+	u32* toEnd = p++;                                   // B over the slow path
+
+	// ---- slow (PERF_LOG Step 3): EA outside the RAM page window -- I/O,
+	// VRAM, BIOS, GBA slot, open bus. Do the access in place through the
+	// profile's slowRead C call and keep running the block; this used to end
+	// the whole chain with an interpreter bail that re-ran the instruction.
+	// Same semantics as emitLoadStoreTail's slow tail: sign-extend inside
+	// emitSlowLoad, then the unaligned-word ROR from the stashed EA. Any base
+	// writeback is committed by the caller after we return, and rd == rn with
+	// writeback never reaches this helper (the caller keeps that form on its
+	// own slow tail), so the ordering is unchanged. Clobbers r10..r12, as the
+	// helper's contract already allows.
+	patchMissSlots(miss, nMiss, p);
+	*p++ = PPC_STW(PPC_R12, 1, 96);                     // stash EA across the call
+	emitMemPrologue();
+	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
+	if (wordRotate) {                                   // ROR(R10, 8 * (EA & 3))
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
+		*p++ = PPC_SUBFIC(PPC_R12, PPC_R12, 4);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
+		*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+	}
+	emitMemEpilogue();
+	*p++ = PPC_OR(hDst, PPC_R10, PPC_R10);
+
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	return true;
 }
 
@@ -794,16 +828,43 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	if (!cpu.pageDescBase) return false;
 	u32*& p = emitPtr;
 
-	emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29);   // LDM: no unaligned rotate
+	u32* miss[2];
+	const int nMiss = emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29, miss);   // LDM: no unaligned rotate
 
-	// r10 = hostBase, r11 = aligned page offset of the low word. Walk ascending;
-	// each destination host reg is allocated here (after the guard) so a bail
-	// never dirties them.
+	// ---- fast: r10 = hostBase, r11 = aligned page offset of the low word ----
 	for (u32 k = 0; k < n; k++) {
 		const u8 hgi = writeReg(regs[k], /*fullOverwrite=*/true, lockedMask);
 		*p++ = PPC_LWBRX(hgi, PPC_R10, PPC_R11);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R11, PPC_R11, 4);
 	}
+	u32* toEnd = p++;                                   // B over the slow path
+
+	// ---- slow (PERF_LOG Step 3): the run is outside the RAM page window or
+	// straddles a 1 MB page. Per-word slowRead C loop over the whole run,
+	// straight into the pinned registers, and the block continues -- the same
+	// shape as emitArm9BlockLoad's slow path (and the unpredicated slow LDM
+	// this path originally replaced), where it used to be one interpreter bail
+	// for the whole instruction. Each word re-reads the low EA from the stash,
+	// so a base register in the list (legal only without writeback) being
+	// overwritten mid-run is harmless. The raw low EA goes back into r12 on
+	// exit, where the fast path leaves it (THUMB LDMIA derives its writeback
+	// from r12). Worst case, ARM LDM with 15 registers: ~9 words per register,
+	// ~200 words for the whole instruction including the fast path -- inside
+	// JIT_MAX_INSTR_RESERVE_WORDS_ARM; THUMB lists are <= 8 registers, inside
+	// JIT_MAX_INSTR_RESERVE_WORDS. The ARM9 block load already emits the same
+	// per-word loop for the same list sizes.
+	patchMissSlots(miss, nMiss, p);
+	*p++ = PPC_STW(PPC_R12, 1, 96);                     // stash low EA
+	emitMemPrologue();
+	for (u32 k = 0; k < n; k++) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
+		emitSlowLoad(hostRegFor(regs[k]), PPC_R12, 4, false);
+	}
+	emitMemEpilogue();
+	*p++ = PPC_LWZ(PPC_R12, 1, 96);                     // restore low EA
+
+	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	return true;
 }
 

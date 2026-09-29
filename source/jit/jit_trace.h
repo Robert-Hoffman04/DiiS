@@ -287,11 +287,13 @@ struct JitTraceCtx {
 
 	// ---- P14/P15 cached page descriptors --------------------------------
 	// Guard EA (PPC_R12) against the descriptor page window (+ optionally that
-	// EA + spanBytes stays in the same 1 MB page), bail to the interpreter on a
-	// miss, then resolve: PPC_R10 <- hostBase, PPC_R11 <- (EA & mask) with low
-	// bits cleared to `alignMe` (29 => &~3, 30 => &~1, 31 => none). Clobbers
-	// r10, r11; EA stays in r12.
-	void emitPageResolve(u32 spanBytes, u8 alignMe);
+	// EA + spanBytes stays in the same 1 MB page), then resolve on the
+	// fall-through: PPC_R10 <- hostBase, PPC_R11 <- (EA & mask) with low bits
+	// cleared to `alignMe` (29 => &~3, 30 => &~1, 31 => none). Each miss test
+	// is a forward branch left for the caller to aim at its slowRead C path:
+	// the slots go to missSlots[] (room for 2) and the count is returned.
+	// Clobbers r10, r11; EA stays in r12.
+	int  emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots);
 
 	// ---- P16 ARM9 two-region inline guard --------------------------------
 	// EA must be in PPC_R12 (any alignment). Emits a runtime guard for the two
@@ -342,12 +344,12 @@ struct JitTraceCtx {
 
 	// ---- P14 inline RAM load via cached page descriptors ------------------
 	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a
-	// page-window guard (out of window -> interpreter bail at currentPC), then
-	// resolves the EA through JitCpuProfile's descriptor table and loads `size`
-	// bytes into rd's host register with emitSlowLoad's byte-swap / sign-extend /
-	// unaligned-word-rotate semantics. The destination host register is allocated
-	// *after* the guard (a bail never dirties rd). No memory prologue, no C call,
-	// register cache otherwise left intact. Returns false without emitting
+	// page-window guard, then resolves the EA through JitCpuProfile's
+	// descriptor table and loads `size` bytes into rd's host register with
+	// emitSlowLoad's byte-swap / sign-extend / unaligned-word-rotate semantics.
+	// No memory prologue, no C call on a hit. Out of window (I/O, VRAM, ...)
+	// does the same access through the slowRead C call in place and the block
+	// continues (PERF_LOG Step 3; was an interpreter bail). Returns false without emitting
 	// anything when the profile has no descriptor table -- the caller then emits
 	// its own slow path. wordRotate applies OP_LDR's unaligned-word ROR (ARM
 	// callers pass true for a word load; THUMB callers pass false to match
@@ -358,12 +360,14 @@ struct JitTraceCtx {
 	// eaReg MUST be PPC_R12 and holds the *low* guest address of the contiguous
 	// word run (callers already fold IA/IB/DA/DB into this). regs is the
 	// ascending list of destination guest registers (0..14, never 15), n its
-	// length (>= 1). Emits a single page-window guard covering the whole run
-	// (out of window, or the run straddles a 1 MB page -> one interpreter bail
-	// for the whole instruction), one descriptor resolve, then n sequential
-	// lwbrx into the registers' host slots -- the register cache stays intact.
-	// LDM/LDMIA word loads do NOT rotate an unaligned base (matches OP_L_IA).
-	// Returns false without emitting when disabled. Clobbers r10, r11, r12.
+	// length (>= 1). Emits a single page-window guard covering the whole run,
+	// one descriptor resolve, then n sequential lwbrx into the registers' host
+	// slots. Out of window, or a run that straddles a 1 MB page, takes a
+	// per-word slowRead C loop instead and the block continues (PERF_LOG
+	// Step 3; was one interpreter bail for the whole instruction). The low EA
+	// is back in r12 on return either way. LDM/LDMIA word loads do NOT rotate
+	// an unaligned base (matches OP_L_IA). Returns false without emitting when
+	// disabled. Clobbers r10, r11.
 	bool emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lockedMask);
 
 	// ---- exits (shared by jit_thumb.cpp and jit_arm.cpp) ----
