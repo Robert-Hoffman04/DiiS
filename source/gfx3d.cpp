@@ -2317,6 +2317,9 @@ SFORMAT SF_GFX3D[]={
 	{ "GSSH", 4, 1, &gfx3d.shading},
 	{ "GSWB", 4, 1, &gfx3d.wbuffer},
 	{ "GSSM", 4, 1, &gfx3d.sortmode},
+	// SWAP_BUFFERS args: the first flush after a load takes sortmode/wbuffer from these
+	{ "GFAF", 4, 1, &gfx3d.activeFlushCommand},
+	{ "GFPF", 4, 1, &gfx3d.pendingFlushCommand},
 	{ "GSAR", 1, 1, &gfx3d.alphaTestRef},
 	{ "GSVP", 4, 1, &viewport},
 	{ "GSCC", 4, 1, &gfx3d.clearColor},
@@ -2336,6 +2339,12 @@ SFORMAT SF_GFX3D[]={
 };
 
 //-------------savestate
+void gfx3d_preloadstate()
+{
+	// Marks the flush args so gfx3d_loadstate() can tell a state without GFAF/GFPF.
+	gfx3d.activeFlushCommand = gfx3d.pendingFlushCommand = GFX3D_FLUSH_UNSAVED;
+}
+
 void gfx3d_savestate(EMUFILE* os){
 	//version
 	write32le(4,os);
@@ -2428,6 +2437,13 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 		OSREAD(cacheLightDirection);
 		OSREAD(cacheHalfVector);
 	}
+
+	// Older states have no GFAF/GFPF: take the flush args from the saved GSSM/GSWB (the flush
+	// before the save), since games reissue the same SWAP_BUFFERS args every frame.
+	if(gfx3d.activeFlushCommand == GFX3D_FLUSH_UNSAVED)
+		gfx3d.activeFlushCommand = (gfx3d.sortmode ? 1 : 0) | (gfx3d.wbuffer ? 2 : 0);
+	if(gfx3d.pendingFlushCommand == GFX3D_FLUSH_UNSAVED)
+		gfx3d.pendingFlushCommand = gfx3d.activeFlushCommand;
 
 	// The loaded G3CX is the frame to show; the snapshot is retaken at the next VBlank end.
 	s_rasterDeferred = false;

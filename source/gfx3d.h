@@ -466,6 +466,8 @@ struct SFORMAT;
 extern SFORMAT SF_GFX3D[];
 void gfx3d_savestate(EMUFILE* os);
 bool gfx3d_loadstate(EMUFILE* is, int size);
+#define GFX3D_FLUSH_UNSAVED 0xFFFFFFFFu
+void gfx3d_preloadstate();
 
 void gfx3d_ClearStack();
 
