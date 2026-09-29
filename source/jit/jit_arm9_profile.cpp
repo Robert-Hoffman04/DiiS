@@ -272,7 +272,7 @@ JitCpuProfile* jitBuildArm9Profile()
 	s_arm9Profile.arm9MainMask      = _MMU_MAIN_MEM_MASK;
 	s_arm9Profile.arm9DtcmBase      = (u32)(uintptr_t)MMU.ARM9_DTCM;
 	s_arm9Profile.arm9DtcmRegionPtr = (u32)(uintptr_t)&MMU.DTCMRegion;
-	// PERF_LOG Step 6: ITCM loads inline too (allocated with MAIN_MEM /
+	// ITCM loads inline too (allocated with MAIN_MEM /
 	// ARM9_DTCM, same lifetime). Stores still use slowWrite.
 	s_arm9Profile.arm9ItcmBase      = (u32)(uintptr_t)MMU.ARM9_ITCM;
 

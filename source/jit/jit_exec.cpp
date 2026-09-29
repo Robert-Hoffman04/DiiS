@@ -7,16 +7,16 @@
  * jitRunArm7() when the ARM7 is due to step: it compiles/looks up a block at
  * the current PC, runs it, points the interpreter's pipeline at the resume
  * PC (the opcode fetch is deferred until the interpreter actually needs it --
- * jitSyncPipeline(), PERF_LOG Step 5) and returns the cycles consumed (0 => "not handled, use the interpreter
+ * jitSyncPipeline()) and returns the cycles consumed (0 => "not handled, use the interpreter
  * for one instruction").
  *
  * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
  * of blocks (up to the runtime quota -- min(scheduler budget, JIT_ARM*_QUOTA_CAP)
- * guest cycles, PERF_LOG Step 1) before returning, not just
+ * guest cycles) before returning, not just
  * one. IRQ delivery still goes through the interpreter (a chain only runs
  * compiled static-exit edges plus guarded dynamic ones; any bailout or quota
  * trip returns here first). Instructions the front end can't compile no
- * longer end the chain: since PERF_LOG Step 2 they run in place through the
+ * longer end the chain: now they run in place through the
  * interpreter's handler (jitInterpFallback() below).
  ***************************************************************************/
 
@@ -117,7 +117,7 @@ struct JitCoreCost {
 	u64 freshNoBlk; // noBlock calls that were NOT a clean pre-existing marker
 	                //   (fresh compile -> instrCount 0, or hash-collision slot,
 	                //   or mode flip) -- these paid the compile scan
-	// PERF_LOG Step 2: in-block interpreter fallback (jitInterpFallback()).
+	// In-block interpreter fallback (jitInterpFallback()).
 	u64 fbCalls;    // refused instructions run through their handler from compiled code
 	u64 fbChain;    //   of those, PC redirected -> dynamic-chain exit
 	u64 fbToC;      //   of those, returned to the dispatcher (T/IRQ/halt/SMC/resched)
@@ -256,7 +256,7 @@ static void jit9ProfileReport()
 }
 #endif
 
-// PERF_LOG Step 2 -- in-block interpreter fallback: the C half of
+// In-block interpreter fallback: the C half of
 // JitTraceCtx::emitInterpFallback() (jit_trace.cpp). Compiled code has just
 // stored the pinned guest registers + CPSR to cpu.R[]/CPSR and calls this for
 // one instruction the front end refused. This is armcpu_exec<>() for a single
@@ -286,7 +286,7 @@ static void jit9ProfileReport()
 //            changeCPSR() requests a reschedule on *every* CPSR write, but
 //            one that doesn't unmask IRQs has nothing to deliver, and
 //            deferring it to the chain's end is the same bounded delay
-//            compiled code already has (PERF_LOG Step 1 caveat 2).
+//            compiled code already has.
 //   CHAIN -- none of the above, but PC left the fall-through (a branch, a PC
 //            load, an exception return, SWI/undef entry into ARM mode from
 //            ARM mode): leave through the guarded dynamic stub at
@@ -338,7 +338,7 @@ u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc) { return jitInterpFallback<AR
 u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc)   { return jitInterpFallback<ARMCPU_ARM7, false>(opcode, pc); }
 u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc) { return jitInterpFallback<ARMCPU_ARM7, true >(opcode, pc); }
 
-// PERF_LOG Step 5 -- per-dispatch fixed cost.
+// Per-dispatch fixed cost.
 //
 // JITResult: the trampoline always writes cycles/nextPC/instructions on
 // return, and emitted exits store bailedOut/smcHit only when nonzero
@@ -473,7 +473,7 @@ u32 jitRunArm7(s32 budget)
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0, _preMarker7); return 0; } // uncompilable / "don't JIT" -> interpreter
 
-	// PERF_LOG Step 1: runtime chain quota. Seed r3 so the (fixed) entry
+	// Runtime chain quota. Seed r3 so the (fixed) entry
 	// guard trips after `quota` cycles, then take the seed back out of the
 	// result so everything below sees plain elapsed cycles as before.
 	const s32 quota = jitQuotaClamp(budget, JIT_ARM7_QUOTA_CAP);
@@ -509,7 +509,7 @@ u32 jitRunArm7(s32 budget)
 	}
 	// TODO item 5: ARM7 counterpart of the ARM9 "why didn't this chain?"
 	// classification below (jitRunArm9(), same #ifdef). ARM7 chains are
-	// shorter than ARM9's (NOTES.md Step 5): this answers whether that's
+	// shorter than ARM9's: this answers whether that's
 	// dynamic-exit-heavy control flow (BX/POP{pc}/hi-reg branches -- nothing
 	// to fix, the target genuinely isn't known at compile time), quota
 	// trips (the runtime quota -- chains are fine, just capped), or the same
@@ -577,7 +577,7 @@ u32 jitRunArm7(s32 budget)
 	// assuming THUMB: landing an ARM-mode target through a 16-bit THUMB
 	// fetch misdecodes the real first opcode and sends ARM7's PC off into
 	// unmapped memory. The opcode fetch into cpu.instruction is deferred to
-	// jitSyncPipeline() (PERF_LOG Step 5), which re-checks CPSR.T the same way.
+	// jitSyncPipeline(), which re-checks CPSR.T the same way.
 	jitPointPipeline(cpu, r.nextPC, JIT_ARM7);
 
 	g_jitBlocksRun++;
@@ -644,7 +644,7 @@ u32 jitRunArm9(s32 budget)
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);
 	// Direct inline region check instead of prof->canEnter*() -- the ARM9 has
-	// exactly one profile, whose canEnter* wrap this same rule (PERF_LOG Step 5).
+	// exactly one profile, whose canEnter* wrap this same rule.
 	const bool canEnter = jitArm9CanEnter(pc, thumb);
 	JCC_CALL(1);
 

@@ -1094,7 +1094,7 @@ extern SFORMAT SF_RTC[];
 static void writechunks(EMUFILE* os) {
 #ifdef DESMUME_JIT
 	// The SF_ARM* chunks store cpu.instruction ("9INS"/"7INS"), which the JIT
-	// dispatcher fetches lazily (PERF_LOG Step 5) -- materialise it so the
+	// dispatcher fetches lazily -- materialise it so the
 	// state is self-consistent for a loader (or a non-JIT build) that runs
 	// the interpreter straight from it.
 	jitSyncPipeline(JIT_ARM9);

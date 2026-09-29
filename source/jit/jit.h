@@ -106,7 +106,7 @@ static inline void jitApplyPendingMode()
 // jitSyncPipeline() below); returns cycles consumed, or 0 if the interpreter
 // should handle this instruction (uncompilable region / "don't JIT" /
 // disabled). Both THUMB and ARM mode are compiled (P11). `budget` is how many ARM7 cycles the
-// scheduler can spare before its next event (PERF_LOG Step 1): a chain of
+// scheduler can spare before its next event: a chain of
 // linked blocks runs up to min(budget, JIT_ARM7_QUOTA_CAP) cycles (plus the
 // usual one-block overshoot) before returning. The ARM7 slot (~3.5 MB arena +
 // tables) is allocated on the first call that gets past jitArm7Enabled -- see
@@ -121,7 +121,7 @@ u32 jitRunArm7(s32 budget);
 extern bool jitArm9Enabled;
 u32 jitRunArm9(s32 budget);
 
-// PERF_LOG Step 5 -- lazy interpreter-pipeline re-prime. A compiled run
+// Lazy interpreter-pipeline re-prime. A compiled run
 // leaves instruct_adr / next_instruction / R[15] pointing at the resume PC
 // but no longer fetches the opcode there into cpu.instruction: the next
 // thing to run is almost always the JIT again, which only reads

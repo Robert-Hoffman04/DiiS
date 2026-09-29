@@ -37,7 +37,7 @@ static const size_t s_jitCanaryPad = 32;
 static const size_t s_jitCanaryPad = 0;
 #endif
 
-// -DJIT_MEM_ACCOUNT: one-off tuning instrumentation (jit/NOTES.md). Prints
+// -DJIT_MEM_ACCOUNT: one-off tuning instrumentation. Prints
 // which libogc arena the JIT backing store (arena + block table + SMC tables)
 // actually comes out of, and how much of that pool is left afterwards, so a
 // table-growth experiment can be sized against real MEM1 headroom rather than
@@ -563,7 +563,7 @@ void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
 // (EA & mask) with the low bits cleared to `alignMe` (29 => &~3, 30 => &~1,
 // 31 => no clear). EA stays in PPC_R12. Clobbers r10, r11.
 //
-// PERF_LOG Step 3: a miss no longer bails to the interpreter. Each miss test
+// A miss no longer bails to the interpreter. Each miss test
 // is a forward conditional branch whose target is left open: the placeholder
 // word already carries the branch condition (BGT for "page outside the window",
 // BNE for "run straddles a 1 MB page") with a zero displacement, and the
@@ -620,7 +620,7 @@ static void patchMissSlots(u32* const* missSlots, int nMiss, const u32* target)
 		*missSlots[i] |= (u32)((target - missSlots[i]) * 4) & 0xFFFC;
 }
 
-// P16: ARM9 two-region inline guard (plus ITCM for loads, PERF_LOG Step 6).
+// P16: ARM9 two-region inline guard (plus ITCM for loads).
 // See jit_trace.h. EA in PPC_R12.
 int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm)
 {
@@ -686,7 +686,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);       // EA & mirrorMask, cleared to align
 	fastSlots[nFast++] = p++;                                      // B -> caller inline block
 
-	// ---- ITCM (loads only, PERF_LOG Step 6): EA < 0x02000000 ----
+	// ---- ITCM (loads only): EA < 0x02000000 ----
 	// Tested after main RAM, on main RAM's miss branch, so the common main-RAM
 	// hit pays nothing for it. The rule is exactly the interpreter's
 	// (_MMU_ARM9_read*, reached once the DTCM and main-RAM checks in _MMU_read*
@@ -832,7 +832,7 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	}
 	u32* toEnd = p++;                                   // B over the slow path
 
-	// ---- slow (PERF_LOG Step 3): EA outside the RAM page window -- I/O,
+	// ---- slow: EA outside the RAM page window -- I/O,
 	// VRAM, BIOS, GBA slot, open bus. Do the access in place through the
 	// profile's slowRead C call and keep running the block; this used to end
 	// the whole chain with an interpreter bail that re-ran the instruction.
@@ -915,7 +915,7 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	}
 	u32* toEnd = p++;                                   // B over the slow path
 
-	// ---- slow (PERF_LOG Step 3): the run is outside the RAM page window or
+	// ---- slow: the run is outside the RAM page window or
 	// straddles a 1 MB page. Per-word slowRead C loop over the whole run,
 	// straight into the pinned registers, and the block continues -- the same
 	// shape as emitArm9BlockLoad's slow path (and the unpredicated slow LDM
@@ -1165,7 +1165,7 @@ void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 	*p++ = PPC_B(retOff);
 }
 
-// PERF_LOG Step 2 -- in-block interpreter fallback (JIT_INTERP_FALLBACK, see
+// In-block interpreter fallback (JIT_INTERP_FALLBACK, see
 // jit_trace.h). The guest register file is only ever in cpu.R[] at trampoline
 // boundaries, so the call is bracketed by the same sync the trampoline does:
 // one stmw of r14..r31 -> R[0..15], CPSR (r30) and SPSR -- the last is r31's

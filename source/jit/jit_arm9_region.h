@@ -7,8 +7,8 @@
  * body of the ARM9 profile's canEnterThumb/canEnterArm (jit_arm9_profile.cpp,
  * which just wrap it) and is also called directly by jitRunArm9()
  * (jit_exec.cpp): there is only one ARM9 profile, so the dispatcher does not
- * need the indirect call through JitCpuProfile on every dispatch (PERF_LOG
- * Step 5). Keep the rule here only, so the two can never disagree.
+ * need the indirect call through JitCpuProfile on every dispatch.
+ * Keep the rule here only, so the two can never disagree.
  ***************************************************************************/
 
 #ifndef DESMUME_JIT_ARM9_REGION_H

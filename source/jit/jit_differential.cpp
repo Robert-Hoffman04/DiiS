@@ -245,7 +245,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	const u32  step  = thumb ? 2u : 4u;
 
 	// Snapshot the block's entry point and length now: with the in-block
-	// interpreter fallback (PERF_LOG Step 2) a block can contain an MCR that
+	// interpreter fallback, a block can contain an MCR that
 	// moves the DTCM/ITCM, and cp15 then flushCache()s the whole ARM9 table --
 	// during the reference pass below, i.e. before the trial and real runs.
 	// The BasicBlock slot is zeroed by that (a null execute -> ISI at PC 0),
