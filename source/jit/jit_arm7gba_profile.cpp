@@ -69,6 +69,7 @@ static u32  arm7gba_swiHandler(u32 comment) { (void)comment; return 0; }
 // CPU can fetch from is backed by a real buffer (per step 4/step 3), if
 // presently zero-filled since no BIOS/ROM exists yet (steps 6/1). Inert
 // either way this pass -- nothing sets gameInfo.isGBA from a real load.
+// Always true, so jitRunArm7() skips the call; make it check if this changes.
 static bool arm7gba_canEnterThumb(u32 pc) { (void)pc; return true; }
 static bool arm7gba_canEnterArm(u32 pc)   { (void)pc; return true; }
 

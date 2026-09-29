@@ -461,9 +461,9 @@ u32 jitRunArm7(s32 budget)
 	armcpu_t& cpu = NDS_ARM7;
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);     // P11: ARM mode is JITted too
-	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
+	// No region check: both ARM7 profiles (DS and GBA) accept every PC, so the
+	// indirect prof->canEnter*() call would only ever return true.
 	JCC_CALL(0);
-	if (!canEnter) { JCC_NOENTER(0); return 0; }   // uncompilable region -> interpreter
 
 	BasicBlock* b = jitCacheArm7.getBlock(pc);
 #ifdef JIT_CORE_COST_HISTO
@@ -472,6 +472,9 @@ u32 jitRunArm7(s32 budget)
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0, _preMarker7); return 0; } // uncompilable / "don't JIT" -> interpreter
+	// Entry-block length, read now: a flush inside the run (arena change via an
+	// in-block interpreter fallback) can recycle *b before the stats below.
+	const u32 entryLen = b->insnCount();
 
 	// Runtime chain quota. Seed r3 so the (fixed) entry
 	// guard trips after `quota` cycles, then take the seed back out of the
@@ -503,7 +506,7 @@ u32 jitRunArm7(s32 budget)
 		if (f) { fprintf(f, "[jit] blk %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
 		                 thumb ? "T" : "A", (unsigned)pc,
 		                 (unsigned)(thumb ? prof->fetch16(pc & ~1u) : prof->fetch32(pc & ~3u)),
-		                 (unsigned)b->insnCount(), (unsigned)r.instructions,
+		                 (unsigned)entryLen, (unsigned)r.instructions,
 		                 (unsigned)r.bailedOut, (unsigned)r.smcHit, (unsigned)r.cycles,
 		                 (unsigned)r.nextPC); fclose(f); }
 	}
@@ -560,10 +563,10 @@ u32 jitRunArm7(s32 budget)
 	// demote it to a "don't JIT" marker so future visits skip straight to
 	// the interpreter instead of paying the compile+trampoline cost.
 	if (r.instructions == 0) {
-		const bool len1 = (b->insnCount() == 1);
+		const bool len1 = (entryLen == 1);
 		if (len1 || trackRepeatedBail(s_bailTrack7, pc))
 			jitCacheArm7.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(0, len1, pc, b->insnCount());
+		JCC_BAIL0(0, len1, pc, entryLen);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		g_jitBail0++;
 		jitMaybeReport();
@@ -582,7 +585,7 @@ u32 jitRunArm7(s32 budget)
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
-	JCC_RAN(0, r.cycles, r.instructions, b->insnCount());
+	JCC_RAN(0, r.cycles, r.instructions, entryLen);
 	jitMaybeReport();
 
 	return r.cycles ? r.cycles : 1;
@@ -668,6 +671,9 @@ u32 jitRunArm9(s32 budget)
 	if (!b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb)
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1, _preMarker9); return 0; }
+	// Entry-block length, read now: a flush inside the run (arena change via an
+	// in-block interpreter fallback) can recycle *b before the stats below.
+	const u32 entryLen = b->insnCount();
 
 	// Runtime chain quota -- see jitRunArm7().
 	const s32 quota = jitQuotaClamp(budget, JIT_ARM9_QUOTA_CAP);
@@ -699,10 +705,10 @@ u32 jitRunArm9(s32 budget)
 		if (!thumb) { s_arm++; if (r.instructions == 0) s_armbail0++; }
 		// chain-length picture: r.instructions is the whole chained-dispatch's
 		// guest-instruction count (the trampoline accumulates it in r31 across
-		// every statically-chained block); b->insnCount() is just the entry
+		// every statically-chained block); entryLen is just the entry
 		// block. s_insns/s_entries == guest instructions per trampoline
 		// round-trip; s_insns/s_blk0 == blocks per round-trip (approx chain len).
-		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += b->insnCount(); }
+		if (r.instructions != 0) { s_insns += r.instructions; s_entries++; s_blk0 += entryLen; }
 		// Why did this non-bail chain exit pay a full trampoline round-trip
 		// instead of chaining on? Classify by what sits in the resume PC's
 		// direct-mapped block-table slot:
@@ -739,7 +745,7 @@ u32 jitRunArm9(s32 budget)
 			FILE* f = fopen("sd:/jit.log", "a");
 			if (f) { fprintf(f, "[jit] a9 %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
 			                 wasMiss ? "MISS" : "hit", (unsigned)pc, (unsigned)prof->fetch32(pc),
-			                 (unsigned)b->insnCount(), (unsigned)r.instructions, (unsigned)r.bailedOut,
+			                 (unsigned)entryLen, (unsigned)r.instructions, (unsigned)r.bailedOut,
 			                 (unsigned)r.smcHit, (unsigned)r.cycles, (unsigned)r.nextPC); fclose(f); }
 		}
 		if (s_disp - s_lastRep >= 500000) {
@@ -772,10 +778,10 @@ u32 jitRunArm9(s32 budget)
 		jitCacheArm9.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
-		const bool len1 = (b->insnCount() == 1);
+		const bool len1 = (entryLen == 1);
 		if (len1 || trackRepeatedBail(s_bailTrack9, pc))
 			jitCacheArm9.registerBlock(pc, 1, nullptr, thumb);
-		JCC_BAIL0(1, len1, pc, b->insnCount());
+		JCC_BAIL0(1, len1, pc, entryLen);
 		cpu.R[15] = pc + (thumb ? 4 : 8);
 		return 0;
 	}
@@ -798,8 +804,8 @@ u32 jitRunArm9(s32 budget)
 			if (f) {
 				fprintf(f, "[jit] !!! ARM9 bad resume pc=%08x npc=%08x thumb=%d ins=%u cyc=%u len=%u ops:",
 				        (unsigned)pc, (unsigned)npc, (int)thumb,
-				        (unsigned)r.instructions, (unsigned)r.cycles, (unsigned)b->insnCount());
-				for (u32 i = 0; i < b->insnCount() && i < 34; i++)
+				        (unsigned)r.instructions, (unsigned)r.cycles, (unsigned)entryLen);
+				for (u32 i = 0; i < entryLen && i < 34; i++)
 					fprintf(f, " %08x", (unsigned)(thumb ? prof->fetch16(pc + i * 2)
 					                                      : prof->fetch32(pc + i * 4)));
 				fprintf(f, "\n");
@@ -811,7 +817,7 @@ u32 jitRunArm9(s32 budget)
 
 	jitPointPipeline(cpu, npc, JIT_ARM9);   // see jitRunArm7()
 
-	JCC_RAN(1, r.cycles, r.instructions, b->insnCount());
+	JCC_RAN(1, r.cycles, r.instructions, entryLen);
 	return r.cycles ? r.cycles : 1;
 }
 

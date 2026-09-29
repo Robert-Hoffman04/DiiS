@@ -1388,6 +1388,10 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			}
 		}
 #endif
+		// Give back the slot ensureArena() reserved, if the scan got that far,
+		// or every marker leaks JIT_MAX_WORDS of arena until the next flush.
+		if (ctx.arenaAllocated)
+			cache.rewindJITMemory((JIT_MAX_WORDS * sizeof(u32) + 31) & ~31u);
 		return cache.registerBlock(startPC, 1, nullptr, thumb);
 	}
 
