@@ -15,6 +15,9 @@
 #-----------------------------------------------------------------------------
 BENCH_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(cd "$BENCH_HERE/../.." && pwd)"
+# The Makefile names its output after the checkout directory
+# (TARGET := $(notdir $(CURDIR))), so derive it rather than hardcoding one name.
+BENCH_TARGET="$(basename "$BENCH_ROOT")"
 
 DOLPHIN_DATA="${DOLPHIN_DATA:-$HOME/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu}"
 DOLPHIN_SD="${DOLPHIN_SD:-$DOLPHIN_DATA/desmume-sd.raw}"
@@ -64,10 +67,10 @@ build_dol() {
 		_BENCH_LAST_JITDEFS="$jitdefs"
 	fi
 	( cd "$BENCH_ROOT" \
-	  && rm -f build/main.o desmumewii.elf desmumewii.dol \
+	  && rm -f build/main.o "$BENCH_TARGET.elf" "$BENCH_TARGET.dol" \
 	  && make -j"$(nproc)" JITDEFS="$jitdefs" TESTDEFS="$testdefs" ) >>"$log" 2>&1 \
 		|| { echo "   BUILD FAILED:"; tail -n 20 "$log"; exit 1; }
-	cp "$BENCH_ROOT/desmumewii.dol" "$DOLDIR/$name.dol"
+	cp "$BENCH_ROOT/$BENCH_TARGET.dol" "$DOLDIR/$name.dol"
 	echo "   -> $DOLDIR/$name.dol"
 }
 
@@ -129,7 +132,7 @@ capture_run() {
 	local dolname="$1" outdir="$2"; shift 2
 	mkdir -p "$outdir"
 	python3 "$BENCH_HERE/capture.py" --host "$HARNESS_HOST" --port "$HARNESS_PORT" \
-		--out "$outdir" --map "$BENCH_ROOT/desmumewii.elf.map" "$@" \
+		--out "$outdir" --map "$BENCH_ROOT/build/$BENCH_TARGET.elf.map" "$@" \
 		>"$outdir/capture.stdout.log" 2>&1 &
 	local cap_pid=$!
 	sleep 1   # let capture.py bind its listen socket before Dolphin tries to connect
