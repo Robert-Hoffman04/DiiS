@@ -31,7 +31,9 @@ bool jitEnsureArm9();
 
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
+#ifndef JIT_YIELD_NUMBER
 #define JIT_YIELD_NUMBER           64
+#endif
 #define JIT_MAX_BAILOUTS           256
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
