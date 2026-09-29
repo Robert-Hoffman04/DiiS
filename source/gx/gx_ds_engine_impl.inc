@@ -326,7 +326,7 @@ static u16 *s_3dLinear;            // 256*192: bit15 = present, low 15 = R6G6B6T
 static u16 *s_3dScratch;
 static u8  s_3dLineTrans[192];     // line has a texel with alpha 1..30
 static u8  s_3dLineHole[192];      // line has a texel with alpha 0 (the 3D layer does not cover the whole line)
-static u32 s_3dScanSeq;             // (g_gfx3dRenderSeq << 1) | clear-only: the key every 3D texture is baked against
+static u32 s_3dScanSeq;             // (g_gfx3dRenderSeq << 1), or (clear generation << 1) | 1 for a clear-only scan (gxDsA3dScan): the key every 3D texture is baked against
 static bool s_3dScanValid;
 // Deferred-raster frames (gfx3d_VBlankEndSignal / gxDsA3dScan): when set, the 3D layer
 // is read as a uniform clear-colour texel line instead of gfx3d_convertedScreen.
@@ -2185,9 +2185,22 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 // That is a characterized, edge-bounded inexactness, so this is GxFast only: GxAccurate
 // keeps the eager raster underneath the overlay. Every other consumer (a bail to the CPU compositor, savestates, capture) goes
 // through gfx3d_ensureRendered() and gets the real raster.
+//
+// Task a3layer: a clear-only layer depends on nothing but the latched clear colour, so it is
+// keyed on (clear colour, clear alpha) instead of the render counter: s_3dClearGen only
+// advances when those change (or the scan was dropped), and the key (s_3dClearGen << 1) | 1
+// keeps the linear copy, the line maps and every texture keyed on s_3dScanSeq across 3D
+// frames. SM64DS GxFast otherwise re-scanned and re-baked the same uniform layer on every
+// recording frame (~3.4 ms).
 static bool gxDsA3dScan(bool clearOnly = false)
 {
-	const u32 key = (g_gfx3dRenderSeq << 1) | (clearOnly ? 1u : 0u);
+	static u32 s_3dClearGen, s_3dClearCc;
+	u32 key = (g_gfx3dRenderSeq << 1);
+	if (clearOnly) {
+		const u32 cc = gfx3d_rasterClearColor() & 0x1F7FFF;   // the bits the clear line reads
+		if (!(s_3dScanValid && s_3dClearOnly && s_3dClearCc == cc)) { ++s_3dClearGen; s_3dClearCc = cc; }
+		key = (s_3dClearGen << 1) | 1u;
+	}
 	if (s_3dScanValid && s_3dScanSeq == key)
 		return true;
 	if (!s_3dLinear) {
