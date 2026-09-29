@@ -8,7 +8,7 @@
 
 #include "jit_differential.h"
 
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 
 #include "jit_trace.h"
 #include "../armcpu.h"
@@ -536,4 +536,4 @@ u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start)
 	                     &armcpu_exec<ARMCPU_ARM9>, cpu, block, pc, start, s_c9);
 }
 
-#endif // DESMUME_JIT_ARM7 && JIT_DIFFERENTIAL_TESTING
+#endif // DESMUME_JIT && JIT_DIFFERENTIAL_TESTING

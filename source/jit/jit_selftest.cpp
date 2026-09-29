@@ -13,16 +13,18 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include <stdio.h>
 #include <string.h>
 #include <ogc/cache.h>
 #include "jit_ppc_emitter.h"
+#include "jit_trace.h"
 
 bool jitSelfTest()
 {
-	if (!jitProfile[JIT_ARM7]) {
+	// The ARM7 slot is allocated lazily (F1) -- make sure it exists.
+	if (!jitEnsureArm7()) {
 		printf("[jit] selftest: no active profile (jitInit failed?)\n");
 		return false;
 	}
@@ -96,4 +98,4 @@ bool jitSelfTest()
 	return ok;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

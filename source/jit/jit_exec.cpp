@@ -22,7 +22,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "jit_trace.h"
 #include "jit_arm9_region.h"
@@ -392,13 +392,53 @@ void jitSyncPipelineSlow(int core)
 	}
 }
 
-// Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
+// F1 runtime CPU mode -- see jit.h. Default JIT: a build that never touches
+// the setting (forced-boot test builds skip the startup picker) runs both
+// JITs, exactly like the old -DDESMUME_JIT_ARM9_ON default.
+bool g_jitOn = true;
+s8   g_jitModePending = -1;
+
+// Per-core switches, driven from the mode by jitSetEnabled(). Kept separate
+// so the wrestler probes (main.cpp) can interpret one core on purpose.
 bool jitArm7Enabled = true;
+bool jitArm9Enabled = true;
+
+void jitSetEnabled(bool jit)
+{
+	// JIT -> interpreter: the interpreter-mode armInnerLoop never calls
+	// jitSyncPipeline(), so a core the JIT last ran must have its deferred
+	// opcode fetch materialised now, while instruct_adr still describes it.
+	// Harmless (nothing stale) in the other direction or before boot.
+	jitSyncPipeline(JIT_ARM9);
+	jitSyncPipeline(JIT_ARM7);
+	// Interpreter mode skips every SMC invalidation (the g_jitOn test in the
+	// MMU hooks), so anything compiled before this point may be stale by the
+	// time the JIT runs again: drop both caches on every switch. Null-safe on
+	// a slot that was never allocated, and cheap next to a mode switch.
+	jitFlushAllCaches();
+	jitArm7Enabled = jitArm9Enabled = jit;
+	g_jitOn = jit;
+}
+
+void jitRequestMode(bool jit)
+{
+	g_jitModePending = jit ? 1 : 0;
+}
 
 u32 jitRunArm7(s32 budget)
 {
+	if (!jitArm7Enabled) return 0;
+
+	// Lazy allocation, same as ARM9 below (jit_trace.cpp): the ARM7 slot is
+	// only reserved once the ARM7 JIT is really asked to run, so interpreter
+	// mode -- and a probe that interprets ARM7 -- never pays for it.
 	JitCpuProfile* prof = jitProfile[JIT_ARM7];
-	if (!jitArm7Enabled || !prof) return 0;
+	if (!prof)
+	{
+		if (!jitEnsureArm7()) return 0;
+		prof = jitProfile[JIT_ARM7];
+		if (!prof) return 0;
+	}
 
 	// perf_zones: everything below (dispatch, compile, trampoline, resume) is
 	// ARM7 JIT time; jitCompileTrace() re-tags its own interval as ARM7_BUILD.
@@ -556,22 +596,12 @@ u32 jitRunArm7(s32 budget)
 // every ARM9 THUMB block through jitRunArm9Checked() against the hardened
 // harness.
 //
-// Default OFF -- the ARM9 JIT's blast radius is the whole game, so it stays
-// opt-in pending a benchmark + soak sign-off. -DDESMUME_JIT_ARM9_ON starts it
-// enabled without touching the production default (mirrors the jitoff/jiton
-// renderer A/B used for ARM7). This flag only picks the runtime default --
-// it no longer decides whether the ~17 MB ARM9 slot gets allocated (see
-// jitRunArm9()'s jitEnsureArm9() call and jit_trace.cpp's jitInit()): that
-// slot is lazily allocated on first real dispatch through here regardless of
-// this flag's value, so a DS session pays for it only once actually needed
-// and a GBA session (which never reaches this function at all) never pays
-// for it either way. One build now serves both.
-#ifdef DESMUME_JIT_ARM9_ON
-bool jitArm9Enabled = true;
-#else
-bool jitArm9Enabled = false;
-#endif
-
+// jitArm9Enabled (defined above, next to jitArm7Enabled) follows the runtime
+// CPU mode -- the old -DDESMUME_JIT_ARM9_ON opt-in is gone now that the ARM9
+// JIT is the default. The ~17 MB ARM9 slot is lazily allocated on the first
+// real dispatch through here (jitEnsureArm9(), jit_trace.cpp), so a DS
+// session pays for it only once actually needed and a GBA session (which
+// never reaches this function at all) never pays for it.
 u32 jitRunArm9(s32 budget)
 {
 #if !defined(JIT_DIFFERENTIAL_TESTING)
@@ -785,4 +815,4 @@ u32 jitRunArm9(s32 budget)
 	return r.cycles ? r.cycles : 1;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

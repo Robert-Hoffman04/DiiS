@@ -19,6 +19,10 @@ START_COMMIT="${START_COMMIT:-5f03307}"                  # A0: first commit wher
 END_REF="${END_REF:-657008d}"                             # stop at A3 (already confirmed bad) -- change if you want to go further
 LOG_FILE="${LOG_FILE:-$REPO_DIR/bisect-log.csv}"
 CLEAN_EACH_BUILD="${CLEAN_EACH_BUILD:-1}"                 # 1 = `make clean` before every build (safer, slower)
+# The flags the walked (pre-F1) commits need to build with both JITs on. From
+# the F1 runtime CPU-mode commit on, the JIT is compiled in by default and
+# defaults to on, so these two names are simply ignored (harmless unused
+# defines) and a newer commit is tested with both JITs on just the same.
 JITDEFS="${JITDEFS:--DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON}"
 TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the file browser
 #

@@ -1092,7 +1092,7 @@ bool savestate_save (const char *file_name)
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	// The SF_ARM* chunks store cpu.instruction ("9INS"/"7INS"), which the JIT
 	// dispatcher fetches lazily (PERF_LOG Step 5) -- materialise it so the
 	// state is self-consistent for a loader (or a non-JIT build) that runs
@@ -1222,7 +1222,7 @@ static void loadstate()
 
 	SetupMMU();
 
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 	// P4: a state load (or rewind) overwrites MAIN_MEM/SWIRAM/ARM7_ERAM in bulk
 	// via direct buffer copies (ReadStateChunks -> mmu_loadstate), completely
 	// bypassing every _MMU_write* SMC hook above. Any block already compiled

@@ -32,7 +32,7 @@
 #ifdef HAVE_LUA
 #include "lua-engine.h"
 #endif
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 #include "jit/jit.h"
 #endif
 
@@ -707,7 +707,7 @@ FORCEINLINE u8 _MMU_read08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u3
 	// §12.3 step 2, but any tool/debugger/Lua code still probing ARM9 here
 	// must keep working exactly as before regardless).
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read08(addr);
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
 	//special handling for DMA: read 0 from TCM
@@ -739,7 +739,7 @@ FORCEINLINE u16 _MMU_read16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u
 {
 	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read16(addr);
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
 	//special handling for DMA: read 0 from TCM
@@ -784,7 +784,7 @@ FORCEINLINE u32 _MMU_read32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const u
 {
 	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) return _MMU_ARM7GBA_read32(addr);
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNoteRead(PROCNUM, (int)AT, addr);
 #endif
 	//special handling for DMA: read 0 from TCM
@@ -850,7 +850,7 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 {
 	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write08(addr, val); return; }
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 1);
 #endif
 	//special handling for DMA: discard writes to TCM
@@ -875,13 +875,15 @@ FORCEINLINE void _MMU_write08(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 1, val, LUAMEMHOOK_WRITE);
 #endif
-#ifdef DESMUME_JIT_ARM7
+#ifdef DESMUME_JIT
 		// P4: main RAM is shared -- ARM9 stores, ARM7 stores and DMA (either
 		// CPU) from every PROCNUM/AT combination all funnel through this one
 		// branch, so a single hook here covers all of them for the ARM7 JIT's
 		// most common SMC/cross-CPU-aliasing case. Cheap no-op when nothing
-		// is registered at this page.
-		jitInvalidateSMC(addr);
+		// is registered at this page. F1: tested inline against the runtime
+		// CPU mode so Interpreter mode pays one load+branch here, not a call
+		// (safe to skip: every mode switch flushes both caches -- jit.h).
+		if (g_jitOn) jitInvalidateSMC(addr);
 #endif
 		return;
 	}
@@ -897,7 +899,7 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 {
 	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write16(addr, val); return; }
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 2);
 #endif
 	//special handling for DMA: discard writes to TCM
@@ -922,8 +924,8 @@ FORCEINLINE void _MMU_write16(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 2, val, LUAMEMHOOK_WRITE);
 #endif
-#ifdef DESMUME_JIT_ARM7
-		jitInvalidateSMC(addr); // see _MMU_write08's comment
+#ifdef DESMUME_JIT
+		if (g_jitOn) jitInvalidateSMC(addr); // see _MMU_write08's comment
 #endif
 		return;
 	}
@@ -939,7 +941,7 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 {
 	// roadmap #20 (GBA compat), §12.3 step 4: see _MMU_read08's comment.
 	if (PROCNUM==ARMCPU_ARM7 && MMU.isGBA) { _MMU_ARM7GBA_write32(addr, val); return; }
-#if defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 	jitDiffJournalNote(PROCNUM, addr, 4);
 #endif
 	//special handling for DMA: discard writes to TCM
@@ -964,8 +966,8 @@ FORCEINLINE void _MMU_write32(const int PROCNUM, const MMU_ACCESS_TYPE AT, const
 #ifdef HAVE_LUA
 		CallRegisteredLuaMemHook(addr, 4, val, LUAMEMHOOK_WRITE);
 #endif
-#ifdef DESMUME_JIT_ARM7
-		jitInvalidateSMC(addr); // see _MMU_write08's comment
+#ifdef DESMUME_JIT
+		if (g_jitOn) jitInvalidateSMC(addr); // see _MMU_write08's comment
 #endif
 		return;
 	}

@@ -25,10 +25,14 @@ import sys
 TARGET_HZ = 59.8261
 MODE_LABEL = {"sw": "Software", "gxa": "GX Accurate", "gxf": "GX Fast",
               "gx": "GX Accurate",
+              "interp": "Interpreter (both cores)", "jit": "JIT (both cores)",
+              # pre-F1 compile-time CPU modes, kept so old results dirs
+              # still label/compare correctly
               "jitoff": "ARM7 interpreter", "jiton": "ARM7 JIT",
               "jit9off": "ARM9 interpreter", "jit9on": "ARM9 JIT",
               "jitfull": "full JIT (GXMerge)"}
-MODE_ORDER = ["sw", "gx", "gxa", "gxf", "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
+MODE_ORDER = ["sw", "gx", "gxa", "gxf", "interp", "jit",
+              "jitoff", "jiton", "jit9off", "jit9on", "jitfull"]
 REGRESSION_REL = 0.03   # >3% relative eff_fps drop vs baseline -> flag
 
 CSV_ROW_RE = re.compile(r"^\d+,\d+")

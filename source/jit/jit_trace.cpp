@@ -13,7 +13,7 @@
 #include "../perf_zones.h"
 #include "../harness/harness.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include <malloc.h>
 #include <string.h>
@@ -91,6 +91,11 @@ extern JitCpuProfile* jitBuildArm7GBAProfile();   // jit_arm7gba_profile.cpp
 // ever be meaningfully true.
 static JitCpuProfile* s_arm7DsProfile  = nullptr;
 static JitCpuProfile* s_arm7GbaProfile = nullptr;
+// Which of the two jitRunArm7() should see -- remembered separately from
+// jitProfile[JIT_ARM7], which doubles as the "slot allocated" flag and stays
+// null until jitEnsureArm7() runs (F1: the ARM7 slot is lazy now too).
+static bool           s_arm7GbaMode    = false;
+static bool           s_arm7AllocFailed = false;   // jitEnsureArm7() OOM latch
 
 // One backing-store set per core, indexed [JIT_ARM9]=0 / [JIT_ARM7]=1.
 static u32*         s_arena[2]        = { nullptr, nullptr };
@@ -232,6 +237,7 @@ void jitShutdown()
 	jitFreeSlot(JIT_ARM9);
 	jitProfile[JIT_ARM7] = jitProfile[JIT_ARM9] = nullptr;
 	s_arm7DsProfile = s_arm7GbaProfile = nullptr;
+	s_arm7AllocFailed = false;
 	s_initDone = false;
 }
 
@@ -291,29 +297,21 @@ void jitInit()
 	jitMemAccountReport("before");
 #endif
 
-	bool ok = jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE, jitCacheArm7, jitBuildArm7Profile());
-
-	// The ARM9 slot (~17 MB: 12 MB arena + ~4 MB block table + ~1 MB SMC
-	// tables) is deliberately NOT allocated here -- see jitEnsureArm9() below.
-	// A GBA session never calls jitRunArm9() at all (gbaExecFrame() has no
-	// ARM9 side, JIT or interpreted -- GBA has no ARM9), so lazy allocation
-	// there means this slot simply never gets allocated for a GBA session
-	// regardless of whether ARM9 JIT is compiled in or runtime-enabled,
-	// leaving that memory free for a GBA cart's own 16+ MB full-ROM buffer
-	// (NDSSystem.cpp's GBA branch) -- one build now serves both, instead of
-	// needing -DDESMUME_JIT_ARM9_ON left off specifically for GBA work.
-
-	if (!ok) { jitShutdown(); return; }
-
-#ifdef JIT_MEM_ACCOUNT
-	jitMemAccountReport("after");
-#endif
-
-	// §12.3 step 5: jitInitSlot() above already published the DS profile into
-	// jitProfile[JIT_ARM7] -- remember that pointer, then build the GBA
-	// profile too (struct fill only, no cache/arena work) so
-	// jitSetArm7GBAMode() has both ready to swap between.
-	s_arm7DsProfile  = jitProfile[JIT_ARM7];
+	// Neither core's slot is allocated here any more (F1). The ARM9 slot
+	// (~17 MB: 12 MB arena + ~4 MB block table + ~1 MB SMC tables) never was
+	// -- see jitEnsureArm9() below. A GBA session never calls jitRunArm9() at
+	// all (gbaExecFrame() has no ARM9 side, JIT or interpreted -- GBA has no
+	// ARM9), so lazy allocation there means this slot simply never gets
+	// allocated for a GBA session, leaving that memory free for a GBA cart's
+	// own 16+ MB full-ROM buffer (NDSSystem.cpp's GBA branch). The ARM7 slot
+	// (~3.5 MB: 2 MB arena + tables) now follows the same rule via
+	// jitEnsureArm7(), so a session in Interpreter mode (jit.h's runtime CPU
+	// mode) allocates no JIT memory at all.
+	//
+	// §12.3 step 5: build both ARM7 profiles up front (struct fill only, no
+	// cache/arena work) so jitSetArm7GBAMode() has both ready to swap between
+	// whether or not the slot exists yet.
+	s_arm7DsProfile  = jitBuildArm7Profile();
 	s_arm7GbaProfile = jitBuildArm7GBAProfile();
 
 #if defined(JIT_CANARY_WATCH) && defined(JIT_HEAP_WATCH)
@@ -326,7 +324,7 @@ void jitInit()
 // instead of unconditionally in jitInit() -- see that function's comment.
 // Idempotent: jitProfile[JIT_ARM9] being non-null already is the "done" state,
 // same check jitRunArm9() itself uses. Requires jitInit() to have already run
-// (ARM7's slot init also builds s_arm7DsProfile/s_arm7GbaProfile); returns
+// (it builds s_arm7DsProfile/s_arm7GbaProfile and sets s_initDone); returns
 // false harmlessly if it hasn't, or if this allocation itself fails (OOM --
 // jitRunArm9() falls back to the interpreter either way, same as any other
 // jitCompileTrace() failure).
@@ -337,13 +335,44 @@ bool jitEnsureArm9()
 	return jitInitSlot(JIT_ARM9, JIT_ARENA_SIZE_ARM9, jitCacheArm9, jitBuildArm9Profile());
 }
 
+// ARM7 counterpart of jitEnsureArm9() (F1): called from jitRunArm7() on its
+// first real dispatch. The cache is initialised against the DS profile (its
+// smcBankMask -- identical to the GBA profile's, banks 2|3 -- is what the
+// slot was always set up with, since jitInit() used to allocate it before any
+// GBA switch), then whichever profile jitSetArm7GBAMode() last chose is
+// published. On an allocation failure the half-allocated buffers are freed,
+// the failure is latched (no memalign retry on every ARM7 step) and
+// jitRunArm7() keeps returning 0, i.e. the ARM7 stays interpreted.
+bool jitEnsureArm7()
+{
+	if (jitProfile[JIT_ARM7]) return true;
+	if (!s_initDone || s_arm7AllocFailed) return false;
+#ifdef JIT_MEM_ACCOUNT
+	jitMemAccountReport("before-arm7");
+#endif
+	if (!jitInitSlot(JIT_ARM7, JIT_ARENA_SIZE, jitCacheArm7, s_arm7DsProfile)) {
+		jitFreeSlot(JIT_ARM7);
+		s_arm7AllocFailed = true;
+		return false;
+	}
+#ifdef JIT_MEM_ACCOUNT
+	jitMemAccountReport("after-arm7");
+#endif
+	jitProfile[JIT_ARM7] = s_arm7GbaMode ? s_arm7GbaProfile : s_arm7DsProfile;
+	return true;
+}
+
 void jitSetArm7GBAMode(bool enable)
 {
 	// Guarded: a no-op if jitInit() hasn't run yet or failed (both pointers
 	// stay null), so an early NDS_DebugForceGBAMode() call before NDS_Init()
 	// can't dereference/publish a null profile.
 	if (!s_arm7DsProfile || !s_arm7GbaProfile) return;
-	jitProfile[JIT_ARM7] = enable ? s_arm7GbaProfile : s_arm7DsProfile;
+	s_arm7GbaMode = enable;
+	// Publish now only if the slot already exists; otherwise jitEnsureArm7()
+	// publishes the remembered choice when it allocates it.
+	if (jitProfile[JIT_ARM7])
+		jitProfile[JIT_ARM7] = enable ? s_arm7GbaProfile : s_arm7DsProfile;
 }
 
 // =========================================================================
@@ -1448,4 +1477,4 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	return cache.registerBlock(startPC, ctx.instrCount, (JITBlockFunc)ctx.blockStart, thumb);
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

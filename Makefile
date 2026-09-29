@@ -40,18 +40,37 @@ OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizati
 # to skip the on-screen device/renderer picker and file browser and boot
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 
-# JITDEFS: empty by default. Pass  make JITDEFS=-DDESMUME_JIT_ARM7  to compile
-# the ARM7 trace-JIT infrastructure in source/jit/ (see
-# desmumewii-arm7-jit-plan.md). Not yet wired into execution. Toggling this
-# needs a  make clean  -- the flag is not tracked in the dependency files.
+# The ARM9 + ARM7 trace JIT (source/jit/) is always compiled in: a plain  make
+# builds it (-DDESMUME_JIT, the master gate every JIT #ifdef checks). Whether it
+# actually runs is a RUNTIME choice with two values -- Interpreter (both cores
+# interpreted) or JIT (both cores JITted, the default) -- picked on the startup
+# menu's CPU line or with the harness PKT_CTRL command  cpumode interp|jit  (see
+# jitRequestMode() in source/jit/jit.h). Interpreter mode costs ~nothing over a
+# JIT-less build: armInnerLoop is instantiated per mode, the MMU SMC hooks are
+# one load+branch, and no JIT memory is allocated until the JIT first runs.
+#
+# NOJIT=1 is the one compile-time escape hatch:  make NOJIT=1  leaves the JIT
+# out of the binary entirely (for bisecting a suspected JIT-infrastructure
+# problem, or an interpreter-only build to compare against).
+#
+# JITDEFS: empty by default. Extra JIT debug/diagnostic defines only, e.g.
+#   make JITDEFS="-DJIT_DIFFERENTIAL_TESTING"   (interpreter-vs-JIT soak)
+#   make JITDEFS="-DJIT_CORE_COST_HISTO"        (per-core dispatch counters)
+# These stay compile-time. Toggling NOJIT or JITDEFS needs a  make clean  --
+# neither is tracked in the dependency files.
 JITDEFS     ?=
+ifeq ($(strip $(NOJIT)),1)
+JITCORE     :=
+else
+JITCORE     :=  -DDESMUME_JIT
+endif
 
-CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS) $(JITDEFS)
+CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS) $(JITCORE) $(JITDEFS)
 CXXFLAGS	=	$(CFLAGS)
 # .S files (jit_trampoline.S) are built with -x assembler-with-cpp and see only
-# CPPFLAGS/ASFLAGS, not CFLAGS -- carry JITDEFS through so the DESMUME_JIT_ARM7
-# guard reaches the assembler too.
-ASFLAGS	    =	$(JITDEFS)
+# CPPFLAGS/ASFLAGS, not CFLAGS -- carry JITCORE/JITDEFS through so the
+# DESMUME_JIT guard reaches the assembler too.
+ASFLAGS	    =	$(JITCORE) $(JITDEFS)
 LDFLAGS	    =	-g $(MACHDEP) $(OPTFLAGS) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 
 #---------------------------------------------------------------------------------

@@ -96,11 +96,12 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 	label="$(trim "${label:-}")"
 	filter_ok "$FILTER" "$id" || continue
 
-	# "-" means explicitly empty JITDEFS (pure interpreter); blank means the
-	# suite default (both JITs on).
+	# "-" means pure interpreter: the JIT compiled out entirely (NOJIT=1 -- the
+	# JIT is otherwise always built in and on by default); blank means the
+	# suite default (both JITs on, no extra JIT debug defines).
+	makevars=""
 	case "$jitdefs" in
-		-) jitdefs="" ;;
-		"") jitdefs="-DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON" ;;
+		-) jitdefs=""; makevars="NOJIT=1" ;;
 	esac
 
 	romfile="$HERE/$rom"
@@ -113,7 +114,7 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 	if [ "$DO_BUILD" = 1 ]; then
 		BENCH_HERE="$HERE" DOLDIR="$DOLDIR" build_dol "gbaconf_$id" \
 			"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=1" \
-			"$jitdefs"
+			"$jitdefs" "$makevars"
 	elif [ ! -f "$DOLDIR/gbaconf_$id.dol" ]; then
 		die "--no-build but $DOLDIR/gbaconf_$id.dol is missing"
 	fi

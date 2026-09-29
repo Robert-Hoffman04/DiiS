@@ -19,7 +19,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 // Lazily allocates the ARM9 JIT slot (arena/block table/SMC tables) on first
 // real ARM9 JIT dispatch instead of unconditionally in jitInit() -- see
@@ -28,6 +28,13 @@
 // Returns true once the slot is ready (idempotent), false if jitInit()
 // hasn't run yet or the allocation itself fails.
 bool jitEnsureArm9();
+
+// ARM7 counterpart (F1): the ~3.5 MB ARM7 slot is lazy too, allocated from
+// jitRunArm7() on the first dispatch with jitArm7Enabled set, so Interpreter
+// mode allocates no JIT memory. Publishes the DS or GBA ARM7 profile per the
+// last jitSetArm7GBAMode(). Same return contract as jitEnsureArm9(); a failed
+// allocation is latched until jitShutdown().
+bool jitEnsureArm7();
 
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
@@ -413,6 +420,6 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 opcode);     // jit_arm.cpp
 
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb);
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT
 
 #endif // DESMUME_JIT_TRACE_H

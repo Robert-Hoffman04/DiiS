@@ -68,7 +68,7 @@
 
 #include "jit_trace.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "jit_ppc_emitter.h"
 
@@ -1862,4 +1862,4 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	ctx.endBlock = true;   // everything else -> interpreter (later B-groups)
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT

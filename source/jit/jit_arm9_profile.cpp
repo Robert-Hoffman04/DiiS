@@ -24,7 +24,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT_ARM7)
+#if defined(DESMUME_JIT)
 
 #include "../MMU.h"
 #include "../armcpu.h"
@@ -285,4 +285,4 @@ JitCpuProfile* jitBuildArm9Profile()
 	return &s_arm9Profile;
 }
 
-#endif // DESMUME_JIT_ARM7
+#endif // DESMUME_JIT
