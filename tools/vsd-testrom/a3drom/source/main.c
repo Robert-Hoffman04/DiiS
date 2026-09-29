@@ -96,6 +96,14 @@
 //      quad (alpha-0 texels neither draw nor stamp); then ID 22 on top of them; then ID 21 again,
 //      disjoint from its first run (two overlapping quads); then ID 23, a 300-triangle fan whose
 //      k-th triangle only wins the sliver it adds (tags past 255).
+//  47  toon shading (gx-remaining-work.md item 7): POLYGON_ATTR mode 2, Z-buffer, isolated like 30.
+//      A toon table of arbitrary entries except 0 (0,31,31) and 31 (31,0,31); untextured toon
+//      triangle + quad (flat red, Gouraud green/blue, which toon ignores) crossing a modulate
+//      Gouraud triangle in depth; two textured toon quads (I8 repeat+flip at index 31, direct
+//      at index 0: entries with 0/31 channels, GxAccurate's texcolor scope).
+//  48  case 47 with the textured quads at indexes 20/9 (arbitrary entries): GxFast only.
+//  49  case 47 in highlight mode (DISP3DCNT bit 1) without the textured quads (untextured
+//      highlight = toon on the CPU rasterizer) -> engaged; 50: with them -> BAIL toon.
 
 #include <nds.h>
 #include <stdio.h>
@@ -134,6 +142,25 @@
 #define A3_CASE 34
 #endif
 #define A3_CLIPGOURAUD 0
+// 47-50: toon/highlight (see the header). A3_TOONIDX: the two textured quads' toon indexes
+// (-1: no textured quads). A3_HILITE: DISP3DCNT highlight mode.
+#define A3_TOONIDX 31, 0
+#define A3_HILITE 0
+#if A3_CASE >= 47 && A3_CASE <= 50
+#if A3_CASE == 48
+#undef A3_TOONIDX
+#define A3_TOONIDX 20, 9
+#elif A3_CASE == 49
+#undef A3_TOONIDX
+#define A3_TOONIDX -1, -1
+#endif
+#if A3_CASE >= 49
+#undef A3_HILITE
+#define A3_HILITE 1
+#endif
+#undef A3_CASE
+#define A3_CASE 47
+#endif
 #if A3_CASE == 39 || A3_CASE == 40
 #if A3_CASE == 39
 #undef A3_WBUF
@@ -264,7 +291,7 @@ static void setupObjs(int semiMask)
 	for (int i = 4; i < 128; i++) oamMain.oamMemory[i].isHidden = true;
 }
 
-#if A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
+#if A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38 || A3_CASE == 47
 // Textured-polygon fixture (gx-remaining-work.md section 1, "Textured polygons"): every
 // opaque texture format, noisy texels so any texel mis-selection shows, colour-0 and
 // alpha-bit holes, clamp / repeat / flip, Z-buffer mode with one overlapping triangle.
@@ -347,6 +374,64 @@ static void texScene(void)
 	glEnd();
 	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 33)
 }
+
+#if A3_CASE == 47
+// Toon fixture (case 47-50). A vertex's toon index is its 5-bit red (the 6-bit colour's r >> 1).
+#define TOONR(i) ((i) << 3)
+static void toonTexQuad(u32 tex, int idx, float x0, float y0, float x1, float y1, float z, int s1, int t1)
+{
+	GFX_TEX_FORMAT = tex;
+	GFX_PAL_FORMAT = palMain;
+	glBegin(GL_QUADS);
+		glColor3b(TOONR(idx), 255, 0);   glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(x0, y1, z);
+		glColor3b(TOONR(idx), 0, 255);   glTexCoord2t16(inttot16(0),  inttot16(t1)); glVertex3f(x0, y0, z);
+		glColor3b(TOONR(idx), 90, 90);   glTexCoord2t16(inttot16(s1), inttot16(t1)); glVertex3f(x1, y0, z);
+		glColor3b(TOONR(idx), 200, 40);  glTexCoord2t16(inttot16(s1), inttot16(0));  glVertex3f(x1, y1, z);
+	glEnd();
+}
+
+static void toonScene(void)
+{
+	static const int tidx[2] = { A3_TOONIDX };
+	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
+	const u32 toon = (2u << 4);   // POLYGON_ATTR mode 2
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | toon);
+	if (tidx[0] >= 0) {
+		toonTexQuad(texI8,   tidx[0], -1.5f, 0.05f, -0.05f, 1.0f, 0.0f, 40, 56);
+		toonTexQuad(texRGBA, tidx[1],  0.05f, 0.05f, 1.5f,  1.0f, 0.0f, 40, 28);
+	}
+	GFX_TEX_FORMAT = 0;
+	glBegin(GL_TRIANGLES);
+		glColor3b(TOONR(5), 0, 0);     glVertex3f(-1.4f, -0.1f,  0.3f);
+		glColor3b(TOONR(5), 90, 200);  glVertex3f(-1.4f, -1.0f, -0.3f);
+		glColor3b(TOONR(5), 255, 30);  glVertex3f( 0.2f, -0.5f,  0.3f);
+	glEnd();
+	glBegin(GL_QUADS);
+		glColor3b(TOONR(17), 10, 250); glVertex3f(0.1f, -0.1f, -0.2f);
+		glColor3b(TOONR(17), 250, 10); glVertex3f(0.1f, -1.0f,  0.2f);
+		glColor3b(TOONR(17), 128, 0);  glVertex3f(1.5f, -1.0f,  0.2f);
+		glColor3b(TOONR(17), 0, 128);  glVertex3f(1.5f, -0.1f, -0.2f);
+	glEnd();
+	// a flat modulate triangle through both, in depth (flat: a perspective Gouraud triangle
+	// is itself up to 1 step off in GxAccurate, found by this fixture's first version)
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(2));
+	glBegin(GL_TRIANGLES);
+		glColor3b(255, 40, 40);  glVertex3f(-0.8f, -0.3f, -0.4f);
+		glColor3b(255, 40, 40);  glVertex3f( 0.9f, -0.9f,  0.4f);
+		glColor3b(255, 40, 40);  glVertex3f( 0.9f, -0.2f,  0.0f);
+	glEnd();
+	glFlush(GL_TRANS_MANUALSORT);   // Z-buffer mode
+}
+
+static void toonSetup(void)
+{
+	for (int i = 0; i < 32; i++)
+		((vu16 *)0x04000380)[i] = RGB15(hashb(i, 71) & 31, hashb(i, 72) & 31, hashb(i, 73) & 31);
+	((vu16 *)0x04000380)[0] = RGB15(0, 31, 31);
+	((vu16 *)0x04000380)[31] = RGB15(31, 0, 31);
+	if (A3_HILITE) glEnable(GL_TOON_HIGHLIGHT);   // DISP3DCNT bit 1
+}
+#endif
 
 #define CV(x, y, z) glVertex3f((x) / 8.0f, (y) / 8.0f, (z) / 8.0f)
 // Clipped-polygon fixture (case 38-40, see the header). Eye space: identity modelview under
@@ -654,6 +739,10 @@ static void draw3D(void)
 	texScene();
 	return;
 #endif
+#if A3_CASE == 47
+	toonScene();
+	return;
+#endif
 #if A3_CASE == 38
 	clipScene();
 	return;
@@ -804,7 +893,7 @@ int main(void)
 	// quad doesn't cover, same as case 1/27.
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 	fog = 1;
-#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
+#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38 || A3_CASE == 47
 	// textured fixture: same isolation as 27/28 (backdrop + BG0/3D only).
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
 #elif A3_CASE == 34
@@ -842,9 +931,12 @@ int main(void)
 	glFogShift(0);
 	glFogOffset(0);
 	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
-#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38
+#elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38 || A3_CASE == 47
 	glEnable(GL_TEXTURE_2D);
 	texSetup();
+#if A3_CASE == 47
+	toonSetup();
+#endif
 #elif A3_CASE == 34
 	glEnable(GL_TEXTURE_2D | GL_BLEND | GL_ALPHA_TEST);
 	glAlphaFunc(5);

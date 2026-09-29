@@ -369,6 +369,59 @@ static bool gxDs3dTexColorExact(const POLY &p)
 }
 
 // ---------------------------------------------------------------------------------
+// Toon/highlight shading (POLYGON_ATTR mode 2, gx-remaining-work.md item 7).
+//
+// rasterize.cpp's Shader::shade looks the fragment's interpolated vertex red up in the
+// toon table, toonTable[r >> 1] (TOON_TABLE's 5-bit entries through GFX3D_5TO6), and:
+//  - untextured (toon or highlight alike): outputs that entry, alpha = polygon alpha;
+//  - textured, DISP3DCNT bit 1 clear (toon): modulates the texel by the entry, exactly
+//    like mode 0 with the entry as the material colour;
+//  - textured highlight: modulates by (r, r, r) then adds the entry, saturating in 6 bits.
+// The lookup is per fragment, but a polygon whose vertices all share one r >> 1 has one
+// entry everywhere (r is interpolated between the vertex values; +0.5 then floor). Such a
+// polygon is drawn as a flat-colour polygon of that entry: every colour sent for it
+// (vertices, spans, clipped vertices) is replaced by the entry, so the existing modulate
+// TEV does the rest. GxAccurate asks for one identical r (no reliance on the rounding at
+// a r >> 1 boundary) and, textured, for an entry the texcolor rule allows (0/63 channels).
+// Per-fragment lookup (Gouraud r across an index boundary, which would need the table as
+// an indirect-indexed texture) and textured highlight (the 6-bit saturating add is not
+// the 8-bit TEV add of the expansions) bail ("toon"), both modes.
+static struct { bool on; u8 rgb[3]; } s_toon;
+
+static inline void gxDs3dToonEntry(int idx, u8 *rgb)
+{
+	const u16 e = gfx3d_rasterToon(idx);
+	rgb[0] = GFX3D_5TO6(e & 0x1F);
+	rgb[1] = GFX3D_5TO6((e >> 5) & 0x1F);
+	rgb[2] = GFX3D_5TO6((e >> 10) & 0x1F);
+}
+
+// The gate half: whether a mode-2 polygon is drawable (see above).
+static bool gxDs3dToonOk(const POLY &p, bool fast)
+{
+	const u8 r0 = gfx3d.vertlist->list[p.vertIndexes[0]].color[0];
+	for (int j = 1; j < p.type; ++j) {
+		const u8 r = gfx3d.vertlist->list[p.vertIndexes[j]].color[0];
+		if (fast ? (r >> 1) != (r0 >> 1) : r != r0) return false;
+	}
+	if (gxDs3dTexFormat(p) == 0) return true;
+	if (gfx3d.shading == GFX3D::HIGHLIGHT) return false;
+	if (fast) return true;
+	u8 rgb[3];
+	gxDs3dToonEntry(r0 >> 1, rgb);
+	for (int c = 0; c < 3; ++c)
+		if (rgb[c] != 0 && rgb[c] != 63) return false;
+	return true;
+}
+
+// The draw half: called per polygon before any colour is sent for it.
+static inline void gxDs3dToonBegin(const POLY &p)
+{
+	s_toon.on = gxDs3dPolyMode(p) == 2;
+	if (s_toon.on) gxDs3dToonEntry(gfx3d.vertlist->list[p.vertIndexes[0]].color[0] >> 1, s_toon.rgb);
+}
+
+// ---------------------------------------------------------------------------------
 // Clipped polygons (gx-remaining-work.md section 1, "Clipped polygons").
 //
 // rasterize.cpp draws GFX3D_Clipper's output, not the polygon: Sutherland-Hodgman against
@@ -490,12 +543,12 @@ static inline u8 gxDs3dF6To8(float f)
 enum {
 	kGateOk = 0, kGateNoList, kGateEmpty, kGateWbuffer, kGateClearImage, kGateEdge, kGateFog,
 	kGateTranslucent, kGatePolyMode, kGateTexNotReady, kGateTexColor, kGateType, kGateW, kGateClipColor,
-	kGateFastProj, kGateDepthEqual, kGateTransClear, kGateTransBlend, kGateTransId, kGateQuadColor, kGatePolyMtx, kGateCount
+	kGateFastProj, kGateDepthEqual, kGateTransClear, kGateTransBlend, kGateTransId, kGateQuadColor, kGatePolyMtx, kGateToon, kGateCount
 };
 static const char *const kGateNames[kGateCount] = {
 	"OK", "nolist", "empty", "wbuffer", "clearimage", "edge", "fog", "translucent", "polymode",
 	"texnotready", "texcolor", "type", "w<=0", "clipcolor", "fastproj", "depthequal", "transclear",
-	"transblend", "transid", "quadcolor", "polymtx"
+	"transblend", "transid", "quadcolor", "polymtx", "toon"
 };
 
 // Set by the last gxDs3dFrameGate: the frame has translucent polygons that will be drawn.
@@ -762,8 +815,11 @@ static int gxDs3dFrameGate(bool requireTex)
 		// POLYGON_ATTR bit 14: depth test EQUAL (rasterize.cpp's decalMode). Not modelled
 		// (GX_EQUAL on GX's own depth would not match the CPU's quantized equality).
 		if (p.polyAttr & (1 << 14)) return kGateDepthEqual;
-		// modulate only: decal/toon/highlight need their own TEV, shadow is 13g
-		if (gxDs3dPolyMode(p) != 0) return kGatePolyMode;
+		// modulate and toon/highlight (as a flat colour, gxDs3dToonOk) only: decal needs
+		// its own TEV, shadow is 13g
+		const bool toon = gxDs3dPolyMode(p) == 2;
+		if (gxDs3dPolyMode(p) != 0 && !toon) return kGatePolyMode;
+		if (toon && !gxDs3dToonOk(p, fast)) return kGateToon;
 		if (gxDs3dTexFormat(p) != 0) {
 			// Every format goes through texcache's decoder (see the textured section);
 			// A3I5/A5I3 (translucent, GxFast only) are baked to RGBA8 per polygon alpha.
@@ -772,14 +828,14 @@ static int gxDs3dFrameGate(bool requireTex)
 				if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_tex[k].seq != s_texPrepSeq)
 					return kGateTexNotReady;
 			}
-			if (!fast && !gxDs3dTexColorExact(p)) return kGateTexColor;
+			if (!fast && !toon && !gxDs3dTexColorExact(p)) return kGateTexColor;
 		}
 		if (p.type != 3 && p.type != 4) return kGateType;
 		// The DS interpolates a quad's colours natively along its edges and spans; GX splits
 		// GX_QUADS into two triangles. Up to 6 steps apart for four different vertex colours
 		// (a3_c37, 4653 px), so GxAccurate takes untextured quads only with one flat colour
 		// (textured ones already need it, gxDs3dTexColorExact). GxFast keeps drawing them.
-		if (!fast && p.type == 4 && gxDs3dTexFormat(p) == 0) {
+		if (!fast && !toon && p.type == 4 && gxDs3dTexFormat(p) == 0) {
 			const VERT &v0 = gfx3d.vertlist->list[p.vertIndexes[0]];
 			for (int j = 1; j < 4; ++j) {
 				const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
@@ -807,7 +863,7 @@ static int gxDs3dFrameGate(bool requireTex)
 			for (int j = 0; j < n; ++j)
 				if (cv[j]->coord[3] <= 0.0f) return kGateW;
 			// GxAccurate spans carry one flat colour (textured polygons: gxDs3dTexColorExact).
-			if (n >= 3 && gxDs3dTexFormat(p) == 0) {
+			if (n >= 3 && !toon && gxDs3dTexFormat(p) == 0) {
 				const VERT &v0 = gfx3d.vertlist->list[p.vertIndexes[0]];
 				for (int j = 1; j < p.type; ++j) {
 					const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
@@ -1096,7 +1152,8 @@ static inline void gxDs3dSendColor(const VERT &v, u8 alpha = 255)
 	if (gxRenderModeIsFast()) GX_Color4u8(0, 255, 255, 255);
 	else                      GX_Color4u8(255, 0, 255, 255);
 #else
-	GX_Color4u8(gxDs3d6To8(v.color[0]), gxDs3d6To8(v.color[1]), gxDs3d6To8(v.color[2]), alpha);
+	const u8 *c = s_toon.on ? s_toon.rgb : v.color;   // gxDs3dToonBegin
+	GX_Color4u8(gxDs3d6To8(c[0]), gxDs3d6To8(c[1]), gxDs3d6To8(c[2]), alpha);
 #endif
 }
 
@@ -1432,6 +1489,7 @@ void gxDs3dRenderAccurate()
 #endif
 
 		if (gxDs3dPolyInvisible(p)) continue;
+		gxDs3dToonBegin(p);
 		const VERT *cv[MAX_CLIPPED_VERTS];
 		bool clipped;
 		const int nv = gxDs3dPolyVerts(gfx3d.polylist->list[i], cv, clipped);
@@ -1633,6 +1691,7 @@ static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
 static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
 	if (gxDs3dPolyInvisible(p)) return;
+	gxDs3dToonBegin(p);
 	const bool trans = p.isTranslucent();
 	const VERT *cv[MAX_CLIPPED_VERTS];
 	bool clipped;
@@ -1757,7 +1816,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 #ifdef DSA_GXGEOM_PROBE
 				gxDs3dSendColor(v, va);
 #else
-				GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
+				if (s_toon.on) gxDs3dSendColor(v, va);
+				else GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
 #endif
 				if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
 			}

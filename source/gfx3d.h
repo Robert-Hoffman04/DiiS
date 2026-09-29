@@ -443,6 +443,7 @@ bool gfx3d_renderDeferred();
 // VBlank end, see gfx3d_rasterLatch in gfx3d.cpp); the GX geometry pass uses these, not
 // the live registers a game may already have rewritten for the next frame.
 u32 gfx3d_rasterClearColor();
+u16 gfx3d_rasterToon(int i);   // TOON_TABLE entry i as the raster reads it (latched at VBlank end)
 u32 gfx3d_rasterClearDepth();
 // A VRAMCNT write is about to change what texture/palette VRAM the raster would read:
 // resolves a deferred raster of a textured frame first.

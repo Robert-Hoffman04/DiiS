@@ -2024,6 +2024,7 @@ static void gfx3d_rasterLatchSwap(){
 
 u32 gfx3d_rasterClearColor(){ return s_rasterLatchValid ? s_rasterLatch.clearColor : gfx3d.clearColor; }
 u32 gfx3d_rasterClearDepth(){ return s_rasterLatchValid ? s_rasterLatch.clearDepth : gfx3d.clearDepth; }
+u16 gfx3d_rasterToon(int i){ return s_rasterLatchValid ? s_rasterLatch.toon[i] : gfx3d.u16ToonTable[i]; }
 
 void gfx3d_ensureRendered(){
 	if (!s_rasterDeferred) return;
