@@ -57,6 +57,20 @@
 #ifdef DSLZ_FRAMECRC
 #include "harness/harness_profile.h"
 #endif
+#ifdef DSHEAP_STATS
+#include "harness/harness_profile.h"
+#include <malloc.h>
+#include <ogc/system.h>
+// Test hook (Task heap): free heap = the unclaimed arena tails malloc can still grow into plus
+// malloc's own free bytes.
+void dsHeapStats(const char *when)
+{
+	struct mallinfo mi = mallinfo();
+	harness_profile_emitf("heap %s arena1=%d arena2=%d mfree=%d total=%dKB", when,
+		SYS_GetArena1Size() >> 10, SYS_GetArena2Size() >> 10, mi.fordblks >> 10,
+		(SYS_GetArena1Size() + SYS_GetArena2Size() + mi.fordblks) >> 10);
+}
+#endif
 #ifdef DESMUME_ARM_TIME_SPLIT
 #include <ogc/lwp_watchdog.h>
 #include <stdio.h>
@@ -1432,6 +1446,9 @@ static void execHardware_hblank()
 			if (nds.VCount == 191) {
 				gxDsEngineARenderFrame();
 				gxDsEngineBRenderFrame();
+#ifdef DSHEAP_STATS
+				{ static u32 s_heapFrame; if ((++s_heapFrame % 60) == 0) dsHeapStats("frame"); }
+#endif
 #ifdef DSLZ_FRAMECRC
 				// Test hook (13j): per-frame hash of the finished frame, both screens, with bit 15 (the CPU
 				// compositor's "written" flag) masked, for frame-by-frame A/B between builds/paths.

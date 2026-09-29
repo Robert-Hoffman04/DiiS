@@ -252,7 +252,13 @@ struct VERT {
 	}
 };
 
-#define VERTLIST_SIZE 100000
+// Task heap (gx-next-steps-log.md): was 100000. The DS holds at most 6144 vertices per frame
+// (GBATEK); 20000 keeps >3x that for pre-clip submissions (this list also holds vertices of
+// polygons the hardware would cull or clip away). Two lists are allocated (gfx3d.cpp
+// `vertlists`), 52 bytes per VERT with 13e's objcoord, so this frees ~8.3MB of heap.
+// SetVertex() refuses a vertex that could index past the end, and gfx3d_loadstate() drops
+// the in-progress lists of an old savestate that holds more than this.
+#define VERTLIST_SIZE 20000
 struct VERTLIST {
 	VERT list[VERTLIST_SIZE];
 	int count;

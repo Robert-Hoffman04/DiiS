@@ -1296,6 +1296,10 @@ bool savestate_load(EMUFILE* is)
 	_HACK_DONT_STOPMOVIE = true;
 	NDS_Reset();
 	_HACK_DONT_STOPMOVIE = false;
+#ifdef DSHEAP_STATS
+	// Test hook (Task heap): heap headroom at the savestate-load peak (`buf` live, after NDS_Reset()).
+	{ extern void dsHeapStats(const char*); dsHeapStats("ssload"); }
+#endif
 
 	//GPU_Reset(MainScreen.gpu, 0);
 	//GPU_Reset(SubScreen.gpu, 1);

@@ -602,7 +602,8 @@ static void SetVertex(){
 
 	//refuse to do anything if we have too many verts or polys
 	polygonListCompleted = 0;
-	if((vertlist->count >= VERTLIST_SIZE) || (polylist->count >= POLYLIST_SIZE)) 
+	// (+4: one vertex can finish a quad/strip step that indexes up to count+3.)
+	if((vertlist->count + 4 > VERTLIST_SIZE) || (polylist->count >= POLYLIST_SIZE)) 
 		return;
 	
 	//TODO - think about keeping the clip matrix concatenated,
@@ -2281,11 +2282,20 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 
 	if(version>=1){
 		OSREAD(vertlist->count);
+		// Task heap: a state saved with the old 100000-entry list may hold more vertices than
+		// VERTLIST_SIZE. Read them past the end into a scratch VERT and drop the in-progress
+		// lists (the next SWAP_BUFFERS starts clean); the stream stays in step.
+		bool vertOverflow = vertlist->count > VERTLIST_SIZE;
 		for(int i=0;i<vertlist->count;i++)
-			vertlist->list[i].load(is);
+		{
+			VERT scratch;
+			(i < VERTLIST_SIZE ? vertlist->list[i] : scratch).load(is);
+		}
 		OSREAD(polylist->count);
 		for(int i=0;i<polylist->count;i++)
 			polylist->list[i].load(is);
+		if(vertOverflow)
+			vertlist->count = polylist->count = 0;
 	}
 
 	if(version>=2){
