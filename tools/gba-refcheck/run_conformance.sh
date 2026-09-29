@@ -112,7 +112,7 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 	echo ">> gba-conformance $id ($label)"
 	if [ "$DO_BUILD" = 1 ]; then
 		BENCH_HERE="$HERE" DOLDIR="$DOLDIR" build_dol "gbaconf_$id" \
-			"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=2" \
+			"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=1" \
 			"$jitdefs"
 	elif [ ! -f "$DOLDIR/gbaconf_$id.dol" ]; then
 		die "--no-build but $DOLDIR/gbaconf_$id.dol is missing"

@@ -44,7 +44,7 @@ RESDIR="$HERE/results/_soak_$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$RESDIR"
 OUT="$RESDIR/jit.log"
 
-build_dol "soak" "-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_FORCE_CORE=2" "$JITDEFS"
+build_dol "soak" "-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=200000 -DDESMUME_FORCE_CORE=1" "$JITDEFS"
 
 bench_sd_snapshot "$RESDIR"
 trap bench_sd_restore EXIT

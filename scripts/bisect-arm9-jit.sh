@@ -20,7 +20,7 @@ END_REF="${END_REF:-657008d}"                             # stop at A3 (already 
 LOG_FILE="${LOG_FILE:-$REPO_DIR/bisect-log.csv}"
 CLEAN_EACH_BUILD="${CLEAN_EACH_BUILD:-1}"                 # 1 = `make clean` before every build (safer, slower)
 JITDEFS="${JITDEFS:--DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON}"
-TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=2 -DDESMUME_FORCE_ROM}"  # 2 = software raster; FORCE_ROM skips the file browser
+TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the file browser
 #
 # Notes:
 # - DEVKITPPC must already be exported in your shell (as the Makefile requires).
