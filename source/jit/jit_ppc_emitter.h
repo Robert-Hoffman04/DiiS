@@ -234,6 +234,12 @@
 #define PPC_LWZ(rD, rA, d)     ((32 << 26) | ((rD) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_STW(rS, rA, d)     ((36 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_CMPW(cr, rA, rB)   ((31 << 26) | ((cr) << 23) | ((rA) << 16) | ((rB) << 11) | (0 << 1))
+// Load/store multiple word: rD/rS..r31 <-> consecutive words at d(rA). Used by
+// the in-block interpreter fallback (JitTraceCtx::emitInterpFallback) to sync
+// the whole pinned guest register file with cpu.R[] in one instruction each
+// way, exactly as the trampoline does on entry/return.
+#define PPC_LMW(rD, rA, d)     ((46 << 26) | ((rD) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
+#define PPC_STMW(rS, rA, d)    ((47 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 
 // Hardware Cache Maintenance
 #define PPC_DCBST(rA, rB)      ((31 << 26) | ((rA) << 16) | ((rB) << 11) | (54 << 1))

@@ -31,7 +31,53 @@ bool jitEnsureArm9();
 
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
+// JIT_YIELD_NUMBER is the constant every block's entry guard compares r3
+// against (ensureArena(): `cmpwi r3, JIT_YIELD_NUMBER; bge yield`). Since the
+// dynamic quota (PERF_LOG Step 1) it is only the guard's fixed *zero point*,
+// not the chain length: the trampoline starts r3 at (JIT_YIELD_NUMBER -
+// quota) instead of 0 (ExecuteJITTrace's 4th arg, see jitQuotaStart()), so a
+// chain yields after ~quota guest cycles with the emitted code unchanged, and
+// the caller subtracts the start value back out of JITResult.cycles. Keeping
+// it a compile-time constant keeps the per-block check a single cmpwi.
+#ifndef JIT_YIELD_NUMBER
 #define JIT_YIELD_NUMBER           64
+#endif
+
+// Runtime chain quota caps, in each core's *own* cycles. armInnerLoop hands
+// jitRunArm9()/jitRunArm7() the cycles left until the next scheduled hardware
+// event (s32next) and the quota is min(that, cap) -- so a chain never runs
+// past an event/IRQ boundary by more than the one block it overshoots with
+// anyway, but also isn't cut at a fixed 64 cycles when the scheduler has
+// thousands to spare (the old fixed quota yielded ~8K times/frame on ARM9
+// back to C for nothing -- PERF_LOG "Probe -- cycle quota 64 vs 256").
+// The cap still bounds how far one core can get ahead of the other in the
+// lockstep interleave (whichever core is behind runs next), which is what
+// IPC/shared-RAM handshakes see. ARM7 cycles are doubled onto the shared
+// timeline, so an ARM7 cap of N is 2N ticks of ARM9-clock time. ARM9's 512
+// was picked by measurement (PERF_LOG Step 1: 128/256/512/1024 swept, 512
+// keeps nearly all of 1024's win at half the inter-core drift); ARM7's 256 is
+// the same 512 ticks of timeline, not yet tuned on an ARM7-heavy scene. Must
+// stay < 32768 - 64 (the seed is a signed value compared by cmpwi).
+#ifndef JIT_ARM9_QUOTA_CAP
+#define JIT_ARM9_QUOTA_CAP         512
+#endif
+#ifndef JIT_ARM7_QUOTA_CAP
+#define JIT_ARM7_QUOTA_CAP         256
+#endif
+
+// Clamp a scheduler budget into [1, cap] and return the r3 start value that
+// makes the entry guard trip after that many cycles. The lower bound of 1 is
+// load-bearing: a start value >= JIT_YIELD_NUMBER would make the *first*
+// block yield before executing anything, which jitRunArm*() reads as a
+// zero-progress bail and demotes the block to a "don't JIT" marker.
+static inline s32 jitQuotaClamp(s32 budget, s32 cap)
+{
+	return budget < 1 ? 1 : (budget > cap ? cap : budget);
+}
+static inline u32 jitQuotaStart(s32 quota)
+{
+	return (u32)(JIT_YIELD_NUMBER - quota);
+}
 #define JIT_MAX_BAILOUTS           256
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
@@ -88,6 +134,8 @@ bool jitEnsureArm9();
 // with zero trampoline round trips, before yielding back to jitRunArm9()/
 // jitRunArm7() and the armInnerLoop interleave. No new scheduler code needed;
 // armcpu_exec_block(quota) was already this mechanism, just gated off.
+// (PERF_LOG Step 1 replaced the fixed ~64-cycle quota with a runtime one
+// seeded per dispatch -- see JIT_ARM9_QUOTA_CAP above.)
 #ifndef JIT_ENABLE_CHAINING
 #define JIT_ENABLE_CHAINING 1
 #endif
@@ -111,6 +159,42 @@ bool jitEnsureArm9();
 #ifndef JIT_ENABLE_DYNAMIC_CHAINING
 #define JIT_ENABLE_DYNAMIC_CHAINING 1
 #endif
+
+// PERF_LOG Step 2: in-block interpreter fallback. When the front end refuses
+// an instruction (sets endBlock without emitting a terminator), the scanner
+// used to end the block there -- and a PC whose *first* instruction is refused
+// got a length-1 "don't JIT" marker, so every visit paid a full dispatch round
+// trip (jitRunArm9() returns 0 -> armInnerLoop -> armcpu_exec for exactly one
+// instruction -> back into jitRunArm9()). ~4,480 of ~9,700 ARM9 dispatches per
+// frame on the benchmark scene were those marker hits, and nearly every clean
+// chain end landed on one. With this on, the scanner instead emits a call to
+// the interpreter's own opcode handler for that one instruction (via
+// jitInterpFallback*() in jit_exec.cpp -- see emitInterpFallback()) and keeps
+// compiling after it; the handler's result decides at run time whether the
+// block continues, dynamically chains to a redirected PC, or returns to C.
+// Every refused instruction on both cores and both ISAs is covered -- the
+// safety net is the run-time exit test in jitInterpFallback(), not an opcode
+// allow-list. 0 restores the old behaviour exactly (A/B switch).
+#ifndef JIT_INTERP_FALLBACK
+#define JIT_INTERP_FALLBACK 1
+#endif
+
+// Worst-case words emitInterpFallback() emits -- comfortably inside either
+// per-instruction reserve below, so the scanner's budget check needs no change.
+#define JIT_INTERP_FALLBACK_WORDS  36
+
+// Run one guest instruction through the interpreter's handler table, from
+// compiled code. The caller (emitted code) has already stored the pinned
+// register file + CPSR to cpu.R[]/CPSR; these set the interpreter pipeline
+// state the handlers read (instruction / instruct_adr / next_instruction /
+// R[15]), apply the condition check (ARM), call the handler, and return its
+// cycle count in bits 0..29 plus two exit flags -- see jit_exec.cpp.
+#define JIT_FALLBACK_EXIT_CHAIN  0x40000000u   // PC redirected, same ISA: dynamic-chain on
+#define JIT_FALLBACK_EXIT_TO_C   0x80000000u   // must return to the dispatcher
+u32 jitInterpFallbackArm9Arm(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc);
 
 // Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top
 // nibble, conventional bits 31..28) -- which is exactly ARM CPSR's N/Z/C/V
@@ -203,11 +287,13 @@ struct JitTraceCtx {
 
 	// ---- P14/P15 cached page descriptors --------------------------------
 	// Guard EA (PPC_R12) against the descriptor page window (+ optionally that
-	// EA + spanBytes stays in the same 1 MB page), bail to the interpreter on a
-	// miss, then resolve: PPC_R10 <- hostBase, PPC_R11 <- (EA & mask) with low
-	// bits cleared to `alignMe` (29 => &~3, 30 => &~1, 31 => none). Clobbers
-	// r10, r11; EA stays in r12.
-	void emitPageResolve(u32 spanBytes, u8 alignMe);
+	// EA + spanBytes stays in the same 1 MB page), then resolve on the
+	// fall-through: PPC_R10 <- hostBase, PPC_R11 <- (EA & mask) with low bits
+	// cleared to `alignMe` (29 => &~3, 30 => &~1, 31 => none). Each miss test
+	// is a forward branch left for the caller to aim at its slowRead C path:
+	// the slots go to missSlots[] (room for 2) and the count is returned.
+	// Clobbers r10, r11; EA stays in r12.
+	int  emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots);
 
 	// ---- P16 ARM9 two-region inline guard --------------------------------
 	// EA must be in PPC_R12 (any alignment). Emits a runtime guard for the two
@@ -218,11 +304,15 @@ struct JitTraceCtx {
 	// (returned in fastSlots[0..count-1]) to its inline-load block. A miss (or,
 	// for spanBytes > 0, a run that straddles a region edge / 1 MB page) falls
 	// through -- the caller emits the slowRead C path there. Clobbers r10, r11;
-	// EA stays in r12. Returns the number of fast-branch slots written (2).
-	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots);
+	// EA stays in r12. Returns the number of fast-branch slots written (1-3).
+	// withItcm (loads only, PERF_LOG Step 6) adds a third region, the 32 KB
+	// ITCM mirrored over 0x00000000-0x01FFFFFF, tested on main RAM's miss
+	// branch so a main-RAM hit costs the same as before; its fast slot comes
+	// last. Stores pass false (ITCM holds JIT code; they keep slowWrite).
+	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm);
 
 	// Full ARM9 single load: EA in PPC_R12. Unconditional dirty flush, then the
-	// region guard -> inline lwbrx (main RAM / DTCM) or the slowRead C call
+	// region guard -> inline lwbrx (main RAM / DTCM / ITCM) or the slowRead C call
 	// (every other region, no interpreter round-trip); result -> gpr[rd] and the
 	// register cache is invalidated. When `writeback`, the caller has stashed the
 	// new base value at 104(r1) and it is committed to gpr[rn] afterwards. Does
@@ -258,12 +348,12 @@ struct JitTraceCtx {
 
 	// ---- P14 inline RAM load via cached page descriptors ------------------
 	// eaReg MUST be PPC_R12 and holds the runtime EA (any alignment). Emits a
-	// page-window guard (out of window -> interpreter bail at currentPC), then
-	// resolves the EA through JitCpuProfile's descriptor table and loads `size`
-	// bytes into rd's host register with emitSlowLoad's byte-swap / sign-extend /
-	// unaligned-word-rotate semantics. The destination host register is allocated
-	// *after* the guard (a bail never dirties rd). No memory prologue, no C call,
-	// register cache otherwise left intact. Returns false without emitting
+	// page-window guard, then resolves the EA through JitCpuProfile's
+	// descriptor table and loads `size` bytes into rd's host register with
+	// emitSlowLoad's byte-swap / sign-extend / unaligned-word-rotate semantics.
+	// No memory prologue, no C call on a hit. Out of window (I/O, VRAM, ...)
+	// does the same access through the slowRead C call in place and the block
+	// continues (PERF_LOG Step 3; was an interpreter bail). Returns false without emitting
 	// anything when the profile has no descriptor table -- the caller then emits
 	// its own slow path. wordRotate applies OP_LDR's unaligned-word ROR (ARM
 	// callers pass true for a word load; THUMB callers pass false to match
@@ -274,12 +364,14 @@ struct JitTraceCtx {
 	// eaReg MUST be PPC_R12 and holds the *low* guest address of the contiguous
 	// word run (callers already fold IA/IB/DA/DB into this). regs is the
 	// ascending list of destination guest registers (0..14, never 15), n its
-	// length (>= 1). Emits a single page-window guard covering the whole run
-	// (out of window, or the run straddles a 1 MB page -> one interpreter bail
-	// for the whole instruction), one descriptor resolve, then n sequential
-	// lwbrx into the registers' host slots -- the register cache stays intact.
-	// LDM/LDMIA word loads do NOT rotate an unaligned base (matches OP_L_IA).
-	// Returns false without emitting when disabled. Clobbers r10, r11, r12.
+	// length (>= 1). Emits a single page-window guard covering the whole run,
+	// one descriptor resolve, then n sequential lwbrx into the registers' host
+	// slots. Out of window, or a run that straddles a 1 MB page, takes a
+	// per-word slowRead C loop instead and the block continues (PERF_LOG
+	// Step 3; was one interpreter bail for the whole instruction). The low EA
+	// is back in r12 on return either way. LDM/LDMIA word loads do NOT rotate
+	// an unaligned base (matches OP_L_IA). Returns false without emitting when
+	// disabled. Clobbers r10, r11.
 	bool emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lockedMask);
 
 	// ---- exits (shared by jit_thumb.cpp and jit_arm.cpp) ----
@@ -301,6 +393,13 @@ struct JitTraceCtx {
 	void emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb);
 	// Bail to the interpreter at ctx.currentPC (this instruction re-run there).
 	void emitInterpreterBail(u32 metaCount);
+	// Execute the refused instruction at ctx.currentPC in place through the
+	// interpreter's handler (JIT_INTERP_FALLBACK, see above) and fall through
+	// to the next instruction when it neither redirected control nor changed
+	// anything a compiled continuation can't absorb. Does not end the block
+	// and adds nothing to cyclesAccum (the handler's own cycle count goes
+	// straight into r3 at run time).
+	void emitInterpFallback(u32 opcode);
 
 	// ARM predication: emit a 0/1 "condition holds" value into PPC_R11 for one of
 	// the 14 real ARM condition codes (0..13; not AL/NV). Clobbers r10, r11.

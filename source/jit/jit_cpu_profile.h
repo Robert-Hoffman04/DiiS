@@ -114,6 +114,11 @@ struct JitCpuProfile {
 	u32  arm9DtcmBase;
 	u32  arm9DtcmRegionPtr;
 	u32  arm9MainMask;
+	// PERF_LOG Step 6: host address of MMU.ARM9_ITCM (32 KB, mirrored over
+	// 0x00000000-0x01FFFFFF), a third inline region for ARM9 loads only. The
+	// interpreter's ITCM decode has no CP15 dependency, so this pointer is
+	// the only thing baked. 0 on the ARM7.
+	u32  arm9ItcmBase;
 };
 
 // One cached page descriptor (see JitCpuProfile::pageDescBase). LAYOUT IS ABI:

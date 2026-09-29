@@ -1092,6 +1092,14 @@ bool savestate_save (const char *file_name)
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
+#ifdef DESMUME_JIT_ARM7
+	// The SF_ARM* chunks store cpu.instruction ("9INS"/"7INS"), which the JIT
+	// dispatcher fetches lazily (PERF_LOG Step 5) -- materialise it so the
+	// state is self-consistent for a loader (or a non-JIT build) that runs
+	// the interpreter straight from it.
+	jitSyncPipeline(JIT_ARM9);
+	jitSyncPipeline(JIT_ARM7);
+#endif
 	SF_MEM_rebind();   // heap MMU buffers -> SF_MEM[].v (see SF_MEM above)
 #ifdef DESMUME_SAVESTATE_DIAG
 	// ftell() delta around each chunk -- works uniformly for both

@@ -41,8 +41,10 @@ struct JITResult {
 
 #if defined(DESMUME_JIT_ARM7)
 
-// Hand-written PowerPC ABI bridge (jit_trampoline.S).
-extern "C" void ExecuteJITTrace(JITBlockFunc execute, JITResult* out, jit_cpu_state* st);
+// Hand-written PowerPC ABI bridge (jit_trampoline.S). startCycles seeds the
+// r3 cycle accumulator (0 == the old fixed JIT_YIELD_NUMBER quota); the
+// returned out->cycles includes it -- see jitQuotaStart() in jit_trace.h.
+extern "C" void ExecuteJITTrace(JITBlockFunc execute, JITResult* out, jit_cpu_state* st, u32 startCycles);
 extern "C" void ExecuteJITTrace_Return();
 
 // Lifecycle -- called from NDS_Init() / NDS_DeInit().
@@ -65,18 +67,44 @@ void jitSetArm7GBAMode(bool enable);
 void jitCheckCanaries();
 
 // Live execution. Called from armInnerLoop() when the ARM7 is due to step.
-// Runs one JIT block from NDS_ARM7.instruct_adr and re-primes the interpreter
-// pipeline; returns cycles consumed, or 0 if the interpreter should handle
-// this instruction (uncompilable region / "don't JIT" / disabled). Both THUMB
-// and ARM mode are compiled (P11).
+// Runs one JIT block from NDS_ARM7.instruct_adr and points the interpreter
+// pipeline at the resume PC (the opcode fetch itself is deferred -- see
+// jitSyncPipeline() below); returns cycles consumed, or 0 if the interpreter
+// should handle this instruction (uncompilable region / "don't JIT" /
+// disabled). Both THUMB and ARM mode are compiled (P11). `budget` is how many ARM7 cycles the
+// scheduler can spare before its next event (PERF_LOG Step 1): a chain of
+// linked blocks runs up to min(budget, JIT_ARM7_QUOTA_CAP) cycles (plus the
+// usual one-block overshoot) before returning.
 extern bool jitArm7Enabled;
-u32 jitRunArm7();
+u32 jitRunArm7(s32 budget);
 
 // ARM9 counterpart. Spliced into armInnerLoop()'s ARM9 arm. jitArm9Enabled
 // defaults false (see jit_exec.cpp), so this compiles nothing and returns 0
-// unless -DDESMUME_JIT_ARM9_ON or JIT_DIFFERENTIAL_TESTING is set.
+// unless -DDESMUME_JIT_ARM9_ON or JIT_DIFFERENTIAL_TESTING is set. `budget`
+// is in ARM9 cycles, capped by JIT_ARM9_QUOTA_CAP -- see jitRunArm7().
 extern bool jitArm9Enabled;
-u32 jitRunArm9();
+u32 jitRunArm9(s32 budget);
+
+// PERF_LOG Step 5 -- lazy interpreter-pipeline re-prime. A compiled run
+// leaves instruct_adr / next_instruction / R[15] pointing at the resume PC
+// but no longer fetches the opcode there into cpu.instruction: the next
+// thing to run is almost always the JIT again, which only reads
+// instruct_adr, so that fetch (an indirect call into _MMU_read*<MMU_AT_CODE>
+// per dispatch) was wasted. Instead the core is flagged stale, and every
+// reader of cpu.instruction outside the interpreter/fallback handlers --
+// armInnerLoop's armcpu_exec() fallback, savestate_save(), the LOG_ARM*
+// tracers -- calls jitSyncPipeline() first. Indexed JIT_ARM9 / JIT_ARM7
+// (== ARMCPU_ARM9 / ARMCPU_ARM7). A stale flag that is set when the pipeline
+// is actually fresh (e.g. armcpu_irqException() prefetched the vector since)
+// only costs a redundant re-fetch of the same opcode, never a wrong one: the
+// sync derives everything from instruct_adr + CPSR.T, exactly like
+// armcpu_prefetch() does from next_instruction.
+extern u8 g_jitPipeStale[2];
+void jitSyncPipelineSlow(int core);
+static inline void jitSyncPipeline(int core)
+{
+	if (g_jitPipeStale[core]) jitSyncPipelineSlow(core);
+}
 
 #if defined(JIT_DIFFERENTIAL_TESTING)
 // Differential-harness guest-memory journal (jit_differential.cpp). The three

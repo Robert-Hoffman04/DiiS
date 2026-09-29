@@ -74,7 +74,7 @@ bool jitSelfTest()
 
 	JITResult r;
 	memset(&r, 0, sizeof(r));
-	ExecuteJITTrace((JITBlockFunc)code, &r, &st);
+	ExecuteJITTrace((JITBlockFunc)code, &r, &st, 0);   // 0 == fixed JIT_YIELD_NUMBER quota
 
 	const bool ok = (r.cycles == kCycles) && (r.nextPC == kNextPC) &&
 	                (r.instructions == kInsns) && (r.bailedOut == 0);

@@ -1633,6 +1633,14 @@ void NDS_Reschedule()
 	sequencer.reschedule = true;
 }
 
+// The JIT's in-block interpreter fallback (jit_exec.cpp jitInterpFallback())
+// runs single interpreter handlers from inside a compiled chain and needs to
+// know whether one of them just asked armInnerLoop to stop and reschedule.
+bool NDS_ReschedulePending()
+{
+	return sequencer.reschedule;
+}
+
 FORCEINLINE u32 _fast_min32(u32 a, u32 b, u32 c, u32 d)
 {
 	return ((( ((s32)(a-b)) >> (32-1)) & (c^d)) ^ d);
@@ -1781,6 +1789,9 @@ FORCEINLINE void arm9log()
 #ifdef LOG_ARM9
 	if(dolog)
 	{
+#ifdef DESMUME_JIT_ARM7
+		jitSyncPipeline(JIT_ARM9);   // cpu.instruction is fetched lazily after a JIT run
+#endif
 		char dasmbuf[4096];
 		if(NDS_ARM9.CPSR.bits.T)
 			des_thumb_instructions_set[((NDS_ARM9.instruction)>>6)&1023](NDS_ARM9.instruct_adr, NDS_ARM9.instruction, dasmbuf);
@@ -1801,6 +1812,9 @@ FORCEINLINE void arm7log()
 #ifdef LOG_ARM7
 	if(dolog)
 	{
+#ifdef DESMUME_JIT_ARM7
+		jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
+#endif
 		char dasmbuf[4096];
 		if(NDS_ARM7.CPSR.bits.T)
 			des_thumb_instructions_set[((NDS_ARM7.instruction)>>6)&1023](NDS_ARM7.instruct_adr, NDS_ARM7.instruction, dasmbuf);
@@ -1881,6 +1895,9 @@ static void arm7TraceRecordAndCheck()
 	e.r4  = NDS_ARM7.R[4];
 	e.r13 = NDS_ARM7.R[13];
 	e.r14 = NDS_ARM7.R[14];
+#ifdef DESMUME_JIT_ARM7
+	jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
+#endif
 	e.op  = NDS_ARM7.instruction;
 	e.cpsr = NDS_ARM7.CPSR.val;
 	if (s_arm7Dumped || arm7PcLooksValid(e.pc)) return;
@@ -1917,9 +1934,16 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				u64 _t0 = gettime();
 #endif
 #ifdef DESMUME_JIT_ARM7
-				u32 jit9Cycles = jitRunArm9();
+				// Budget = ARM9 cycles until the next scheduled hardware event;
+				// jitRunArm9() caps it (JIT_ARM9_QUOTA_CAP) so the lockstep
+				// interleave with ARM7 stays tight. arm9 <= timer < s32next
+				// here, so it is always >= 1.
+				// A 0 return hands this instruction to the interpreter, which
+				// needs the opcode fetch the JIT defers (jitSyncPipeline(),
+				// jit.h -- a no-op load+branch unless a JIT run came last).
+				u32 jit9Cycles = jitRunArm9(s32next - arm9);
 				if (jit9Cycles) { arm9 += jit9Cycles; }
-				else { PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
+				else { jitSyncPipeline(JIT_ARM9); PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #else
 				{ PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #endif
@@ -1944,9 +1968,12 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				arm7TraceRecordAndCheck();
 #endif
 #ifdef DESMUME_JIT_ARM7
-				u32 jitCycles = jitRunArm7();
+				// Same budget in ARM7 cycles: ARM7 time is doubled onto the
+				// shared timeline below, so halve the ticks left to s32next
+				// (jitQuotaClamp() lifts a 0 from the rounding back to 1).
+				u32 jitCycles = jitRunArm7((s32next - arm7) >> 1);
 				if (jitCycles) { arm7 += jitCycles << 1; }
-				else { PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
+				else { jitSyncPipeline(JIT_ARM7); PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
 #else
 				{ PZ_SCOPE(PZ_ARM7_INTERP); arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1); }
 #endif
