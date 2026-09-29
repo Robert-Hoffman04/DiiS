@@ -9,7 +9,7 @@
  *
  * P1 changes vs upstream:
  *   - New C signature: ExecuteJITTrace(JITBlockFunc execute, JITResult* out,
- *                                      jit_cpu_state* st).
+ *                                      jit_cpu_state* st, u32 startCycles).
  *     The three loose pointers VBA passed (gbaRegs, flags-array, readTable)
  *     plus its busPrefetchCount are replaced by one jit_cpu_state* whose
  *     layout is { u32* gpr; u32* cpsr; u8** readTable; } (see
@@ -19,6 +19,10 @@
  *   - Flags: VBA faulted four separate flag words from a base pointer; here a
  *     single guest CPSR word pointer sits at 84(r1) and the emitter (P2)
  *     masks/inserts the N/Z/C/V nibble (CPSR bits 31..28).
+ *   - startCycles (PERF_LOG Step 1) seeds the r3 cycle accumulator instead
+ *     of 0, turning the fixed JIT_YIELD_NUMBER entry guard into a runtime
+ *     quota -- see jitQuotaStart() in jit_trace.h. out->cycles is returned
+ *     raw (start included); callers subtract startCycles.
  *
  * Stack frame (128 bytes), offsets referenced by emitted trace code:
  *    80(r1)  guest gpr base pointer   (== r14 for the whole trace)
@@ -50,7 +54,8 @@
 
 # ExecuteJITTrace(r3 = JITBlockFunc execute,
 #                 r4 = JITResult*   out,
-#                 r5 = jit_cpu_state* st)
+#                 r5 = jit_cpu_state* st,
+#                 r6 = u32 startCycles)
 ExecuteJITTrace:
     mflr 0
     stw 0, 4(1)                  # save LR into caller linkage area
@@ -62,7 +67,8 @@ ExecuteJITTrace:
     # trace, CPSR in r30 (== &R[0] + 16, contiguous in armcpu_t), synced to
     # memory only here. One lmw covers all of it -- r31 briefly holds SPSR
     # (&R[0] + 17), immediately zeroed as the P12 instruction-count accumulator.
-    # r3 = execute, r4 = JITResult* out, r5 = st -- keep all three until used.
+    # r3 = execute, r4 = JITResult* out, r5 = st, r6 = startCycles -- keep
+    # all four until used (r6 is untouched until the mr below).
     lwz 10, 0(5)              # r10 = st->gpr  (== &cpu.R[0])
     lwz 11, 4(5)              # r11 = st->cpsr
 
@@ -74,8 +80,9 @@ ExecuteJITTrace:
     li 31, 0                    # P12: resident guest-instruction-count accumulator
 
     mtctr 3                     # enter the compiled block via CTR (never a call:
-    li 3, 0                     #   the trace may chain through further blocks
+    mr 3, 6                     #   the trace may chain through further blocks
     bctr                       #   via the linker stub before returning here)
+                               # r3 = startCycles: seeds the cross-block quota
 
     # ---------------------------------------------------------------------
     # Every trace exit path (clean epilogue, deferred bailout, SMC bailout,

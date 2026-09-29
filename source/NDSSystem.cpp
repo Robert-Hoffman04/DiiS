@@ -1834,7 +1834,11 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				u64 _t0 = gettime();
 #endif
 #ifdef DESMUME_JIT_ARM7
-				u32 jit9Cycles = jitRunArm9();
+				// Budget = ARM9 cycles until the next scheduled hardware event;
+				// jitRunArm9() caps it (JIT_ARM9_QUOTA_CAP) so the lockstep
+				// interleave with ARM7 stays tight. arm9 <= timer < s32next
+				// here, so it is always >= 1.
+				u32 jit9Cycles = jitRunArm9(s32next - arm9);
 				if (jit9Cycles) { arm9 += jit9Cycles; }
 				else { PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
 #else
@@ -1861,7 +1865,10 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				arm7TraceRecordAndCheck();
 #endif
 #ifdef DESMUME_JIT_ARM7
-				u32 jitCycles = jitRunArm7();
+				// Same budget in ARM7 cycles: ARM7 time is doubled onto the
+				// shared timeline below, so halve the ticks left to s32next
+				// (jitQuotaClamp() lifts a 0 from the rounding back to 1).
+				u32 jitCycles = jitRunArm7((s32next - arm7) >> 1);
 				if (jitCycles) { arm7 += jitCycles << 1; }
 				else { PZ_SCOPE(PZ_ARM7_INTERP); arm7 += armcpu_exec<ARMCPU_ARM7>() << 1; }
 #else

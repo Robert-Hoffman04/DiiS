@@ -232,7 +232,8 @@ static DiffCounters s_c9 = { "diff9", 0,0,0,0,0,0,0,0,0,0, 0xFFFFFFFFu };
 extern u64 g_jitBlocksRun, g_jitInsnsRun;
 
 static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(),
-                         armcpu_t* cpu, BasicBlock* block, u32 pc, DiffCounters& C)
+                         armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start,
+                         DiffCounters& C)
 {
 	JitCpuProfile* prof = jitProfile[jitIdx];
 	const armcpu_t save = *cpu;
@@ -295,7 +296,8 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	JITResult rTrial;
 	memset(&rTrial, 0, sizeof rTrial);
 	journalArm(proc);
-	ExecuteJITTrace(block->execute, &rTrial, &stTrial);
+	ExecuteJITTrace(block->execute, &rTrial, &stTrial, start);
+	rTrial.cycles -= start;
 	const bool trialTrustable = !s_journalOverflow && !s_journalUnrestorable;
 	u32 tR[16];
 	memcpy(tR, cpu->R, sizeof tR);
@@ -402,7 +404,8 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	}
 #endif
 
-	ExecuteJITTrace(block->execute, &r, &st);
+	ExecuteJITTrace(block->execute, &r, &st, start);
+	r.cycles -= start;
 	if (r.smcHit) jcache.invalidateSMCTarget(r.smcAddress);
 
 	if (r.instructions == 0) {
@@ -509,16 +512,16 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	return r.cycles ? r.cycles : 1;
 }
 
-u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
+u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start)
 {
 	return jitRunChecked(JIT_ARM7, ARMCPU_ARM7, jitCacheArm7,
-	                     &armcpu_exec<ARMCPU_ARM7>, cpu, block, pc, s_c7);
+	                     &armcpu_exec<ARMCPU_ARM7>, cpu, block, pc, start, s_c7);
 }
 
-u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc)
+u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start)
 {
 	return jitRunChecked(JIT_ARM9, ARMCPU_ARM9, jitCacheArm9,
-	                     &armcpu_exec<ARMCPU_ARM9>, cpu, block, pc, s_c9);
+	                     &armcpu_exec<ARMCPU_ARM9>, cpu, block, pc, start, s_c9);
 }
 
 #endif // DESMUME_JIT_ARM7 && JIT_DIFFERENTIAL_TESTING

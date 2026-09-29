@@ -39,8 +39,10 @@
 
 struct armcpu_t;
 
-u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc);
-u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc);
+// `start` is the ExecuteJITTrace r3 seed (jitQuotaStart(), jit_trace.h) --
+// both the trial and the real JIT run use it so they chain identically.
+u32 jitRunArm7Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start);
+u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start);
 
 #endif
 

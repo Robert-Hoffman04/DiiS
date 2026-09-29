@@ -10,7 +10,8 @@
  * for one instruction").
  *
  * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
- * of blocks (up to ~JIT_YIELD_NUMBER guest cycles) before returning, not just
+ * of blocks (up to the runtime quota -- min(scheduler budget, JIT_ARM*_QUOTA_CAP)
+ * guest cycles, PERF_LOG Step 1) before returning, not just
  * one. IRQ delivery, mode switches and anything a block can't compile still
  * fall back to the interpreter (a chain only runs compiled static-exit edges;
  * any dynamic exit, bailout or quota trip returns here first).
@@ -240,7 +241,7 @@ static void jit9ProfileReport()
 // Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
 bool jitArm7Enabled = true;
 
-u32 jitRunArm7()
+u32 jitRunArm7(s32 budget)
 {
 	JitCpuProfile* prof = jitProfile[JIT_ARM7];
 	if (!jitArm7Enabled || !prof) return 0;
@@ -278,8 +279,14 @@ u32 jitRunArm7()
 		b = jitCompileTrace(pc, jitCacheArm7, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(0, _preMarker7); return 0; } // uncompilable / "don't JIT" -> interpreter
 
+	// PERF_LOG Step 1: runtime chain quota. Seed r3 so the (fixed) entry
+	// guard trips after `quota` cycles, then take the seed back out of the
+	// result so everything below sees plain elapsed cycles as before.
+	const s32 quota = jitQuotaClamp(budget, JIT_ARM7_QUOTA_CAP);
+	const u32 start = jitQuotaStart(quota);
+
 #if defined(JIT_DIFFERENTIAL_TESTING)
-	return jitRunArm7Checked(&cpu, b, pc);
+	return jitRunArm7Checked(&cpu, b, pc, start);
 #endif
 
 	cpu.R[15] = pc + (thumb ? 4 : 8);             // pipeline offset the block expects
@@ -288,8 +295,9 @@ u32 jitRunArm7()
 	JITResult r;
 	memset(&r, 0, sizeof r);
 	JCC_EXEC_BEGIN();
-	ExecuteJITTrace(b->execute, &r, &st);
+	ExecuteJITTrace(b->execute, &r, &st, start);
 	JCC_EXEC_END(0);
+	r.cycles -= start;
 	g_jitAttempts++;
 
 	if (r.smcHit)
@@ -310,7 +318,7 @@ u32 jitRunArm7()
 	// shorter than ARM9's (NOTES.md Step 5): this answers whether that's
 	// dynamic-exit-heavy control flow (BX/POP{pc}/hi-reg branches -- nothing
 	// to fix, the target genuinely isn't known at compile time), quota
-	// trips (JIT_YIELD_NUMBER -- chains are fine, just capped), or the same
+	// trips (the runtime quota -- chains are fine, just capped), or the same
 	// slot-eviction/dontJIT/SMC edges ARM9 sees (cache-pressure family,
 	// already addressed for ARM9 by 2-way associativity -- item 4). Slot
 	// classification mirrors jitRunArm9() exactly: resident=should have
@@ -324,7 +332,7 @@ u32 jitRunArm7()
 		s_disp++;
 		if (r.instructions != 0 && !r.bailedOut && !r.smcHit) {
 			s_edge++;
-			if (r.cycles >= JIT_YIELD_NUMBER) s_yield++;
+			if ((s32)r.cycles >= quota) s_yield++;
 			if (r.instructions < 4)           s_edgeShort++;
 			u32 tpc = r.nextPC & ~1u;
 			u32 idx = jitHashPC(tpc);
@@ -419,7 +427,7 @@ bool jitArm9Enabled = true;
 bool jitArm9Enabled = false;
 #endif
 
-u32 jitRunArm9()
+u32 jitRunArm9(s32 budget)
 {
 #if !defined(JIT_DIFFERENTIAL_TESTING)
 	if (!jitArm9Enabled) return 0;
@@ -484,8 +492,12 @@ u32 jitRunArm9()
 		b = jitCompileTrace(pc, jitCacheArm9, *prof, thumb);
 	if (!b || b->execute == nullptr) { JCC_NOBLOCK(1, _preMarker9); return 0; }
 
+	// Runtime chain quota -- see jitRunArm7().
+	const s32 quota = jitQuotaClamp(budget, JIT_ARM9_QUOTA_CAP);
+	const u32 start = jitQuotaStart(quota);
+
 #if defined(JIT_DIFFERENTIAL_TESTING)
-	return jitRunArm9Checked(&cpu, b, pc);
+	return jitRunArm9Checked(&cpu, b, pc, start);
 #endif
 
 	cpu.R[15] = pc + (thumb ? 4 : 8);
@@ -494,8 +506,9 @@ u32 jitRunArm9()
 	JITResult r;
 	memset(&r, 0, sizeof r);
 	JCC_EXEC_BEGIN();
-	ExecuteJITTrace(b->execute, &r, &st);
+	ExecuteJITTrace(b->execute, &r, &st, start);
 	JCC_EXEC_END(1);
+	r.cycles -= start;
 
 #ifdef DESMUME_JIT_TRACE_FIRST
 	{
@@ -530,7 +543,7 @@ u32 jitRunArm9()
 		//   smc      -> same PC, execute==null, len==0: SMC-killed, recompile due.
 		if (r.instructions != 0 && !r.bailedOut && !r.smcHit) {
 			s_edge++;
-			if (r.cycles >= JIT_YIELD_NUMBER) s_yield++;
+			if ((s32)r.cycles >= quota) s_yield++;
 			if (r.instructions < 4)           s_edgeShort++;
 			{
 				u32 tpc = r.nextPC & ~1u;

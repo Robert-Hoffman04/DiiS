@@ -152,7 +152,7 @@ int jitThumbSelfTest()
 		NDS_ARM7.R[15] = JITT_SCRATCH + 4;
 		jit_cpu_state st = { &NDS_ARM7.R[0], &NDS_ARM7.CPSR.val, nullptr };
 		JITResult r; memset(&r, 0, sizeof r);
-		ExecuteJITTrace(b->execute, &r, &st);
+		ExecuteJITTrace(b->execute, &r, &st, 0);   // 0 == fixed JIT_YIELD_NUMBER quota
 		u32 jR[16]; memcpy(jR, NDS_ARM7.R, sizeof jR);
 		u32 jCPSR = NDS_ARM7.CPSR.val;
 

@@ -31,9 +31,53 @@ bool jitEnsureArm9();
 
 // --- arena / block budget ------------------------------------------------
 #define JIT_MAX_WORDS              3072
+// JIT_YIELD_NUMBER is the constant every block's entry guard compares r3
+// against (ensureArena(): `cmpwi r3, JIT_YIELD_NUMBER; bge yield`). Since the
+// dynamic quota (PERF_LOG Step 1) it is only the guard's fixed *zero point*,
+// not the chain length: the trampoline starts r3 at (JIT_YIELD_NUMBER -
+// quota) instead of 0 (ExecuteJITTrace's 4th arg, see jitQuotaStart()), so a
+// chain yields after ~quota guest cycles with the emitted code unchanged, and
+// the caller subtracts the start value back out of JITResult.cycles. Keeping
+// it a compile-time constant keeps the per-block check a single cmpwi.
 #ifndef JIT_YIELD_NUMBER
 #define JIT_YIELD_NUMBER           64
 #endif
+
+// Runtime chain quota caps, in each core's *own* cycles. armInnerLoop hands
+// jitRunArm9()/jitRunArm7() the cycles left until the next scheduled hardware
+// event (s32next) and the quota is min(that, cap) -- so a chain never runs
+// past an event/IRQ boundary by more than the one block it overshoots with
+// anyway, but also isn't cut at a fixed 64 cycles when the scheduler has
+// thousands to spare (the old fixed quota yielded ~8K times/frame on ARM9
+// back to C for nothing -- PERF_LOG "Probe -- cycle quota 64 vs 256").
+// The cap still bounds how far one core can get ahead of the other in the
+// lockstep interleave (whichever core is behind runs next), which is what
+// IPC/shared-RAM handshakes see. ARM7 cycles are doubled onto the shared
+// timeline, so an ARM7 cap of N is 2N ticks of ARM9-clock time. ARM9's 512
+// was picked by measurement (PERF_LOG Step 1: 128/256/512/1024 swept, 512
+// keeps nearly all of 1024's win at half the inter-core drift); ARM7's 256 is
+// the same 512 ticks of timeline, not yet tuned on an ARM7-heavy scene. Must
+// stay < 32768 - 64 (the seed is a signed value compared by cmpwi).
+#ifndef JIT_ARM9_QUOTA_CAP
+#define JIT_ARM9_QUOTA_CAP         512
+#endif
+#ifndef JIT_ARM7_QUOTA_CAP
+#define JIT_ARM7_QUOTA_CAP         256
+#endif
+
+// Clamp a scheduler budget into [1, cap] and return the r3 start value that
+// makes the entry guard trip after that many cycles. The lower bound of 1 is
+// load-bearing: a start value >= JIT_YIELD_NUMBER would make the *first*
+// block yield before executing anything, which jitRunArm*() reads as a
+// zero-progress bail and demotes the block to a "don't JIT" marker.
+static inline s32 jitQuotaClamp(s32 budget, s32 cap)
+{
+	return budget < 1 ? 1 : (budget > cap ? cap : budget);
+}
+static inline u32 jitQuotaStart(s32 quota)
+{
+	return (u32)(JIT_YIELD_NUMBER - quota);
+}
 #define JIT_MAX_BAILOUTS           256
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
@@ -90,6 +134,8 @@ bool jitEnsureArm9();
 // with zero trampoline round trips, before yielding back to jitRunArm9()/
 // jitRunArm7() and the armInnerLoop interleave. No new scheduler code needed;
 // armcpu_exec_block(quota) was already this mechanism, just gated off.
+// (PERF_LOG Step 1 replaced the fixed ~64-cycle quota with a runtime one
+// seeded per dispatch -- see JIT_ARM9_QUOTA_CAP above.)
 #ifndef JIT_ENABLE_CHAINING
 #define JIT_ENABLE_CHAINING 1
 #endif
