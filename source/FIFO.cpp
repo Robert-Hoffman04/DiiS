@@ -175,6 +175,41 @@ static void GXF_FIFO_handleEvents()
 
 }
 
+// Task fifobatch: batched pushes (a DMA block into GXFIFO, DmaController::doCopy()).
+// Per push, GFX_FIFOsend() runs GXF_FIFO_handleEvents() and NDS_RescheduleGXFIFO(1).
+// Inside one DMA block nds_timer, the GXSTAT IRQ mode and every DMA channel's state are
+// fixed and the FIFO only grows, so those calls are idempotent except for the cost sum:
+// the half-IRQ / GXFIFO-DMA trigger fires iff any push left size <= 127 (the empty case
+// can't follow a push), and the reschedule adds 1 per push. End replays exactly that.
+static bool s_gxfBatch = false;
+static bool s_gxfBatchHalf;
+static u32  s_gxfBatchPushes;
+
+void GFX_FIFObatchBegin()
+{
+	s_gxfBatch = true;
+	s_gxfBatchHalf = false;
+	s_gxfBatchPushes = 0;
+}
+
+void GFX_FIFObatchEnd()
+{
+	s_gxfBatch = false;
+	if (s_gxfBatchPushes == 0) return;
+	if (s_gxfBatchHalf)
+	{
+		if(MMU_new.gxstat.gxfifo_irq == 1)
+			setIF(0, (1<<21)); //the half gxfifo irq
+		triggerDma(EDMAMode_GXFifo);
+	}
+	NDS_RescheduleGXFIFO(s_gxfBatchPushes);
+}
+
+void GFX_FIFOhandleEvents()
+{
+	GXF_FIFO_handleEvents();
+}
+
 void GFX_FIFOsend(u8 cmd, u32 param)
 {
 	//INFO("gxFIFO: send 0x%02X = 0x%08X (size %03i/0x%02X) gxstat 0x%08X\n", cmd, param, gxFIFO.size, gxFIFO.size, gxstat);
@@ -190,6 +225,13 @@ void GFX_FIFOsend(u8 cmd, u32 param)
 	}
 	
 	//gxstat |= 0x08000000;		// set busy flag
+
+	if (s_gxfBatch)
+	{
+		++s_gxfBatchPushes;
+		if (gxFIFO.size <= 127) s_gxfBatchHalf = true;
+		return;
+	}
 
 	GXF_FIFO_handleEvents();
 
@@ -215,6 +257,23 @@ bool GFX_PIPErecv(u8 *cmd, u32 *param)
 	if (gxFIFO.head > HACK_GXIFO_SIZE-1) gxFIFO.head = 0;
 	
 	GXF_FIFO_handleEvents();
+
+	return true;
+}
+
+// Task fifobatch: GFX_PIPErecv() without the event check (see FIFO.h), for
+// gfx3d_execute3D()'s loop. The FIFO only shrinks there, so one GFX_FIFOhandleEvents()
+// after the last pop (or the failing one) raises exactly what the per-pop checks would.
+bool GFX_PIPErecvNoEvents(u8 *cmd, u32 *param)
+{
+	if (gxFIFO.size == 0) return false;
+
+	*cmd = gxFIFO.cmd[gxFIFO.head];
+	*param = gxFIFO.param[gxFIFO.head];
+
+	gxFIFO.head++;
+	gxFIFO.size--;
+	if (gxFIFO.head > HACK_GXIFO_SIZE-1) gxFIFO.head = 0;
 
 	return true;
 }

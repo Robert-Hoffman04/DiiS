@@ -1727,8 +1727,11 @@ void gfx3d_execute3D(){
 	//without this batch size the emuloop will escape way too often to run fast.
 	const int HACK_FIFO_BATCH_SIZE = 64;
 
+	// Task fifobatch: pop without the per-word FIFO event check, run it once after the
+	// loop (GFX_PIPErecvNoEvents, FIFO.cpp). No CPU runs in between and the loop only
+	// shrinks the FIFO, so the half/empty IRQ and GXFIFO-DMA trigger come out the same.
 	for(int i=0;i<HACK_FIFO_BATCH_SIZE;i++) {
-		if(GFX_PIPErecv(&cmd, &param)){
+		if(GFX_PIPErecvNoEvents(&cmd, &param)){
 			//if (isSwapBuffers) printf("Executing while swapbuffers is pending: %d:%08X\n",cmd,param);
 
 			//since we did anything at all, incur a pipeline motion cost.
@@ -1751,6 +1754,7 @@ void gfx3d_execute3D(){
 			MMU.gfx3dCycles = nds_timer+1;
 		} else break;
 	}
+	GFX_FIFOhandleEvents();
 
 }
 

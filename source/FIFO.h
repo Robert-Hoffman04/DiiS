@@ -73,6 +73,16 @@ extern void GFX_PIPEclear();
 extern void GFX_FIFOclear();
 extern void GFX_FIFOsend(u8 cmd, u32 param);
 extern bool GFX_PIPErecv(u8 *cmd, u32 *param);
+// Task fifobatch: the same FIFO without the per-word event checks. Between
+// GFX_FIFObatchBegin() and GFX_FIFObatchEnd(), GFX_FIFOsend() only pushes and the
+// End raises what the pushes would have (see FIFO.cpp). GFX_PIPErecvNoEvents() pops
+// without GFX_PIPErecv()'s event check; the caller runs GFX_FIFOhandleEvents() once
+// after its last pop. Both are exact only while nds_timer and the GXSTAT IRQ mode can't
+// change and nothing reads the FIFO state in between (no CPU runs).
+extern void GFX_FIFObatchBegin();
+extern void GFX_FIFObatchEnd();
+extern bool GFX_PIPErecvNoEvents(u8 *cmd, u32 *param);
+extern void GFX_FIFOhandleEvents();
 extern void GFX_FIFOcnt(u32 val);
 
 //=================================================== Display memory FIFO

@@ -2167,6 +2167,28 @@ void DmaController::exec()
 //	driver->DEBUG_UpdateIORegView(BaseDriver::EDEBUG_IOREG_DMA);
 }
 
+// Task fifobatch: may a 32-bit ARM9 DMA block take doCopy()'s GXFIFO fast path? Every
+// source word must be a plain main-RAM read for _MMU_read32<ARM9,DMA> (0x02xxxxxx, not
+// under DTCM) and every destination a GXFIFO port write for _MMU_write32<ARM9,DMA>
+// (0x04000400-0x0400043F, not under DTCM), which _MMU_ARM9_write32 stores to the I/O
+// page and hands to gfx3d_sendCommandToFIFO() with no other side effect. |inc| <= 4 and
+// todo <= 0x200000, so checking both ends of each span covers it.
+static bool dmaGxFifoBlockOk(u32 src, u32 srcinc, u32 dst, u32 dstinc, u32 todo)
+{
+#if defined(HAVE_LUA) || (defined(DESMUME_JIT_ARM7) && defined(JIT_DIFFERENTIAL_TESTING))
+	return false;
+#else
+	const u32 dstLast = dst + (todo-1)*dstinc;
+	if (dst - 0x04000400u >= 0x40u || dstLast - 0x04000400u >= 0x40u) return false;
+	if ((dst & ~0x3FFFu) == MMU.DTCMRegion) return false;
+	const u32 srcLast = src + (todo-1)*srcinc;
+	if ((src >> 24) != 0x02 || (srcLast >> 24) != 0x02) return false;
+	const u32 lo = std::min(src, srcLast) & ~0x3FFFu, hi = std::max(src, srcLast) & ~0x3FFFu;
+	if (MMU.DTCMRegion >= lo && MMU.DTCMRegion <= hi) return false;
+	return true;
+#endif
+}
+
 void DmaController::doCopy()
 {
 	//generate a copy count depending on various copy mode's behavior
@@ -2217,7 +2239,23 @@ void DmaController::doCopy()
 	//TODO - these might be losing out a lot by not going through the templated version anymore.
 	//we might make another function to do just the raw copy op which can use them with checks
 	//outside the loop
-	if(sz==4) {
+	if(sz==4 && procnum==ARMCPU_ARM9 && dmaGxFifoBlockOk(src, srcinc, dst, dstinc, todo)) {
+		// Task fifobatch: a block from main RAM into the GXFIFO command port (SM64DS: ~100
+		// immediate-DMA words per block, ~10k words a frame). Same reads and writes as the
+		// generic loop below, minus the per-word address decode, and the FIFO's per-word
+		// event checks folded into one (GFX_FIFObatchBegin/End, FIFO.cpp).
+		u32 *io = (u32 *)MMU.MMU_MEM[ARMCPU_ARM9][0x40];
+		GFX_FIFObatchBegin();
+		for(s32 i=(s32)todo; i>0; i--)
+		{
+			u32 temp = T1ReadLong_guaranteedAligned(MMU.MAIN_MEM, src & _MMU_MAIN_MEM_MASK32);
+			io[(dst & 0xFFF) >> 2] = temp;
+			gfx3d_sendCommandToFIFO(temp);
+			dst += dstinc;
+			src += srcinc;
+		}
+		GFX_FIFObatchEnd();
+	} else if(sz==4) {
 		for(s32 i=(s32)todo; i>0; i--)
 		{
 			u32 temp = _MMU_read32(procnum,MMU_AT_DMA,src);
