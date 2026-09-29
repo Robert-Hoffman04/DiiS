@@ -9,9 +9,22 @@
 #include <malloc.h>
 #include <math.h>
 #include <string.h>
-#if defined(DSA_GXGEOM_DEBUGWHY) || defined(DSA_GXGEOM_TEXSTATS)
+#if defined(DSA_GXGEOM_DEBUGWHY) || defined(DSA_GXGEOM_TEXSTATS) || defined(DSA_GXGEOM_TAGPROF)
 #include "../harness/harness.h"
 #include "../harness/harness_profile.h"
+#endif
+
+#ifdef DSA_GXGEOM_TAGPROF
+// Task tagcost: CPU time of the recording frame's pieces, averaged per recorded pass.
+#include <ogc/lwp_watchdog.h>
+enum { kTpPrep, kTpGate, kTpPlan, kTpPlanVerts, kTpPlanShape, kTpDVerts, kTpDShape, kTpDraw, kTpPre, kTpTagDraw, kTpCallRec, kTpCallHit, kTpCount };
+static u64 s_tp[kTpCount];
+static u32 s_tpRec, s_tpHit, s_tpShapes, s_tpPlanPolys, s_tpPlanClip, s_tpDPolys, s_tpDClip, s_tpChain, s_tpRunChk, s_tpSat;
+#define GXDS3D_TP_BEGIN(v) const u64 v = gettime()
+#define GXDS3D_TP_END(k, v) (s_tp[k] += gettime() - (v))
+#else
+#define GXDS3D_TP_BEGIN(v) do {} while (0)
+#define GXDS3D_TP_END(k, v) do {} while (0)
 #endif
 
 extern MMU_struct MMU;
@@ -407,13 +420,22 @@ static int gxDs3dPolyVerts(POLY &p, const VERT **out, bool &clipped)
 	return m;
 }
 
+// fmaxf(0, fminf(hi, v)) without the libm calls (Task tagcost: they were most of
+// gxDs3dTransShapeBuild's cost). Same value for every input, NaN and +-inf included
+// (NaN -> hi); only the sign of a zero result may differ, which no consumer can see.
+static inline float gxDs3dClampF(float v, float hi)
+{
+	v = v < hi ? v : hi;
+	return v > 0.0f ? v : 0.0f;
+}
+
 // rasterize.cpp's homogeneous divide + viewport + Y flip + screen clamp for x, y.
 static inline void gxDs3dScreenXY(const VERT &v, const VIEWPORT &vp, float &x, float &y)
 {
 	x = (v.coord[0] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.width + (float)vp.x;
 	y = 192.0f - ((v.coord[1] + v.coord[3]) / (2.0f * v.coord[3]) * (float)vp.height + (float)vp.y);
-	x = fmaxf(0.0f, fminf(256.0f, x));
-	y = fmaxf(0.0f, fminf(192.0f, y));
+	x = gxDs3dClampF(x, 256.0f);
+	y = gxDs3dClampF(y, 192.0f);
 }
 
 // fcolor (0-63, fractional at clipper-made vertices) to 8 bits, = gxDs3d6To8Tex on integers.
@@ -449,6 +471,8 @@ struct GxDs3dTransShape { float x[MAX_CLIPPED_VERTS], y[MAX_CLIPPED_VERTS], x0, 
 static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *const *cv, int n, GxDs3dTransShape &sh)
 {
 	if (n < 3) return false;
+	const int cull = (p.polyAttr >> 6) & 3;
+	if (cull == 0) return false;   // neither face is drawn
 	VIEWPORT vp;
 	vp.decode(p.viewport);
 	float fx[MAX_CLIPPED_VERTS], fy[MAX_CLIPPED_VERTS];
@@ -456,20 +480,16 @@ static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *const *cv, int n, G
 	float facing = (fy[0] + fy[n - 1]) * (fx[0] - fx[n - 1]);
 	for (int j = 0; j < n - 1; ++j) facing += (fy[j + 1] + fy[j]) * (fx[j + 1] - fx[j]);
 	const bool back = facing < 0;
-	switch ((p.polyAttr >> 6) & 3) {
-		case 0: return false;
-		case 1: if (!back) return false; break;
-		case 2: if (back) return false; break;
-		default: break;
-	}
+	if ((cull == 1 && !back) || (cull == 2 && back)) return false;
 	sh.n = n;
 	sh.id = (u8)((p.polyAttr >> 24) & 0x3F);
 	sh.x0 = sh.y0 = 1e30f; sh.x1 = sh.y1 = -1e30f;
 	for (int j = 0; j < n; ++j) {
-		sh.x[j] = floorf(16.0f * fx[j]);
-		sh.y[j] = floorf(16.0f * fy[j]);
-		sh.x0 = fminf(sh.x0, sh.x[j]); sh.x1 = fmaxf(sh.x1, sh.x[j]);
-		sh.y0 = fminf(sh.y0, sh.y[j]); sh.y1 = fmaxf(sh.y1, sh.y[j]);
+		// floorf of a value in [0, 4096] (gxDs3dScreenXY's clamp): a truncating convert.
+		sh.x[j] = (float)(int)(16.0f * fx[j]);
+		sh.y[j] = (float)(int)(16.0f * fy[j]);
+		sh.x0 = sh.x[j] < sh.x0 ? sh.x[j] : sh.x0; sh.x1 = sh.x[j] > sh.x1 ? sh.x[j] : sh.x1;
+		sh.y0 = sh.y[j] < sh.y0 ? sh.y[j] : sh.y0; sh.y1 = sh.y[j] > sh.y1 ? sh.y[j] : sh.y1;
 	}
 	return true;
 }
@@ -480,6 +500,9 @@ static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *const *cv, int n, G
 static bool gxDs3dTransShapesDisjoint(const GxDs3dTransShape &a, const GxDs3dTransShape &b)
 {
 	if (a.x1 <= b.x0 || b.x1 <= a.x0 || a.y1 <= b.y0 || b.y1 <= a.y0) return true;
+#ifdef DSA_GXGEOM_TAGPROF
+	++s_tpSat;
+#endif
 	for (int pass = 0; pass < 2; ++pass) {
 		const GxDs3dTransShape &e = pass ? b : a;
 		for (int j = 0; j < e.n; ++j) {
@@ -524,6 +547,43 @@ static u16 s_tagRun[POLYLIST_SIZE];      // per polylist index: tagged run (1-ba
 static u16 s_tagIdx[POLYLIST_SIZE];      // its 1-based position in that run (the tag it writes)
 static GxDs3dTagRun s_tagRuns[kMaxTrans + 1];
 static int s_tagRunCount = 0;
+
+// Task tagcost: what the plan found per translucent polygon it visited, so the pass's draws
+// of it (the tag pass's and the real one) skip the clipper and gxDs3dTransShapeBuild. For
+// a clipped polygon, a copy of the clipper's N-gon in s_planVerts. Valid for the list the
+// plan ran on, which is the list the pass draws (gxDs3dGeomFrameSupported's guards), and
+// read only for translucent polygons: a frame with any has run the plan over all of them.
+struct GxDs3dPlanPoly { u32 vert; u8 n, state; };
+enum { kPlanCulled = 1, kPlanInPlace, kPlanPooled };
+static u16 s_planSlot[POLYLIST_SIZE];    // per polylist index: 1-based s_planPoly entry, 0 = none
+static GxDs3dPlanPoly s_planPoly[kMaxTrans];
+static int s_planPolyCount = 0;
+static VERT *s_planVerts = nullptr;      // grow-only (~110 KB on SM64DS)
+static u32 s_planVertCap = 0, s_planVertCount = 0;
+
+static void gxDs3dPlanStore(int i, const VERT *const *cv, int nv, bool clipped, bool draws)
+{
+	s_planSlot[i] = 0;
+	if (s_planPolyCount == kMaxTrans) return;
+	GxDs3dPlanPoly &e = s_planPoly[s_planPolyCount];
+	if (!draws) e.state = kPlanCulled;
+	else if (!clipped) e.state = kPlanInPlace;
+	else {
+		if (s_planVertCount + (u32)nv > s_planVertCap) {
+			const u32 cap = s_planVertCap ? 2 * s_planVertCap : 1024;
+			VERT *v = (VERT *)realloc(s_planVerts, cap * sizeof(VERT));
+			if (!v) return;   // not cached: the draws compute it
+			s_planVerts = v;
+			s_planVertCap = cap;
+		}
+		e.state = kPlanPooled;
+		e.vert = s_planVertCount;
+		e.n = (u8)nv;
+		for (int j = 0; j < nv; ++j) s_planVerts[s_planVertCount++] = *cv[j];
+	}
+	s_planSlot[i] = (u16)++s_planPolyCount;
+}
+
 static int gxDs3dTransIdPlan()
 {
 	static GxDs3dTransShape s_sh[kMaxTrans];
@@ -535,6 +595,8 @@ static int gxDs3dTransIdPlan()
 	int nt = 0, runStart = 0, curId = -1;
 	bool runTag = false, runA31 = false;
 	s_tagRunCount = 0;
+	s_planPolyCount = 0;
+	s_planVertCount = 0;
 	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n <= polycount; ++n) {
 		POLY *pp = NULL;
@@ -543,15 +605,28 @@ static int gxDs3dTransIdPlan()
 			const int i = gfx3d.indexlist[n];
 			POLY &p = gfx3d.polylist->list[i];
 			s_tagRun[i] = 0;
+			s_planSlot[i] = 0;
 			if (!p.isTranslucent() || !gxDs3dTransDraws(p)) continue;
 			if (nt == kMaxTrans) return -1;
 			sh = &s_sh[nt];
 			const VERT *cv[MAX_CLIPPED_VERTS];
 			bool clipped;
+			GXDS3D_TP_BEGIN(tpv);
 			const int nv = gxDs3dPolyVerts(p, cv, clipped);
-			if (!gxDs3dTransShapeBuild(p, cv, nv, *sh)) continue;
+			GXDS3D_TP_END(kTpPlanVerts, tpv);
+#ifdef DSA_GXGEOM_TAGPROF
+			++s_tpPlanPolys; s_tpPlanClip += clipped;
+#endif
+			GXDS3D_TP_BEGIN(tps);
+			const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, *sh);
+			GXDS3D_TP_END(kTpPlanShape, tps);
+			gxDs3dPlanStore(i, cv, nv, clipped, shOk);
+			if (!shOk) continue;
 			if (sh->x1 <= 0 || sh->x0 >= 16.0f * kScreenW || sh->y1 <= 0 || sh->y0 >= 16.0f * kScreenH) continue;   // off screen
 			pp = &p;
+#ifdef DSA_GXGEOM_TAGPROF
+			++s_tpShapes;
+#endif
 			s_shPoly[nt] = (u16)i;
 			s_shN[nt] = n;
 		}
@@ -577,7 +652,11 @@ static int gxDs3dTransIdPlan()
 			runStart = nt; curId = sh->id; runTag = false; runA31 = false;
 		}
 		for (int k = head[sh->id]; k >= 0; k = s_next[k])
+#ifdef DSA_GXGEOM_TAGPROF
+			if (++s_tpChain, !gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
+#else
 			if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
+#endif
 #ifdef DSA_GXGEOM_TRANSIDDBG
 				static u32 s_dbg;
 				if ((s_dbg++ & 31) == 0)
@@ -590,7 +669,11 @@ static int gxDs3dTransIdPlan()
 			}
 		if (!runTag)
 			for (int k = runStart; k < nt; ++k)
+#ifdef DSA_GXGEOM_TAGPROF
+				if (++s_tpRunChk, !gxDs3dTransShapesDisjoint(s_sh[k], *sh)) { runTag = true; break; }
+#else
 				if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) { runTag = true; break; }
+#endif
 		runA31 |= gxDs3dPolyAlpha(*pp) == 31;
 		if (runTag && (runA31 || (rmode && rmode->aa))) return -1;
 		++nt;
@@ -668,7 +751,9 @@ static int gxDs3dFrameGate(bool requireTex)
 	// Translucent polygon-ID rule (gxDs3dTransIdPlan). Checked before the per-vertex loop
 	// below: it is what rejects SM64DS's frames, and that loop is the gate's biggest cost.
 	if (anyTrans) {
+		GXDS3D_TP_BEGIN(tp0);
 		const int nt = gxDs3dTransIdPlan();
+		GXDS3D_TP_END(kTpPlan, tp0);
 		if (nt < 0) return kGateTransId;
 		s_gateHasTrans = nt > 0;
 	}
@@ -735,6 +820,30 @@ static struct {
 	bool fast, valid, ok;
 } s_suppCache;
 
+// Task tagcost: what this seq's gxDs3dGeomFramePrepare gated, with the same guards as
+// s_suppCache. The line-191 gate differs from Prepare's only in requireTex, and all its
+// other inputs are fixed for the seq, so when Prepare passed on the same lists it only
+// has to check that every textured polygon's texture was prepared (gxDs3dFrameTexReady).
+static struct {
+	const void *list;
+	int count;
+	bool fast;
+} s_prepKey;
+
+// The requireTex part of gxDs3dFrameGate, for a frame the rest of the gate passed.
+static int gxDs3dFrameTexReady()
+{
+	const int polycount = gfx3d.polylist->count;
+	for (int i = 0; i < polycount; ++i) {
+		const POLY &p = gfx3d.polylist->list[i];
+		if (gxDs3dTexFormat(p) == 0) continue;
+		const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, gxDs3dTexAMode(p));
+		if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_tex[k].seq != s_texPrepSeq)
+			return kGateTexNotReady;
+	}
+	return kGateOk;
+}
+
 bool gxDs3dGeomFrameSupported()
 {
 	if (s_prepSeq == g_gfx3dRenderSeq && !s_prepOk) return false;
@@ -743,7 +852,14 @@ bool gxDs3dGeomFrameSupported()
 	if (s_suppCache.valid && s_suppCache.seq == g_gfx3dRenderSeq && s_suppCache.list == gfx3d.polylist &&
 	    s_suppCache.count == count && s_suppCache.fast == fast)
 		return s_suppCache.ok;
+	GXDS3D_TP_BEGIN(tp0);
+#ifdef DSA_GXGEOM_NOPREPREUSE
 	const int g = gxDs3dFrameGate(true);
+#else
+	const int g = (s_prepSeq == g_gfx3dRenderSeq && s_prepKey.list == gfx3d.polylist && s_prepKey.count == count &&
+	               s_prepKey.fast == fast) ? gxDs3dFrameTexReady() : gxDs3dFrameGate(true);
+#endif
+	GXDS3D_TP_END(kTpGate, tp0);
 #ifdef DSA_GXGEOM_DEBUGWHY
 	harness_profile_emitf("gxds3dwhy %s polycount=%d", kGateNames[g], count);
 #endif
@@ -759,7 +875,9 @@ bool gxDs3dGeomFramePrepare()
 	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead (and frees its tag buffers)
 	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
+	GXDS3D_TP_BEGIN(tp0);
 	const int g = gxDs3dFrameGate(false);
+	GXDS3D_TP_END(kTpPrep, tp0);
 #ifdef DSA_GXGEOM_TEXSTATS
 	// Per-3D-frame first failing gate, plus per-format polygon counts, every 32 frames.
 	// transidclash: the ID-rule check on every 3D frame regardless of earlier gates.
@@ -803,6 +921,9 @@ bool gxDs3dGeomFramePrepare()
 #endif
 	s_prepSeq = g_gfx3dRenderSeq;
 	s_prepOk = g == kGateOk && gxDs3dPrepareTextures();
+	s_prepKey.list = gfx3d.polylist;
+	s_prepKey.count = gfx3d.polylist ? gfx3d.polylist->count : -1;
+	s_prepKey.fast = gxRenderModeIsFast();
 	return s_prepOk;
 }
 
@@ -1473,19 +1594,44 @@ static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
 static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
 	if (gxDs3dPolyInvisible(p)) return;
+	const bool trans = p.isTranslucent();
 	const VERT *cv[MAX_CLIPPED_VERTS];
 	bool clipped;
-	const int nv = gxDs3dPolyVerts(p, cv, clipped);
+	int nv;
+	GXDS3D_TP_BEGIN(tpv);
+#ifdef DSA_GXGEOM_NOPLANCACHE
+	const int slot = 0;
+#else
+	const int slot = trans ? s_planSlot[&p - gfx3d.polylist->list] : 0;   // the plan's result (gxDs3dPlanStore)
+#endif
+	if (slot) {
+		const GxDs3dPlanPoly &e = s_planPoly[slot - 1];
+		if (e.state == kPlanCulled) return;
+		clipped = e.state == kPlanPooled;
+		nv = clipped ? e.n : p.type;
+		for (int j = 0; j < nv; ++j)
+			cv[j] = clipped ? &s_planVerts[e.vert + j] : &gfx3d.vertlist->list[p.vertIndexes[j]];
+	} else {
+		nv = gxDs3dPolyVerts(p, cv, clipped);
+	}
+	GXDS3D_TP_END(kTpDVerts, tpv);
+#ifdef DSA_GXGEOM_TAGPROF
+	++s_tpDPolys; s_tpDClip += clipped;
+#endif
 	if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
 		bool bad = false;
 		for (int j = 0; j < nv; ++j) bad |= cv[j]->coord[3] <= 0.0f;
 		if (bad) return;
 	}
 	// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
-	// outline; false also when clipped away.
-	GxDs3dTransShape shape;
-	if (!gxDs3dTransShapeBuild(p, cv, nv, shape)) return;
-	const bool trans = p.isTranslucent();
+	// outline; false also when clipped away. Already known for a polygon the plan cached.
+	if (!slot) {
+		GxDs3dTransShape shape;
+		GXDS3D_TP_BEGIN(tps);
+		const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, shape);
+		GXDS3D_TP_END(kTpDShape, tps);
+		if (!shOk) return;
+	}
 	const bool tagWrite = tag < 0;
 	u8 va = 255;
 	bool zw = true, twoPass = false;
@@ -1690,10 +1836,14 @@ static void gxDs3dRenderFastDraw()
 		POLY &p = gfx3d.polylist->list[i];
 		const int r = (tags && p.isTranslucent()) ? s_tagRun[i] : 0;
 		if (r && r != curRun) {
+			GXDS3D_TP_BEGIN(tp0);
 			gxDs3dTagRunPrepass(c, r);
+			GXDS3D_TP_END(kTpPre, tp0);
 			curRun = r;
 		}
+		GXDS3D_TP_BEGIN(tp1);
 		gxDs3dFastPoly(c, p, r ? (int)s_tagIdx[i] : 0);
+		if (r) GXDS3D_TP_END(kTpTagDraw, tp1);
 	}
 	if (c.blendOn) {
 		GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
@@ -1752,7 +1902,13 @@ void gxDs3dRenderFast()
 {
 	const int count = gfx3d.polylist->count;
 	if (s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == count) {
+		GXDS3D_TP_BEGIN(tp0);
 		GX_CallDispList(s_dl, s_dlSize);
+#ifdef DSA_GXGEOM_TAGPROF
+		GX_DrawDone();
+		GXDS3D_TP_END(kTpCallHit, tp0);
+		++s_tpHit;
+#endif
 		GXDS3D_RPSTAT(s_rpHit);
 		return;
 	}
@@ -1768,12 +1924,31 @@ void gxDs3dRenderFast()
 		const bool texDirty = s_texDirty;
 		DCInvalidateRange(s_dl, s_dlCap);
 		GX_BeginDispList(s_dl, s_dlCap);
+		GXDS3D_TP_BEGIN(tpd);
 		gxDs3dRenderFastDraw();
+		GXDS3D_TP_END(kTpDraw, tpd);
 		const u32 n = GX_EndDispList();
 		if (n) {
 			s_dlSize = n;
 			s_dlKey.seq = g_gfx3dRenderSeq; s_dlKey.list = gfx3d.polylist; s_dlKey.count = count;
+			GXDS3D_TP_BEGIN(tp0);
 			GX_CallDispList(s_dl, s_dlSize);
+#ifdef DSA_GXGEOM_TAGPROF
+			GX_DrawDone();
+			GXDS3D_TP_END(kTpCallRec, tp0);
+			if ((++s_tpRec & 31) == 0) {
+				const float d = 1.0f / (float)s_tpRec;
+				harness_profile_emitf("gxds3dtagprof rec=%u hit=%u us/rec prep=%.0f gate=%.0f plan=%.0f draw=%.0f pre=%.0f tagdraw=%.0f callrec=%.0f callhit=%.0f planverts=%.0f planshape=%.0f dverts=%.0f dshape=%.0f per rec: dpolys=%.0f dclip=%.0f planpolys=%.0f planclip=%.0f shapes=%.0f chain=%.0f runchk=%.0f sat=%.0f",
+				                      (unsigned)s_tpRec, (unsigned)s_tpHit,
+				                      d * ticks_to_microsecs(s_tp[kTpPrep]), d * ticks_to_microsecs(s_tp[kTpGate]), d * ticks_to_microsecs(s_tp[kTpPlan]),
+				                      d * ticks_to_microsecs(s_tp[kTpDraw]), d * ticks_to_microsecs(s_tp[kTpPre]),
+				                      d * ticks_to_microsecs(s_tp[kTpTagDraw]), d * ticks_to_microsecs(s_tp[kTpCallRec]),
+				                      s_tpHit ? ticks_to_microsecs(s_tp[kTpCallHit]) / (float)s_tpHit : 0.0f,
+				                      d * ticks_to_microsecs(s_tp[kTpPlanVerts]), d * ticks_to_microsecs(s_tp[kTpPlanShape]),
+				                      d * ticks_to_microsecs(s_tp[kTpDVerts]), d * ticks_to_microsecs(s_tp[kTpDShape]),
+				                      d * s_tpDPolys, d * s_tpDClip, d * s_tpPlanPolys, d * s_tpPlanClip, d * s_tpShapes, d * s_tpChain, d * s_tpRunChk, d * s_tpSat);
+			}
+#endif
 			GXDS3D_RPSTAT(s_rpRec);
 			return;
 		}
