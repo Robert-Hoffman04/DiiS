@@ -43,8 +43,9 @@ extern const void *g_gxDsPresentPending[2];
 
 // Engine side: record `buf` (256x192 tiled RGB5A3, all texels opaque) as slot's content.
 void gxDsPresentSet(int slot, const void *buf);
-// Engine side, before its GX_CopyTex overwrites `buf`: resolve any slot still pointing at it.
-void gxDsPresentReleaseBuffer(const void *buf);
+// Engine side, before its GX_CopyTex overwrites `buf`: resolve any slot still pointing at it,
+// except keepSlot, which the caller rewrites whole right after (dropped unconverted; lazyfix).
+void gxDsPresentReleaseBuffer(const void *buf, int keepSlot);
 
 void gxDsPresentResolveSlotImpl(int slot);
 static inline void gxDsPresentResolveSlot(int slot)

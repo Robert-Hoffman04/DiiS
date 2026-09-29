@@ -14,10 +14,15 @@ void gxDsPresentSet(int slot, const void *buf)
 	g_gxDsPresentPending[slot] = buf;
 }
 
-void gxDsPresentReleaseBuffer(const void *buf)
+void gxDsPresentReleaseBuffer(const void *buf, int keepSlot)
 {
+	// Task lazyfix: keepSlot is about to be overwritten whole by the copy being released for,
+	// so its stale contents are dropped, not converted (they were already presented).
 	for (int s = 0; s < 2; ++s)
-		if (g_gxDsPresentPending[s] == buf) gxDsPresentResolveSlotImpl(s);
+		if (g_gxDsPresentPending[s] == buf) {
+			if (s == keepSlot) g_gxDsPresentPending[s] = NULL;
+			else gxDsPresentResolveSlotImpl(s);
+		}
 }
 
 void gxDsPresentDropAll()

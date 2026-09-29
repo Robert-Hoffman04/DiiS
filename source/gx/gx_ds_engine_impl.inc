@@ -3931,8 +3931,11 @@ static bool gxDsBRenderFrameImpl()
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
 	// Task directpresent: a GPU_screen slot may still point at last frame's copy (e.g. the
 	// other slot after a screen swap); read it back before the copy below overwrites it.
+	// Task lazyfix: not this frame's own slot -- every path below rewrites it whole (pending
+	// copy or eager readback), so last frame's copy there is dropped unconverted.
 	PZ_SUB_SCOPE(PZ_EFB_COPY);   // to the end of the function; the readbacks below re-zone themselves
-	gxDsPresentReleaseBuffer(s_copyBackBuf);
+	const int slot = GXDS_SCREEN.offset ? 1 : 0;
+	gxDsPresentReleaseBuffer(s_copyBackBuf, slot);
 	// clear=GX_TRUE (task 12): wipe the 256x192 EFB corner just drawn into so it
 	// does not ghost under draw_thread's present (visible in the live window).
 	GX_CopyTex(s_copyBackBuf, GX_TRUE);
@@ -3954,7 +3957,6 @@ static bool gxDsBRenderFrameImpl()
 	// old eager CPU path stays only if that pass could not run (no buffers) and for the
 	// in-process A/B. The copy is always opaque: the EFB is RGB8_Z24 / RGB565_Z16 here
 	// (no alpha, so the copy's alpha is 255), which made the old per-frame scan redundant.
-	const int slot = GXDS_SCREEN.offset ? 1 : 0;
 	u16 *dst = (u16 *)(GPU_screen + (u32)GXDS_SCREEN.offset * 512);
 #ifndef DSB_ABCMP
 	if (!anyMb || mbOnGpu) {
