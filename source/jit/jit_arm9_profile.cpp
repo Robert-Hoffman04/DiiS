@@ -178,6 +178,8 @@ static u8 arm9_cyclesForArm(u32 op)
 	// (the Rd == 15 PC-write path, which returns 3, bails in the emitter).
 	if ((op & 0x0F900FF0u) == 0x01000050u) return 2;
 	if ((op & 0x0F900090u) == 0x01000080u) return 2;
+	// MCR (coprocessor register transfer, L=0): OP_MCR returns 2.
+	if ((op & 0x0F100010u) == 0x0E000010u) return 2;
 
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;
