@@ -2608,6 +2608,13 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 #endif
 				if (fade) p.fadeBg |= (u8)(1 << bg);
 				if (want && (under & p.t2)) {
+#if GXDS_CORE == 0
+					// P0-4 (gx-next-steps-log.md Task P0-4): a 2D layer alpha-blended over the 3D
+					// layer as 2nd target comes out 1 LSB off the CPU (EFB /255 lerp vs the CPU's
+					// 6-bit-3D-colour blend; SM64DS letter text, row 162). GxAccurate bails it,
+					// GxFast keeps the characterized +-1 LSB.
+					if (r.bg3d && (under & p.t2 & 1) && !gxRenderModeIsFast()) { DSB_WHY("3dblend"); return false; }
+#endif
 					if (under & ~p.t2) {
 						DSB_WHY("blendunder");
 #ifdef DSB_STATS
@@ -2628,6 +2635,9 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				const u8 u = (u8)(under & ~0x10); // a sprite never blends with another sprite
 				if (want && (u & p.t2)) {
 					if (u & ~p.t2) { DSB_WHY("blendunder"); return false; }
+#if GXDS_CORE == 0
+					if (r.bg3d && (u & p.t2 & 1) && !gxRenderModeIsFast()) { DSB_WHY("3dblend"); return false; } // P0-4, as above
+#endif
 					p.blendLive[c] |= (u8)(1 << (4 + prio));
 					anyLive = true;
 					needOverlapCheck = true;
