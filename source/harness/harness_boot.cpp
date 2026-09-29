@@ -30,8 +30,9 @@ static struct {
 	int  core;
 	int  usb;
 	int  autoload_slot;
+	int  rendermode;
 	volatile int next_req;
-} s_m = { 0, 0, 0, {{0}}, 0, 0, -1, -1, -1, 0 };
+} s_m = { 0, 0, 0, {{0}}, 0, 0, -1, -1, -1, -1, 0 };
 
 static const char *hb_basename(const char *p)
 {
@@ -91,6 +92,14 @@ int harness_boot_load(const char *mount)
 			s_m.usb = (int)strtol(val, 0, 10);
 		} else if (!strcmp(key, "autoload_slot")) {
 			s_m.autoload_slot = (int)strtol(val, 0, 10);
+		} else if (!strcmp(key, "rendermode")) {
+			// Mirrors the PKT_CTRL "rendermode software|accurate|fast" strings
+			// (main.cpp) plus the raw enum ordinal, for setups with no live
+			// transport to send that command over.
+			if (!strcmp(val, "software"))      s_m.rendermode = 0;
+			else if (!strcmp(val, "accurate")) s_m.rendermode = 1;
+			else if (!strcmp(val, "fast"))     s_m.rendermode = 2;
+			else                                s_m.rendermode = (int)strtol(val, 0, 10);
 		}
 	}
 	fclose(f);
@@ -105,6 +114,7 @@ u32  harness_boot_frame_every(void)     { return s_m.frame_every; }
 int  harness_boot_core(void)            { return s_m.core; }
 int  harness_boot_usb(void)             { return s_m.usb; }
 int  harness_boot_autoload_slot(void)   { return s_m.autoload_slot; }
+int  harness_boot_rendermode(void)      { return s_m.rendermode; }
 
 const char *harness_boot_rom_path(void)
 {

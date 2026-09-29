@@ -324,9 +324,12 @@ int main(int argc, char **argv){
 		rom_filename[MAXPATHLEN - 1] = 0;
 		if (harness_boot_core() == 0 || harness_boot_core() == 1)
 			current3Dcore = (u8)harness_boot_core();
-		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d\n",
+		if (harness_boot_rendermode() >= 0 && harness_boot_rendermode() <= 2)
+			gxSetRenderMode((RenderMode)harness_boot_rendermode());
+		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d, rendermode=%d\n",
 			harness_boot_rom_count(),
-			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore);
+			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore,
+			(int)gxRenderMode());
 	} else if(FileBrowser(rom_filename) != 0) {
 		quit_game = true;
 	}
@@ -339,6 +342,21 @@ int main(int argc, char **argv){
 	// pinned backend). No-op without -DDESMUME_HARNESS; on failure it disables
 	// itself and boot continues.
 	harness_transport_init();
+
+#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+	// The core=/rendermode= manifest keys are applied above, before the
+	// transport exists -- harness_send() is a silent no-op until
+	// harness_transport_init() has picked a backend, so that printf never
+	// reached sd:/bench.log. Log the values actually applied now that the
+	// transport is up, so a boot with no live console (real hardware, no
+	// network) still leaves a record of what ran.
+	if (harness_boot_have()) {
+		char hb_buf[96];
+		snprintf(hb_buf, sizeof hb_buf, "boot: core=%d rendermode=%d",
+			(int)current3Dcore, (int)gxRenderMode());
+		harness_profile_log(hb_buf);
+	}
+#endif
 
 	// §3.6: install the PPC exception panic hook now that the transport is up,
 	// so any later trap ships a PKT_CRASH register dump + backtrace before the
