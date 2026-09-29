@@ -5,8 +5,9 @@
  *
  * The bridge into live emulation. armInnerLoop() (NDSSystem.cpp) calls
  * jitRunArm7() when the ARM7 is due to step: it compiles/looks up a block at
- * the current PC, runs it, re-primes the interpreter's pipeline at the resume
- * PC and returns the cycles consumed (0 => "not handled, use the interpreter
+ * the current PC, runs it, points the interpreter's pipeline at the resume
+ * PC (the opcode fetch is deferred until the interpreter actually needs it --
+ * jitSyncPipeline(), PERF_LOG Step 5) and returns the cycles consumed (0 => "not handled, use the interpreter
  * for one instruction").
  *
  * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
@@ -24,6 +25,7 @@
 #if defined(DESMUME_JIT_ARM7)
 
 #include "jit_trace.h"
+#include "jit_arm9_region.h"
 #include "../armcpu.h"
 #include "../arm_instructions.h"
 #include "../thumb_instructions.h"
@@ -336,6 +338,60 @@ u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc) { return jitInterpFallback<AR
 u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc)   { return jitInterpFallback<ARMCPU_ARM7, false>(opcode, pc); }
 u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc) { return jitInterpFallback<ARMCPU_ARM7, true >(opcode, pc); }
 
+// PERF_LOG Step 5 -- per-dispatch fixed cost.
+//
+// JITResult: the trampoline always writes cycles/nextPC/instructions on
+// return, and emitted exits store bailedOut/smcHit only when nonzero
+// (JitTraceCtx::emitResultMetadata()), relying on the caller to have zeroed
+// them; smcAddress is only read when smcHit is set. So those two flags are
+// the only fields that need clearing -- not a memset of the whole 32-byte
+// struct on every dispatch.
+static FORCEINLINE void jitResultInit(JITResult& r)
+{
+	r.bailedOut = 0;
+	r.smcHit    = 0;
+}
+
+// Lazy pipeline re-prime (jit.h, jitSyncPipeline()). The cheap part of the
+// old re-prime stays eager -- instruct_adr (the next jitRun*() dispatch and
+// armcpu_irqException()'s R14 both read it), next_instruction and R[15] are
+// plain stores and keep every reader of those coherent -- only the opcode
+// fetch into cpu.instruction is deferred behind the stale flag.
+u8 g_jitPipeStale[2] = { 0, 0 };
+
+static FORCEINLINE void jitPointPipeline(armcpu_t& cpu, u32 npc, int core)
+{
+	const u32 step = cpu.CPSR.bits.T ? 2u : 4u;
+	cpu.instruct_adr     = npc;
+	cpu.next_instruction = npc + step;
+	cpu.R[15]            = npc + 2 * step;
+	g_jitPipeStale[core] = 1;
+}
+
+// The deferred half: exactly the fetch the dispatcher used to do at every
+// exit, through the same profile fetch (the ARM7 slot may be the GBA
+// profile), from instruct_adr and the *current* CPSR.T. Setting
+// next_instruction/R[15] again is redundant after jitPointPipeline() but
+// makes the sync self-contained, so it is also correct after anything that
+// moved instruct_adr since (IRQ entry, a savestate load).
+void jitSyncPipelineSlow(int core)
+{
+	armcpu_t& cpu = (core == JIT_ARM9) ? NDS_ARM9 : NDS_ARM7;
+	const JitCpuProfile* prof = jitProfile[core];
+	g_jitPipeStale[core] = 0;
+	if (!prof) return;   // unreachable: only a JIT run sets the flag
+	const u32 pc = cpu.instruct_adr;
+	if (cpu.CPSR.bits.T) {
+		cpu.instruction      = prof->fetch16(pc & ~1u);
+		cpu.next_instruction = pc + 2;
+		cpu.R[15]            = pc + 4;
+	} else {
+		cpu.instruction      = prof->fetch32(pc & ~3u);
+		cpu.next_instruction = pc + 4;
+		cpu.R[15]            = pc + 8;
+	}
+}
+
 // Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
 bool jitArm7Enabled = true;
 
@@ -391,7 +447,7 @@ u32 jitRunArm7(s32 budget)
 	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };
 
 	JITResult r;
-	memset(&r, 0, sizeof r);
+	jitResultInit(r);
 	JCC_EXEC_BEGIN();
 	ExecuteJITTrace(b->execute, &r, &st, start);
 	JCC_EXEC_END(0);
@@ -474,24 +530,15 @@ u32 jitRunArm7(s32 budget)
 		return 0;
 	}
 
-	// re-prime the interpreter pipeline at the resume PC. Most exits stay in
+	// Point the interpreter pipeline at the resume PC. Most exits stay in
 	// THUMB (any mode switch via BX/hi-reg bailed out before executing, see
 	// above) -- but POP{...,PC} switches mode inline (jit_thumb.cpp) and
 	// clears CPSR.T itself before returning here, so check it rather than
 	// assuming THUMB: landing an ARM-mode target through a 16-bit THUMB
 	// fetch misdecodes the real first opcode and sends ARM7's PC off into
-	// unmapped memory.
-	const u32 npc = r.nextPC;
-	cpu.instruct_adr = npc;
-	if (cpu.CPSR.bits.T) {
-		cpu.instruction      = prof->fetch16(npc & ~1u);
-		cpu.next_instruction = npc + 2;
-		cpu.R[15]            = npc + 4;
-	} else {
-		cpu.instruction      = prof->fetch32(npc & ~3u);
-		cpu.next_instruction = npc + 4;
-		cpu.R[15]            = npc + 8;
-	}
+	// unmapped memory. The opcode fetch into cpu.instruction is deferred to
+	// jitSyncPipeline() (PERF_LOG Step 5), which re-checks CPSR.T the same way.
+	jitPointPipeline(cpu, r.nextPC, JIT_ARM7);
 
 	g_jitBlocksRun++;
 	g_jitInsnsRun += r.instructions;
@@ -566,7 +613,9 @@ u32 jitRunArm9(s32 budget)
 	armcpu_t& cpu = NDS_ARM9;
 	const u32 pc = cpu.instruct_adr;
 	const bool thumb = (cpu.CPSR.bits.T != 0);
-	const bool canEnter = thumb ? prof->canEnterThumb(pc) : prof->canEnterArm(pc);
+	// Direct inline region check instead of prof->canEnter*() -- the ARM9 has
+	// exactly one profile, whose canEnter* wrap this same rule (PERF_LOG Step 5).
+	const bool canEnter = jitArm9CanEnter(pc, thumb);
 	JCC_CALL(1);
 
 #ifdef DESMUME_JIT_TRACE_FIRST
@@ -602,7 +651,7 @@ u32 jitRunArm9(s32 budget)
 	jit_cpu_state st = { &cpu.R[0], &cpu.CPSR.val, nullptr };
 
 	JITResult r;
-	memset(&r, 0, sizeof r);
+	jitResultInit(r);
 	JCC_EXEC_BEGIN();
 	ExecuteJITTrace(b->execute, &r, &st, start);
 	JCC_EXEC_END(1);
@@ -730,16 +779,7 @@ u32 jitRunArm9(s32 budget)
 	}
 #endif
 
-	cpu.instruct_adr = npc;
-	if (cpu.CPSR.bits.T) {
-		cpu.instruction      = prof->fetch16(npc & ~1u);
-		cpu.next_instruction = npc + 2;
-		cpu.R[15]            = npc + 4;
-	} else {
-		cpu.instruction      = prof->fetch32(npc & ~3u);
-		cpu.next_instruction = npc + 4;
-		cpu.R[15]            = npc + 8;
-	}
+	jitPointPipeline(cpu, npc, JIT_ARM9);   // see jitRunArm7()
 
 	JCC_RAN(1, r.cycles, r.instructions, b->insnCount());
 	return r.cycles ? r.cycles : 1;
