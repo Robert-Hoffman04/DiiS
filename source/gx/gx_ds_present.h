@@ -11,6 +11,7 @@
       - On a GX-handled frame with no MASTER_BRIGHT on any line and every copied texel
         in the opaque RGB5A3 sub-format (bit 15 set), the engine only records its copy
         buffer as "pending" for its physical GPU_screen slot (0 = top, 1 = bottom).
+        (Task mbright: MASTER_BRIGHT frames too, see below.)
         GPU_screen for that slot is then stale.
       - Draw() binds a pending slot's copy buffer as that screen's present texture
         instead of converting GPU_screen (draw_thread's geometry, layout, swap and
@@ -21,8 +22,10 @@
         gpu_savestate. Writers: GPU_RenderLine (bail frames, skipped-line MASTER_BRIGHT,
         display-off/VRAM/FIFO modes, capture), gpu_loadstate / Screen_Reset (these
         overwrite the whole buffer, so they just drop the pending state).
-      - A frame with MASTER_BRIGHT active on any line keeps the old eager readback
-        (exact, applied on the CPU); so does a copy with a non-opaque texel.
+      - Task mbright: a frame with MASTER_BRIGHT on any line first gets the fade applied
+        to the EFB on the GPU (gxDsPresentMasterBright, exact per line), then goes direct
+        like any other. Every copy is opaque (the EFB has no alpha channel at copy time),
+        so the old per-frame opaque scan is gone.
 
     The copy buffers are only written by their engine's GX_CopyTex under vidmutex, and
     draw_thread samples them under vidmutex followed by GX_DrawDone, so a copy can never
@@ -54,7 +57,10 @@ static inline void gxDsPresentResolveAll() { gxDsPresentResolveSlot(0); gxDsPres
 // GPU_screen is being overwritten wholesale: forget the pending state.
 void gxDsPresentDropAll();
 
-// true iff every texel of the 256x192 tiled RGB5A3 buffer has bit 15 set (opaque sub-format).
-bool gxDsPresentAllOpaque(const void *buf);
+// Task mbright: apply MASTER_BRIGHT (per line: mode 0 none / 1 up / 2 down, factor 0..16)
+// to the 256x192 EFB corner in place, before the engine's RGB5A3 copy. Under vidmutex, copy
+// filter off, EFB RGB8/RGB565. Leaves TEV/blend state non-standard (caller resyncs). Returns
+// false (EFB untouched) if its buffers can't be allocated.
+bool gxDsPresentMasterBright(const u8 *mode, const u8 *fac);
 
 #endif

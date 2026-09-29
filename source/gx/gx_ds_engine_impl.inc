@@ -3887,6 +3887,18 @@ static bool gxDsBRenderFrameImpl()
 	// GxRestorePresentState() puts rmode's real filter back before
 	// draw_thread's next GX_CopyDisp().
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	// Task mbright: MASTER_BRIGHT on the GPU (gxDsPresentMasterBright: per-line exact TLUT
+	// lookup of the EFB's own channels), so fade frames present directly too.
+	bool anyMb = false;
+	for (int y = 0; y < kDsBScreenH; ++y)
+		if (s_mbMode[y] != 0 && s_mbFac[y] != 0) { anyMb = true; break; }
+	bool mbOnGpu = false;
+#ifndef DSB_ABCMP
+	if (anyMb) {
+		mbOnGpu = gxDsPresentMasterBright(s_mbMode, s_mbFac);
+		s_tevK = -2;   // stage0 wiring left non-standard -- force a resync next use
+	}
+#endif
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
 	// Task directpresent: a GPU_screen slot may still point at last frame's copy (e.g. the
@@ -3907,17 +3919,16 @@ static bool gxDsBRenderFrameImpl()
 	// Readback + MASTER_BRIGHT. GPU_RenderLine_MasterBrightness() runs on the
 	// finished 15-bit line, so applying the same per-channel tables here (with the
 	// per-line mode/factor sampled by Stage 0) is exact -- no GX pass, no rounding.
-	// Task directpresent: without MASTER_BRIGHT and with an all-opaque copy, the
-	// readback is deferred (gx_ds_present.h): Draw() presents s_copyBackBuf as is and
-	// GPU_screen is converted only if something reads it. The old eager path stays for
-	// MASTER_BRIGHT frames (CPU-exact), non-opaque copies and the in-process A/B.
-	bool anyMb = false;
-	for (int y = 0; y < kDsBScreenH; ++y)
-		if (s_mbMode[y] != 0 && s_mbFac[y] != 0) { anyMb = true; break; }
+	// Task directpresent: the readback is deferred (gx_ds_present.h): Draw() presents
+	// s_copyBackBuf as is and GPU_screen is converted only if something reads it.
+	// Task mbright: MASTER_BRIGHT frames too once the fade is in the copy (mbOnGpu); the
+	// old eager CPU path stays only if that pass could not run (no buffers) and for the
+	// in-process A/B. The copy is always opaque: the EFB is RGB8_Z24 / RGB565_Z16 here
+	// (no alpha, so the copy's alpha is 255), which made the old per-frame scan redundant.
 	const int slot = GXDS_SCREEN.offset ? 1 : 0;
 	u16 *dst = (u16 *)(GPU_screen + (u32)GXDS_SCREEN.offset * 512);
 #ifndef DSB_ABCMP
-	if (!anyMb && gxDsPresentAllOpaque(s_copyBackBuf)) {
+	if (!anyMb || mbOnGpu) {
 		gxDsPresentSet(slot, s_copyBackBuf);
 	} else
 #endif
