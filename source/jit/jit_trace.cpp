@@ -1028,6 +1028,83 @@ void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 	*p++ = PPC_B(retOff);
 }
 
+// PERF_LOG Step 2 -- in-block interpreter fallback (JIT_INTERP_FALLBACK, see
+// jit_trace.h). The guest register file is only ever in cpu.R[] at trampoline
+// boundaries, so the call is bracketed by the same sync the trampoline does:
+// one stmw of r14..r31 -> R[0..15], CPSR (r30) and SPSR -- the last is r31's
+// instruction count, so SPSR is saved around it exactly like
+// ExecuteJITTrace_Return does -- and one lmw back afterwards. Reloading
+// *everything* is what makes mode switches work: armcpu_switchMode() swaps the
+// banked R8-R14 in cpu.R[] and the lmw picks up whichever bank is now live,
+// with the new CPSR in r30. r31 (icount) rides through the lmw in r12.
+//
+// jitInterpFallback*() (jit_exec.cpp) sets up the interpreter pipeline state,
+// runs the handler and returns its cycles | exit flags:
+//   0                         -> fall through into the next compiled insn
+//   JIT_FALLBACK_EXIT_CHAIN   -> PC redirected, ISA unchanged: exit to
+//                                cpu.next_instruction through the guarded
+//                                dynamic-chaining stub (same as BX/POP{pc})
+//   JIT_FALLBACK_EXIT_TO_C    -> anything the dispatcher must see (T flip,
+//                                IRQ unmask, halt, SMC kill / cache flush,
+//                                a fresh reschedule request): plain return
+// Handler cycles go straight into r3; the instruction counts in r31 on both
+// exits (it has executed). ~31 words.
+void JitTraceCtx::emitInterpFallback(u32 opcode)
+{
+	ensureArena();
+	u32*& p = emitPtr;
+	const bool arm9 = (cpu.isaLevel >= 5);
+	const u32 fn = arm9 ? (thumbMode ? (u32)&jitInterpFallbackArm9Thumb : (u32)&jitInterpFallbackArm9Arm)
+	                    : (thumbMode ? (u32)&jitInterpFallbackArm7Thumb : (u32)&jitInterpFallbackArm7Arm);
+	const u32 pc = currentPC;
+
+	// ---- pinned R0..R15 + CPSR -> cpu.R[] / CPSR ----
+	*p++ = PPC_LWZ(PPC_R10, 1, 80);                   // &cpu.R[0]
+	*p++ = PPC_LWZ(0, PPC_R10, 17 * 4);               // SPSR (the stmw clobbers it with r31)
+	*p++ = PPC_STMW(14, PPC_R10, 0);
+	*p++ = PPC_STW(0, PPC_R10, 17 * 4);
+	*p++ = PPC_STW(PPC_R3, 1, 92);                    // cycle accumulator
+	*p++ = PPC_LIS(PPC_R3, opcode >> 16);             // arg1 = opcode
+	*p++ = PPC_ORI(PPC_R3, PPC_R3, opcode & 0xFFFF);
+	*p++ = PPC_LIS(PPC_R4, pc >> 16);                 // arg2 = its address
+	*p++ = PPC_ORI(PPC_R4, PPC_R4, pc & 0xFFFF);
+	*p++ = PPC_LIS(PPC_R12, fn >> 16);
+	*p++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+	*p++ = PPC_MTCTR(PPC_R12);
+	*p++ = PPC_BCTRL();
+
+	// ---- cpu.R[] / CPSR -> pinned registers (possibly a different bank now) ----
+	*p++ = PPC_LWZ(PPC_R10, 1, 80);
+	*p++ = PPC_OR(PPC_R12, PPC_R31, PPC_R31);         // icount survives the lmw in r12
+	*p++ = PPC_LMW(14, PPC_R10, 0);                   // r14..r29 = R0..R15, r30 = CPSR, r31 = SPSR
+	*p++ = PPC_OR(PPC_R31, PPC_R12, PPC_R12);
+	*p++ = PPC_OR(PPC_R11, PPC_R3, PPC_R3);           // r11 = cycles | exit flags
+	*p++ = PPC_LWZ(PPC_R3, 1, 92);
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 0, 2, 31);    // handler cycles
+	*p++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R12);
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 2, 30, 31) | 1;   // rlwinm.: TO_C -> 2, CHAIN -> 1
+	u32* cont = p++;
+
+	// ---- exit: the handler moved PC, or the dispatcher has to look ----
+	*p++ = PPC_LWZ(PPC_R4, PPC_R10, -4);              // cpu.next_instruction (R[-1])
+	emitAddCycles(cyclesAccum);
+	emitResultMetadata(instrCount + 1, 0);
+	*p++ = PPC_CMPWI(0, PPC_R12, 1);
+	u32* toC = p++;
+#if JIT_ENABLE_DYNAMIC_CHAINING
+	*p++ = PPC_ADDI(PPC_R29, PPC_R4, thumbMode ? 4 : 8);
+	{
+		u32* stub = thumbMode ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
+		s32 o = (s32)((u8*)stub - (u8*)p);
+		*p++ = PPC_B(o);
+	}
+#endif
+	*toC = PPC_BNE((u32)((p - toC) * 4));
+	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
+
+	*cont = PPC_BEQ((u32)((p - cont) * 4));
+}
+
 // ARM predication: 0/1 "condition holds" -> PPC_R11. cond is 0..13. Clobbers
 // r10, r11. Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
 void JitTraceCtx::emitEvalCond(u8 cond)
@@ -1097,16 +1174,24 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			if (used > budget) { ctx.endBlock = true; break; }
 		}
 
+		// Snapshot for the interpreter fallback below: a refusal may come after
+		// the emitter already wrote part of a sequence (or registered a deferred
+		// bailout pointing into it), so a refused instruction is rewound to
+		// exactly here before the fallback call replaces it.
+		u32* const emitMark = ctx.arenaAllocated ? ctx.emitPtr : nullptr;
+		const u32  bailMark = ctx.bailoutCount;
+
+		u32 opcode;
 		if (thumb) {
-			u16 opcode = (u16)cpu.fetch16(ctx.currentPC);
-			jitThumbEmitOne(ctx, opcode);
+			opcode = (u16)cpu.fetch16(ctx.currentPC);
+			jitThumbEmitOne(ctx, (u16)opcode);
 			if (!ctx.endBlock) {
 				ctx.instrCount++;
 				ctx.currentPC   += 2;
-				ctx.cyclesAccum += cpu.cyclesForThumb(opcode);
+				ctx.cyclesAccum += cpu.cyclesForThumb((u16)opcode);
 			}
 		} else {
-			u32 opcode = cpu.fetch32(ctx.currentPC);
+			opcode = cpu.fetch32(ctx.currentPC);
 			jitArmEmitOne(ctx, opcode);
 			if (!ctx.endBlock) {
 				ctx.instrCount++;
@@ -1114,6 +1199,24 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 				ctx.cyclesAccum += cpu.cyclesForArm(opcode);
 			}
 		}
+
+#if JIT_INTERP_FALLBACK
+		// endBlock without blockTerminatedEarly == the front end refused this
+		// instruction (every terminator sets both and has already counted
+		// itself). Instead of ending the block here -- and, at a block's first
+		// instruction, caching a "don't JIT" marker -- run it through the
+		// interpreter's handler in place and keep scanning. No cyclesAccum
+		// term: the handler's own count is added to r3 at run time.
+		if (ctx.endBlock && !ctx.blockTerminatedEarly) {
+			if (emitMark)                ctx.emitPtr = emitMark;
+			else if (ctx.arenaAllocated) ctx.emitPtr = ctx.quotaGuard + 1;   // just past ensureArena()'s guard
+			ctx.bailoutCount = bailMark;
+			ctx.endBlock = false;
+			ctx.emitInterpFallback(opcode);
+			ctx.instrCount++;
+			ctx.currentPC += thumb ? 2 : 4;
+		}
+#endif
 	}
 
 	if (ctx.instrCount == 0) {

@@ -12,9 +12,11 @@
  * A4-P1: JIT_ENABLE_CHAINING is on -- a call here can now run a whole chain
  * of blocks (up to the runtime quota -- min(scheduler budget, JIT_ARM*_QUOTA_CAP)
  * guest cycles, PERF_LOG Step 1) before returning, not just
- * one. IRQ delivery, mode switches and anything a block can't compile still
- * fall back to the interpreter (a chain only runs compiled static-exit edges;
- * any dynamic exit, bailout or quota trip returns here first).
+ * one. IRQ delivery still goes through the interpreter (a chain only runs
+ * compiled static-exit edges plus guarded dynamic ones; any bailout or quota
+ * trip returns here first). Instructions the front end can't compile no
+ * longer end the chain: since PERF_LOG Step 2 they run in place through the
+ * interpreter's handler (jitInterpFallback() below).
  ***************************************************************************/
 
 #include "jit.h"
@@ -23,6 +25,9 @@
 
 #include "jit_trace.h"
 #include "../armcpu.h"
+#include "../arm_instructions.h"
+#include "../thumb_instructions.h"
+#include "../NDSSystem.h"
 #include "../perf_zones.h"
 #include "../harness/harness.h"
 #include <string.h>
@@ -110,6 +115,10 @@ struct JitCoreCost {
 	u64 freshNoBlk; // noBlock calls that were NOT a clean pre-existing marker
 	                //   (fresh compile -> instrCount 0, or hash-collision slot,
 	                //   or mode flip) -- these paid the compile scan
+	// PERF_LOG Step 2: in-block interpreter fallback (jitInterpFallback()).
+	u64 fbCalls;    // refused instructions run through their handler from compiled code
+	u64 fbChain;    //   of those, PC redirected -> dynamic-chain exit
+	u64 fbToC;      //   of those, returned to the dispatcher (T/IRQ/halt/SMC/resched)
 	u32 demoPC[4096]; u32 demoDistinct;              // distinct PCs demoted via the exec-side len-1 path
 	u32 spinPC[4096]; u32 spinDistinct; u64 spinHits;// bail0 with insnCount() != 1: a block that keeps
 	                //   bailing on its first instruction but the single-terminator
@@ -149,12 +158,15 @@ extern "C" void jitCoreCostEmit(u32 frame)
 			(unsigned long long)x.entryLen[2], (unsigned long long)x.entryLen[3],
 			(unsigned long long)x.entryLen[4]);
 		harness_profile_emitf("jitcorecost2 frame=%u core=%s exec_us=%llu "
-			"marker_hits=%llu fresh_noblk=%llu demoted_pcs=%u spin_pcs=%u spin_hits=%llu",
+			"marker_hits=%llu fresh_noblk=%llu demoted_pcs=%u spin_pcs=%u spin_hits=%llu "
+			"fb_calls=%llu fb_chain=%llu fb_toc=%llu",
 			frame, c ? "arm9" : "arm7",
 			(unsigned long long)ticks_to_microsecs(x.execTicks),
 			(unsigned long long)x.markerHits, (unsigned long long)x.freshNoBlk,
 			(unsigned)x.demoDistinct, (unsigned)x.spinDistinct,
-			(unsigned long long)x.spinHits);
+			(unsigned long long)x.spinHits,
+			(unsigned long long)x.fbCalls, (unsigned long long)x.fbChain,
+			(unsigned long long)x.fbToC);
 	}
 	jitCacheArm7.ccBlockLenReport("arm7");   // Step 2: compiled-block-length distribution
 	jitCacheArm9.ccBlockLenReport("arm9");
@@ -170,6 +182,9 @@ extern "C" void jitCoreCostEmit(u32 frame)
         _x.entryLen[(_el) <= 1 ? 0 : (_el) <= 4 ? 1 : (_el) <= 8 ? 2 : (_el) <= 16 ? 3 : 4]++; } while (0)
   #define JCC_EXEC_BEGIN()        const u64 _jccE0 = gettime()
   #define JCC_EXEC_END(core)      (g_coreCost[core].execTicks += gettime() - _jccE0)
+  #define JCC_FALLBACK(core, ret) do { JitCoreCost& _x = g_coreCost[core]; _x.fbCalls++; \
+        if ((ret) & JIT_FALLBACK_EXIT_CHAIN) _x.fbChain++; \
+        if ((ret) & JIT_FALLBACK_EXIT_TO_C) _x.fbToC++; } while (0)
 #else
   #define JCC_CALL(core)          ((void)0)
   #define JCC_NOENTER(core)       ((void)0)
@@ -178,6 +193,7 @@ extern "C" void jitCoreCostEmit(u32 frame)
   #define JCC_RAN(core, _c, _i, _el) ((void)0)
   #define JCC_EXEC_BEGIN()        ((void)0)
   #define JCC_EXEC_END(core)      ((void)0)
+  #define JCC_FALLBACK(core, ret) ((void)0)
 #endif
 static void jitMaybeReport()
 {
@@ -237,6 +253,88 @@ static void jit9ProfileReport()
 	         fclose(f); }
 }
 #endif
+
+// PERF_LOG Step 2 -- in-block interpreter fallback: the C half of
+// JitTraceCtx::emitInterpFallback() (jit_trace.cpp). Compiled code has just
+// stored the pinned guest registers + CPSR to cpu.R[]/CPSR and calls this for
+// one instruction the front end refused. This is armcpu_exec<>() for a single
+// opcode minus the prefetch: set the pipeline state the handlers read, apply
+// the ARM condition check, run the handler. The prefetch is not needed --
+// compiled code or the dispatcher's own resume re-prime owns the pipeline
+// from here -- and with ACCOUNT_FOR_CODE_FETCH_CYCLES off (MMU_timing.h)
+// MMU_fetchExecuteCycles() is the handler's own execute count in DS mode, so
+// the returned cycles are exactly what the interpreter would have charged.
+// (GBA mode also adds a cartridge-fetch waitstate term there; the JIT's
+// compile-time GBA cycle model already ignores it everywhere else too.)
+//
+// The emitted code reloads every register afterwards, so anything the handler
+// did to cpu.R[], the banked registers or CPSR is picked up as-is. What it
+// cannot absorb by continuing in-block is reported through the exit flags:
+//   TO_C  -- CPSR.T flipped (the rest of the block is the wrong ISA);
+//            CPSR.I went 1->0 (a pending IRQ must be able to fire now, as the
+//            interpreter would let it at the next armInnerLoop turn);
+//            waitIRQ set (MCR halt / HLE Halt / IntrWait);
+//            an SMC kill or a cache flush happened (a store onto compiled
+//            code -- possibly this very block -- or CP15 moving the DTCM,
+//            whose base is baked into compiled ARM9 loads/stores);
+//            a reschedule was newly requested by anything other than a CPSR
+//            write that leaves IRQs masked (e.g. an I/O store that starts a
+//            timer/DMA or touches IE/IME -- armInnerLoop checks
+//            sequencer.reschedule between dispatches, so it must get one).
+//            changeCPSR() requests a reschedule on *every* CPSR write, but
+//            one that doesn't unmask IRQs has nothing to deliver, and
+//            deferring it to the chain's end is the same bounded delay
+//            compiled code already has (PERF_LOG Step 1 caveat 2).
+//   CHAIN -- none of the above, but PC left the fall-through (a branch, a PC
+//            load, an exception return, SWI/undef entry into ARM mode from
+//            ARM mode): leave through the guarded dynamic stub at
+//            cpu.next_instruction, which the handler set.
+template<int PROCNUM, bool THUMB>
+static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
+{
+	armcpu_t& cpu = (PROCNUM == ARMCPU_ARM9) ? NDS_ARM9 : NDS_ARM7;
+	JITCache& jc  = (PROCNUM == ARMCPU_ARM9) ? jitCacheArm9 : jitCacheArm7;
+	const u32 step = THUMB ? 2u : 4u;
+
+	const u32  oldCPSR       = cpu.CPSR.val;
+	const bool reschedBefore = NDS_ReschedulePending();
+	const u64  smcBefore     = g_jitSmcKills;
+	const u32  arenaBefore   = jc.getArenaOffset();
+
+	cpu.instruction      = opcode;
+	cpu.instruct_adr     = pc;
+	cpu.next_instruction = pc + step;
+	cpu.R[15]            = pc + 2 * step;
+
+	u32 c;
+	if (THUMB)
+		c = (PROCNUM == ARMCPU_ARM9 ? thumb_instructions_set_0 : thumb_instructions_set_1)[opcode >> 6](opcode);
+	else if (CONDITION(opcode) == 0x0E || TEST_COND(CONDITION(opcode), CODE(opcode), cpu.CPSR))
+		c = (PROCNUM == ARMCPU_ARM9 ? arm_instructions_set_0 : arm_instructions_set_1)[INSTRUCTION_INDEX(opcode)](opcode);
+	else
+		c = 1;   // condition false: 1S, as armcpu_exec
+	c &= ~(JIT_FALLBACK_EXIT_CHAIN | JIT_FALLBACK_EXIT_TO_C);
+
+	const u32 newCPSR = cpu.CPSR.val;
+	u32 ret = c;
+	if (((oldCPSR ^ newCPSR) & 0x20) ||                        // T flipped
+	    (oldCPSR & ~newCPSR & 0x80) ||                         // IRQs unmasked
+	    cpu.waitIRQ ||
+	    g_jitSmcKills != smcBefore ||
+	    jc.getArenaOffset() != arenaBefore ||                  // flushCache() (CP15 TCM move)
+	    (!reschedBefore && ((oldCPSR ^ newCPSR) & 0xFF) == 0 && NDS_ReschedulePending()))
+		ret |= JIT_FALLBACK_EXIT_TO_C;
+	else if (cpu.next_instruction != pc + step)
+		ret |= JIT_FALLBACK_EXIT_CHAIN;
+
+	JCC_FALLBACK(PROCNUM == ARMCPU_ARM9 ? 1 : 0, ret);
+	return ret;
+}
+
+u32 jitInterpFallbackArm9Arm(u32 opcode, u32 pc)   { return jitInterpFallback<ARMCPU_ARM9, false>(opcode, pc); }
+u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc) { return jitInterpFallback<ARMCPU_ARM9, true >(opcode, pc); }
+u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc)   { return jitInterpFallback<ARMCPU_ARM7, false>(opcode, pc); }
+u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc) { return jitInterpFallback<ARMCPU_ARM7, true >(opcode, pc); }
 
 // Runtime master switch. Defaults on for a JIT build; a menu toggle can flip it.
 bool jitArm7Enabled = true;

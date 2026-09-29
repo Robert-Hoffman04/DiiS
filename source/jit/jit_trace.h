@@ -160,6 +160,42 @@ static inline u32 jitQuotaStart(s32 quota)
 #define JIT_ENABLE_DYNAMIC_CHAINING 1
 #endif
 
+// PERF_LOG Step 2: in-block interpreter fallback. When the front end refuses
+// an instruction (sets endBlock without emitting a terminator), the scanner
+// used to end the block there -- and a PC whose *first* instruction is refused
+// got a length-1 "don't JIT" marker, so every visit paid a full dispatch round
+// trip (jitRunArm9() returns 0 -> armInnerLoop -> armcpu_exec for exactly one
+// instruction -> back into jitRunArm9()). ~4,480 of ~9,700 ARM9 dispatches per
+// frame on the benchmark scene were those marker hits, and nearly every clean
+// chain end landed on one. With this on, the scanner instead emits a call to
+// the interpreter's own opcode handler for that one instruction (via
+// jitInterpFallback*() in jit_exec.cpp -- see emitInterpFallback()) and keeps
+// compiling after it; the handler's result decides at run time whether the
+// block continues, dynamically chains to a redirected PC, or returns to C.
+// Every refused instruction on both cores and both ISAs is covered -- the
+// safety net is the run-time exit test in jitInterpFallback(), not an opcode
+// allow-list. 0 restores the old behaviour exactly (A/B switch).
+#ifndef JIT_INTERP_FALLBACK
+#define JIT_INTERP_FALLBACK 1
+#endif
+
+// Worst-case words emitInterpFallback() emits -- comfortably inside either
+// per-instruction reserve below, so the scanner's budget check needs no change.
+#define JIT_INTERP_FALLBACK_WORDS  36
+
+// Run one guest instruction through the interpreter's handler table, from
+// compiled code. The caller (emitted code) has already stored the pinned
+// register file + CPSR to cpu.R[]/CPSR; these set the interpreter pipeline
+// state the handlers read (instruction / instruct_adr / next_instruction /
+// R[15]), apply the condition check (ARM), call the handler, and return its
+// cycle count in bits 0..29 plus two exit flags -- see jit_exec.cpp.
+#define JIT_FALLBACK_EXIT_CHAIN  0x40000000u   // PC redirected, same ISA: dynamic-chain on
+#define JIT_FALLBACK_EXIT_TO_C   0x80000000u   // must return to the dispatcher
+u32 jitInterpFallbackArm9Arm(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm9Thumb(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm7Arm(u32 opcode, u32 pc);
+u32 jitInterpFallbackArm7Thumb(u32 opcode, u32 pc);
+
 // Packed-flag bit indices. These are IBM/rlwinm bit numbers 0..3 (the top
 // nibble, conventional bits 31..28) -- which is exactly ARM CPSR's N/Z/C/V
 // layout, so PPC_REG_FLAGS can just hold the whole CPSR word.
@@ -349,6 +385,13 @@ struct JitTraceCtx {
 	void emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb);
 	// Bail to the interpreter at ctx.currentPC (this instruction re-run there).
 	void emitInterpreterBail(u32 metaCount);
+	// Execute the refused instruction at ctx.currentPC in place through the
+	// interpreter's handler (JIT_INTERP_FALLBACK, see above) and fall through
+	// to the next instruction when it neither redirected control nor changed
+	// anything a compiled continuation can't absorb. Does not end the block
+	// and adds nothing to cyclesAccum (the handler's own cycle count goes
+	// straight into r3 at run time).
+	void emitInterpFallback(u32 opcode);
 
 	// ARM predication: emit a 0/1 "condition holds" value into PPC_R11 for one of
 	// the 14 real ARM condition codes (0..13; not AL/NV). Clobbers r10, r11.

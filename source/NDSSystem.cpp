@@ -1550,6 +1550,14 @@ void NDS_Reschedule()
 	sequencer.reschedule = true;
 }
 
+// The JIT's in-block interpreter fallback (jit_exec.cpp jitInterpFallback())
+// runs single interpreter handlers from inside a compiled chain and needs to
+// know whether one of them just asked armInnerLoop to stop and reschedule.
+bool NDS_ReschedulePending()
+{
+	return sequencer.reschedule;
+}
+
 FORCEINLINE u32 _fast_min32(u32 a, u32 b, u32 c, u32 d)
 {
 	return ((( ((s32)(a-b)) >> (32-1)) & (c^d)) ^ d);

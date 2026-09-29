@@ -244,6 +244,18 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	const bool thumb = (save.CPSR.bits.T != 0);
 	const u32  step  = thumb ? 2u : 4u;
 
+	// Snapshot the block's entry point and length now: with the in-block
+	// interpreter fallback (PERF_LOG Step 2) a block can contain an MCR that
+	// moves the DTCM/ITCM, and cp15 then flushCache()s the whole ARM9 table --
+	// during the reference pass below, i.e. before the trial and real runs.
+	// The BasicBlock slot is zeroed by that (a null execute -> ISI at PC 0),
+	// but the emitted code itself stays intact in the arena until the next
+	// compile, which cannot happen inside this call, and its exits go
+	// through the (identically re-emitted) linker stubs -- so running the
+	// snapshot is exactly what the non-differential dispatcher does.
+	const JITBlockFunc blockExec = block->execute;
+	const u32          blockLen  = block->insnCount();
+
 	// ---- interpreter reference: up to block->insnCount() steps, journalled ----
 	journalArm(proc);
 	cpu->R[15] = pc + (thumb ? 4u : 8u);
@@ -253,7 +265,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 
 	u32 istep = 0;
 	u32 iCycles = 0;
-	while (istep < block->insnCount() &&
+	while (istep < blockLen &&
 	       ((bool)cpu->CPSR.bits.T == thumb) && !cpu->waitIRQ) {
 		u32 curPC = cpu->instruct_adr;
 		iCycles += execOne();
@@ -296,7 +308,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	JITResult rTrial;
 	memset(&rTrial, 0, sizeof rTrial);
 	journalArm(proc);
-	ExecuteJITTrace(block->execute, &rTrial, &stTrial, start);
+	ExecuteJITTrace(blockExec, &rTrial, &stTrial, start);
 	rTrial.cycles -= start;
 	const bool trialTrustable = !s_journalOverflow && !s_journalUnrestorable;
 	u32 tR[16];
@@ -361,7 +373,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 						if (f) {
 							fprintf(f, "[jit] %s CHAIN-DIFF @%08x %s ins=%u blk0len=%u:%s\n",
 							        C.tag, pc, thumb ? "T" : "A", (unsigned)rTrial.instructions,
-							        (unsigned)block->insnCount(), d);
+							        (unsigned)blockLen, d);
 #ifdef JIT_DIFF_CHAIN_TRAIL
 							fprintf(f, "[jit]   trail:");
 							for (u32 ti = 0; ti < trailN; ti++)
@@ -392,9 +404,9 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 			s_dumped = true;
 			FILE* f = fopen("sd:/jit.log", "a");
 			if (f) {
-				const u32* code = (const u32*)block->execute;
+				const u32* code = (const u32*)blockExec;
 				fprintf(f, "[jit] DUMP @%08x %s ins=%u r7=%08x r13=%08x:\n",
-				        pc, thumb ? "T" : "A", (unsigned)block->insnCount(),
+				        pc, thumb ? "T" : "A", (unsigned)blockLen,
 				        (unsigned)save.R[7], (unsigned)save.R[13]);
 				for (u32 i = 0; i < 140; i++)
 					fprintf(f, "  %3u %08x\n", i, (unsigned)code[i]);
@@ -404,7 +416,7 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 	}
 #endif
 
-	ExecuteJITTrace(block->execute, &r, &st, start);
+	ExecuteJITTrace(blockExec, &r, &st, start);
 	r.cycles -= start;
 	if (r.smcHit) jcache.invalidateSMCTarget(r.smcAddress);
 
@@ -472,11 +484,11 @@ static u32 jitRunChecked(int jitIdx, int proc, JITCache& jcache, u32 (*execOne)(
 				if (f) {
 					fprintf(f, "[jit] %s DIFF @%08x %s len=%u ins=%u:%s\n",
 					        C.tag, pc, thumb ? "T" : "A",
-					        (unsigned)block->insnCount(), (unsigned)r.instructions, d);
+					        (unsigned)blockLen, (unsigned)r.instructions, d);
 					if (pc != C.lastDumpPC) {
 						C.lastDumpPC = pc;
 						fprintf(f, "[jit]   opcodes:");
-						for (u32 i = 0; i < block->insnCount(); i++)
+						for (u32 i = 0; i < blockLen; i++)
 							fprintf(f, thumb ? " %04x" : " %08x",
 							        (unsigned)(thumb ? prof->fetch16(pc + i * 2)
 							                         : prof->fetch32(pc + i * 4)));
