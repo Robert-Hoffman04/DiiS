@@ -17,9 +17,9 @@
 #ifdef DSA_GXGEOM_TAGPROF
 // Task tagcost: CPU time of the recording frame's pieces, averaged per recorded pass.
 #include <ogc/lwp_watchdog.h>
-enum { kTpPrep, kTpGate, kTpPlan, kTpPlanVerts, kTpPlanShape, kTpDVerts, kTpDShape, kTpDraw, kTpPre, kTpTagDraw, kTpCallRec, kTpCallHit, kTpCount };
+enum { kTpPrep, kTpGate, kTpPlan, kTpPlanVerts, kTpPlanShape, kTpDVerts, kTpDShape, kTpDraw, kTpPre, kTpTagDraw, kTpCallRec, kTpCallHit, kTpEmit, kTpSetup, kTpCount };
 static u64 s_tp[kTpCount];
-static u32 s_tpRec, s_tpHit, s_tpShapes, s_tpPlanPolys, s_tpPlanClip, s_tpDPolys, s_tpDClip, s_tpChain, s_tpRunChk, s_tpSat;
+static u32 s_tpRec, s_tpHit, s_tpShapes, s_tpPlanPolys, s_tpPlanClip, s_tpDPolys, s_tpDClip, s_tpChain, s_tpRunChk, s_tpSat, s_tpDGone;
 #define GXDS3D_TP_BEGIN(v) const u64 v = gettime()
 #define GXDS3D_TP_END(k, v) (s_tp[k] += gettime() - (v))
 #else
@@ -66,6 +66,18 @@ struct GxDs3dFastXform {
 
 // DS matrices are column-major: element (row r, col c) = m[4*c + r].
 static inline float gxDs3dM(const float *m, int r, int c) { return m[4 * c + r]; }
+
+// Bitwise equality of two 16-float matrices, = memcmp(a, b, 64) == 0 without the libc call
+// (Task recordcost: the gate and the draw compare every polygon's two matrices).
+static inline bool gxDs3dMtxEq(const float *a, const float *b)
+{
+	for (int k = 0; k < 16; ++k) {
+		u32 x, y;
+		memcpy(&x, a + k, 4); memcpy(&y, b + k, 4);
+		if (x != y) return false;
+	}
+	return true;
+}
 
 static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, float wK)
 {
@@ -381,6 +393,27 @@ static inline bool gxDs3dVertOutside(const VERT &v)
 	       v.coord[2] < -w || v.coord[2] > w;
 }
 
+// Task recordcost: the clipper's result for a polygon it clips away entirely, without
+// running it (on SM64DS ~1600 of the ~1700 clipped polygons a frame). The clipper runs its
+// planes in the order x<-w, x>w, y<-w, y>w, z<-w, z>w (gfx3d.cpp's Stage1..6, same out
+// tests as below). Up to the first plane any vertex is outside of, every stage passes the
+// vertices through unchanged, so if ALL of them are outside that plane it emits nothing
+// and the result is 0 vertices. A later plane is not used: an earlier stage's interpolated
+// vertices could round back inside it.
+static inline bool gxDs3dClipTrivialReject(const VERT *const *v, int n)
+{
+	for (int k = 0; k < 6; ++k) {
+		const int c = k >> 1;
+		int outs = 0;
+		for (int j = 0; j < n; ++j) {
+			const float w = v[j]->coord[3], x = v[j]->coord[c];
+			outs += (k & 1) ? x > w : x < -w;
+		}
+		if (outs) return outs == n;
+	}
+	return false;
+}
+
 // The polygon as rasterize.cpp draws it, in clip space, as pointers into out[MAX_CLIPPED_VERTS]:
 // its own vertices, read in place from the vertex list, when none is outside, else the
 // clipper's N-gon (s_clipOut, valid until the next call). Returns the vertex count (< 3:
@@ -395,6 +428,9 @@ static int gxDs3dPolyVerts(POLY &p, const VERT **out, bool &clipped)
 		clipped |= gxDs3dVertOutside(*out[j]);
 	}
 	if (!clipped) return n;
+#ifndef DSA_GXGEOM_NOTRIVREJECT
+	if (gxDs3dClipTrivialReject(out, n)) return 0;
+#endif
 	VERT in[4];
 	VERT *pin[4];
 	for (int j = 0; j < n; ++j) {
@@ -709,6 +745,7 @@ static int gxDs3dFrameGate(bool requireTex)
 
 	bool anyTrans = false;
 	s_gateHasTrans = false;
+	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
 		if (p.isTranslucent()) {
@@ -746,26 +783,12 @@ static int gxDs3dFrameGate(bool requireTex)
 					return kGateQuadColor;
 			}
 		}
-	}
 
-	// Translucent polygon-ID rule (gxDs3dTransIdPlan). Checked before the per-vertex loop
-	// below: it is what rejects SM64DS's frames, and that loop is the gate's biggest cost.
-	if (anyTrans) {
-		GXDS3D_TP_BEGIN(tp0);
-		const int nt = gxDs3dTransIdPlan();
-		GXDS3D_TP_END(kTpPlan, tp0);
-		if (nt < 0) return kGateTransId;
-		s_gateHasTrans = nt > 0;
-	}
-
-	// Clipping (see the clipped-polygons section): every polygon is taken as the CPU clipper
-	// leaves it. A clipped vertex has w >= |x|, |y|, |z|, so w > 0 unless it is degenerate
-	// (the polygon passes exactly through the eye). GxAccurate clips here to rule that out;
-	// GxFast doesn't (SM64DS clips ~1500 polygons a frame, and the gate runs on every frame):
-	// gxDs3dRenderFast skips such a polygon, where the CPU would divide by zero.
-	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
-	for (int i = 0; i < polycount; ++i) {
-		POLY &p = gfx3d.polylist->list[i];
+		// Clipping (see the clipped-polygons section): every polygon is taken as the CPU clipper
+		// leaves it. A clipped vertex has w >= |x|, |y|, |z|, so w > 0 unless it is degenerate
+		// (the polygon passes exactly through the eye). GxAccurate clips here to rule that out;
+		// GxFast doesn't (SM64DS clips ~1500 polygons a frame, and the gate runs on every frame):
+		// gxDs3dRenderFast skips such a polygon, where the CPU would divide by zero.
 		bool clipped = false;
 		for (int j = 0; j < p.type; ++j) {
 			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
@@ -789,12 +812,21 @@ static int gxDs3dFrameGate(bool requireTex)
 				}
 			}
 		}
-		if (fast && (!lastP || memcmp(lastP->mvMatrix, p.mvMatrix, sizeof(p.mvMatrix)) != 0 ||
-		             memcmp(lastP->projMatrix, p.projMatrix, sizeof(p.projMatrix)) != 0)) {
+		if (fast && (!lastP || !gxDs3dMtxEq(lastP->mvMatrix, p.mvMatrix) || !gxDs3dMtxEq(lastP->projMatrix, p.projMatrix))) {
 			GxDs3dFastXform x;
 			if (!gxDs3dFastXformBuild(p, x, gfx3d.wbuffer != 0, 1.0f)) return kGateFastProj;
 			lastP = &p;
 		}
+	}
+
+	// Translucent polygon-ID rule (gxDs3dTransIdPlan). After the per-polygon loop
+	// (Task recordcost merged its two passes over the list; the verdict is the same AND).
+	if (anyTrans) {
+		GXDS3D_TP_BEGIN(tp0);
+		const int nt = gxDs3dTransIdPlan();
+		GXDS3D_TP_END(kTpPlan, tp0);
+		if (nt < 0) return kGateTransId;
+		s_gateHasTrans = nt > 0;
 	}
 
 	return kGateOk;
@@ -1617,6 +1649,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	GXDS3D_TP_END(kTpDVerts, tpv);
 #ifdef DSA_GXGEOM_TAGPROF
 	++s_tpDPolys; s_tpDClip += clipped;
+	if (clipped && nv < 3) ++s_tpDGone;
 #endif
 	if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
 		bool bad = false;
@@ -1632,6 +1665,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		GXDS3D_TP_END(kTpDShape, tps);
 		if (!shOk) return;
 	}
+	GXDS3D_TP_BEGIN(tpsu);
 	const bool tagWrite = tag < 0;
 	u8 va = 255;
 	bool zw = true, twoPass = false;
@@ -1657,8 +1691,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		               (f32)c.vp.width, (f32)c.vp.height, 0, 1);
 		c.lastVp = p.viewport;
 	}
-	if (!c.haveLast || memcmp(c.lastMv, p.mvMatrix, sizeof(c.lastMv)) != 0 ||
-	    memcmp(c.lastProj, p.projMatrix, sizeof(c.lastProj)) != 0) {
+	if (!c.haveLast || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix)) {
 		GxDs3dFastXform x;
 		if (!gxDs3dFastXformBuild(p, x, c.wbuf, s_wK))
 			return;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
@@ -1696,6 +1729,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		GX_SetTevKColor(GX_KCOLOR1, k1);
 		if (mode == 2) gxDs3dTagTexMtx(c, clipped);
 	}
+	GXDS3D_TP_END(kTpSetup, tpsu);
+	GXDS3D_TP_BEGIN(tpe);
 	for (int pass = twoPass ? 0 : 1; pass < 2; ++pass) {
 		if (trans) {
 			// pass 0: the a == 31 fragments of a non-depth-writing polygon (opaque
@@ -1731,6 +1766,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		}
 		GX_End();
 	}
+	GXDS3D_TP_END(kTpEmit, tpe);
 }
 
 // A full-screen quad at the pass's EFB origin: the clear colour (tex NULL) or tex, no Z, no blend.
@@ -1938,7 +1974,7 @@ void gxDs3dRenderFast()
 			GXDS3D_TP_END(kTpCallRec, tp0);
 			if ((++s_tpRec & 31) == 0) {
 				const float d = 1.0f / (float)s_tpRec;
-				harness_profile_emitf("gxds3dtagprof rec=%u hit=%u us/rec prep=%.0f gate=%.0f plan=%.0f draw=%.0f pre=%.0f tagdraw=%.0f callrec=%.0f callhit=%.0f planverts=%.0f planshape=%.0f dverts=%.0f dshape=%.0f per rec: dpolys=%.0f dclip=%.0f planpolys=%.0f planclip=%.0f shapes=%.0f chain=%.0f runchk=%.0f sat=%.0f",
+				harness_profile_emitf("gxds3dtagprof rec=%u hit=%u us/rec prep=%.0f gate=%.0f plan=%.0f draw=%.0f pre=%.0f tagdraw=%.0f callrec=%.0f callhit=%.0f planverts=%.0f planshape=%.0f dverts=%.0f dshape=%.0f per rec: dpolys=%.0f dclip=%.0f planpolys=%.0f planclip=%.0f shapes=%.0f chain=%.0f runchk=%.0f sat=%.0f emit=%.0f setup=%.0f dgone=%.0f",
 				                      (unsigned)s_tpRec, (unsigned)s_tpHit,
 				                      d * ticks_to_microsecs(s_tp[kTpPrep]), d * ticks_to_microsecs(s_tp[kTpGate]), d * ticks_to_microsecs(s_tp[kTpPlan]),
 				                      d * ticks_to_microsecs(s_tp[kTpDraw]), d * ticks_to_microsecs(s_tp[kTpPre]),
@@ -1946,7 +1982,8 @@ void gxDs3dRenderFast()
 				                      s_tpHit ? ticks_to_microsecs(s_tp[kTpCallHit]) / (float)s_tpHit : 0.0f,
 				                      d * ticks_to_microsecs(s_tp[kTpPlanVerts]), d * ticks_to_microsecs(s_tp[kTpPlanShape]),
 				                      d * ticks_to_microsecs(s_tp[kTpDVerts]), d * ticks_to_microsecs(s_tp[kTpDShape]),
-				                      d * s_tpDPolys, d * s_tpDClip, d * s_tpPlanPolys, d * s_tpPlanClip, d * s_tpShapes, d * s_tpChain, d * s_tpRunChk, d * s_tpSat);
+				                      d * s_tpDPolys, d * s_tpDClip, d * s_tpPlanPolys, d * s_tpPlanClip, d * s_tpShapes, d * s_tpChain, d * s_tpRunChk, d * s_tpSat,
+				                      d * ticks_to_microsecs(s_tp[kTpEmit]), d * ticks_to_microsecs(s_tp[kTpSetup]), d * s_tpDGone);
 			}
 #endif
 			GXDS3D_RPSTAT(s_rpRec);
