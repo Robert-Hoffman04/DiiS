@@ -1817,6 +1817,29 @@ struct GxDs3dFastCtx {
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
 static GXTexObj s_tagSaveTex, s_tagLoTex, s_tagHiTex;
 
+// Task gxfast-perf: per polylist index, what the main pass's gxDs3dFastPoly found for a
+// polygon it ran gxDs3dTransShapeBuild on, so the shadow ID pass (which replays the
+// polygons drawn before it) skips the ones that draw nothing and box-tests the rest on
+// their outline instead of re-projecting them. Only filled in a frame with a shadow plan
+// (s_shRec); grow-only.
+enum { kShBoxUnknown = 0, kShBoxDraws, kShBoxNone };
+static bool s_shRec = false;
+static u8 *s_shBoxState = nullptr;
+static float (*s_shPolyBox)[4] = nullptr;
+static int s_shBoxCap = 0;
+static bool gxDs3dShBoxAlloc(int n)
+{
+	if (n > s_shBoxCap) {
+		free(s_shBoxState); free(s_shPolyBox);
+		s_shBoxState = (u8 *)malloc(n);
+		s_shPolyBox = (float (*)[4])malloc(n * sizeof(float[4]));
+		s_shBoxCap = (s_shBoxState && s_shPolyBox) ? n : 0;
+		if (!s_shBoxCap) { free(s_shBoxState); free(s_shPolyBox); s_shBoxState = nullptr; s_shPolyBox = nullptr; return false; }
+	}
+	memset(s_shBoxState, kShBoxUnknown, n);
+	return true;
+}
+
 static bool gxDs3dTagBuffers()
 {
 	if (s_tagSaveBuf) return true;
@@ -2009,6 +2032,11 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		GXDS3D_TP_BEGIN(tps);
 		const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, shape);
 		GXDS3D_TP_END(kTpDShape, tps);
+		if (s_shRec && !c.shIdPass) {
+			const int i = (int)(&p - gfx3d.polylist->list);
+			s_shBoxState[i] = shOk ? kShBoxDraws : kShBoxNone;
+			if (shOk) { s_shPolyBox[i][0] = shape.x0; s_shPolyBox[i][1] = shape.y0; s_shPolyBox[i][2] = shape.x1; s_shPolyBox[i][3] = shape.y1; }
+		}
 		if (!shOk) return;
 	}
 	GXDS3D_TP_BEGIN(tpsu);
@@ -2198,11 +2226,35 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 }
 
 // Shadow volumes, the opaque-ID texture (see the shadow section), at indexlist position s_shIdAt.
-static bool gxDs3dShadowBoxHit(const POLY &p)
+// Task gxfast-perf: the ID pass's cull without gxDs3dShadowPolyBox's divides. False only if
+// every vertex (all w > 0) lies past one edge of s_shBox widened by 2 px, compared in clip
+// space: x = (cx + w) / 2w * W + vx < L  <=>  (cx + w) * W < (L - vx) * 2w. Such a polygon
+// (and whatever the clipper makes of it: the hull projects convexly) covers no pixel the
+// shadow draws read the ID texture at. Conservative: a polygon drawn needlessly just writes
+// its own correct ID outside the box.
+static bool gxDs3dShadowPolyMayHit(const POLY &p)
 {
-	float b[4];
-	gxDs3dShadowPolyBox(p, b);
-	return gxDs3dShadowBoxMeet(b, s_shBox);
+	VIEWPORT vp;
+	vp.decode(p.viewport);
+	const float W = (float)vp.width, H = (float)vp.height;
+	const float lx = s_shBox[0] * (1.0f / 16.0f) - 2.0f - (float)vp.x;
+	const float rx = s_shBox[2] * (1.0f / 16.0f) + 2.0f - (float)vp.x;
+	// y = 192 - ((cy + w) / 2w * H + vy): y < T  <=>  (cy + w) * H > (192 - vy - T) * 2w
+	const float ty = (float)kScreenH - (float)vp.y - (s_shBox[1] * (1.0f / 16.0f) - 2.0f);
+	const float by = (float)kScreenH - (float)vp.y - (s_shBox[3] * (1.0f / 16.0f) + 2.0f);
+	const int n = p.type;
+	int l = 0, r = 0, t = 0, b = 0;
+	for (int j = 0; j < n; ++j) {
+		const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
+		const float w = v.coord[3];
+		if (!(w > 0.0f)) return true;
+		const float sx = (v.coord[0] + w) * W, sy = (v.coord[1] + w) * H, w2 = 2.0f * w;
+		l += sx < lx * w2;
+		r += sx > rx * w2;
+		t += sy > ty * w2;
+		b += sy < by * w2;
+	}
+	return l != n && r != n && t != n && b != n;
 }
 
 static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
@@ -2218,7 +2270,14 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 	for (int n = s_shIdAt - 1; n >= 0; --n) {
 		POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 		const bool trans = p.isTranslucent();
-		if ((trans && !gxDs3dShadowA31(p)) || !gxDs3dShadowBoxHit(p)) continue;
+		if (trans && !gxDs3dShadowA31(p)) continue;
+		// The main pass's outline of it (1/16 px, truncated: 2 px margin), else the clip-space test.
+		const int st = s_shRec ? s_shBoxState[&p - gfx3d.polylist->list] : kShBoxUnknown;
+		if (st == kShBoxNone) continue;   // culled / clipped away: draws nothing here either
+		if (st == kShBoxDraws) {
+			const float *b = s_shPolyBox[&p - gfx3d.polylist->list];
+			if (b[2] + 32.0f < s_shBox[0] || b[0] - 32.0f > s_shBox[2] || b[3] + 32.0f < s_shBox[1] || b[1] - 32.0f > s_shBox[3]) continue;
+		} else if (!gxDs3dShadowPolyMayHit(p)) continue;
 		if (!trans) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);   // after a translucent one's
 		gxDs3dFastPoly(c, p, -(gxDs3dPolyId(p) + 1));
 	}
@@ -2299,6 +2358,7 @@ static void gxDs3dRenderFastDraw()
 #endif
 	// Shadow volumes (see the shadow section). Without the buffers (heap) the draws are left out.
 	const bool sh = s_shGroupCount > 0 && gxDs3dShadowBuffers();
+	s_shRec = sh && s_shIdAt >= 0 && gxDs3dShBoxAlloc(gfx3d.polylist->count);
 	bool shCnt = false;
 	int sg = 0;
 	const int polycount = gfx3d.polylist->count;
@@ -2333,6 +2393,7 @@ static void gxDs3dRenderFastDraw()
 		GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
 	}
 	if (c.tagMode > 0) GX_SetNumTevStages(1);
+	s_shRec = false;
 	gxDs3dRestoreState();
 }
 
