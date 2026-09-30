@@ -650,6 +650,9 @@ template<int PROCNUM, MMU_ACCESS_TYPE AT> u32 _MMU_read32(u32 addr);
 template<int PROCNUM, MMU_ACCESS_TYPE AT> void _MMU_write08(u32 addr, u8 val);
 template<int PROCNUM, MMU_ACCESS_TYPE AT> void _MMU_write16(u32 addr, u16 val);
 template<int PROCNUM, MMU_ACCESS_TYPE AT> void _MMU_write32(u32 addr, u32 val);
+// JIT slow-path shortcut for the ARM9 IME / IE / IF registers (MMU.cpp).
+bool MMU_ARM9_irqRead32(u32 adr, u32* out);
+bool MMU_ARM9_irqWrite32(u32 adr, u32 val);
 
 template<int PROCNUM> FORCEINLINE u8 _MMU_read08(u32 addr) { return _MMU_read08<PROCNUM, MMU_AT_DATA>(addr); }
 template<int PROCNUM> FORCEINLINE u16 _MMU_read16(u32 addr) { return _MMU_read16<PROCNUM, MMU_AT_DATA>(addr); }

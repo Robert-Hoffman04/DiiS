@@ -58,6 +58,11 @@ static u32 arm9_fetch32(u32 addr) { return _MMU_read32<ARMCPU_ARM9, MMU_AT_CODE>
 static u32 arm9_slowRead(u32 addr, u32 size)
 {
 	PZ_SCOPE(arm9MemZone(addr));
+#if !defined(JIT_DIFFERENTIAL_TESTING)
+	// IME / IE / IF (the IRQ dispatcher's accesses) skip the generic decode.
+	u32 v;
+	if (size == 4 && (addr >> 12) == 0x04000 && MMU_ARM9_irqRead32(addr, &v)) return v;
+#endif
 	switch (size) {
 		case 1:  return _MMU_read08<ARMCPU_ARM9>(addr);
 		case 2:  return _MMU_read16<ARMCPU_ARM9>(addr);
@@ -68,6 +73,11 @@ static u32 arm9_slowRead(u32 addr, u32 size)
 static void arm9_slowWrite(u32 addr, u32 val, u32 size)
 {
 	PZ_SCOPE(arm9MemZone(addr));
+#if !defined(JIT_DIFFERENTIAL_TESTING)
+	// IME / IE / IF skip the generic decode (the differential build keeps the
+	// journaled _MMU_write* path).
+	if (size == 4 && (addr >> 12) == 0x04000 && MMU_ARM9_irqWrite32(addr, val)) return;
+#endif
 	switch (size) {
 		case 1:  _MMU_write08<ARMCPU_ARM9>(addr, (u8)val);  break;
 		case 2:  _MMU_write16<ARMCPU_ARM9>(addr, (u16)val); break;

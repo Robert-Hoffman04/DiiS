@@ -3147,6 +3147,78 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 }
 
 //================================================= MMU ARM9 write 32
+// The ARM9 IRQ-register writes, shared by _MMU_ARM9_write32() and the JIT's
+// slow-path shortcut MMU_ARM9_irqWrite32() below.
+static FORCEINLINE void arm9WriteIME32(u32 val)
+{
+	NDS_Reschedule();
+	u32 old_val = MMU.reg_IME[ARMCPU_ARM9];
+	u32 new_val = val & 0x01;
+	MMU.reg_IME[ARMCPU_ARM9] = new_val;
+	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x208, val);
+#ifndef NEW_IRQ
+	if ( new_val && old_val != new_val)
+	{
+		// raise an interrupt request to the CPU if needed
+		if ( MMU.reg_IE[ARMCPU_ARM9] & MMU.reg_IF[ARMCPU_ARM9])
+		{
+			NDS_ARM9.waitIRQ = FALSE;
+		}
+	}
+#endif
+}
+
+static FORCEINLINE void arm9WriteIE32(u32 val)
+{
+	NDS_Reschedule();
+	MMU.reg_IE[ARMCPU_ARM9] = val;
+#ifndef NEW_IRQ
+	if ( MMU.reg_IME[ARMCPU_ARM9])
+	{
+		// raise an interrupt request to the CPU if needed
+		if ( MMU.reg_IE[ARMCPU_ARM9] & MMU.reg_IF[ARMCPU_ARM9])
+		{
+			NDS_ARM9.waitIRQ = FALSE;
+		}
+	}
+#endif
+}
+
+static FORCEINLINE void arm9WriteIF32(u32 val)
+{
+	NDS_Reschedule();
+	MMU.reg_IF[ARMCPU_ARM9] &= (~val);
+	validateIF_arm9();
+}
+
+// JIT slow-path shortcut (jit_arm9_profile.cpp): 32-bit ARM9 accesses to IME /
+// IE / IF -- the libnds IRQ dispatcher makes ~8 per IRQ -- handled exactly as
+// _MMU_read32/_MMU_write32<ARMCPU_ARM9>() would (DTCM overlay first, then the
+// lazy-2D I/O barrier for writes, then the same register code), skipping the
+// generic region and I/O decode. Return false (nothing done) for anything
+// else; the caller then takes the normal path.
+bool MMU_ARM9_irqRead32(u32 adr, u32* out)
+{
+	if ((adr & ~0x3FFFu) == MMU.DTCMRegion) return false;
+	switch (adr) {
+		case REG_IME: *out = MMU.reg_IME[ARMCPU_ARM9]; return true;
+		case REG_IE:  *out = MMU.reg_IE[ARMCPU_ARM9];  return true;
+		case REG_IF:  *out = MMU.reg_IF[ARMCPU_ARM9];  return true;
+		default:      return false;
+	}
+}
+
+bool MMU_ARM9_irqWrite32(u32 adr, u32 val)
+{
+	if (adr != REG_IME && adr != REG_IE && adr != REG_IF) return false;
+	if ((adr & ~0x3FFFu) == MMU.DTCMRegion) return false;
+	GXDS_LAZY_IO_BARRIER(adr);
+	if (adr == REG_IME)     arm9WriteIME32(val);
+	else if (adr == REG_IE) arm9WriteIE32(val);
+	else                    arm9WriteIF32(val);
+	return true;
+}
+
 void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 {
 	mmu_log_debug_ARM9(adr, "(write32) 0x%08X", val);
@@ -3409,46 +3481,9 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 				MMU_VRAMmapControl(adr-REG_VRAMCNTA+1, (val >> 8) & 0xFF);
 				break;
 
-			case REG_IME : 
-				{
-					NDS_Reschedule();
-			        u32 old_val = MMU.reg_IME[ARMCPU_ARM9];
-					u32 new_val = val & 0x01;
-					MMU.reg_IME[ARMCPU_ARM9] = new_val;
-					T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM9][0x40], 0x208, val);
-#ifndef NEW_IRQ
-					if ( new_val && old_val != new_val) 
-					{
-						// raise an interrupt request to the CPU if needed
-						if ( MMU.reg_IE[ARMCPU_ARM9] & MMU.reg_IF[ARMCPU_ARM9]) 
-						{
-							NDS_ARM9.waitIRQ = FALSE;
-						}
-					}
-#endif
-				}
-				return;
-				
-			case REG_IE :
-				NDS_Reschedule();
-				MMU.reg_IE[ARMCPU_ARM9] = val;
-#ifndef NEW_IRQ
-				if ( MMU.reg_IME[ARMCPU_ARM9]) 
-				{
-					// raise an interrupt request to the CPU if needed
-					if ( MMU.reg_IE[ARMCPU_ARM9] & MMU.reg_IF[ARMCPU_ARM9]) 
-					{
-						NDS_ARM9.waitIRQ = FALSE;
-					}
-				}
-#endif
-				return;
-			
-			case REG_IF :
-				NDS_Reschedule();
-				MMU.reg_IF[ARMCPU_ARM9] &= (~val); 
-				validateIF_arm9();
-				return;
+			case REG_IME : arm9WriteIME32(val); return;
+			case REG_IE :  arm9WriteIE32(val);  return;
+			case REG_IF :  arm9WriteIF32(val);  return;
 
             case REG_TM0CNTL:
             case REG_TM1CNTL:
