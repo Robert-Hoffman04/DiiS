@@ -67,6 +67,7 @@ resolved since then by deferring actual rendering to the next vcount=0 (giving t
 But since we're not sure how we'll eventually want this, I am leaving it sort of reconfigurable, doing all the work
 in this function: */
 static void gfx3d_doFlush();
+static void gfx3d_normEpochBump();   // see s_normEpoch
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
 static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
 static bool s_rasterGx = false;          // gfx3d_convertedScreen is this frame's GX readback (gfx3d_ensureRendered)
@@ -103,6 +104,18 @@ static const u8 gfx3d_commandTypes[] = {
 	/* E0 */ 0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC, 0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,
 	/* F0 */ 0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC, 0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC
 };
+
+// Task gedma: T1ReadLong_guaranteedAligned() as one byte-reversed load (lwbrx). GCC turns the
+// __builtin_bswap32 of a load into lwz + rotlwi + 2x rlwimi here.
+static FORCEINLINE u32 ldle32(const u8 *mem, u32 off){
+#if defined(__PPC__) && defined(DESMUME_FAST_LE_ACCESS)
+	u32 v;
+	__asm__("lwbrx %0,%y1" : "=r"(v) : "Z"(*(const u32 *)(mem + off)));
+	return v;
+#else
+	return T1ReadLong_guaranteedAligned((u8 *)mem, off);
+#endif
+}
 
 class GXF_Hardware{
 public:
@@ -153,6 +166,87 @@ public:
 			if (size == 0) break;
 			dequeue();
 		}
+	}
+
+	// Task gedma: receive<true>() over a whole DMA block of main-RAM words (see
+	// gfx3d_sendCommandBlockToFIFO). Same words, same FIFO pushes in the same order, same
+	// state after the block; only the bookkeeping is batched. The FIFO push state (tail,
+	// size) and the hardware state (size, cursor) live in locals for the whole block, the
+	// packed-command unpack is inline, and nothing is called per word: the per-word
+	// receive<true>() reloads and stores every one of those fields (the pushes are byte and
+	// word stores, and with -fno-strict-aliasing none of them may stay in a register) and
+	// calls unpack() for each packed word. The caller has checked the FIFO can't fill (size +
+	// 4*todo < HACK_GXIFO_SIZE; one word pushes at most four entries), so the "FIFO FULL"
+	// diagnostic can't fire and the ring index only wraps.
+	// FIXED_DST: dstinc == 0, so every I/O-page store hits the same word and only the last
+	// one is visible (nothing reads it in between).
+	template<bool FIXED_DST>
+	FORCEINLINE void receiveBlock(u32 src, u32 srcinc, u32 dst, u32 dstinc, u32 todo, u32 *io){
+		const u8 *const mem = MMU.MAIN_MEM;
+		const u32 mask = _MMU_MAIN_MEM_MASK32;
+		u8 *const cmdArr = gxFIFO.cmd;
+		u32 *const parArr = gxFIFO.param;
+		CommandItem *const pend = commandsPending;
+		u32 tail = gxFIFO.tail, fsize = gxFIFO.size;
+		u32 sz = size, cur = commandCursor;
+		u32 last = 0;
+#define GXF_BLOCK_PUSH(c, p) do { cmdArr[tail] = (u8)(c); parArr[tail] = (p); fsize++; \
+			if (++tail > HACK_GXIFO_SIZE-1) tail = 0; } while (0)
+		for (u32 i = 0; i < todo; i++)
+		{
+			const u32 val = ldle32(mem, src & mask);
+			if (!FIXED_DST) io[(dst & 0xFFF) >> 2] = val;
+			last = val;
+			src += srcinc; dst += dstinc;
+			if (sz > 0)
+			{
+				// a parameter of the front command (receive<true>() + frontDone<true>())
+				CommandItem &f = pend[cur];
+				GXF_BLOCK_PUSH(f.command, val);
+				if (--f.countdown == 0)
+				{
+					if (--sz == 0) continue;
+					cur++;
+					// push the no-parameter commands that follow it in the packed word
+					while (gfx3d_commandTypes[pend[cur].command] == GFX_NOARG_COMMAND)
+					{
+						GXF_BLOCK_PUSH(pend[cur].command, 0);
+						if (--sz == 0) break;
+						cur++;
+					}
+				}
+			}
+			else if (val != 0)
+			{
+				// a packed command word (unpack()); a 0 word is a nop
+				cur = 0; sz = 0;
+				for (u32 k = 0; k < 4; k++)
+				{
+					const u32 c = (val >> (8*k)) & 0xFF;
+					const u32 t = gfx3d_commandTypes[c];
+					if (t > 0x20) continue;	// GFX_INVALID_COMMAND / GFX_UNDEFINED_COMMAND (the rest are parameter counts)
+					pend[sz].command = (u8)c;
+					pend[sz].countdown = (u8)t;
+					if (t == 0 && sz == 0)	// no parameters and nothing ahead of it: straight into the FIFO
+					{
+						GXF_BLOCK_PUSH(c, 0);
+						while (k < 3)
+						{
+							const u32 n = (val >> (8*(k+1))) & 0xFF;
+							if (n == 0 || gfx3d_commandTypes[n] != GFX_NOARG_COMMAND) break;
+							GXF_BLOCK_PUSH(n, 0);
+							k++;
+						}
+					}
+					else
+						sz++;
+				}
+			}
+		}
+#undef GXF_BLOCK_PUSH
+		gxFIFO.tail = tail; gxFIFO.size = fsize;
+		size = sz; commandCursor = cur;
+		if (FIXED_DST && todo != 0) io[(dst & 0xFFF) >> 2] = last;
 	}
 
 	__attribute__((noinline)) void unpack(u32 val){
@@ -536,6 +630,7 @@ void gfx3d_init(){
 
 void gfx3d_reset(){
 	gfx3d = GFX3D();
+	gfx3d_normEpochBump();
 
 	gxf_hardware.reset();
 
@@ -619,6 +714,9 @@ void gfx3d_reset(){
 #define SUBMITVERTEX(ii, nn) polylist->list[polylist->count].vertIndexes[ii] = tempVertInfo.map[nn];
 //Submit a vertex to the GE
 static void SetVertex(){
+	// Task gedma: a local (it was the file-scope global of the same name, stored to and
+	// reloaded three times per vertex, and read by nothing outside this function).
+	int polygonListCompleted;
 
 	float coord[3] = {
 		float16table[u16coord[0]],
@@ -1143,12 +1241,10 @@ static struct {
 	float spe[4][3], dif[4][3], amb[4][3];
 } s_lightProd;
 
-static void gfx3d_lightProductsUpdate(){
-	if (s_lightProd.valid && s_lightProd.diffuse == dsDiffuse && s_lightProd.ambient == dsAmbient &&
-	    s_lightProd.specular == dsSpecular && s_lightProd.lightColor[0] == lightColor[0] &&
-	    s_lightProd.lightColor[1] == lightColor[1] && s_lightProd.lightColor[2] == lightColor[2] &&
-	    s_lightProd.lightColor[3] == lightColor[3])
-		return;
+// Task gelight: the rebuild is out of line (it was inlined into gfx3d_glNormal, whose ~500 byte
+// frame and 13 saved registers were paid on every NORMAL command for a path that runs a
+// couple of times a frame); only the "unchanged?" check stays inline.
+static GE_NOINLINE void gfx3d_lightProductsRebuild(){
 	s_lightProd.diffuse = dsDiffuse; s_lightProd.ambient = dsAmbient; s_lightProd.specular = dsSpecular;
 	for(int i=0; i<4; i++){
 		s_lightProd.lightColor[i] = lightColor[i];
@@ -1162,7 +1258,28 @@ static void gfx3d_lightProductsUpdate(){
 	s_lightProd.valid = true;
 }
 
-static GE_NOINLINE void gfx3d_glNormal(u32 v){
+static FORCEINLINE void gfx3d_lightProductsUpdate(){
+	if (s_lightProd.valid && s_lightProd.diffuse == dsDiffuse && s_lightProd.ambient == dsAmbient &&
+	    s_lightProd.specular == dsSpecular && s_lightProd.lightColor[0] == lightColor[0] &&
+	    s_lightProd.lightColor[1] == lightColor[1] && s_lightProd.lightColor[2] == lightColor[2] &&
+	    s_lightProd.lightColor[3] == lightColor[3])
+		return;
+	gfx3d_lightProductsRebuild();
+}
+
+// Task gelight: (int)(x / 31.0f) for 0 <= x < 2^22 without the fdivs (17 cycles, not pipelined,
+// x3 per light). q0 = x*RN(1/31) is within 1 ulp of x/31; e = x - 31*q0 is exact (fnmsubs);
+// q0 + e*RN(1/31) is then the correctly rounded quotient (Markstein), i.e. bit-identical to
+// fdivs. Checked exhaustively over every float in [0, 2^22) (also with the fma done in double
+// and rounded to single afterwards, as Dolphin does): identical bits for all of them.
+static FORCEINLINE int gfx3d_trunc_div31(float x){
+	const float r = 1.0f/31.0f;
+	const float q0 = x * r;
+	const float e = __builtin_fmaf(-q0, 31.0f, x);
+	return (int)__builtin_fmaf(e, r, q0);
+}
+
+static GE_NOINLINE void gfx3d_glNormalCompute(u32 v){
 
 	DS_ALIGN(16) float normal[4] = { normalTable[v&1023],
 									normalTable[(v>>10)&1023],
@@ -1191,9 +1308,10 @@ static GE_NOINLINE void gfx3d_glNormal(u32 v){
 
 	int shininessTable_size = (int)ARRAY_SIZE(shininessTable);
 
-	for(int i=0; i<4; i++){
-	
-		if(!((lightMask>>i)&1)) continue;
+	// (Task gelight: visits the enabled lights in the same ascending order, without testing
+	// the disabled ones.)
+	for(u32 lm = lightMask; lm != 0; lm &= lm - 1){
+		const int i = __builtin_ctz(lm);
 
 		// This formula is the one used by the DS
 		// Reference : http://nocash.emubase.de/gbatek.htm#ds3dpolygonlightparameters
@@ -1219,10 +1337,21 @@ static GE_NOINLINE void gfx3d_glNormal(u32 v){
 			shininessLevel = shininessTable[shininessIndex];
 		}
 
-		for(int c = 0; c < 3; c++){
-			vertexColor[c] += (int)(((s_lightProd.spe[i][c] * shininessLevel)
-					+ (s_lightProd.dif[i][c] * diffuseLevel)
-					+ s_lightProd.amb[i][c]) / 31.0f);
+		// Task gelight: with both levels in [0, 1024] every sum below is in [0, 2^22) (the
+		// products are at most 31*31 each, so under 3*961*1024), where gfx3d_trunc_div31() equals (int)(x / 31.0f).
+		// Anything else (a jacked matrix, NaN) takes the original division.
+		if((diffuseLevel <= 1024.0f) && (shininessLevel >= 0.0f) && (shininessLevel <= 1024.0f)){
+			for(int c = 0; c < 3; c++){
+				vertexColor[c] += gfx3d_trunc_div31((s_lightProd.spe[i][c] * shininessLevel)
+						+ (s_lightProd.dif[i][c] * diffuseLevel)
+						+ s_lightProd.amb[i][c]);
+			}
+		} else {
+			for(int c = 0; c < 3; c++){
+				vertexColor[c] += (int)(((s_lightProd.spe[i][c] * shininessLevel)
+						+ (s_lightProd.dif[i][c] * diffuseLevel)
+						+ s_lightProd.amb[i][c]) / 31.0f);
+			}
 		}
 	}
 
@@ -1235,6 +1364,49 @@ static GE_NOINLINE void gfx3d_glNormal(u32 v){
 	GFX_DELAY_M2((lightMask>>1) & 0x01);
 	GFX_DELAY_M2((lightMask>>2) & 0x01);
 	GFX_DELAY_M2((lightMask>>3) & 0x01);
+}
+
+// Task gelight: the colour a NORMAL produces is a pure function of the normal word and of the
+// lighting inputs (the directional matrix, the light vectors / colours, the material and
+// shininess registers, and the enabled-lights mask), and a mesh sends the same normal word many
+// times over (flat faces, shared vertices: ~3 of 4 NORMALs in a frame here). So a small direct
+// mapped table remembers the last result per normal word, valid for one "epoch": s_normEpoch is
+// bumped by everything that writes one of those inputs (the matrix commands that can change the
+// directional matrix, LIGHT_VECTOR / LIGHT_COLOR / DIF_AMB / SPE_EMI / SHININESS, reset, state
+// load); the lights mask is compared in the entry. TEXCOORD-from-normal mode (2) also updates
+// the texture coordinate, so it never uses the table. A hit stores the very bytes the
+// computation stored.
+struct GfxNormalCacheEntry { u32 key, epoch; u8 rgb[3], lightMask; };
+#define GFX_NORMAL_CACHE_SIZE 64
+static GfxNormalCacheEntry s_normCache[GFX_NORMAL_CACHE_SIZE];
+static u32 s_normEpoch = 1;   // (the zeroed entries have epoch 0: they never match)
+
+static void gfx3d_normEpochBump(){
+	if (++s_normEpoch == 0) {
+		memset(s_normCache, 0, sizeof(s_normCache));
+		s_normEpoch = 1;
+	}
+}
+
+static GE_NOINLINE void gfx3d_glNormal(u32 v){
+	if (texCoordinateTransform == 2) {
+		gfx3d_glNormalCompute(v);
+		return;
+	}
+	GfxNormalCacheEntry &e = s_normCache[(v ^ (v >> 10) ^ (v >> 20)) & (GFX_NORMAL_CACHE_SIZE-1)];
+	if (e.key == v && e.epoch == s_normEpoch && e.lightMask == (u8)lightMask) {
+		colorRGB[0] = e.rgb[0];
+		colorRGB[1] = e.rgb[1];
+		colorRGB[2] = e.rgb[2];
+		return;
+	}
+	gfx3d_glNormalCompute(v);
+	e.key = v;
+	e.epoch = s_normEpoch;
+	e.lightMask = (u8)lightMask;
+	e.rgb[0] = colorRGB[0];
+	e.rgb[1] = colorRGB[1];
+	e.rgb[2] = colorRGB[2];
 }
 
 static GE_NOINLINE void gfx3d_glTexCoord(u32 val){
@@ -1344,6 +1516,7 @@ static void gfx3d_glTexPalette(u32 val){
 	26-30 Ambient Reflection Blue
 */
 static GE_NOINLINE void gfx3d_glMaterial0(u32 val){
+	gfx3d_normEpochBump();
 	dsDiffuse = val&0xFFFF;
 	dsAmbient = val>>16;
 
@@ -1356,6 +1529,7 @@ static GE_NOINLINE void gfx3d_glMaterial0(u32 val){
 }
 
 static GE_NOINLINE void gfx3d_glMaterial1(u32 val){
+	gfx3d_normEpochBump();
 	dsSpecular = val&0xFFFF;
 	dsEmission = val>>16;
 	GFX_DELAY(4);
@@ -1368,6 +1542,7 @@ static GE_NOINLINE void gfx3d_glMaterial1(u32 val){
 	30-31 Light Number                     (0..3)
 */
 static GE_NOINLINE void gfx3d_glLightDirection (u32 v){
+	gfx3d_normEpochBump();
 	int index = v>>30;
 
 	lightDirection[index] = v;
@@ -1376,12 +1551,14 @@ static GE_NOINLINE void gfx3d_glLightDirection (u32 v){
 }
 
 static GE_NOINLINE void gfx3d_glLightColor (u32 v){
+	gfx3d_normEpochBump();
 	int index = v>>30;
 	lightColor[index] = v;
 	GFX_DELAY(1);
 }
 
 static GE_NOINLINE void gfx3d_glShininess (u32 val){
+	gfx3d_normEpochBump();
 	shininessTable[shininessInd++] = ((val & 0xFF) / 256.0f);
 	shininessTable[shininessInd++] = (((val >> 8) & 0xFF) / 256.0f);
 	shininessTable[shininessInd++] = (((val >> 16) & 0xFF) / 256.0f);
@@ -1661,8 +1838,9 @@ static void gfx3d_execute(u8 cmd, u32 param){
 #endif
 
 	// Task gespeed: MTX_POP .. MTX_TRANS may change mtxCurrent[0]/[1] (see s_polyMtx).
-	if ((u8)(cmd - 0x12) <= 0x1C - 0x12)
-		s_polyMtxDirty = true;
+	// Task gelight: and, in matrix modes 1 and 2, the directional matrix (see s_normEpoch).
+	// (Task gedma: done in those commands' own cases below rather than as a range test on every command.)
+#define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode - 1 <= 1u) gfx3d_normEpochBump(); } while (0)
 
 	switch (cmd)
 	{
@@ -1673,36 +1851,47 @@ static void gfx3d_execute(u8 cmd, u32 param){
 			gfx3d_glPushMatrix();
 		break;
 		case 0x12:		// MTX_POP - Pop Current Matrix from Stack (W)
+			GE_MTX_CMD();
 			gfx3d_glPopMatrix(param);
 		break;
 		case 0x13:		// MTX_STORE - Store Current Matrix on Stack (W)
+			GE_MTX_CMD();
 			gfx3d_glStoreMatrix(param);
 		break;
 		case 0x14:		// MTX_RESTORE - Restore Current Matrix from Stack (W)
+			GE_MTX_CMD();
 			gfx3d_glRestoreMatrix(param);
 		break;
 		case 0x15:		// MTX_IDENTITY - Load Unit Matrix to Current Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glLoadIdentity();
 		break;
 		case 0x16:		// MTX_LOAD_4x4 - Load 4x4 Matrix to Current Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glLoadMatrix4x4(param);
 		break;
 		case 0x17:		// MTX_LOAD_4x3 - Load 4x3 Matrix to Current Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glLoadMatrix4x3(param);
 		break;
 		case 0x18:		// MTX_MULT_4x4 - Multiply Current Matrix by 4x4 Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glMultMatrix4x4(param);
 		break;
 		case 0x19:		// MTX_MULT_4x3 - Multiply Current Matrix by 4x3 Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glMultMatrix4x3(param);
 		break;
 		case 0x1A:		// MTX_MULT_3x3 - Multiply Current Matrix by 3x3 Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glMultMatrix3x3(param);
 		break;
 		case 0x1B:		// MTX_SCALE - Multiply Current Matrix by Scale Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glScale(param);
 		break;
 		case 0x1C:		// MTX_TRANS - Mult. Curr. Matrix by Translation Matrix (W)
+			GE_MTX_CMD();
 			gfx3d_glTranslate(param);
 		break;
 		case 0x20:		// COLOR - Directly Set Vertex Color (W)
@@ -1800,10 +1989,18 @@ void gfx3d_execute3D(){
 	// Task fifobatch: pop without the per-word FIFO event check, run it once after the
 	// loop (GFX_PIPErecvNoEvents, FIFO.cpp). No CPU runs in between and the loop only
 	// shrinks the FIFO, so the half/empty IRQ and GXFIFO-DMA trigger come out the same.
-	int i;
-	for(i=0;i<HACK_FIFO_BATCH_SIZE;i++) {
-		if(GFX_PIPErecvNoEvents(&cmd, &param)){
-			//if (isSwapBuffers) printf("Executing while swapbuffers is pending: %d:%08X\n",cmd,param);
+	// Task gedma: the pops are done here on a local head with the count known up front (the
+	// handlers never touch the FIFO, so nothing changes it under the loop), and the
+	// head/size are written back once, instead of an out-of-line-style pop per command.
+	u32 i = gxFIFO.size;
+	if (i > (u32)HACK_FIFO_BATCH_SIZE) i = HACK_FIFO_BATCH_SIZE;
+	if (i > 0) {
+		const u32 n = i;
+		u32 head = gxFIFO.head;
+		do {
+			cmd = gxFIFO.cmd[head];
+			param = gxFIFO.param[head];
+			if (++head > HACK_GXIFO_SIZE-1) head = 0;
 
 			//since we did anything at all, incur a pipeline motion cost.
 			//also, we can't let gxfifo sequencer stall until the fifo is empty.
@@ -1811,9 +2008,14 @@ void gfx3d_execute3D(){
 			//the one NDS_RescheduleGXFIFO() after the loop; see GFX_DELAY.)
 			//printf("%05d:%03d:%12lld: executed 3d: %02X %08X\n",currFrameCounter, nds.VCount, nds_timer , cmd, param);
 			gfx3d_execute(cmd, param);
-		} else break;
-	}
-	if (i > 0) {
+		} while (--i);
+		gxFIFO.head = head;
+		gxFIFO.size -= n;
+		// Task gedma: the ring position is not observable, so restart at the base once the
+		// FIFO is drained: the next DMA block then refills the same few KB (which are
+		// still in the L1) instead of sweeping the whole 100KB ring.
+		if (gxFIFO.size == 0) gxFIFO.head = gxFIFO.tail = 0;
+
 		NDS_RescheduleGXFIFO(1);
 
 		//this is a COMPATIBILITY HACK.
@@ -1844,9 +2046,9 @@ GE_NOINLINE void gfx3d_glFlush(u32 v){
 	GFX_DELAY(1);
 }
 
-static FORCEINLINE bool gfx3d_ysort_compare(int num1, int num2){
-	const POLY &poly1 = polylist->list[num1];
-	const POLY &poly2 = polylist->list[num2];
+static FORCEINLINE bool gfx3d_ysort_compare(const POLY *list, int num1, int num2){
+	const POLY &poly1 = list[num1];
+	const POLY &poly2 = list[num2];
 
 	//this may be verified by checking the game create menus in harvest moon island of happiness
 	//also the buttons in the knights in the nightmare frontend depend on this and the perspective division
@@ -1869,8 +2071,12 @@ static FORCEINLINE bool gfx3d_ysort_compare(int num1, int num2){
 // Task gespeed: gfx3d_ysort_compare() as a functor, so std::sort inlines it (a function
 // pointer comparator was an out-of-line call per comparison). Same comparisons, so the
 // same permutation.
+// (Task gedma: the poly array base is a member, not re-read from the polylist pointer, which
+// the float stores of the comparison itself may alias, on every comparison.)
 struct YSortCompare {
-	FORCEINLINE bool operator()(int num1, int num2) const { return gfx3d_ysort_compare(num1, num2); }
+	const POLY *list;
+	explicit YSortCompare(const POLY *l) : list(l) {}
+	FORCEINLINE bool operator()(int num1, int num2) const { return gfx3d_ysort_compare(list, num1, num2); }
 };
 
 static void gfx3d_doFlush(){
@@ -1899,6 +2105,11 @@ static void gfx3d_doFlush(){
 	gfx3d.activeFlushCommand = gfx3d.pendingFlushCommand;
 
 	int polycount = polylist->count;
+	// Task gedma: the list bases in locals (the float / int stores below may alias the
+	// polylist / vertlist / gfx3d.indexlist pointers, so they were re-read on every iteration).
+	POLY *const plist = polylist->list;
+	const VERT *const vlist = vertlist->list;
+	int *const idxlist = gfx3d.indexlist;
 	
 	//we need to sort the poly list with alpha polys last
 	//first, look for opaque polys
@@ -1906,15 +2117,15 @@ static void gfx3d_doFlush(){
 	//tail is reversed back into submission order.)
 	int ctr=0, back=polycount;
 	for(int i=0;i<polycount;i++) {
-		POLY &poly = polylist->list[i];
+		POLY &poly = plist[i];
 		if(!poly.isTranslucent())
-			gfx3d.indexlist[ctr++] = i;
+			idxlist[ctr++] = i;
 		else
-			gfx3d.indexlist[--back] = i;
+			idxlist[--back] = i;
 	}
 	int opaqueCount = ctr;
 	//then the translucent polys
-	std::reverse(gfx3d.indexlist + opaqueCount, gfx3d.indexlist + polycount);
+	std::reverse(idxlist + opaqueCount, idxlist + polycount);
 
 	//find the min and max y values for each poly.
 	//(Task gespeed: only for the polys sorted below: miny/maxy are read by nothing else.)
@@ -1923,31 +2134,33 @@ static void gfx3d_doFlush(){
 	//also the buttons in the knights in the nightmare frontend depend on this
 	const int sortCount = gfx3d.sortmode ? opaqueCount : polycount;
 	for(int k=0; k<sortCount; k++){
-		POLY &poly = polylist->list[gfx3d.indexlist[k]];
-		float verty = vertlist->list[poly.vertIndexes[0]].y;
-		float vertw = vertlist->list[poly.vertIndexes[0]].w;
+		POLY &poly = plist[idxlist[k]];
+		float verty = vlist[poly.vertIndexes[0]].y;
+		float vertw = vlist[poly.vertIndexes[0]].w;
 		verty = (verty+vertw)/(2*vertw);
-		poly.miny = poly.maxy = verty;
+		float miny = verty, maxy = verty;
 
 		for(int j=1; j<poly.type; j++){
-			verty = vertlist->list[poly.vertIndexes[j]].y;
-			vertw = vertlist->list[poly.vertIndexes[j]].w;
+			verty = vlist[poly.vertIndexes[j]].y;
+			vertw = vlist[poly.vertIndexes[j]].w;
 			verty = (verty+vertw)/(2*vertw);
-			poly.miny = min(poly.miny, verty);
-			poly.maxy = max(poly.maxy, verty);
+			miny = min(miny, verty);
+			maxy = max(maxy, verty);
 		}
+		poly.miny = miny;
+		poly.maxy = maxy;
 	}
 
 	//now we have to sort the opaque polys by y-value.
 	//(test case: harvest moon island of happiness character cretor UI)
 	//should this be done after clipping??
-	std::sort(gfx3d.indexlist, gfx3d.indexlist + opaqueCount, YSortCompare());
+	std::sort(idxlist, idxlist + opaqueCount, YSortCompare(plist));
 	
 	if(!gfx3d.sortmode)
 	{
 		//if we are autosorting translucent polys, we need to do this also
 		//TODO - this is unverified behavior. need a test case
-		std::sort(gfx3d.indexlist + opaqueCount, gfx3d.indexlist + polycount, YSortCompare());
+		std::sort(idxlist + opaqueCount, idxlist + polycount, YSortCompare(plist));
 	}
 
 	//switch to the new lists
@@ -2131,6 +2344,13 @@ void gfx3d_sendCommandToFIFO(u32 val){
 void gfx3d_sendCommandBlockToFIFO(u32 src, u32 srcinc, u32 dst, u32 dstinc, s32 todo){
 	u32 *io = (u32 *)MMU.MMU_MEM[ARMCPU_ARM9][0x40];
 	GFX_FIFObatchBegin();
+	if (gxFIFO.size + 4u*(u32)todo < HACK_GXIFO_SIZE)
+	{
+		// Task gedma: the block loop is GXF_Hardware::receiveBlock() (see there).
+		if (dstinc == 0) gxf_hardware.receiveBlock<true>(src, srcinc, dst, dstinc, (u32)todo, io);
+		else             gxf_hardware.receiveBlock<false>(src, srcinc, dst, dstinc, (u32)todo, io);
+	}
+	else
 	for(s32 i=todo; i>0; i--)
 	{
 		u32 temp = T1ReadLong_guaranteedAligned(MMU.MAIN_MEM, src & _MMU_MAIN_MEM_MASK32);
@@ -2361,6 +2581,7 @@ SFORMAT SF_GFX3D[]={
 //-------------savestate
 void gfx3d_preloadstate()
 {
+	gfx3d_normEpochBump();
 	// Marks the flush args so gfx3d_loadstate() can tell a state without GFAF/GFPF.
 	gfx3d.activeFlushCommand = gfx3d.pendingFlushCommand = GFX3D_FLUSH_UNSAVED;
 }
@@ -2391,6 +2612,7 @@ void gfx3d_savestate(EMUFILE* os){
 }
 
 bool gfx3d_loadstate(EMUFILE* is, int size){
+	gfx3d_normEpochBump();
 	int version;
 	if(read32le(&version,is) != 1) return false;
 	if(size==8) version = 0;

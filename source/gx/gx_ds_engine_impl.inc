@@ -544,6 +544,9 @@ struct GxDsBBgPlaneCache {
 	u32 texDataCap;
 	u16 wpx, hpx;
 	bool valid;
+	// Task gebake: texData is followed by the plane's tilemap entries as of the last CI bake
+	// (one u16 per tile, row-major), so a partial re-bake can tell which entries changed.
+	bool entriesOk;
 	// Last-baked configuration. The coarse VRAM/palette dirty flags below
 	// can't see a pure BGxCNT rewrite (new char/screen base, new colour
 	// depth, new size selector) that happens to touch no VRAM or palette
@@ -1495,7 +1498,7 @@ static const u8 *gxDsBExtPalFor(int bg)
 	return applies ? MMU.ExtPal[GXDS_CORE][gpu->BGExtPalSlot[bg]] : NULL;
 }
 
-static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
+static void gxDsBBakeBgPlaneGeneric(int bg, GxDsBBgPlaneCache &pc)
 {
 	GPU *gpu = GXDS_SCREEN.gpu;
 	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
@@ -1513,6 +1516,7 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	const int rowBytes = c256 ? 8 : 4;
 
 	pc.valid = false;
+	pc.entriesOk = false;
 	if (lg <= 0 || ht <= 0 || lg > kDsBBgPlaneMaxPx || ht > kDsBBgPlaneMaxPx)
 		return;
 	if (!gxDsBEnsureBgScratch((u32)lg * ht))
@@ -1648,6 +1652,219 @@ static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	pc.valid = true;
 }
 
+// Task gebake: is the LCDC page `host` (an MMU_gpu_map() pointer) written since the last frame?
+static inline bool gxDsBHostPageDirty(const void *host)
+{
+	const u32 off = (u32)((const u8 *)host - (const u8 *)MMU.ARM9_LCD);
+	return off < kDsBLcdcBytes && GXDS_PLAN.vram.isPageDirty(off >> 10);
+}
+
+// Task gebake: gxDsBBakeBgPlaneGeneric() for the case that is always CI8 (a text plane on the
+// regular palette, no -DDSB_NOCI): the same decode, but each tile is written straight into
+// its final GX CI8 layout (an 8x8 tile is two 8x4 GX blocks) in the plane's own texture
+// buffer. The generic path decodes to a u16 scratch, compacts it to u8 and swizzles it
+// texel by texel (~19 cycles a texel, the whole 256x256 plane, every bake); this is a byte
+// or word copy per tile row. Bytes, TLUT, texobj and read-set are identical to the generic
+// bake's.
+// PARTIAL: `pc` holds the bake of the same configuration (the caller's fingerprint check
+// passed) and only VRAM it read has been written since. Then only the tiles whose map entry
+// or tile data sit in a written LCDC page are decoded again (their texels are a pure function
+// of those bytes, and the palette number for 4bpp); every other tile's texels are already
+// right. The read-set keeps what it had and gains what the decoded tiles read, and usedPal
+// keeps its bits (both may then name a little more than the plane uses, which only costs a
+// spurious re-bake / an unsampled TLUT entry, as a plane whose map changed to skip a tile
+// already could).
+static void gxDsBBakeBgPlaneCI(int bg, GxDsBBgPlaneCache &pc, bool partial)
+{
+	GPU *gpu = GXDS_SCREEN.gpu;
+	const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
+	const int lg = (int)gpu->BGSize[bg][0];
+	const int ht = (int)gpu->BGSize[bg][1];
+	const u32 tileBase = gpu->BG_tile_ram[bg];
+	const u32 mapBase = gpu->BG_map_ram[bg];
+	const bool c256 = cnt.Palette_256 != 0;
+	const int screenSize = cnt.ScreenSize;
+	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
+	const int tileBytes = c256 ? 0x40 : 0x20;
+	const int rowBytes = c256 ? 8 : 4;
+
+	pc.valid = false;
+	if (lg <= 0 || ht <= 0 || lg > kDsBBgPlaneMaxPx || ht > kDsBBgPlaneMaxPx) {
+		pc.entriesOk = false;
+		return;
+	}
+	const u32 texels = (u32)lg * ht;
+	const u32 tw = (u32)lg >> 3;          // tiles per row
+	{
+		// (a buffer that had to grow lost its texels: nothing to update in place)
+		const void *const before = pc.texData;
+		if (!gxDsBEnsureCap(&pc.texData, &pc.texDataCap, texels + tw * (u32)(ht >> 3) * 2)) {
+			pc.entriesOk = false;
+			return;
+		}
+		if (pc.texData != before) { partial = false; pc.entriesOk = false; }
+	}
+	if (!gxDsBEnsureTlut(&pc.tlutData)) {
+		pc.entriesOk = false;
+		return;
+	}
+	const bool useEnt = partial && pc.entriesOk;
+	pc.entriesOk = false;   // (until this bake has filled it in)
+
+	// Task 10: record the read-set (see gxDsBDeps), as the generic bake does; a partial bake
+	// adds to the previous one instead of starting it over.
+	if (partial) {
+		s_rec = &pc.deps;
+		s_recLastPage = ~0u;
+	} else {
+		gxDsBRecBegin(&pc.deps);
+	}
+	GxDsBRecGuard recGuard;
+	u32 seenTile[32] = { 0 };
+	u32 seenPal = 0;
+	u32 usedPal = partial ? pc.usedPal : 0;
+	if (c256)
+		gxDsBRecPal(kDsBBgPalOff, 512);
+
+	u8 *const dst = (u8 *)pc.texData;
+	u16 *const ent = (u16 *)(dst + texels);   // tilemap entries seen by this bake
+	const u32 bw = (u32)lg >> 3;          // GX blocks (8 texels wide) per row
+	u32 wLo = ~0u, wHi = 0;               // byte range of the texture written
+
+	for (int ty = 0; ty < ht / 8; ++ty) {
+		u32 rowMap = mapBase + (u32)(ty & 31) * 64;
+		if (ty > 31)
+			rowMap += (u32)ADDRESS_STEP_512B << screenSize;
+		for (int tx = 0; tx < lg / 8; ++tx) {
+			u32 mapAddr = rowMap + (u32)((tx & 31) << 1);
+			if (tx > 31)
+				mapAddr += 32 * 32 * 2;
+			const void *const mapHost = MMU_gpu_map(mapAddr);
+			const u16 entry = T1ReadWord((void *)mapHost, 0);
+			const int tileNum = entry & 0x3FF;
+			const u8 *const tileHost = (const u8 *)MMU_gpu_map(tileBase + (u32)tileNum * tileBytes);
+			u16 &prevEntry = ent[(u32)ty * tw + (u32)tx];
+			// Partial: this tile is up to date unless its map entry changed (compared with the
+			// one the texels were baked from when we have it, else: its map page was written)
+			// or its tile data page was written.
+			const bool entryUnchanged = useEnt ? (prevEntry == entry) : !gxDsBHostPageDirty(mapHost);
+			prevEntry = entry;
+			if (partial && entryUnchanged && !gxDsBHostPageDirty(tileHost))
+				continue;
+			gxDsBRecVram(mapHost, 2);
+			const bool hflip = ((entry >> 10) & 1) != 0;
+			const bool vflip = ((entry >> 11) & 1) != 0;
+			const int palNum = (entry >> 12) & 0xF;
+			if (!((seenTile[tileNum >> 5] >> (tileNum & 31)) & 1)) {
+				seenTile[tileNum >> 5] |= 1u << (tileNum & 31);
+				gxDsBRecVram(tileHost, (u32)tileBytes);
+			}
+			if (!((seenPal >> palNum) & 1)) {
+				seenPal |= 1u << palNum;
+				if (!c256) gxDsBRecPal(kDsBBgPalOff + (u32)palNum * 32, 32);   // 4bpp: its own 16-colour sub-palette
+			}
+
+			const u32 off0 = ((u32)(2 * ty) * bw + (u32)tx) << 5;   // texel rows 0-3 of the tile
+			const u32 off1 = off0 + (bw << 5);                      // texel rows 4-7
+			if (off0 < wLo) wLo = off0;
+			if (off1 + 32 > wHi) wHi = off1 + 32;
+			u8 *const blk0 = dst + off0;
+			u8 *const blk1 = dst + off1;
+			u32 acc = 0;   // OR of the tile's texels: nonzero == some opaque texel
+			for (int sy = 0; sy < 8; ++sy) {
+				const int srcY = vflip ? 7 - sy : sy;
+				const u8 *line = tileHost + (u32)srcY * rowBytes;
+				u8 *out = ((sy < 4) ? blk0 : blk1) + (sy & 3) * 8;
+				if (c256) {
+					// texel == palette index (0 stays transparent)
+					if (!hflip) {
+						const u32 a = ((const u32 *)line)[0], b = ((const u32 *)line)[1];
+						((u32 *)out)[0] = a; ((u32 *)out)[1] = b;
+						acc |= a | b;
+					} else {
+						for (int sx = 0; sx < 8; ++sx) { const u8 v = line[7 - sx]; out[sx] = v; acc |= v; }
+					}
+				} else {
+					// 4bpp: texel == palNum*16 + nibble (0 stays transparent)
+					const u32 pb = (u32)palNum << 4;
+					for (int sx = 0; sx < 8; ++sx) {
+						const int srcX = hflip ? 7 - sx : sx;
+						const u8 b = line[srcX >> 1];
+						const u32 nib = (srcX & 1) ? (u32)(b >> 4) : (u32)(b & 0xF);
+						const u32 t = nib ? (pb | nib) : 0;
+						out[sx] = (u8)t;
+						acc |= t;
+					}
+				}
+			}
+			if (acc) usedPal |= 1u << palNum;
+		}
+	}
+
+	// Task 11: format is CI8 (see above): TLUT as the generic bake builds it.
+	u16 *tlut = (u16 *)pc.tlutData;
+	memset(tlut, 0, 256 * sizeof(u16));
+	if (!c256) {
+		// 4bpp: TLUT entry palNum*16+e for every sub-bank with an opaque texel (the rest are
+		// never sampled and stay 0, which keeps the TLUT a pure function of the recorded read-set).
+		for (int pn = 0; pn < 16; ++pn)
+			if ((usedPal >> pn) & 1)
+				for (int e = 1; e < 16; ++e)
+					tlut[pn * 16 + e] = gxDsBOpaqueTexel(T1ReadWord(pal, (u32)(pn * 16 + e) * 2));
+	} else {
+		gxDsBTlutFromPal(tlut, pal, 256);
+	}
+	pc.tlutEntries = 256;
+	// (gxDsBUploadCI8()'s tail, the texel data being in place already)
+	if (partial) {
+		if (wLo < wHi) DCFlushRange(dst + wLo, wHi - wLo);
+	} else {
+		DCFlushRange(pc.texData, texels);
+	}
+	DCFlushRange(pc.tlutData, 256 * sizeof(u16));
+	GX_InitTlutObj(&pc.tlutObj, pc.tlutData, GX_TL_RGB5A3, 256);
+	GX_InitTexObjCI(&pc.texObj, pc.texData, lg, ht, GX_TF_CI8, GX_REPEAT, GX_REPEAT, GX_FALSE, gxDsBBgSlotFor(bg));
+	GX_InitTexObjFilterMode(&pc.texObj, GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+	gxDsBMutantLoad(&pc.tlutObj, gxDsBBgSlotFor(bg));
+	pc.texBytes = texels;
+
+	pc.wpx = (u16)lg;
+	pc.hpx = (u16)ht;
+	pc.ci = true;
+	gxDsBStatBake(true, pc.texBytes, texels * 2, false);
+	pc.bufW = (u16)lg;
+	pc.bufH = (u16)ht;
+	pc.cfgTileBase = tileBase;
+	pc.cfgMapBase = mapBase;
+	pc.cfgColorMode = (u8)(c256 ? 1 : 0);
+	pc.cfgScreenSize = (u8)screenSize;
+	pc.cfgType = (u8)BGType_Text;
+	pc.cfgWrap = 0;
+	pc.cfgAuxBase = 0;
+	pc.cfgExtPal = NULL;
+	pc.cfgFx = (u16)((s_bakeFadeMode << 8) | s_bakeFadeLvl);
+	pc.usedPal = usedPal;
+	pc.entriesOk = true;
+	pc.valid = true;
+}
+
+static void gxDsBBakeBgPlane(int bg, GxDsBBgPlaneCache &pc, bool partial = false)
+{
+#ifndef DSB_NOCI
+	{
+		// (GX's CI8 block is 8x4 texels; a text plane is a whole number of 8x8 tiles.)
+		const GXBlockShape blk = gxBlockShape(GXTEXFMT_CI8);
+		GPU *gpu = GXDS_SCREEN.gpu;
+		if (blk.texelsWide == 8 && blk.texelsTall == 4 && !gxDsBExtPalFor(bg) &&
+		    (gpu->BGSize[bg][0] & 7) == 0 && (gpu->BGSize[bg][1] & 7) == 0) {
+			gxDsBBakeBgPlaneCI(bg, pc, partial);
+			return;
+		}
+	}
+#endif
+	gxDsBBakeBgPlaneGeneric(bg, pc);
+}
+
 // Task 8: one affine-flavoured BG plane -> one RGB5A3 texture.
 //
 // Covers BGType_Affine (1-byte map entries, no flip), BGType_AffineExt_256x16
@@ -1686,6 +1903,7 @@ static void gxDsBBakeAffineBgPlane(int bg, GxDsBBgPlaneCache &pc)
 	u8 *const pal = MMU.ARM9_VMEM + kDsBBgPalOff;
 
 	pc.valid = false;
+	pc.entriesOk = false;
 	if (lg <= 0 || ht <= 0 || lg > 1024 || ht > 1024)
 		return;
 	const int border = wrap ? 0 : 1;
@@ -3369,11 +3587,15 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 	// encodes colour). A non-CI cache (RGB5A3 fallback: direct-colour or multi-slice
 	// extended palette) has no separable TLUT and always takes the full path below,
 	// same as before this task.
+	// Task gebake: the configuration is unchanged, so a text plane that only saw VRAM writes
+	// can be brought up to date tile by tile (gxDsBBakeBgPlaneCI).
+	bool partialBake = false;
 	if (!needBake) {
 		bool vramDirty = false, palDirty = false;
 		gxDsBDepsDirtySplit(pc.deps, &vramDirty, &palDirty);
 		if (vramDirty) {
 			needBake = true;
+			partialBake = pc.ci && !affine;
 		} else if (palDirty) {
 			if (pc.ci) {
 #ifdef DSB_STATS
@@ -3415,7 +3637,7 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 #endif
 	PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_BG : PZ_2DB_BAKE_BG);
 	if (affine) gxDsBBakeAffineBgPlane(bg, pc);
-	else gxDsBBakeBgPlane(bg, pc);
+	else gxDsBBakeBgPlane(bg, pc, partialBake);
 #ifdef DSB_STATS
 	s_dsbBakeTicks += gettime() - t0;
 #endif
