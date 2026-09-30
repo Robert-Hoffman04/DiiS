@@ -806,9 +806,9 @@ static void arm9LoadHit(JitTraceCtx& c, void* a, int /*region*/)
 	if (h.size == 4) {
 		*p++ = PPC_LWBRX(h.hRd, PPC_R10, PPC_R11);
 		if (h.wordRotate) {
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31);        // x = EA & 3
-			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);                // 4 - x
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28);        // ((4 - x) & 3) << 3
+			// ROR by 8x == ROL by (-8x) & 31 (rlwnm uses the low 5 bits)
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 3, 27, 28);        // 8 * (EA & 3)
+			*p++ = PPC_NEG(PPC_R11, PPC_R11);
 			*p++ = PPC_RLWNM(h.hRd, h.hRd, PPC_R11, 0, 31);
 		}
 	} else if (h.size == 2) {
@@ -877,10 +877,9 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 		// caller passes wordRotate to match its own slow path exactly (THUMB
 		// PC/SP-relative loads have a word-aligned EA and pass false).
 		if (wordRotate) {
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31); // x = EA & 3
-			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);         // 4 - x
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28); // ((4 - x) & 3) << 3  in {0,24,16,8}
-			*p++ = PPC_RLWNM(hDst, hDst, PPC_R11, 0, 31);   // ROL by that == ROR by 8*x
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 3, 27, 28); // 8 * (EA & 3)
+			*p++ = PPC_NEG(PPC_R11, PPC_R11);               // ROL by -8x & 31 == ROR by 8x
+			*p++ = PPC_RLWNM(hDst, hDst, PPC_R11, 0, 31);
 		}
 	} else if (size == 2) {
 		*p++ = PPC_LHBRX(hDst, PPC_R10, PPC_R11);

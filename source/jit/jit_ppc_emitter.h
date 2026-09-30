@@ -170,6 +170,7 @@
 #define PPC_MULHWU(rD, rA, rB) ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (11 << 1))   // unsigned high 32 of rA*rB
 #define PPC_MULLI(rD, rA, imm) ((7 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))
 #define PPC_DIVWU(rD, rA, rB) ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (459 << 1))
+#define PPC_NEG(rD, rA)       ((31 << 26) | ((rD) << 21) | ((rA) << 16) | (104 << 1))
 
 // Hardware Flag Math (XER & Zero Checks)
 #define PPC_ADDCO(rD, rA, rB)	((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (1 << 10) | (10 << 1))
