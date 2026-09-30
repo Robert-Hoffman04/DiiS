@@ -272,6 +272,15 @@ struct JitTraceCtx {
 	u8   spinLoopLen;
 	u8   spinBase;
 	u8   spinImm;
+
+	// THUMB CMP+Bcc fusion. fuseCmp is set by jitCompileTrace() for a CMP (imm8
+	// or lo-reg) directly followed by a fusable Bcc whose fall-through needs no
+	// flag: the CMP then emits nothing and parks its opcode in fusedCmpOp, and
+	// the Bcc compares natively (cmpw/cmplw + bc) and materialises N/Z/C/V
+	// only on its taken (exit) path -- see jit_thumb.cpp.
+	bool fuseCmp;
+	bool fusedCmpValid;
+	u16  fusedCmpOp;
 	bool flagDead(u8 flagIdx) const { return (deadFlags >> flagIdx) & 1; }
 	bool cvDead() const { return flagDead(JITF_C) && flagDead(JITF_V); }
 
@@ -461,6 +470,7 @@ struct JitTraceCtx {
 // Emit one guest instruction at ctx.currentPC (opcode already fetched). Sets
 // ctx.endBlock when the trace must stop here.
 void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode);   // jit_thumb.cpp
+void jitThumbEmitCmpFlags(JitTraceCtx& ctx, u16 cmpOpcode);        // jit_thumb.cpp (CMP+Bcc fusion)
 void jitArmEmitOne(JitTraceCtx& ctx, u32 opcode);     // jit_arm.cpp
 
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb);

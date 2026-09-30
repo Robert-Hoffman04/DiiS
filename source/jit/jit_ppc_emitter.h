@@ -236,6 +236,10 @@
 #define PPC_STW(rS, rA, d)     ((36 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_STB(rS, rA, d)     ((38 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_CMPW(cr, rA, rB)   ((31 << 26) | ((cr) << 23) | ((rA) << 16) | ((rB) << 11) | (0 << 1))
+#define PPC_CMPLW(cr, rA, rB)  ((31 << 26) | ((cr) << 23) | ((rA) << 16) | ((rB) << 11) | (32 << 1))
+// Generic conditional branch: bo 12 = branch if CR bit set, 4 = if clear;
+// bi 0 lt, 1 gt, 2 eq (cr0).
+#define PPC_BC(bo, bi, offset) ((16 << 26) | ((bo) << 21) | ((bi) << 16) | ((offset) & 0xFFFC))
 // Load/store multiple word: rD/rS..r31 <-> consecutive words at d(rA). Used by
 // the in-block interpreter fallback (JitTraceCtx::emitInterpFallback) to sync
 // the whole pinned guest register file with cpu.R[] in one instruction each

@@ -1492,8 +1492,9 @@ static bool jitArmFlagClass(u32 op, bool /*v5*/, u8& rd, u8& wr)
 	return true;
 }
 
-// dead[i] = flags dead after the i-th instruction from startPC (JITF masks).
-static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u8* dead)
+// dead[i] = flags dead after the i-th instruction from startPC (JITF masks);
+// liveIn[i] (optional) = flags live on entry to it.
+static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u8* dead, u8* liveIn = nullptr)
 {
 	u8 rd[JIT_TRACE_MAX_INSTRUCTIONS], wr[JIT_TRACE_MAX_INSTRUCTIONS];
 	bool bar[JIT_TRACE_MAX_INSTRUCTIONS];
@@ -1503,9 +1504,10 @@ static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u
 		               : jitArmFlagClass(cpu.fetch32(startPC + 4 * i), v5, rd[i], wr[i]);
 	u8 live = 0xF;                                   // everything live past the window
 	for (int i = JIT_TRACE_MAX_INSTRUCTIONS - 1; i >= 0; i--) {
-		if (bar[i]) { dead[i] = 0; live = 0xF; continue; }
+		if (bar[i]) { dead[i] = 0; live = 0xF; if (liveIn) liveIn[i] = live; continue; }
 		dead[i] = (u8)(0xF & ~live);
 		live = (u8)((live & ~wr[i]) | rd[i]);
+		if (liveIn) liveIn[i] = live;
 	}
 }
 
@@ -1599,8 +1601,8 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	if (thumb) ctx.spinLoopLen = jitThumbSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinImm);
 #endif
 #if JIT_FLAG_ELIM
-	u8 flagDeadAt[JIT_TRACE_MAX_INSTRUCTIONS];
-	jitFlagLiveness(cpu, startPC, thumb, flagDeadAt);
+	u8 flagDeadAt[JIT_TRACE_MAX_INSTRUCTIONS], flagLiveIn[JIT_TRACE_MAX_INSTRUCTIONS];
+	jitFlagLiveness(cpu, startPC, thumb, flagDeadAt, flagLiveIn);
 #endif
 
 	while (!ctx.endBlock && ctx.instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
@@ -1629,6 +1631,16 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 				(s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
 				      - (s32)(ctx.bailoutCount + 4) * JIT_BAILOUT_STUB_WORDS - reserve);
 			if (idx < JIT_TRACE_MAX_INSTRUCTIONS && !nearEnd) ctx.deadFlags = flagDeadAt[idx];
+			// CMP+Bcc fusion (THUMB): this is CMP #imm8 / CMP lo,lo, the next
+			// instruction a Bcc on a relational condition (not MI/PL/VS/VC,
+			// SWI, AL), and no flag is live after that Bcc's fall-through.
+			ctx.fuseCmp = false;
+			if (thumb && !nearEnd && idx + 2 < JIT_TRACE_MAX_INSTRUCTIONS && flagLiveIn[idx + 2] == 0) {
+				const u16 op0 = (u16)cpu.fetch16(ctx.currentPC), op1 = (u16)cpu.fetch16(ctx.currentPC + 2);
+				const u8 bc = (op1 >> 8) & 0xF;
+				ctx.fuseCmp = ((op0 & 0xF800) == 0x2800 || (op0 & 0xFFC0) == 0x4280) &&
+				              (op1 & 0xF000) == 0xD000 && bc <= 0xD && (bc < 4 || bc > 7);
+			}
 		}
 #endif
 
@@ -1677,6 +1689,17 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		}
 #endif
 	}
+
+#if JIT_FLAG_ELIM
+	// A fused CMP whose Bcc never got emitted (cannot happen by construction:
+	// the Bcc always follows and is never refused, and fusion is off near the
+	// budget) would leave its flags unwritten -- materialise them.
+	if (ctx.fusedCmpValid) {
+		ctx.fusedCmpValid = false;
+		ctx.deadFlags = 0;
+		jitThumbEmitCmpFlags(ctx, ctx.fusedCmpOp);
+	}
+#endif
 
 	if (ctx.instrCount == 0) {
 		// Nothing compilable at startPC -- cache a length-1 fallback so the

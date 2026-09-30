@@ -27,6 +27,27 @@
 // and the ARM predication helper (emitEvalCond) are JitTraceCtx methods shared
 // with jit_arm.cpp -- see jit_trace.cpp.
 
+// Flags of THUMB CMP Rd,#imm8 (0x28xx) / CMP Rd,Rs (0x428x) into the packed
+// flags -- the non-fused CMP emitters and the fused Bcc's taken path.
+void jitThumbEmitCmpFlags(JitTraceCtx& ctx, u16 op)
+{
+	u32*& emitPtr = ctx.emitPtr;
+	u32 lockedMask = 0;
+	if ((op & 0xF800) == 0x2800) {
+		const u8 hRd = ctx.readReg((op >> 8) & 7, lockedMask);
+		*emitPtr++ = PPC_LI(PPC_R12, op & 0xFF);
+		*emitPtr++ = PPC_SUBFCO(PPC_R11, PPC_R12, hRd);
+		ctx.emitCVfromXER(PPC_R10);
+		ctx.emitNZ(PPC_R11);
+	} else {
+		const u8 hRs = ctx.readReg((op >> 3) & 7, lockedMask);
+		const u8 hRd = ctx.readReg(op & 7, lockedMask);
+		*emitPtr++ = PPC_SUBFCO(PPC_R12, hRs, hRd);
+		ctx.emitCVfromXER(PPC_R11);
+		ctx.emitNZ(PPC_R12);
+	}
+}
+
 void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 {
 	u32*&     emitPtr    = ctx.emitPtr;
@@ -78,12 +99,13 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		u8 hRn = 0;
 		if (type < 2) hRn = ctx.readReg(rn_imm, lockedMask);
 		const u8 hRd = ctx.writeReg(rd, true, lockedMask);
-		if (type < 2) *emitPtr++ = PPC_OR(PPC_R12, hRn, hRn);
-		else          *emitPtr++ = PPC_LI(PPC_R12, rn_imm);
+		// Register operand read in place (pinned); imm3 via r12.
+		const u8 rB = (type < 2) ? hRn : PPC_R12;
+		if (type >= 2) *emitPtr++ = PPC_LI(PPC_R12, rn_imm);
 		// C/V dead (dead-flag elimination): plain add/subf, no XER update.
 		const bool cvd = ctx.cvDead();
-		if (type == 0 || type == 2) *emitPtr++ = cvd ? PPC_ADD(hRd, hRs, PPC_R12)  : PPC_ADDCO(hRd, hRs, PPC_R12);
-		else                        *emitPtr++ = cvd ? PPC_SUBF(hRd, PPC_R12, hRs) : PPC_SUBFCO(hRd, PPC_R12, hRs);
+		if (type == 0 || type == 2) *emitPtr++ = cvd ? PPC_ADD(hRd, hRs, rB)  : PPC_ADDCO(hRd, hRs, rB);
+		else                        *emitPtr++ = cvd ? PPC_SUBF(hRd, rB, hRs) : PPC_SUBFCO(hRd, rB, hRs);
 		ctx.emitCVfromXER(PPC_R11);
 		ctx.emitNZ(hRd);
 		break;
@@ -100,6 +122,11 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitFlagConst(JITF_N, false);
 			ctx.emitFlagConst(JITF_Z, imm == 0);
 		} else {
+			if (op == 1 && ctx.fuseCmp) {                       // fused into the next Bcc
+				ctx.fusedCmpValid = true; ctx.fusedCmpOp = opcode;
+				break;
+			}
+			if (op == 1) { jitThumbEmitCmpFlags(ctx, opcode); break; }
 			u8 hRd = ctx.readReg(rd, lockedMask);
 			*emitPtr++ = PPC_LI(PPC_R12, imm);
 			if (op == 1)      { *emitPtr++ = PPC_SUBFCO(PPC_R11, PPC_R12, hRd); }
@@ -249,11 +276,8 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitNZ(hRd);
 		}
 		else if (op == 10) {
-			const u8 hRs = ctx.readReg(rs, lockedMask);
-			const u8 hRd = ctx.readReg(rd, lockedMask);
-			*emitPtr++ = PPC_SUBFCO(PPC_R12, hRs, hRd);
-			ctx.emitCVfromXER(PPC_R11);
-			ctx.emitNZ(PPC_R12);
+			if (ctx.fuseCmp) { ctx.fusedCmpValid = true; ctx.fusedCmpOp = opcode; }
+			else             jitThumbEmitCmpFlags(ctx, opcode);
 		}
 		else if (op == 11) {
 			const u8 hRs = ctx.readReg(rs, lockedMask);
@@ -706,7 +730,40 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		const u32 targetPC = currentPC + 4 + (off8 << 1);
 		ctx.ensureArena();
 
-		bool composite = false, branchIfZero = false, guardIsBEQ = false;
+		// Fused CMP+Bcc (see JitTraceCtx::fuseCmp): native compare, branch over
+		// the taken path when the condition fails; the taken path rebuilds the
+		// packed flags from the (unchanged, pinned) CMP operands before exiting.
+		u32* fusedSkip = nullptr;
+		if (ctx.fusedCmpValid) {
+			const u16 cop = ctx.fusedCmpOp;
+			ctx.fusedCmpValid = false;
+			const bool uns = (cond == 0x2 || cond == 0x3 || cond == 0x8 || cond == 0x9);
+			if ((cop & 0xF800) == 0x2800) {
+				const u8 hA = ctx.readReg((cop >> 8) & 7, lockedMask);
+				*emitPtr++ = uns ? PPC_CMPLI(0, hA, cop & 0xFF) : PPC_CMPWI(0, hA, cop & 0xFF);
+			} else {
+				const u8 hA = ctx.readReg(cop & 7, lockedMask), hB = ctx.readReg((cop >> 3) & 7, lockedMask);
+				*emitPtr++ = uns ? PPC_CMPLW(0, hA, hB) : PPC_CMPW(0, hA, hB);
+			}
+			// skip-when-not-taken: {BO, BI} of the inverse condition
+			static const u8 kSkip[14][2] = {
+				{4, 2}, {12, 2},          // EQ, NE
+				{12, 0}, {4, 0},          // CS (>=u), CC (<u)
+				{0, 0}, {0, 0}, {0, 0}, {0, 0},   // MI PL VS VC: never fused
+				{4, 1}, {12, 1},          // HI (>u), LS (<=u)
+				{12, 0}, {4, 0},          // GE, LT
+				{4, 1}, {12, 1},          // GT, LE
+			};
+			fusedSkip = emitPtr;
+			*emitPtr++ = PPC_BC(kSkip[cond][0], kSkip[cond][1], 0);
+			ctx.deadFlags = 0;
+			jitThumbEmitCmpFlags(ctx, cop);                             // taken path: flags for the exit
+		}
+		u32* guard = nullptr;
+		bool guardIsBEQ = false;
+		if (!fusedSkip) {
+
+		bool composite = false, branchIfZero = false;
 		u32 flagReg = 0;
 		switch (cond) {
 			case 0x0: flagReg = ctx.readFlag(JITF_Z, PPC_R12); guardIsBEQ = true;  break;
@@ -727,7 +784,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 		if (ctx.endBlock) break;
 
-		u32* guard;
 		if (!composite) {
 			*emitPtr++ = PPC_CMPWI(0, flagReg, 0);
 			guard = emitPtr++;
@@ -750,6 +806,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
 			guard = emitPtr++;
 			guardIsBEQ = !branchIfZero;
+		}
 		}
 
 		// Taken cost is hardcoded to 3 here (matching OP_B_COND's taken
@@ -792,10 +849,11 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 #endif
 		ctx.emitChainTail(targetPC);
-		{
+		if (guard) {
 			u32 skip = (u32)((emitPtr - guard) * 4);
 			*guard = guardIsBEQ ? PPC_BEQ(skip) : PPC_BNE(skip);
 		}
+		if (fusedSkip) *fusedSkip |= (u32)((emitPtr - fusedSkip) * 4) & 0xFFFC;
 		break;
 	}
 
