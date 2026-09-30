@@ -2614,9 +2614,18 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 1);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 1); return; }
+		if(T1ReadByte(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 1);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
@@ -2671,7 +2680,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			case 0x0400039:
 			case 0x040003A:
 			case 0x040003B:
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF)>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_UpdateToonTable((adr & 0x3F) >> 1, val);
 			return;
 		}
@@ -2711,7 +2720,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Alpha test reference value - Parameters:1
 			case eng_3D_ALPHA_TEST_REF:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x340>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x340, val);
 				gfx3d_glAlphaFunc(val);
 				return;
 			}
@@ -2719,7 +2728,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Clear background color setup - Parameters:2
 			case eng_3D_CLEAR_COLOR:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x350>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x350, val);
 				gfx3d_glClearColor(val);
 				return;
 			}
@@ -2727,20 +2736,20 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 			// Clear background depth setup - Parameters:2
 			case eng_3D_CLEAR_DEPTH:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x354>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x354, val);
 				gfx3d_glClearDepth(val);
 				return;
 			}
 			// Fog Color - Parameters:4b
 			case eng_3D_FOG_COLOR:
 			{
-				((u16 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x358>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x358, val);
 				gfx3d_glFogColor(val);
 				return;
 			}
 			case eng_3D_FOG_OFFSET:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x35C>>1] = val;
+				T1WriteWord(MMU.ARM9_REG, 0x35C, val); // was a u32 store at [0x35C>>1] (byte 0x6B8)
 				gfx3d_glFogOffset(val);
 				return;
 			}
@@ -3114,9 +3123,18 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 2);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 2); return; }
+		if(T1ReadWord(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 2);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
@@ -3178,18 +3196,18 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		switch (adr >> 4)
 		{
 			case 0x400033:		//edge color table
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				return;
 			case 0x400036:		//fog table
 			case 0x400037:
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				return;
 
 			case 0x400038:
 			case 0x400039:
 			case 0x40003A:
 			case 0x40003B:		//toon table
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_UpdateToonTable((adr & 0x3F) >> 1, val);
 				return;
 
@@ -3197,7 +3215,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			case 0x400041:
 			case 0x400042:
 			case 0x400043:		// FIFO Commands
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_sendCommandToFIFO(val);
 				return;
 				
@@ -3226,7 +3244,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			case 0x40005A:
 			case 0x40005B:
 			case 0x40005C:		// Individual Commands
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[(adr & 0xFFF) >> 2] = val;
+				T1WriteLong(MMU.ARM9_REG, adr & 0xFFF, val);
 				gfx3d_sendCommand(adr, val);
 				return;
 
@@ -3272,34 +3290,34 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 			// Alpha test reference value - Parameters:1
 			case eng_3D_ALPHA_TEST_REF:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x340>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x340, val);
 				gfx3d_glAlphaFunc(val);
 				return;
 			}
 			// Clear background color setup - Parameters:2
 			case eng_3D_CLEAR_COLOR:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x350>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x350, val);
 				gfx3d_glClearColor(val);
 				return;
 			}
 			// Clear background depth setup - Parameters:2
 			case eng_3D_CLEAR_DEPTH:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x354>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x354, val);
 				gfx3d_glClearDepth(val);
 				return;
 			}
 			// Fog Color - Parameters:4b
 			case 0x04000358:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x358>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x358, val);
 				gfx3d_glFogColor(val);
 				return;
 			}
 			case 0x0400035C:
 			{
-				((u32 *)(MMU.MMU_MEM[ARMCPU_ARM9][0x40]))[0x35C>>2] = val;
+				T1WriteLong(MMU.ARM9_REG, 0x35C, val);
 				gfx3d_glFogOffset(val);
 				return;
 			}
@@ -3530,9 +3548,18 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 4);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 4); return; }
+		if(T1ReadLong(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 4);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the

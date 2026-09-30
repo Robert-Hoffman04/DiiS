@@ -221,9 +221,12 @@
        native only if EVERY layer that can lie beneath it is a 2nd target, or
        NONE is (then the CPU never blends it = an ordinary draw). Mixed sets
        bail ("blendunder"), as does EVA+EVB != 16 ("blendcoef"; SRC/INVSRC
-       alpha can only express complementary weights) and a blended sprite whose
-       box overlaps another sprite ("blendobjoverlap": the CPU resolves
-       sprite-vs-sprite first and blends only the winner). A sprite never blends
+       alpha can only express complementary weights; GxFast instead draws it
+       with a two-stage premultiplied TEV + ONE/INVSRCALPHA blend, 1-2 LSB of a 5-bit
+       channel -- Task gxfast-perf, gxDsBTevAlphaAB) and a blended sprite with an
+       opaque texel on a pixel where an EARLIER-drawn sprite also has one
+       ("blendobjoverlap": the CPU resolves sprite-vs-sprite first and blends
+       only the winner; GxFast: a later-drawn sprite wins anyway, Task gxfast-perf). A sprite never blends
        with another sprite pixel (`bg_under != 4`), and a Mode-1 sprite blends
        independently of BLDCNT's effect field / OBJ 1st-target bit / window
        effect bit -- all reproduced.

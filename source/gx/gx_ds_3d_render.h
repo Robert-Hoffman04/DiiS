@@ -155,4 +155,11 @@ void gxDs3dRenderFast();
 // same "caller restores before the next 2D draw" contract as the two render functions above.
 void gxDs3dApplyFogFast();
 
+// Task P1-6a-flicker (implemented in Engine A, gx_ds_engine_impl.inc): resolves a deferred
+// GxFast raster (gfx3d_ensureRendered) by drawing the geometry pass off-screen and reading it
+// back into gfx3d_convertedScreen, so the CPU compositor shows the same 3D as the GX overlay.
+// False (the caller runs rasterize.cpp) outside GxFast, when this frame's gate refuses, or
+// when called from under vidmutex.
+bool gxDsEngineA3dReadback();
+
 #endif // GX_DS_3D_RENDER_H

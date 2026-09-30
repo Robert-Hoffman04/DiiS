@@ -38,6 +38,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <stdio.h>
+#include <algorithm>
 #include <stddef.h>
 #if (defined(DSB_STATS) || defined(DSLZ_STATS)) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 #include "../harness/harness_profile.h"
@@ -82,7 +83,7 @@ static u32 s_abExact, s_abAlpha, s_abBad, s_abFirstBad;
 static int s_abMn, s_abMp;
 static u16 s_abCpu[256 * 192];
 #endif
-static char s_dsbNote[96];   // free-form detail for the last bail (blendunder: the layer/target sets)
+static char s_dsbNote[192];   // free-form detail for the last bail (blendunder: the layer/target sets)
 static u32 s_dsb3dOk = 0, s_dsb3dEnabled = 0;   // engaged frames drawing the 3D layer / frames with BG0_3D+BG0 enabled (any outcome)
 static bool s_dsbFr3d, s_dsb3dSeen;
 // bail-reason histogram (why -> frames), emitted as the `<tag>w` line
@@ -2185,7 +2186,8 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 // top of the overlay's own 15; a3_c27: none; see the log's Task 1a-rasterskip section).
 // That is a characterized, edge-bounded inexactness, so this is GxFast only: GxAccurate
 // keeps the eager raster underneath the overlay. Every other consumer (a bail to the CPU compositor, savestates, capture) goes
-// through gfx3d_ensureRendered() and gets the real raster.
+// through gfx3d_ensureRendered() and gets the real raster -- since Task P1-6a-flicker, the GX
+// pass's readback of it (gxDsEngineA3dReadback) whenever the pass can draw the frame.
 //
 // Task a3layer: a clear-only layer depends on nothing but the latched clear colour, so it is
 // keyed on (clear colour, clear alpha) instead of the render counter: s_3dClearGen only
@@ -2491,6 +2493,44 @@ static bool gxDsBBoxOverlap(const GxDsBObjDraw &a, const GxDsBObjDraw &b)
 	return a.x < b.x + b.boxW && b.x < a.x + a.boxW && a.y < b.y + b.boxH && b.y < a.y + a.boxH;
 }
 
+// Task gxfast-perf: raw palette index of a plain (non-affine) sprite's on-screen pixel
+// (sx, sy): the same flip / 1D-2D mapping / per-row MMU_gpu_map() reads as
+// gxDsBBakeObjTexture. 0 = transparent.
+static int gxDsBObjIndexAt(const GxDsBObjDraw &d, int sx, int sy)
+{
+	GPU *gpu = GXDS_SCREEN.gpu;
+	const bool oneDim = (gpu->spriteRenderMode == GPU::SPRITE_1D);
+	const int rowBytes = d.depth ? 8 : 4;
+	int x = sx - d.x, y = sy - d.y;
+	if (d.hflip) x = d.w - 1 - x;
+	if (d.vflip) y = d.h - 1 - y;
+	const u8 *src;
+	if (oneDim)
+		src = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << gpu->sprBoundary)
+		                              + (u32)(y >> 3) * (u32)d.w * rowBytes + (u32)(y & 7) * rowBytes);
+	else
+		src = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << 5) + ((u32)(y >> 3) << 10) + (u32)(y & 7) * rowBytes);
+	if (d.depth) return src[(x & 7) + ((x & 0xFFF8) << 3)];
+	const int x1 = x >> 1;
+	const u8 b = src[(x1 & 3) + ((x1 & 0xFFFC) << 3)];
+	return (x & 1) ? (b >> 4) : (b & 0xF);
+}
+
+// True if two box-overlapping sprites have an opaque texel on a common on-screen pixel
+// of lines [y0,y1). Affine sprites: assumed true (not modelled).
+static bool gxDsBObjOpaqueOverlap(const GxDsBObjDraw &a, const GxDsBObjDraw &b, int y0, int y1)
+{
+	if (a.affine || b.affine) return true;
+	const int xs = std::max(std::max((int)a.x, (int)b.x), 0);
+	const int xe = std::min(std::min(a.x + a.boxW, b.x + b.boxW), kDsBScreenW);
+	const int ys = std::max(std::max((int)a.y, (int)b.y), y0);
+	const int ye = std::min(std::min(a.y + a.boxH, b.y + b.boxH), y1);
+	for (int y = ys; y < ye; ++y)
+		for (int x = xs; x < xe; ++x)
+			if (gxDsBObjIndexAt(a, x, y) && gxDsBObjIndexAt(b, x, y)) return true;
+	return false;
+}
+
 // Builds and validates one band's plan. Returns false (with DSB_WHY set) when
 // the band needs something GX can't do exactly -> the whole frame bails.
 static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan &p)
@@ -2608,6 +2648,13 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 #endif
 				if (fade) p.fadeBg |= (u8)(1 << bg);
 				if (want && (under & p.t2)) {
+#if GXDS_CORE == 0
+					// P0-4 (gx-next-steps-log.md Task P0-4): a 2D layer alpha-blended over the 3D
+					// layer as 2nd target comes out 1 LSB off the CPU (EFB /255 lerp vs the CPU's
+					// 6-bit-3D-colour blend; SM64DS letter text, row 162). GxAccurate bails it,
+					// GxFast keeps the characterized +-1 LSB.
+					if (r.bg3d && (under & p.t2 & 1) && !gxRenderModeIsFast()) { DSB_WHY("3dblend"); return false; }
+#endif
 					if (under & ~p.t2) {
 						DSB_WHY("blendunder");
 #ifdef DSB_STATS
@@ -2628,6 +2675,9 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				const u8 u = (u8)(under & ~0x10); // a sprite never blends with another sprite
 				if (want && (u & p.t2)) {
 					if (u & ~p.t2) { DSB_WHY("blendunder"); return false; }
+#if GXDS_CORE == 0
+					if (r.bg3d && (u & p.t2 & 1) && !gxRenderModeIsFast()) { DSB_WHY("3dblend"); return false; } // P0-4, as above
+#endif
 					p.blendLive[c] |= (u8)(1 << (4 + prio));
 					anyLive = true;
 					needOverlapCheck = true;
@@ -2636,7 +2686,15 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 			}
 		}
 	}
-	if (anyLive && (int)p.eva + (int)p.evb != 16) { DSB_WHY("blendcoef"); return false; }
+	// Task gxfast-perf: EVA+EVB != 16 has no SRCALPHA/INVSRCALPHA form; GxFast draws it
+	// with the two-stage premultiplied blend (gxDsBTevAlphaAB), GxAccurate bails.
+	if (anyLive && (int)p.eva + (int)p.evb != 16 && !gxRenderModeIsFast()) {
+		DSB_WHY("blendcoef");
+#ifdef DSB_STATS
+		snprintf(s_dsbNote, sizeof(s_dsbNote), "bc eva=%d evb=%d mode=%d t1=%02x t2=%02x live=%02x,%02x,%02x y=%d-%d semi=%02x", p.eva, p.evb, p.mode, p.t1, p.t2, p.blendLive[0], p.blendLive[1], p.blendLive[2], y0, y1, p.tierSemi);
+#endif
+		return false;
+	}
 	if (needOverlapCheck) {
 		// A blended sprite must sit directly on the BG/backdrop line buffer. Painter
 		// order would blend it with any sprite drawn earlier under it (the CPU
@@ -2650,7 +2708,21 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				if (j == i) continue;
 				const GxDsBObjDraw &o = s_objDraws[j];
 				if (o.y >= y1 || o.y + o.boxH <= y0) continue;
-				if (gxDsBBoxOverlap(a, o)) { DSB_WHY("blendobjoverlap"); return false; }
+				// Task gxfast-perf (exact): a sprite drawn AFTER `a` (higher priority, or the same
+				// tier and a lower OAM index) also wins the CPU's sprite-vs-sprite resolution, so
+				// its opaque texels overwrite `a` in both renderers and `a` only shows (and
+				// blends with the layer beneath) where it is transparent -- no mismatch. Only a
+				// sprite drawn BEFORE `a` would be blended with instead of the BG. GxFast only:
+				// in GxAccurate it would put these frames on the +-1 LSB alpha path (SM64DS
+				// cutscene: == Software before, 5150 px 1 step after), which stays a bail there.
+				if (gxRenderModeIsFast() && (o.priority < a.priority || (o.priority == a.priority && o.oamIndex < a.oamIndex))) continue;
+				if (gxDsBBoxOverlap(a, o) && (!gxRenderModeIsFast() || gxDsBObjOpaqueOverlap(a, o, y0, y1))) {
+					DSB_WHY("blendobjoverlap");
+#ifdef DSB_STATS
+					snprintf(s_dsbNote, sizeof(s_dsbNote), "bo a=%d(%d,%d %dx%d s%d p%d) o=%d(%d,%d %dx%d s%d p%d) mode=%d t1=%02x t2=%02x eva=%d evb=%d", a.oamIndex, a.x, a.y, a.boxW, a.boxH, a.semi, a.priority, o.oamIndex, o.x, o.y, o.boxW, o.boxH, o.semi, o.priority, p.mode, p.t1, p.t2, p.eva, p.evb);
+#endif
+					return false;
+				}
 			}
 		}
 	}
@@ -2705,6 +2777,42 @@ static void gxDsBTevAlpha(int k)
 	}
 	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)k });
 	s_tevK = k;
+}
+
+// Task gxfast-perf, GxFast only (the plan bails "blendcoef" in GxAccurate): EVA+EVB != 16.
+// SRCALPHA/INVSRCALPHA can only weight complementarily, so the source is premultiplied
+// in the TEV instead and the EFB blend is ONE / INVSRCALPHA:
+//   stage 0: colour = texC * texA (0 in a hole), alpha = texA > 0 ? 255 - EVB*16 : 0
+//   stage 1: colour = prev * EVA*16 (KONST), alpha = prev
+//   EFB:     out = src + dst * (255 - alpha)/255 ~= (c0*EVA + c1*EVB)/16, clamped at 255
+// A hole leaves dst untouched (src 0, alpha 0). Error class: the /255 blend, the /256 TEV
+// multiply and the 8-bit expansion of both operands vs GPU.cpp's (c0*EVA + c1*EVB) >> 4 on
+// 5-bit values -- a few LSB of the 8-bit channel: SM64DS gameplay's sub screen (EVA 4,
+// EVB 13) differs from the CPU on 4103 px, 3981 by one 5-bit step and 122 by two. Restored by gxDsBTevAlphaABEnd() right after the draw.
+static inline bool gxDsBAlphaNeedsAB(const GxDsBBandPlan &p) { return (int)p.eva + (int)p.evb != 16; }
+static void gxDsBTevAlphaAB(int eva, int evb)
+{
+	const u8 ka = gxDsBAlphaK(eva), kb = gxDsBAlphaK(evb);
+	GX_SetNumTevStages(2);
+	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO);
+	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
+	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_COMP_A8_GT, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)(255 - kb) });
+	GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+	GX_SetTevKColor(GX_KCOLOR0, (GXColor){ ka, ka, ka, 255 });
+	GX_SetTevKColorSel(GX_TEVSTAGE1, GX_TEV_KCSEL_K0);
+	GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_CPREV, GX_CC_KONST, GX_CC_ZERO);
+	GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+	GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	s_tevK = -2;   // stage 0 no longer holds either cached wiring
+}
+static void gxDsBTevAlphaABEnd()
+{
+	GX_SetNumTevStages(1);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 }
 
 static void gxDsBDrawBgQuad(const GxDsBBgPlaneCache &pcc, const GxDsBBandRegs &r, int bg, int y0, int y1)
@@ -2859,11 +2967,14 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 			const bool alpha = want && ((p.blendLive[ru.cfg] >> bg) & 1);
 			const GxDsBBgPlaneCache &pc = fade ? s_bgPlaneFx[bg] : s_bgPlane[bg];
 			if (!pc.valid) continue;
-			if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+			const bool ab = alpha && gxDsBAlphaNeedsAB(p);
+			if (ab) gxDsBTevAlphaAB(p.eva, p.evb);
+			else if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
 			if (pc.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&pc.tlutObj), gxDsBBgSlotFor(bg));
 			GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
 			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
+			if (ab) gxDsBTevAlphaABEnd();
 		}
 	}
 }
@@ -2891,17 +3002,20 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 				const bool alpha = want && ((p.blendLive[ru.cfg] >> (4 + prio)) & 1);
 				const GxDsBObjTexSlot &slot = fade ? s_objTexFx[d.oamIndex] : s_objTex[d.oamIndex];
 				if (!slot.valid) continue;
-				if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+				const bool ab = alpha && gxDsBAlphaNeedsAB(p);
+				if (ab) gxDsBTevAlphaAB(p.eva, p.evb);
+				else if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
 				if (slot.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&slot.tlutObj), gxDsBObjSlotFor());
 				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 				if (d.affine) {
 					gxDsBDrawAffineObj(d, slot);
-					continue;
+				} else {
+					f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
+					f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
+					gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
+					              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
 				}
-				f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
-				f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
-				gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
-				              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
+				if (ab) gxDsBTevAlphaABEnd();
 			}
 		}
 	}
@@ -3498,6 +3612,107 @@ static void gxDsA3dRenderGeomTex()
 	if (holes) GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
 	GX_InvalidateTexAll();
 }
+
+// Task P1-6a-flicker: set while the compositor holds vidmutex (not recursive), so a raster
+// resolved from inside that section never tries to take it again (it gets the CPU raster).
+static bool s_inVidLock;
+
+// Task P1-6a-flicker (gx_ds_3d_render.h): a deferred GxFast raster resolved by the GX
+// geometry pass instead of rasterize.cpp. Each 3D frame is shown on two 60 Hz frames, and a
+// compositor bail (`midframewrite`: SM64DS gameplay, every other frame) used to show the CPU
+// raster on one of them and the GX overlay on the other. Rendered like the texture form
+// (gxDsA3dRenderGeomTex) over a flat clear-colour background, copied out as RGB5A3 and
+// written into gfx3d_convertedScreen in the raster's layout. Per pixel that is what the
+// overlay shows: the final copy is RGB5A3 too, so both keep the top 5 bits of the same EFB
+// colour, and a translucent frame (clear alpha 31, gxDs3dFrameGate) blends over the clear
+// colour in both. Alpha: a polygon pixel is 31 (opaque polygons, or anything over a 31
+// clear); with clear alpha < 31 (opaque polygons only) the pass runs in RGBA6 over an
+// alpha-0 background, so the copy's opaque bit is the coverage and uncovered pixels get the
+// exact clear fragment. Not exact (the GX pass's own GxFast error), so GxFast only; nothing
+// else ever defers the raster.
+bool gxDsEngineA3dReadback()
+{
+#ifdef GXDS_FORCE_CPU
+	return false;
+#else
+	if (!gxRenderModeIsFast() || s_inVidLock || vidmutex == LWP_MUTEX_NULL) return false;
+	if (!GXDS_API(RenderInit)() || !gxDs3dGeomFrameSupported()) return false;
+	const u32 cb = (u32)k3dW * k3dH * sizeof(u16);
+	if (!s_3dScratch) s_3dScratch = (u16 *)memalign(32, (size_t)k3dW * k3dTexH * sizeof(u16));
+	if (!s_3dScratch) return false;
+	const u32 cc = gfx3d_rasterClearColor();
+	const u8 ca = (u8)((cc >> 16) & 0x1F);
+	const u8 c5[3] = { (u8)(cc & 0x1F), (u8)((cc >> 5) & 0x1F), (u8)((cc >> 10) & 0x1F) };   // r, g, b
+	const bool cover = ca != 31;
+
+	LWP_MutexLock(vidmutex);
+	gxDsBSetup2DState();
+	if (cover) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+	// Background: the clear colour (the overlay's clear-only BG0 texel), or alpha 0 for coverage.
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	GX_SetNumTexGens(0);
+	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	{
+		const u8 r = (u8)((c5[0] << 3) | (c5[0] >> 2)), g = (u8)((c5[1] << 3) | (c5[1] >> 2)),
+		         b = (u8)((c5[2] << 3) | (c5[2] >> 2)), a = cover ? 0 : 255;
+		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+			GX_Position2f32(0, 0);                                   GX_Color4u8(r, g, b, a);
+			GX_Position2f32((f32)kDsBScreenW, 0);                    GX_Color4u8(r, g, b, a);
+			GX_Position2f32((f32)kDsBScreenW, (f32)kDsBScreenH);     GX_Color4u8(r, g, b, a);
+			GX_Position2f32(0, (f32)kDsBScreenH);                    GX_Color4u8(r, g, b, a);
+		GX_End();
+	}
+	gxDsBSetup2DState();
+	gxDsA3dGeomDraw();
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
+	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
+	DCFlushRange(s_3dScratch, cb);   // no dirty line may be written back over the copy
+	// clear=GX_TRUE as the compositor's own copy (the corner must not ghost under draw_thread);
+	// an RGBA6 pass is cleared by a second copy once the format is back.
+	GX_CopyTex(s_3dScratch, cover ? GX_FALSE : GX_TRUE);
+	GX_PixModeSync();
+	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+	DCInvalidateRange(s_3dScratch, cb);
+	{
+		// RGB5A3, 4x4 texel blocks; out: gfx3d_convertedScreen's (a, b, g, r) bytes, 6-bit colour.
+		const u8 cf[4] = { ca, (u8)GFX3D_5TO6(c5[2]), (u8)GFX3D_5TO6(c5[1]), (u8)GFX3D_5TO6(c5[0]) };
+		const u16 *t = s_3dScratch;
+		for (int by = 0; by < k3dH; by += 4)
+			for (int bx = 0; bx < k3dW; bx += 4)
+				for (int y = by; y < by + 4; ++y) {
+					u8 *o = gfx3d_convertedScreen + ((size_t)y * k3dW + bx) * 4;
+					for (int x = 0; x < 4; ++x, ++t, o += 4) {
+						const u16 v = *t;
+						if (!(v & 0x8000)) { memcpy(o, cf, 4); continue; }
+						o[0] = 31;
+						o[1] = (u8)GFX3D_5TO6(v & 0x1F);
+						o[2] = (u8)GFX3D_5TO6((v >> 5) & 0x1F);
+						o[3] = (u8)GFX3D_5TO6((v >> 10) & 0x1F);
+					}
+				}
+	}
+	if (cover) {
+		GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
+		DCFlushRange(s_3dScratch, cb);
+		GX_CopyTex(s_3dScratch, GX_TRUE);
+		GX_PixModeSync();
+		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }   // before the CPU reuses s_3dScratch
+	}
+	GX_InvalidateTexAll();
+	GxRestorePresentState();
+	LWP_MutexUnlock(vidmutex);
+	return true;
+#endif
+}
 #endif
 
 static bool gxDsBRenderFrameImpl()
@@ -3708,8 +3923,11 @@ static bool gxDsBRenderFrameImpl()
 		bool pzScanOk;
 		{
 			PZ_SUB_SCOPE(PZ_2DA_3DSCAN);
+			// Task P1-6a-flicker: a raster resolved by the GX readback is this pass's own output,
+			// so the overlay still goes over the clear-only layer (same pixels, no re-scan).
 			pzScanOk = !any3dBand || gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
-			                                     (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()));
+			                                     (gfx3d_renderDeferred() || gfx3d_renderedByGx() ||
+			                                      gxDs3dGeomFrameHasTranslucent()));
 		}
 		if (!pzScanOk) { DSB_WHY("3dscan"); return false; }
 #endif
@@ -3824,6 +4042,9 @@ static bool gxDsBRenderFrameImpl()
 	// mutex; taking it here extends that same contract to cover Engine B's
 	// composite pass rather than inventing a new one.
 	{ PZ_SUB_SCOPE(PZ_VIDLOCK); LWP_MutexLock(vidmutex); }
+#if GXDS_CORE == 0
+	s_inVidLock = true;
+#endif
 
 	gxDsBSetup2DState();
 	gxDsBTlutReset();   // task 11: assume nothing about TMEM's TLUT contents from an earlier frame / another engine
@@ -3946,6 +4167,9 @@ static bool gxDsBRenderFrameImpl()
 	// changed, before draw_thread's next present pass can observe it.
 	GxRestorePresentState();
 
+#if GXDS_CORE == 0
+	s_inVidLock = false;
+#endif
 	LWP_MutexUnlock(vidmutex);
 
 	// Readback + MASTER_BRIGHT. GPU_RenderLine_MasterBrightness() runs on the

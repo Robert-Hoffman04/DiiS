@@ -5,11 +5,17 @@
     companion file over wiiload) - replaces the -DDESMUME_FORCE_ROM /
     -DDESMUME_FORCE_CORE / -DDESMUME_FORCE_USB compile-time flags:
 
-        core=1                 # 1=GX, 2=software raster   (optional)
+        core=1                 # index into core3DList[] (main.cpp): 0=null (no 3D),
+                               # 1=CPU SoftRasterizer (only real option -- there is
+                               # no GX 3D polygon core yet, see gxRenderMode()'s
+                               # header for what GX *does* cover)   (optional)
         usb=0                  # 0=SD, 1=USB               (optional)
         frames_per_rom=1800    # advance after N frames    (0 = never, manual)
         autoload_slot=0        # loadstate_slot() once, early (optional, -1=off)
         frame_every=0          # PKT_FRAME every N frames  (0 = off)
+        rendermode=fast        # software|accurate|fast, see gx_rendermode.h
+                               # (optional; same effect as PKT_CTRL "rendermode",
+                               # for setups with no live transport to send it over)
         rom=sd:/DS/ROMS/test1.nds
         rom=sd:/DS/ROMS/test2.nds
 
@@ -47,6 +53,7 @@ int  harness_boot_core(void);                  // -1 if unset
 int  harness_boot_usb(void);                   // -1 if unset
 int  harness_boot_autoload_slot(void);         // -1 if unset
 u32  harness_boot_frame_every(void);           // 0 = off
+int  harness_boot_rendermode(void);            // RenderMode enum value, -1 if unset
 
 // Called by the Execute() playlist loop. Requests the next ROM (next_rom CTRL);
 // harness_boot_advance() loads it via NDS_LoadROM and returns 1, or 0 when the
@@ -71,6 +78,7 @@ static inline int  harness_boot_core(void) { return -1; }
 static inline int  harness_boot_usb(void) { return -1; }
 static inline int  harness_boot_autoload_slot(void) { return -1; }
 static inline u32  harness_boot_frame_every(void) { return 0; }
+static inline int  harness_boot_rendermode(void) { return -1; }
 static inline void harness_boot_request_next(void) {}
 static inline int  harness_boot_next_requested(void) { return 0; }
 static inline int  harness_boot_advance(void) { return 0; }

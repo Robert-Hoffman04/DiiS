@@ -323,9 +323,12 @@ int main(int argc, char **argv){
 		rom_filename[MAXPATHLEN - 1] = 0;
 		if (harness_boot_core() == 0 || harness_boot_core() == 1)
 			current3Dcore = (u8)harness_boot_core();
-		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d\n",
+		if (harness_boot_rendermode() >= 0 && harness_boot_rendermode() <= 2)
+			gxSetRenderMode((RenderMode)harness_boot_rendermode());
+		printf("harness: manifest %d ROM(s), frames_per_rom=%lu, core=%d, rendermode=%d\n",
 			harness_boot_rom_count(),
-			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore);
+			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore,
+			(int)gxRenderMode());
 	} else if(FileBrowser(rom_filename) != 0) {
 		quit_game = true;
 	}
@@ -338,6 +341,21 @@ int main(int argc, char **argv){
 	// pinned backend). No-op without -DDESMUME_HARNESS; on failure it disables
 	// itself and boot continues.
 	harness_transport_init();
+
+#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+	// The core=/rendermode= manifest keys are applied above, before the
+	// transport exists -- harness_send() is a silent no-op until
+	// harness_transport_init() has picked a backend, so that printf never
+	// reached sd:/bench.log. Log the values actually applied now that the
+	// transport is up, so a boot with no live console (real hardware, no
+	// network) still leaves a record of what ran.
+	if (harness_boot_have()) {
+		char hb_buf[96];
+		snprintf(hb_buf, sizeof hb_buf, "boot: core=%d rendermode=%d",
+			(int)current3Dcore, (int)gxRenderMode());
+		harness_profile_log(hb_buf);
+	}
+#endif
 
 	// §3.6: install the PPC exception panic hook now that the transport is up,
 	// so any later trap ships a PKT_CRASH register dump + backtrace before the
@@ -1997,9 +2015,11 @@ bool PickDevice(){
 	// Hardcoded selection for automated testing (see Makefile TESTDEFS).
 	// DESMUME_FORCE_CORE: 1 = software raster (only option; see core3DList)
 	// DESMUME_FORCE_USB:  0 = SD, 1 = USB
-	// The CPU line below is skipped too, so the runtime CPU mode keeps its
-	// default (JIT, g_jitOn in jit_exec.cpp); a test that wants Interpreter
-	// sends the harness command "cpumode interp" instead.
+	// The CPU and render-mode lines below are skipped too, so the runtime CPU
+	// mode keeps its default (JIT, g_jitOn in jit_exec.cpp) and the render
+	// mode keeps its default (GxAccurate, gx_rendermode.cpp); a test that
+	// wants otherwise sends the harness command "cpumode interp" / the
+	// rendermode= boot-manifest key (applied after PickDevice() either way).
 	current3Dcore = DESMUME_FORCE_CORE;
 #ifdef DESMUME_FORCE_USB
 	return DESMUME_FORCE_USB;
@@ -2018,9 +2038,19 @@ bool PickDevice(){
 	const bool useJit = false;
 #endif
 
+	// Render mode (gx_rendermode.h): Software / GxAccurate (default) / GxFast,
+	// cycled with 1/X/X (Wiimote/GC/Classic). Same idiom as the CPU line
+	// above; a harness build with rendermode= in its boot manifest overrides
+	// whatever's picked here (applied after PickDevice() returns).
+	static const RenderMode kRenderModes[] = { RenderMode::Software, RenderMode::GxAccurate, RenderMode::GxFast };
+	static const char *const kRenderModeNames[] = { "Software", "GxAccurate", "GxFast" };
+	int renderModeIdx = 1; // GxAccurate
+
 	while(true){
 		PAD_ScanPads();
 		WPAD_ScanPads();
+		GECKO_Update();   // USB Gecko / EXI debug-serial input (gekko_utils/geckoinput.h);
+		                  // every other input loop in this file calls it, this one hadn't.
 
 		printf("\x1b[2J");
 		printf("\x1b[2;0H");
@@ -2029,6 +2059,7 @@ bool PickDevice(){
 		printf("%s", device ? "USB >>" : "SD >>");
 		printf("\nSelect CPU \\/ ");
 		printf("%s", useJit ? "JIT /\\" : "Interpreter /\\");
+		printf("\nSelect Render (1): %s", kRenderModeNames[renderModeIdx]);
 		printf("\n\nPress B to see the credits.");
 
 		if(GetInput(LEFT, LEFT, LEFT) || GetInput(RIGHT, RIGHT, RIGHT)) {
@@ -2041,6 +2072,10 @@ bool PickDevice(){
 		}
 #endif
 
+		if(GetInput(1, X, X)) {
+			renderModeIdx = (renderModeIdx + 1) % 3;
+		}
+
 		if(GetInput(A, A, A)){
 #ifdef DESMUME_JIT
 			// Pre-boot (NDS_Init() hasn't run), so apply at once rather than
@@ -2048,6 +2083,9 @@ bool PickDevice(){
 			// probes' per-core overrides further down main() still win.
 			jitSetEnabled(useJit);
 #endif
+			// Pre-boot, same as above: gxSetRenderMode() is a plain global
+			// write (gx_rendermode.cpp), safe to apply directly here.
+			gxSetRenderMode(kRenderModes[renderModeIdx]);
 			break;
 		}
 

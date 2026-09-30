@@ -1142,6 +1142,7 @@ static void writechunks(EMUFILE* os) {
 static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 {
 	bool ret = true;
+	gfx3d_preloadstate();
 	while(totalsize > 0)
 	{
 		uint32 size;
