@@ -192,7 +192,7 @@ static inline u32 jitQuotaStart(s32 quota)
 #define JIT_FLAG_ELIM 1
 #endif
 
-// THUMB spin-loop fast-forward (jit_trace.cpp, jitThumbSpinLoop()). 0 = off.
+// Spin-loop fast-forward, THUMB and ARM (jit_trace.cpp, jit*SpinLoop()). 0 = off.
 #ifndef JIT_SPIN_SKIP
 #define JIT_SPIN_SKIP 1
 #endif
@@ -266,12 +266,15 @@ struct JitTraceCtx {
 
 	// THUMB spin-loop fast-forward (jitThumbSpinLoop()). Non-zero when the block
 	// opens with an idempotent poll loop -- spinLoopLen instructions, the last a
-	// Bcc back to startPC -- whose single load reads [R(spinBase) + spinImm]. The
+	// Bcc back to startPC -- whose single load reads [R(spinBase) + spinOff]. The
 	// Bcc's taken exit then adds the cycles of every further iteration the chain
 	// would have run before its quota guard trips (see jit_thumb.cpp).
 	u8   spinLoopLen;
 	u8   spinBase;
-	u8   spinImm;
+	s32  spinOff;
+	// At a taken back-edge to startPC: emit the fast-forward when this block is
+	// a detected spin loop and this is its closing branch (no-op otherwise).
+	void emitSpinSkip(u32 targetPC);
 
 	// THUMB CMP+Bcc fusion. fuseCmp is set by jitCompileTrace() for a CMP (imm8
 	// or lo-reg) directly followed by a fusable Bcc whose fall-through needs no

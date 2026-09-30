@@ -161,6 +161,9 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (isBL)                                            // guest R14 = return address
 		emitLoadImm32(p, ctx.hostRegFor(14), retLR);    // pinned reg; only the taken path runs this
 	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
+#if JIT_SPIN_SKIP
+	if (!isBL) ctx.emitSpinSkip(target);                // ARM poll loop back-edge (jit_trace.cpp)
+#endif
 	ctx.emitChainTail(target);
 
 	// --- cond-false falls through: keep compiling the block ---

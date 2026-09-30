@@ -820,37 +820,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.emitAddCycles(ctx.cyclesAccum + 3);
 		ctx.emitResultMetadata(ctx.instrCount + 1, 0);
 #if JIT_SPIN_SKIP
-		// Spin-loop fast-forward (jitThumbSpinLoop(), jit_trace.cpp). r3 already
-		// holds this iteration's cycles; each further iteration adds c = the
-		// loop's own cost and one would run while r3 < JIT_YIELD_NUMBER, so add
-		// n = ceil((Y - r3) / c) iterations' worth of cycles and instructions.
-		// The self-chained entry guard then yields exactly as the loop would
-		// have. Skipped (loop runs normally) when r3 is already at the quota or
-		// the load hits a port whose read has side effects (0x041xxxxx IPC FIFO
-		// / card data) or anything at/above 0x08000000 (slot 2).
-		if (ctx.spinLoopLen && ctx.instrCount + 1 == ctx.spinLoopLen && targetPC == ctx.startPC) {
-			const u32 c = ctx.cyclesAccum + 3;
-			*emitPtr++ = PPC_ADDI(PPC_R12, ctx.hostRegFor(ctx.spinBase), ctx.spinImm);
-			*emitPtr++ = PPC_SRWI(PPC_R12, PPC_R12, 20);
-			*emitPtr++ = PPC_CMPLI(0, PPC_R12, 0x041);
-			u32* skipA = emitPtr++;                                       // BEQ: side-effect port
-			*emitPtr++ = PPC_CMPLI(0, PPC_R12, 0x07F);
-			u32* skipB = emitPtr++;                                       // BGT: slot 2 and up
-			*emitPtr++ = PPC_CMPWI(0, PPC_R3, JIT_YIELD_NUMBER);
-			u32* skipC = emitPtr++;                                       // BGE: already at quota
-			*emitPtr++ = PPC_LI(PPC_R12, JIT_YIELD_NUMBER - 1);
-			*emitPtr++ = PPC_SUBF(PPC_R12, PPC_R3, PPC_R12);             // Y - 1 - r3 (>= 0)
-			*emitPtr++ = PPC_LI(PPC_R11, (s32)c);
-			*emitPtr++ = PPC_DIVWU(PPC_R12, PPC_R12, PPC_R11);           // n - 1
-			*emitPtr++ = PPC_ADDI(PPC_R12, PPC_R12, 1);                  // n
-			*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R12, PPC_R11);
-			*emitPtr++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R11);               // r3 += n * c
-			*emitPtr++ = PPC_MULLI(PPC_R11, PPC_R12, (s32)ctx.spinLoopLen);
-			*emitPtr++ = PPC_ADD(PPC_R31, PPC_R31, PPC_R11);             // icount += n * len
-			*skipA = PPC_BEQ((u32)((emitPtr - skipA) * 4));
-			*skipB = PPC_BGT((u32)((emitPtr - skipB) * 4));
-			*skipC = PPC_BGE((u32)((emitPtr - skipC) * 4));
-		}
+		ctx.emitSpinSkip(targetPC);                                  // jit_trace.cpp
 #endif
 		ctx.emitChainTail(targetPC);
 		if (guard) {

@@ -1602,7 +1602,7 @@ static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u
 // the load's base register is never written (so its address is invariant --
 // the emitted code still refuses to skip reads of side-effecting ports, see
 // jit_thumb.cpp). Returns the loop length including the Bcc, or 0.
-static u8 jitThumbSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, u8& imm)
+static u8 jitThumbSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, s32& imm)
 {
 	u16 ops[5];
 	u32 len = 0;
@@ -1639,7 +1639,7 @@ static u8 jitThumbSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, u8& 
 			if (loads++) return 0;
 			rd[i] = 1 << r3; wr[i] = 1 << r0;
 			base = r3;
-			imm  = (u8)(((op >> 6) & 0x1F) << ((op >> 11) == 13 ? 2 : (op >> 11) == 17 ? 1 : 0));
+			imm  = (s32)(((op >> 6) & 0x1F) << ((op >> 11) == 13 ? 2 : (op >> 11) == 17 ? 1 : 0));
 			break;
 		default: return 0;
 		}
@@ -1653,6 +1653,118 @@ static u8 jitThumbSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, u8& 
 		sofar |= wr[i];
 	}
 	return (u8)(len + 1);
+}
+
+// ARM counterpart of jitThumbSpinLoop(): 1..4 unconditional instructions
+// from {data-processing without pc operands (not ADC/SBC/RSC, RRX, MRS/MSR,
+// or an S-form logical op with a register shift, whose C may be left over from
+// the previous iteration), one LDR/LDRB/LDRH/LDRSB/LDRSH with an immediate
+// offset and no writeback}, then B<cond> (not BL, not AL) to the loop head.
+// Same idempotence rule as the THUMB version. Returns the loop length
+// including the branch, or 0.
+static u8 jitArmSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, s32& off)
+{
+	u32 ops[5];
+	u32 len = 0;
+	for (; len < 5; len++) {
+		ops[len] = cpu.fetch32(startPC + 4 * len);
+		if ((ops[len] & 0x0E000000u) == 0x0A000000u) break;
+	}
+	if (len == 0 || len > 4) return 0;
+	const u32 br = ops[len];
+	if ((br >> 28) >= 0xE || ((br >> 24) & 1)) return 0;             // AL/NV, or BL
+	const s32 disp = ((s32)(br << 8)) >> 6;
+	if (startPC + 4 * len + 8 + (u32)disp != startPC) return 0;
+
+	u16 rd[4], wr[4];
+	int loads = 0;
+	for (u32 i = 0; i < len; i++) {
+		const u32 op = ops[i];
+		if ((op >> 28) != 0xE) return 0;
+		const u8 rn = (op >> 16) & 0xF, rdst = (op >> 12) & 0xF, rm = op & 0xF, rs = (op >> 8) & 0xF;
+		rd[i] = wr[i] = 0;
+		if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60u)) {  // LDRH / LDRSB / LDRSH
+			if (!((op >> 20) & 1) || !((op >> 24) & 1) || ((op >> 21) & 1) || !((op >> 22) & 1)) return 0;
+			if (rn == 15 || rdst == 15 || loads++) return 0;
+			const s32 k = (s32)(((op >> 4) & 0xF0) | (op & 0xF));
+			off = ((op >> 23) & 1) ? k : -k;
+			base = rn; rd[i] = 1 << rn; wr[i] = 1 << rdst;
+			continue;
+		}
+		if ((op & 0x0C000000u) == 0x04000000u) {                    // LDR / LDRB
+			if (!((op >> 20) & 1) || ((op >> 25) & 1) || !((op >> 24) & 1) || ((op >> 21) & 1)) return 0;
+			if (rn == 15 || rdst == 15 || loads++) return 0;
+			const s32 k = (s32)(op & 0xFFF);
+			off = ((op >> 23) & 1) ? k : -k;
+			base = rn; rd[i] = 1 << rn; wr[i] = 1 << rdst;
+			continue;
+		}
+		if ((op & 0x0C000000u) != 0) return 0;                     // not data-processing
+		const bool immForm = (op >> 25) & 1;
+		if (!immForm && ((op >> 4) & 1) && ((op >> 7) & 1)) return 0;
+		const u8 aluOp = (op >> 21) & 0xF;
+		const bool S = (op >> 20) & 1;
+		const bool testOnly = (aluOp >= 8 && aluOp <= 11);
+		const bool ignoresRn = (aluOp == 13 || aluOp == 15);
+		const bool regShift = !immForm && ((op >> 4) & 1);
+		const bool isLogical = (aluOp <= 1) || (aluOp == 8) || (aluOp == 9) || (aluOp >= 12);
+		if (testOnly && !S) return 0;
+		if (aluOp == 5 || aluOp == 6 || aluOp == 7) return 0;
+		if (!immForm && !regShift && ((op >> 5) & 3) == 3 && ((op >> 7) & 0x1F) == 0) return 0;   // RRX
+		if (S && isLogical && regShift) return 0;
+		if (rdst == 15 || (!ignoresRn && rn == 15)) return 0;
+		if (!immForm && (rm == 15 || (regShift && rs == 15))) return 0;
+		if (!ignoresRn) rd[i] |= 1 << rn;
+		if (!immForm) rd[i] |= 1 << rm;
+		if (regShift) rd[i] |= 1 << rs;
+		if (!testOnly) wr[i] = 1 << rdst;
+	}
+	if (loads != 1) return 0;
+	u16 all = 0, sofar = 0;
+	for (u32 i = 0; i < len; i++) all |= wr[i];
+	if (all & (1 << base)) return 0;
+	for (u32 i = 0; i < len; i++) {
+		if (rd[i] & all & ~sofar) return 0;
+		sofar |= wr[i];
+	}
+	if (off < -32768 || off > 32767) return 0;
+	return (u8)(len + 1);
+}
+
+// Spin-loop fast-forward (jit*SpinLoop() above). Emitted on the taken path of
+// the loop's closing branch, after its cycles and instruction count: r3 then
+// holds this iteration's cycles, each further iteration adds c = the loop's
+// own cost and one would run while r3 < JIT_YIELD_NUMBER, so add
+// n = ceil((Y - r3) / c) iterations' worth of cycles and instructions. The
+// self-chained entry guard then yields exactly as the loop would have. Skipped
+// (the loop runs normally) when r3 is already at the quota or the load hits a
+// port whose read has side effects (0x041xxxxx IPC FIFO / card data) or
+// anything at/above 0x08000000 (slot 2).
+void JitTraceCtx::emitSpinSkip(u32 targetPC)
+{
+	if (!spinLoopLen || instrCount + 1 != spinLoopLen || targetPC != startPC) return;
+	u32*& p = emitPtr;
+	const u32 c = cyclesAccum + 3;                                    // + the taken branch
+	*p++ = PPC_ADDI(PPC_R12, hostRegFor(spinBase), spinOff);
+	*p++ = PPC_SRWI(PPC_R12, PPC_R12, 20);
+	*p++ = PPC_CMPLI(0, PPC_R12, 0x041);
+	u32* skipA = p++;                                                 // BEQ: side-effect port
+	*p++ = PPC_CMPLI(0, PPC_R12, 0x07F);
+	u32* skipB = p++;                                                 // BGT: slot 2 and up
+	*p++ = PPC_CMPWI(0, PPC_R3, JIT_YIELD_NUMBER);
+	u32* skipC = p++;                                                 // BGE: already at quota
+	*p++ = PPC_LI(PPC_R12, JIT_YIELD_NUMBER - 1);
+	*p++ = PPC_SUBF(PPC_R12, PPC_R3, PPC_R12);                       // Y - 1 - r3 (>= 0)
+	*p++ = PPC_LI(PPC_R11, (s32)c);
+	*p++ = PPC_DIVWU(PPC_R12, PPC_R12, PPC_R11);                     // n - 1
+	*p++ = PPC_ADDI(PPC_R12, PPC_R12, 1);                            // n
+	*p++ = PPC_MULLW(PPC_R11, PPC_R12, PPC_R11);
+	*p++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R11);                         // r3 += n * c
+	*p++ = PPC_MULLI(PPC_R11, PPC_R12, (s32)spinLoopLen);
+	*p++ = PPC_ADD(PPC_R31, PPC_R31, PPC_R11);                       // icount += n * len
+	*skipA = PPC_BEQ((u32)((p - skipA) * 4));
+	*skipB = PPC_BGT((u32)((p - skipB) * 4));
+	*skipC = PPC_BGE((u32)((p - skipC) * 4));
 }
 
 // =========================================================================
@@ -1669,7 +1781,8 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	ctx.thumbMode = thumb;
 
 #if JIT_SPIN_SKIP
-	if (thumb) ctx.spinLoopLen = jitThumbSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinImm);
+	ctx.spinLoopLen = thumb ? jitThumbSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinOff)
+	                        : jitArmSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinOff);
 #endif
 #if JIT_FLAG_ELIM
 	u8 flagDeadAt[JIT_TRACE_MAX_INSTRUCTIONS], flagLiveIn[JIT_TRACE_MAX_INSTRUCTIONS];
