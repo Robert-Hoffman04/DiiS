@@ -1,0 +1,116 @@
+diff --git a/source/main.cpp b/source/main.cpp
+index b77abae..36ba410 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -1067,6 +1067,101 @@ void ShowFPS() {
+ #define DESMUME_BENCH_BLOCK 60
+ #endif
+ 
++#ifdef DESMUME_STATE_HASH
++//---------------------------------------------------------------------------
++// Determinism/regression gate (-DDESMUME_STATE_HASH, needs -DDESMUME_BENCH).
++// At each frame in DESMUME_STATE_HASH_FRAMES (comma list, default 300,600,900)
++// writes per-region FNV-1a-64 hashes of guest-visible state to sd:/statehash.log:
++// main RAM, ITCM/DTCM, shared WRAM, ARM7 WRAM, LCD VRAM, palette/OAM, both CPUs'
++// R0-R15/CPSR/SPSR, nds_timer, and the composited GPU_screen. The whole file is
++// rewritten every 30 frames so a killed Dolphin's periodic SD flush has a
++// complete copy. Two builds that behave identically produce identical files.
++//---------------------------------------------------------------------------
++#include "gfx3d.h"
++#include <string.h>
++#ifndef DESMUME_STATE_HASH_FRAMES
++#define DESMUME_STATE_HASH_FRAMES 300,600,900
++#endif
++static u64 sh_fnv(const void* p, size_t n, u64 h = 0xcbf29ce484222325ULL)
++{
++	const u8* b = (const u8*)p;
++	for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ULL; }
++	return h;
++}
++static u64 sh_w32(u64 h, u32 v)
++{
++	u8 b[4] = { (u8)(v >> 24), (u8)(v >> 16), (u8)(v >> 8), (u8)v };
++	return sh_fnv(b, 4, h);
++}
++static u64 sh_wf(u64 h, float f) { u32 v; memcpy(&v, &f, 4); return sh_w32(h, v); }
++// Geometry-engine output the renderer consumes (last flushed frame): field-wise so struct
++// padding never leaks in. Float bit patterns are hashed, so any FP-reassociation shows up here.
++static u64 sh_ge()
++{
++	u64 h = 0xcbf29ce484222325ULL;
++	const POLYLIST* pl = gfx3d.polylist; const VERTLIST* vl = gfx3d.vertlist;
++	if (!pl || !vl) return h;
++	h = sh_w32(h, pl->count); h = sh_w32(h, vl->count);
++	for (int i = 0; i < pl->count; i++) {
++		const POLY& p = pl->list[i];
++		h = sh_w32(h, p.type);
++		for (int j = 0; j < 4; j++) h = sh_w32(h, p.vertIndexes[j]);
++		h = sh_w32(h, p.polyAttr); h = sh_w32(h, p.texParam); h = sh_w32(h, p.texPalette); h = sh_w32(h, p.viewport);
++		h = sh_wf(h, p.miny); h = sh_wf(h, p.maxy);
++		if (p.projMatrix) for (int j = 0; j < 16; j++) h = sh_wf(h, p.projMatrix[j]);
++		if (p.mvMatrix)   for (int j = 0; j < 16; j++) h = sh_wf(h, p.mvMatrix[j]);
++	}
++	for (int i = 0; i < vl->count; i++) {
++		const VERT& v = vl->list[i];
++		for (int j = 0; j < 4; j++) h = sh_wf(h, v.coord[j]);
++		h = sh_wf(h, v.u); h = sh_wf(h, v.v);
++		for (int j = 0; j < 3; j++) h = sh_w32(h, v.color[j]);
++		for (int j = 0; j < 3; j++) h = sh_wf(h, v.fcolor[j]);
++		for (int j = 0; j < 3; j++) h = sh_wf(h, v.objcoord[j]);
++	}
++	return h;
++}
++static u64 sh_cpu(const armcpu_t& c)
++{
++	u32 v[18];
++	for (int i = 0; i < 16; i++) v[i] = c.R[i];
++	v[16] = c.CPSR.val; v[17] = c.SPSR.val;
++	u8 be[72];
++	for (int i = 0; i < 18; i++) { be[i*4] = v[i] >> 24; be[i*4+1] = v[i] >> 16; be[i*4+2] = v[i] >> 8; be[i*4+3] = (u8)v[i]; }
++	return sh_fnv(be, sizeof be);
++}
++static void state_hash_tick(u32 frame)
++{
++	static const u32 cps[] = { DESMUME_STATE_HASH_FRAMES };
++	static char buf[8192];
++	static int  len = 0;
++	static bool any = false;
++	for (unsigned i = 0; i < sizeof(cps) / sizeof(cps[0]); i++) {
++		if (cps[i] != frame) continue;
++		gxDsPresentResolveAll();
++		len += snprintf(buf + len, sizeof(buf) - len,
++			"frame=%u main=%016llx itcm=%016llx dtcm=%016llx swram=%016llx a7wram=%016llx lcd=%016llx pal_oam=%016llx "
++			"arm9=%016llx arm7=%016llx timer=%016llx screen=%016llx ge=%016llx\n", frame,
++			(unsigned long long)sh_fnv(MMU.MAIN_MEM, 0x400000),
++			(unsigned long long)sh_fnv(MMU.ARM9_ITCM, 0x8000),
++			(unsigned long long)sh_fnv(MMU.ARM9_DTCM, 0x4000),
++			(unsigned long long)sh_fnv(MMU.SWIRAM, 0x8000),
++			(unsigned long long)sh_fnv(MMU.ARM7_ERAM, 0x10000),
++			(unsigned long long)sh_fnv(MMU.ARM9_LCD, 0xA4000),
++			(unsigned long long)sh_fnv(MMU.ARM9_VMEM, 0x800),
++			(unsigned long long)sh_cpu(NDS_ARM9), (unsigned long long)sh_cpu(NDS_ARM7),
++			(unsigned long long)nds_timer,
++			(unsigned long long)sh_fnv(GPU_screen, sizeof(GPU_screen)),
++			(unsigned long long)sh_ge());
++		any = true;
++	}
++	if (any && (frame % 30) == 0) {
++		FILE* f = fopen("sd:/statehash.log", "w");
++		if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
++	}
++}
++#endif // DESMUME_STATE_HASH
++
+ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
+ {
+ 	static bool  started = false;
+@@ -1092,6 +1187,9 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
+ 	}
+ 
+ 	frame++;
++#ifdef DESMUME_STATE_HASH
++	state_hash_tick(frame);
++#endif
+ 	acc_exec += ticks_to_microsecs(exec_ticks);
+ 	acc_draw += ticks_to_microsecs(draw_ticks);
+ 
