@@ -82,7 +82,7 @@ static u32 s_abExact, s_abAlpha, s_abBad, s_abFirstBad;
 static int s_abMn, s_abMp;
 static u16 s_abCpu[256 * 192];
 #endif
-static char s_dsbNote[96];   // free-form detail for the last bail (blendunder: the layer/target sets)
+static char s_dsbNote[192];   // free-form detail for the last bail (blendunder: the layer/target sets)
 static u32 s_dsb3dOk = 0, s_dsb3dEnabled = 0;   // engaged frames drawing the 3D layer / frames with BG0_3D+BG0 enabled (any outcome)
 static bool s_dsbFr3d, s_dsb3dSeen;
 // bail-reason histogram (why -> frames), emitted as the `<tag>w` line
@@ -2647,7 +2647,15 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 			}
 		}
 	}
-	if (anyLive && (int)p.eva + (int)p.evb != 16) { DSB_WHY("blendcoef"); return false; }
+	// Task gxfast-perf: EVA+EVB != 16 has no SRCALPHA/INVSRCALPHA form; GxFast draws it
+	// with the two-stage premultiplied blend (gxDsBTevAlphaAB), GxAccurate bails.
+	if (anyLive && (int)p.eva + (int)p.evb != 16 && !gxRenderModeIsFast()) {
+		DSB_WHY("blendcoef");
+#ifdef DSB_STATS
+		snprintf(s_dsbNote, sizeof(s_dsbNote), "bc eva=%d evb=%d mode=%d t1=%02x t2=%02x live=%02x,%02x,%02x y=%d-%d semi=%02x", p.eva, p.evb, p.mode, p.t1, p.t2, p.blendLive[0], p.blendLive[1], p.blendLive[2], y0, y1, p.tierSemi);
+#endif
+		return false;
+	}
 	if (needOverlapCheck) {
 		// A blended sprite must sit directly on the BG/backdrop line buffer. Painter
 		// order would blend it with any sprite drawn earlier under it (the CPU
@@ -2716,6 +2724,42 @@ static void gxDsBTevAlpha(int k)
 	}
 	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)k });
 	s_tevK = k;
+}
+
+// Task gxfast-perf, GxFast only (the plan bails "blendcoef" in GxAccurate): EVA+EVB != 16.
+// SRCALPHA/INVSRCALPHA can only weight complementarily, so the source is premultiplied
+// in the TEV instead and the EFB blend is ONE / INVSRCALPHA:
+//   stage 0: colour = texC * texA (0 in a hole), alpha = texA > 0 ? 255 - EVB*16 : 0
+//   stage 1: colour = prev * EVA*16 (KONST), alpha = prev
+//   EFB:     out = src + dst * (255 - alpha)/255 ~= (c0*EVA + c1*EVB)/16, clamped at 255
+// A hole leaves dst untouched (src 0, alpha 0). Error class: the /255 blend, the /256 TEV
+// multiply and the 8-bit expansion of both operands vs GPU.cpp's (c0*EVA + c1*EVB) >> 4 on
+// 5-bit values -- a few LSB of the 8-bit channel: SM64DS gameplay's sub screen (EVA 4,
+// EVB 13) differs from the CPU on 4103 px, 3981 by one 5-bit step and 122 by two. Restored by gxDsBTevAlphaABEnd() right after the draw.
+static inline bool gxDsBAlphaNeedsAB(const GxDsBBandPlan &p) { return (int)p.eva + (int)p.evb != 16; }
+static void gxDsBTevAlphaAB(int eva, int evb)
+{
+	const u8 ka = gxDsBAlphaK(eva), kb = gxDsBAlphaK(evb);
+	GX_SetNumTevStages(2);
+	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO);
+	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_TEXA, GX_CA_ZERO, GX_CA_A0, GX_CA_ZERO);
+	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_COMP_A8_GT, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevColor(GX_TEVREG0, (GXColor){ 0, 0, 0, (u8)(255 - kb) });
+	GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+	GX_SetTevKColor(GX_KCOLOR0, (GXColor){ ka, ka, ka, 255 });
+	GX_SetTevKColorSel(GX_TEVSTAGE1, GX_TEV_KCSEL_K0);
+	GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_CPREV, GX_CC_KONST, GX_CC_ZERO);
+	GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+	GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	s_tevK = -2;   // stage 0 no longer holds either cached wiring
+}
+static void gxDsBTevAlphaABEnd()
+{
+	GX_SetNumTevStages(1);
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 }
 
 static void gxDsBDrawBgQuad(const GxDsBBgPlaneCache &pcc, const GxDsBBandRegs &r, int bg, int y0, int y1)
@@ -2870,11 +2914,14 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 			const bool alpha = want && ((p.blendLive[ru.cfg] >> bg) & 1);
 			const GxDsBBgPlaneCache &pc = fade ? s_bgPlaneFx[bg] : s_bgPlane[bg];
 			if (!pc.valid) continue;
-			if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+			const bool ab = alpha && gxDsBAlphaNeedsAB(p);
+			if (ab) gxDsBTevAlphaAB(p.eva, p.evb);
+			else if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
 			if (pc.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&pc.tlutObj), gxDsBBgSlotFor(bg));
 			GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
 			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
+			if (ab) gxDsBTevAlphaABEnd();
 		}
 	}
 }
@@ -2902,17 +2949,20 @@ static void gxDsBDrawObjLayer(int prio, const GxDsBBandPlan &p, int y0, int y1)
 				const bool alpha = want && ((p.blendLive[ru.cfg] >> (4 + prio)) & 1);
 				const GxDsBObjTexSlot &slot = fade ? s_objTexFx[d.oamIndex] : s_objTex[d.oamIndex];
 				if (!slot.valid) continue;
-				if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
+				const bool ab = alpha && gxDsBAlphaNeedsAB(p);
+				if (ab) gxDsBTevAlphaAB(p.eva, p.evb);
+				else if (alpha) gxDsBTevAlpha(gxDsBAlphaK(p.eva)); else gxDsBTevReplace();
 				if (slot.ci) gxDsBBindTlut(const_cast<GXTlutObj *>(&slot.tlutObj), gxDsBObjSlotFor());
 				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
 				if (d.affine) {
 					gxDsBDrawAffineObj(d, slot);
-					continue;
+				} else {
+					f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
+					f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
+					gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
+					              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
 				}
-				f32 s0 = d.hflip ? 1.0f : 0.0f, s1 = d.hflip ? 0.0f : 1.0f;
-				f32 t0 = d.vflip ? 1.0f : 0.0f, t1 = d.vflip ? 0.0f : 1.0f;
-				gxDsBDrawQuad(const_cast<GXTexObj *>(&slot.texObj), (f32)d.x, (f32)d.y,
-				              (f32)(d.x + d.w), (f32)(d.y + d.h), s0, t0, s1, t1);
+				if (ab) gxDsBTevAlphaABEnd();
 			}
 		}
 	}
