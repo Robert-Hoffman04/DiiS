@@ -29,6 +29,21 @@
 #include "../MMU.h"
 #include "../armcpu.h"
 #include "jit_arm9_region.h"
+#include "../perf_zones.h"
+
+#ifdef DESMUME_PERFZONES
+// perf_zones: which slow-memory zone an ARM9 compiled-code C call lands in.
+static inline PerfZone arm9MemZone(u32 addr)
+{
+	switch (addr >> 24) {
+		case 0x03: return PZ_JIT9_M_WRAM;
+		case 0x04: return (addr - 0x04000400u) < 0x200u ? PZ_JIT9_M_GXFIFO : PZ_JIT9_M_IO;
+		case 0x05: case 0x07: return PZ_JIT9_M_PALOBJ;
+		case 0x06: return PZ_JIT9_M_VRAM;
+		default:   return PZ_JIT9_M_OTHER;
+	}
+}
+#endif
 
 // --- compile-time guest fetch (trace scanning / literal folding) ------------
 // Routes ITCM (addr < 0x02000000) and shared main RAM correctly via the ARM9
@@ -42,6 +57,7 @@ static u32 arm9_fetch32(u32 addr) { return _MMU_read32<ARMCPU_ARM9, MMU_AT_CODE>
 // main RAM, shared WRAM, VRAM bank mapping, palette/OAM and I/O.
 static u32 arm9_slowRead(u32 addr, u32 size)
 {
+	PZ_SCOPE(arm9MemZone(addr));
 	switch (size) {
 		case 1:  return _MMU_read08<ARMCPU_ARM9>(addr);
 		case 2:  return _MMU_read16<ARMCPU_ARM9>(addr);
@@ -51,6 +67,7 @@ static u32 arm9_slowRead(u32 addr, u32 size)
 
 static void arm9_slowWrite(u32 addr, u32 val, u32 size)
 {
+	PZ_SCOPE(arm9MemZone(addr));
 	switch (size) {
 		case 1:  _MMU_write08<ARMCPU_ARM9>(addr, (u8)val);  break;
 		case 2:  _MMU_write16<ARMCPU_ARM9>(addr, (u16)val); break;

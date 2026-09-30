@@ -66,6 +66,21 @@ enum PerfZone {
 	PZ_2DA_3DGEOMTEX, // gxDsA3dRenderGeomTex(): GX 3D pass drawn to a texture (a3 bake)
 	PZ_SCHED,         // NDS_exec() loop: IRQ dispatch, findNext(), hstart/hblank glue, armInnerLoop() residual
 	PZ_HOST,          // frame-loop glue outside NDS_exec()/Draw(): input, harness, bench tick
+	// JIT split: carved out of arm9_jit / arm7_jit, which keep only the dispatcher
+	// (block lookup, compile trigger, pipeline re-prime). *_exec is time inside
+	// ExecuteJITTrace() (compiled code + trampoline); the slow-memory C calls and
+	// in-block interpreter fallbacks made from compiled code are split out of it.
+	PZ_JIT9_EXEC,     // ARM9 compiled code + trampoline
+	PZ_JIT9_M_IO,     // ARM9 slowRead/slowWrite: I/O (0x04, not GX FIFO ports)
+	PZ_JIT9_M_GXFIFO, // ARM9 slowRead/slowWrite: GX command ports 0x04000400-0x040005FF
+	PZ_JIT9_M_VRAM,   // ARM9 slowRead/slowWrite: VRAM (0x06)
+	PZ_JIT9_M_PALOBJ, // ARM9 slowRead/slowWrite: palette / OAM (0x05, 0x07)
+	PZ_JIT9_M_WRAM,   // ARM9 slowRead/slowWrite: shared WRAM (0x03)
+	PZ_JIT9_M_OTHER,  // ARM9 slowRead/slowWrite: anything else (ITCM stores, main RAM straddles, BIOS, slot-2)
+	PZ_JIT9_FB,       // ARM9 in-block interpreter fallback (jitInterpFallback)
+	PZ_JIT7_EXEC,     // ARM7 compiled code + trampoline
+	PZ_JIT7_MEM,      // ARM7 slowRead/slowWrite (all regions)
+	PZ_JIT7_FB,       // ARM7 in-block interpreter fallback
 	PZ_COUNT
 };
 

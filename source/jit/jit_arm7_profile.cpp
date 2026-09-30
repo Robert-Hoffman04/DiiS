@@ -20,6 +20,7 @@
 
 #include "../MMU.h"
 #include "../armcpu.h"
+#include "../perf_zones.h"
 
 // --- compile-time guest fetch (trace scanning / literal folding) ------------
 static u32 arm7_fetch16(u32 addr) { return _MMU_read16<ARMCPU_ARM7, MMU_AT_CODE>(addr & ~1u); }
@@ -28,6 +29,7 @@ static u32 arm7_fetch32(u32 addr) { return _MMU_read32<ARMCPU_ARM7, MMU_AT_CODE>
 // --- runtime guest memory slow path ----------------------------------------
 static u32 arm7_slowRead(u32 addr, u32 size)
 {
+	PZ_SCOPE(PZ_JIT7_MEM);
 	switch (size) {
 		case 1:  return _MMU_read08<ARMCPU_ARM7>(addr);
 		case 2:  return _MMU_read16<ARMCPU_ARM7>(addr);
@@ -37,6 +39,7 @@ static u32 arm7_slowRead(u32 addr, u32 size)
 
 static void arm7_slowWrite(u32 addr, u32 val, u32 size)
 {
+	PZ_SCOPE(PZ_JIT7_MEM);
 	switch (size) {
 		case 1:  _MMU_write08<ARMCPU_ARM7>(addr, (u8)val);  break;
 		case 2:  _MMU_write16<ARMCPU_ARM7>(addr, (u16)val); break;

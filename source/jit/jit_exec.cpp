@@ -294,6 +294,7 @@ static void jit9ProfileReport()
 template<int PROCNUM, bool THUMB>
 static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
 {
+	PZ_SCOPE(PROCNUM == ARMCPU_ARM9 ? PZ_JIT9_FB : PZ_JIT7_FB);
 	armcpu_t& cpu = (PROCNUM == ARMCPU_ARM9) ? NDS_ARM9 : NDS_ARM7;
 	JITCache& jc  = (PROCNUM == ARMCPU_ARM9) ? jitCacheArm9 : jitCacheArm7;
 	const u32 step = THUMB ? 2u : 4u;
@@ -492,7 +493,7 @@ u32 jitRunArm7(s32 budget)
 	JITResult r;
 	jitResultInit(r);
 	JCC_EXEC_BEGIN();
-	ExecuteJITTrace(b->execute, &r, &st, start);
+	{ PZ_SCOPE(PZ_JIT7_EXEC); ExecuteJITTrace(b->execute, &r, &st, start); }
 	JCC_EXEC_END(0);
 	r.cycles -= start;
 	g_jitAttempts++;
@@ -689,7 +690,7 @@ u32 jitRunArm9(s32 budget)
 	JITResult r;
 	jitResultInit(r);
 	JCC_EXEC_BEGIN();
-	ExecuteJITTrace(b->execute, &r, &st, start);
+	{ PZ_SCOPE(PZ_JIT9_EXEC); ExecuteJITTrace(b->execute, &r, &st, start); }
 	JCC_EXEC_END(1);
 	r.cycles -= start;
 

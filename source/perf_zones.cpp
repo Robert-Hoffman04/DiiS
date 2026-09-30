@@ -60,6 +60,8 @@ static const char* k_name[PZ_COUNT] = {
 	"readback", "gxwait", "vidlock", "g3rec", "g3replay", "g3acc", "g3prep", "g3tex",
 	"g3gate", "a_3dscan", "a_3dtex",
 	"efb_copy", "mbright", "a_3dgeomtex", "sched", "host",
+	"j9_exec", "j9m_io", "j9m_gxfifo", "j9m_vram", "j9m_palobj", "j9m_wram", "j9m_other", "j9_fb",
+	"j7_exec", "j7_mem", "j7_fb",
 };
 const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 
