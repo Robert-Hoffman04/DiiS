@@ -2614,9 +2614,18 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 1);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 1); return; }
+		if(T1ReadByte(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 1);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
@@ -3114,9 +3123,18 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 2);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 2); return; }
+		if(T1ReadWord(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 2);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
@@ -3530,9 +3548,18 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 	// already uses on the GBA side. Marked BEFORE MMU_LCDmap() rewrites
 	// `adr` into LCDC space, so the classifier sees the real 0x05/0x06/
 	// 0x07 region address.
-	if(adr >= 0x05000000 && adr < 0x08000000) gxDsMarkWrite(adr, 4);
+	// Task gxfast-perf: a write that leaves the bytes unchanged (games rewrite palette
+	// entries with the value they already hold, e.g. SM64DS mid-frame) changes nothing
+	// any renderer reads, so it is dropped before the marking: no lazy-2D barrier, no
+	// dirty tag, no `midframewrite` compositor bail. Exact.
+	const u32 gxRawAdr = adr;
 	bool unmapped;
 	adr = MMU_LCDmap<ARMCPU_ARM9>(adr, unmapped);
+	if(gxRawAdr >= 0x05000000 && gxRawAdr < 0x08000000) {
+		if(unmapped) { gxDsMarkWrite(gxRawAdr, 4); return; }
+		if(T1ReadLong(MMU.MMU_MEM[ARMCPU_ARM9][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM9][adr>>20]) == val) return;
+		gxDsMarkWrite(gxRawAdr, 4);
+	}
 	if(unmapped) return;
 	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
