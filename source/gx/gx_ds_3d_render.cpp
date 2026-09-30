@@ -2615,10 +2615,10 @@ void gxDs3dRenderFast()
 		free(s_dl);
 		s_dl = memalign(32, s_dlWant);
 		s_dlCap = s_dl ? s_dlWant : 0;
+		if (s_dl) DCInvalidateRange(s_dl, s_dlCap);
 	}
 	if (s_dl) {
 		const bool texDirty = s_texDirty;
-		DCInvalidateRange(s_dl, s_dlCap);
 		GX_BeginDispList(s_dl, s_dlCap);
 		GXDS3D_TP_BEGIN(tpd);
 		gxDs3dRenderFastDraw();
