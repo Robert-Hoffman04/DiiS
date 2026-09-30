@@ -169,6 +169,7 @@
 #define PPC_MULHW(rD, rA, rB)  ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (75 << 1))   // signed   high 32 of rA*rB
 #define PPC_MULHWU(rD, rA, rB) ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (11 << 1))   // unsigned high 32 of rA*rB
 #define PPC_MULLI(rD, rA, imm) ((7 << 26) | ((rD) << 21) | ((rA) << 16) | ((imm) & 0xFFFF))
+#define PPC_DIVWU(rD, rA, rB) ((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (459 << 1))
 
 // Hardware Flag Math (XER & Zero Checks)
 #define PPC_ADDCO(rD, rA, rB)	((31 << 26) | ((rD) << 21) | ((rA) << 16) | ((rB) << 11) | (1 << 10) | (10 << 1))
@@ -233,6 +234,7 @@
 #define PPC_MFLR(rD)           ((31 << 26) | ((rD) << 21) | (256 << 11) | (339 << 1))
 #define PPC_LWZ(rD, rA, d)     ((32 << 26) | ((rD) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_STW(rS, rA, d)     ((36 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
+#define PPC_STB(rS, rA, d)     ((38 << 26) | ((rS) << 21) | ((rA) << 16) | ((d) & 0xFFFF))
 #define PPC_CMPW(cr, rA, rB)   ((31 << 26) | ((cr) << 23) | ((rA) << 16) | ((rB) << 11) | (0 << 1))
 // Load/store multiple word: rD/rS..r31 <-> consecutive words at d(rA). Used by
 // the in-block interpreter fallback (JitTraceCtx::emitInterpFallback) to sync

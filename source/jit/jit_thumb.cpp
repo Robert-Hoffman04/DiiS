@@ -80,8 +80,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		const u8 hRd = ctx.writeReg(rd, true, lockedMask);
 		if (type < 2) *emitPtr++ = PPC_OR(PPC_R12, hRn, hRn);
 		else          *emitPtr++ = PPC_LI(PPC_R12, rn_imm);
-		if (type == 0 || type == 2) *emitPtr++ = PPC_ADDCO(hRd, hRs, PPC_R12);
-		else                        *emitPtr++ = PPC_SUBFCO(hRd, PPC_R12, hRs);
+		// C/V dead (dead-flag elimination): plain add/subf, no XER update.
+		const bool cvd = ctx.cvDead();
+		if (type == 0 || type == 2) *emitPtr++ = cvd ? PPC_ADD(hRd, hRs, PPC_R12)  : PPC_ADDCO(hRd, hRs, PPC_R12);
+		else                        *emitPtr++ = cvd ? PPC_SUBF(hRd, PPC_R12, hRs) : PPC_SUBFCO(hRd, PPC_R12, hRs);
 		ctx.emitCVfromXER(PPC_R11);
 		ctx.emitNZ(hRd);
 		break;
@@ -102,9 +104,11 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_LI(PPC_R12, imm);
 			if (op == 1)      { *emitPtr++ = PPC_SUBFCO(PPC_R11, PPC_R12, hRd); }
 			else if (op == 2) { hRd = ctx.writeReg(rd, false, lockedMask);
-			                    *emitPtr++ = PPC_ADDCO(hRd, hRd, PPC_R12); }
+			                    *emitPtr++ = ctx.cvDead() ? PPC_ADDI(hRd, hRd, imm)
+			                                              : PPC_ADDCO(hRd, hRd, PPC_R12); }
 			else              { hRd = ctx.writeReg(rd, false, lockedMask);
-			                    *emitPtr++ = PPC_SUBFCO(hRd, PPC_R12, hRd); }
+			                    *emitPtr++ = ctx.cvDead() ? PPC_ADDI(hRd, hRd, -(s32)imm)
+			                                              : PPC_SUBFCO(hRd, PPC_R12, hRd); }
 			ctx.emitCVfromXER(PPC_R10);
 			ctx.emitNZ((op == 1) ? PPC_R11 : hRd);
 		}
@@ -157,7 +161,28 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			const u8 rs = ((opcode >> 3) & 0x07) | (h2 << 3);
 			const u8 rd = (opcode & 0x07) | (h1 << 3);
 
-			if (rd == 15 && sub != 1) { ctx.endBlock = true; break; }  // PC write = branch
+			if (rd == 15 && sub != 1) {
+				// MOV pc,Rs / ADD pc,Rs (OP_MOV_SPE / OP_ADD_SPE): R15 = Rs or
+				// R15 + Rs, used as-is as the next fetch address (no interworking,
+				// no bit0 masking), 3 cycles. A guarded dynamic THUMB exit -- the
+				// same exit the in-block interpreter fallback took for it.
+				const u32 pc4 = currentPC + 4;
+				if (sub == 2) {                                       // MOV
+					if (rs == 15) { *emitPtr++ = PPC_LIS(PPC_R12, pc4 >> 16);
+					                *emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, pc4 & 0xFFFF); }
+					else          { const u8 hRs = ctx.readReg(rs, lockedMask);
+					                *emitPtr++ = PPC_OR(PPC_R12, hRs, hRs); }
+				} else {                                              // ADD
+					const u32 k = (rs == 15) ? 2 * pc4 : pc4;
+					*emitPtr++ = PPC_LIS(PPC_R12, k >> 16);
+					*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, k & 0xFFFF);
+					if (rs != 15) *emitPtr++ = PPC_ADD(PPC_R12, PPC_R12, ctx.readReg(rs, lockedMask));
+				}
+				ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, 3, /*targetThumb=*/true);
+				ctx.instrCount++; ctx.currentPC += 2;
+				ctx.endBlock = true; ctx.blockTerminatedEarly = true;
+				break;
+			}
 
 			if (sub == 1) {                          // CMP (flags, no write)
 				u8 rRs, rRd;
@@ -367,8 +392,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 
 		if (isStore && ctx.cpu.arm9DtcmBase) {          // P16 inline RAM store
-			*emitPtr++ = PPC_STW(hVal, 1, 100);
-			ctx.emitArm9Store(size, /*writeback=*/false, /*rn=*/0);
+			ctx.emitArm9Store(size, /*writeback=*/false, /*rn=*/0, hVal);
 			break;
 		}
 
@@ -415,8 +439,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			break;
 		}
 		if (!isLoad && ctx.cpu.arm9DtcmBase) {          // P16 inline RAM store
-			*emitPtr++ = PPC_STW(hVal, 1, 100);
-			ctx.emitArm9Store(4, /*writeback=*/false, /*rn=*/0);
+			ctx.emitArm9Store(4, /*writeback=*/false, /*rn=*/0, hVal);
 			break;
 		}
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
@@ -510,6 +533,25 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			break;
 		}
 
+		// POP {...,pc} inline: the popped pc is loaded like any other list word,
+		// into guest R15's pinned host register (r29, about to be rewritten by the
+		// exit anyway), through the same region-guarded inline block load as the
+		// no-pc form above (slowRead per word off the RAM regions). It is then
+		// stashed where the slow path below leaves it and shares that path's
+		// interworking exit. This is THUMB's standard function return, so it
+		// used to cost one slowRead C call per popped word on every return.
+		bool popPC = false;
+		if ((ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && isPop && Rbit) {
+			const u8 hSpP = ctx.readReg(13, lockedMask);
+			*emitPtr++ = PPC_RLWINM(PPC_R12, hSpP, 0, 0, 29);         // word-aligned low addr
+			u8 regs[9]; u32 nn = 0;
+			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
+			regs[nn++] = 15;                                          // pc popped at the top
+			ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+			*emitPtr++ = PPC_ADDI(hSpP, hSpP, 4 * nregs);
+			*emitPtr++ = PPC_STW(ctx.hostRegFor(15), 1, 100);          // raw popped pc
+			popPC = true;
+		} else {
 		u8 hSp;
 		if (!isPop) {
 			// Compute the prospective post-decrement, word-aligned base into a
@@ -542,7 +584,6 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitMemPrologue();
 		}
 
-		bool popPC = false;
 		u32 slot = 0;
 		for (int i = 0; i < 9; i++) {
 			const bool isLR = (i == 8);
@@ -564,6 +605,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// SP writeback: PUSH already holds the decremented SP in the pinned reg;
 		// POP adds the popped size to it.
 		if (isPop) *emitPtr++ = PPC_ADDI(ctx.hostRegFor(13), ctx.hostRegFor(13), 4 * nregs);
+		}
 
 		if (popPC) {
 			// The popped value's bit0 is the real ARMv4T mode switch (same
@@ -716,14 +758,40 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// range -- see the comment on jit_arm7_profile.cpp's case 0xD.
 		ctx.emitAddCycles(ctx.cyclesAccum + 3);
 		ctx.emitResultMetadata(ctx.instrCount + 1, 0);
-		*emitPtr++ = PPC_LIS(PPC_R29, (targetPC + 4) >> 16);
-		*emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, (targetPC + 4) & 0xFFFF);
-		*emitPtr++ = PPC_LIS(PPC_R4, targetPC >> 16);
-		*emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
-#if JIT_ENABLE_CHAINING
-		{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)emitPtr); *emitPtr++ = PPC_BL(o); }
+#if JIT_SPIN_SKIP
+		// Spin-loop fast-forward (jitThumbSpinLoop(), jit_trace.cpp). r3 already
+		// holds this iteration's cycles; each further iteration adds c = the
+		// loop's own cost and one would run while r3 < JIT_YIELD_NUMBER, so add
+		// n = ceil((Y - r3) / c) iterations' worth of cycles and instructions.
+		// The self-chained entry guard then yields exactly as the loop would
+		// have. Skipped (loop runs normally) when r3 is already at the quota or
+		// the load hits a port whose read has side effects (0x041xxxxx IPC FIFO
+		// / card data) or anything at/above 0x08000000 (slot 2).
+		if (ctx.spinLoopLen && ctx.instrCount + 1 == ctx.spinLoopLen && targetPC == ctx.startPC) {
+			const u32 c = ctx.cyclesAccum + 3;
+			*emitPtr++ = PPC_ADDI(PPC_R12, ctx.hostRegFor(ctx.spinBase), ctx.spinImm);
+			*emitPtr++ = PPC_SRWI(PPC_R12, PPC_R12, 20);
+			*emitPtr++ = PPC_CMPLI(0, PPC_R12, 0x041);
+			u32* skipA = emitPtr++;                                       // BEQ: side-effect port
+			*emitPtr++ = PPC_CMPLI(0, PPC_R12, 0x07F);
+			u32* skipB = emitPtr++;                                       // BGT: slot 2 and up
+			*emitPtr++ = PPC_CMPWI(0, PPC_R3, JIT_YIELD_NUMBER);
+			u32* skipC = emitPtr++;                                       // BGE: already at quota
+			*emitPtr++ = PPC_LI(PPC_R12, JIT_YIELD_NUMBER - 1);
+			*emitPtr++ = PPC_SUBF(PPC_R12, PPC_R3, PPC_R12);             // Y - 1 - r3 (>= 0)
+			*emitPtr++ = PPC_LI(PPC_R11, (s32)c);
+			*emitPtr++ = PPC_DIVWU(PPC_R12, PPC_R12, PPC_R11);           // n - 1
+			*emitPtr++ = PPC_ADDI(PPC_R12, PPC_R12, 1);                  // n
+			*emitPtr++ = PPC_MULLW(PPC_R11, PPC_R12, PPC_R11);
+			*emitPtr++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R11);               // r3 += n * c
+			*emitPtr++ = PPC_MULLI(PPC_R11, PPC_R12, (s32)ctx.spinLoopLen);
+			*emitPtr++ = PPC_ADD(PPC_R31, PPC_R31, PPC_R11);             // icount += n * len
+			*skipA = PPC_BEQ((u32)((emitPtr - skipA) * 4));
+			*skipB = PPC_BGT((u32)((emitPtr - skipB) * 4));
+			*skipC = PPC_BGE((u32)((emitPtr - skipC) * 4));
+		}
 #endif
-		{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)emitPtr); *emitPtr++ = PPC_B(o); }
+		ctx.emitChainTail(targetPC);
 		{
 			u32 skip = (u32)((emitPtr - guard) * 4);
 			*guard = guardIsBEQ ? PPC_BEQ(skip) : PPC_BNE(skip);

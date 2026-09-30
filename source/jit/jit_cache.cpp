@@ -367,6 +367,12 @@ void JITCache::flushCache() {
 		u32* emitPtr = jitArena;
 		linkerStubAddress = emitPtr;
 
+		// 0. Every call site is `bl linkerStub ; .long targetPC`
+		// (JitTraceCtx::emitChainTail()): the target PC is the word at LR, the
+		// bl itself at LR - 4. r5 keeps LR for the patch in step 6.
+		*emitPtr++ = PPC_MFLR(PPC_R5);
+		*emitPtr++ = PPC_LWZ(PPC_R4, PPC_R5, 0);
+
 		// 1. Load the Base Address of the blockTable struct array
 		*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
 		*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
@@ -412,8 +418,7 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_BEQ(0);
 
 		// 6. DIRECT PATCHING (Only runs for valid, executable JIT blocks!)
-		*emitPtr++ = PPC_MFLR(PPC_R10);
-		*emitPtr++ = PPC_ADDI(PPC_R10, PPC_R10, -4);
+		*emitPtr++ = PPC_ADDI(PPC_R10, PPC_R5, -4);          // the bl site
 		*emitPtr++ = PPC_SUBF(PPC_R11, PPC_R10, PPC_R12);
 		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 6, 29);
 		*emitPtr++ = PPC_ORIS(PPC_R11, PPC_R11, 0x4800);

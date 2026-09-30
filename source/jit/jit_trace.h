@@ -186,6 +186,17 @@ static inline u32 jitQuotaStart(s32 quota)
 #define JIT_INTERP_FALLBACK 1
 #endif
 
+// Dead-flag elimination (jit_trace.cpp, jitFlagLiveness()). 0 turns
+// it off (A/B switch).
+#ifndef JIT_FLAG_ELIM
+#define JIT_FLAG_ELIM 1
+#endif
+
+// THUMB spin-loop fast-forward (jit_trace.cpp, jitThumbSpinLoop()). 0 = off.
+#ifndef JIT_SPIN_SKIP
+#define JIT_SPIN_SKIP 1
+#endif
+
 // Worst-case words emitInterpFallback() emits -- comfortably inside either
 // per-instruction reserve below, so the scanner's budget check needs no change.
 #define JIT_INTERP_FALLBACK_WORDS  36
@@ -244,6 +255,25 @@ struct JitTraceCtx {
 
 	bool flagsLoaded;
 	bool flagsDirty;
+
+	// Dead-flag elimination: bit (1 << JITF_x) set => that flag is
+	// overwritten by a later instruction of this block before anything can read
+	// it, so the current instruction need not compute it. Set per instruction by
+	// jitCompileTrace() from a backward liveness pass (jitFlagLiveness()). The
+	// flag helpers below consult it, so emitters only
+	// need to check it where they can also pick a cheaper arithmetic form.
+	u8   deadFlags;
+
+	// THUMB spin-loop fast-forward (jitThumbSpinLoop()). Non-zero when the block
+	// opens with an idempotent poll loop -- spinLoopLen instructions, the last a
+	// Bcc back to startPC -- whose single load reads [R(spinBase) + spinImm]. The
+	// Bcc's taken exit then adds the cycles of every further iteration the chain
+	// would have run before its quota guard trips (see jit_thumb.cpp).
+	u8   spinLoopLen;
+	u8   spinBase;
+	u8   spinImm;
+	bool flagDead(u8 flagIdx) const { return (deadFlags >> flagIdx) & 1; }
+	bool cvDead() const { return flagDead(JITF_C) && flagDead(JITF_V); }
 
 	JitDeferredBailout bailouts[JIT_MAX_BAILOUTS];
 	u32                bailoutCount;
@@ -316,7 +346,13 @@ struct JitTraceCtx {
 	// ITCM mirrored over 0x00000000-0x01FFFFFF, tested on main RAM's miss
 	// branch so a main-RAM hit costs the same as before; its fast slot comes
 	// last. Stores pass false (ITCM holds JIT code; they keep slowWrite).
-	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm);
+	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm,
+	                         void (*onHit)(JitTraceCtx&, void*, int) = nullptr, void* hitArg = nullptr);
+	// onHit (optional): instead of leaving a fast-branch slot, the guard calls
+	// onHit(ctx, hitArg, region) at each hit point (region 0 DTCM, 1 main RAM,
+	// 2 ITCM) with r10 = host base, r11 = aligned in-region offset, EA in r12,
+	// and the callback emits the access itself (ending in its own branch to
+	// the caller's join point). Returns 0 then.
 
 	// Full ARM9 single load: EA in PPC_R12. Unconditional dirty flush, then the
 	// region guard -> inline lwbrx (main RAM / DTCM / ITCM) or the slowRead C call
@@ -342,7 +378,8 @@ struct JitTraceCtx {
 	// note), or the slowWrite C call for every other region (no interpreter
 	// round-trip). Register cache invalidated; writeback committed to gpr[rn].
 	// Does not end the block. Clobbers r3, r4, r5, r10, r11, r12.
-	void emitArm9Store(u32 size, bool writeback, u8 rn);
+	void emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal);
+	void emitArm9StoreJournaled(u32 size, bool writeback, u8 rn);   // differential builds
 
 	// ARM9 inline block store (STM / PUSH / STMIA, non-pc). Low guest address of
 	// the contiguous word run in PPC_R12; regs the ascending source list (0..14),
@@ -391,6 +428,14 @@ struct JitTraceCtx {
 
 	// Static-target exit: chain through the linker stub (self-patches on a hit).
 	void emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles);
+	// The tail every static exit ends with, after its cycles/metadata:
+	// `bl linkerStub ; .long targetPC`. The stub reads the target from the word
+	// at LR (so r4 needs no lis/ori pair) and, on a hit, patches the bl into a
+	// direct `b target`; on a miss it returns to C with r4 = target. Guest R15's
+	// pinned r29 is not set: C rewrites cpu.R[15] from the returned nextPC
+	// (jitPointPipeline()) after every trace, and no compiled code reads r29
+	// as an operand (pc reads are compile-time constants).
+	void emitChainTail(u32 targetPC);
 	// Dynamic-target exit: pcReg holds the runtime PC (already aligned). pcReg
 	// must be a scratch (r10..r12) that survives the register flush. targetThumb
 	// is the resume ISA this exit path leads to -- always a compile-time

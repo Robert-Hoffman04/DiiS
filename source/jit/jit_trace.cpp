@@ -406,6 +406,7 @@ void JitTraceCtx::ensureFlagsLoaded()
 
 void JitTraceCtx::emitFlagBit(u8 targetBit, u32 srcReg, u8 sh)
 {
+	if (flagDead(targetBit)) return;
 	ensureFlagsLoaded();
 	*emitPtr++ = PPC_MERGE_FLAG_BIT(targetBit, srcReg, sh);
 	flagsDirty = true;
@@ -413,6 +414,7 @@ void JitTraceCtx::emitFlagBit(u8 targetBit, u32 srcReg, u8 sh)
 
 void JitTraceCtx::emitFlagConst(u8 targetBit, bool value)
 {
+	if (flagDead(targetBit)) return;
 	ensureFlagsLoaded();
 	*emitPtr++ = PPC_LI(PPC_R8, value ? 1 : 0);
 	*emitPtr++ = PPC_MERGE_FLAG_BIT(targetBit, PPC_R8, 0);
@@ -437,12 +439,14 @@ void JitTraceCtx::emitDirtyFlagFlush() {}
 void JitTraceCtx::emitNZ(u32 srcReg)
 {
 	emitFlagBit(JITF_N, srcReg, 1);
+	if (flagDead(JITF_Z)) return;
 	*emitPtr++ = PPC_CNTLZW(PPC_R8, srcReg);
 	emitFlagBit(JITF_Z, PPC_R8, 27);
 }
 
 void JitTraceCtx::emitCVfromXER(u32 scratchReg)
 {
+	if (cvDead()) return;                        // skips the mfxer too
 	*emitPtr++ = PPC_MFXER(scratchReg);
 	emitFlagBit(JITF_C, scratchReg, 3);
 	emitFlagBit(JITF_V, scratchReg, 2);
@@ -622,7 +626,8 @@ static void patchMissSlots(u32* const* missSlots, int nMiss, const u32* target)
 
 // P16: ARM9 two-region inline guard (plus ITCM for loads).
 // See jit_trace.h. EA in PPC_R12.
-int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm)
+int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm,
+                                     void (*onHit)(JitTraceCtx&, void*, int), void* hitArg)
 {
 	(void)size;
 	u32*& p = emitPtr;
@@ -658,7 +663,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 		*p++ = PPC_LIS(PPC_R10, dtcmBase >> 16);
 		if (dtcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, dtcmBase & 0xFFFF);
 		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, alignMe);       // EA & 0x3FFF, cleared to align
-		fastSlots[nFast++] = p++;                                  // B -> caller inline block
+		if (onHit) onHit(*this, hitArg, 0); else fastSlots[nFast++] = p++;                                  // B -> caller inline block
 
 		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
 	}
@@ -684,7 +689,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	*p++ = PPC_LIS(PPC_R10, mainBase >> 16);
 	if (mainBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, mainBase & 0xFFFF);
 	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);       // EA & mirrorMask, cleared to align
-	fastSlots[nFast++] = p++;                                      // B -> caller inline block
+	if (onHit) onHit(*this, hitArg, 1); else fastSlots[nFast++] = p++;                                      // B -> caller inline block
 
 	// ---- ITCM (loads only): EA < 0x02000000 ----
 	// Tested after main RAM, on main RAM's miss branch, so the common main-RAM
@@ -728,7 +733,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 		*p++ = PPC_LIS(PPC_R10, itcmBase >> 16);
 		if (itcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, itcmBase & 0xFFFF);
 		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, alignMe);       // EA & 0x7FFF, cleared to align
-		fastSlots[nFast++] = p++;                                  // B -> caller inline block
+		if (onHit) onHit(*this, hitArg, 2); else fastSlots[nFast++] = p++;                                  // B -> caller inline block
 	}
 
 	// slow fall-through starts here; retarget every miss branch to it
@@ -740,21 +745,46 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 }
 
 // P16: full ARM9 single load. See jit_trace.h. EA in PPC_R12.
+//
+// Layout: each region hit loads straight into rd's pinned host register and
+// branches to the join; the slowRead C path is the guard's fall-through. So a
+// hit costs the guard, one indexed load (+ fix-up) and one taken branch, with
+// no EA stash / register copy -- the stash only happens on the slow path.
+namespace {
+struct Arm9LoadHit { u8 hRd; u32 size; bool signExt, wordRotate; u32* ends[3]; int nEnd; };
+}
+static void arm9LoadHit(JitTraceCtx& c, void* a, int /*region*/)
+{
+	Arm9LoadHit& h = *(Arm9LoadHit*)a;
+	u32*& p = c.emitPtr;
+	if (h.size == 4) {
+		*p++ = PPC_LWBRX(h.hRd, PPC_R10, PPC_R11);
+		if (h.wordRotate) {
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31);        // x = EA & 3
+			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);                // 4 - x
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28);        // ((4 - x) & 3) << 3
+			*p++ = PPC_RLWNM(h.hRd, h.hRd, PPC_R11, 0, 31);
+		}
+	} else if (h.size == 2) {
+		*p++ = PPC_LHBRX(h.hRd, PPC_R10, PPC_R11);
+		if (h.signExt) *p++ = PPC_EXTSH(h.hRd, h.hRd);
+	} else {
+		*p++ = PPC_LBZX(h.hRd, PPC_R10, PPC_R11);
+		if (h.signExt) *p++ = PPC_EXTSB(h.hRd, h.hRd);
+	}
+	h.ends[h.nEnd++] = p++;                                        // B -> join
+}
+
 void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn)
 {
 	u32*& p = emitPtr;
-
-	// Guest state is resident (r14..r31) so the SMC-bail / slowRead / inline
-	// paths all see coherent registers with nothing to flush.
-	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA for the slow path
-
-	u32* fast[3];
+	Arm9LoadHit h = { hostRegFor(rd), size, signExt, wordRotate, {}, 0 };
 	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast, /*withItcm=*/true);
+	emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/true, arm9LoadHit, &h);
 
-	// ---- slow: slowRead C call ----
+	// ---- slow: slowRead C call (EA still in r12) ----
+	*p++ = PPC_STW(PPC_R12, 1, 96);                                // EA survives the call here
 	emitMemPrologue();
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
 	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
 	if (wordRotate) {                                              // ROR(R10, 8 * (EA & 3))
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
@@ -765,31 +795,11 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 		*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
 	}
 	emitMemEpilogue();
-	u32* toEnd = p++;                                              // B over the fast block
+	*p++ = PPC_OR(h.hRd, PPC_R10, PPC_R10);
 
-	// ---- fast: inline lwbrx (r10 = host base, r11 = aligned in-region offset) ----
-	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
-	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
-	if (size == 4) {
-		*p++ = PPC_LWBRX(PPC_R10, 0, PPC_R10);
-		if (wordRotate) {
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 30, 31);        // x = EA & 3
-			*p++ = PPC_SUBFIC(PPC_R11, PPC_R11, 4);                // 4 - x
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 3, 27, 28);        // ((4 - x) & 3) << 3
-			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R11, 0, 31);
-		}
-	} else if (size == 2) {
-		*p++ = PPC_LHBRX(PPC_R10, 0, PPC_R10);
-		if (signExt) *p++ = PPC_EXTSH(PPC_R10, PPC_R10);
-	} else {
-		*p++ = PPC_LBZX(PPC_R10, 0, PPC_R10);
-		if (signExt) *p++ = PPC_EXTSB(PPC_R10, PPC_R10);
-	}
-
-	// ---- converge ---- (guest regs are pinned: commit straight into them)
-	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	// ---- join ---- (the caller excludes rd == rn with writeback)
+	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
 	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
-	*p++ = PPC_OR(hostRegFor(rd), PPC_R10, PPC_R10);
 }
 
 // P14: inline RAM load. See jit_trace.h. eaReg == PPC_R12 by contract.
@@ -952,8 +962,82 @@ static inline void emitArm9Stw(u32*& p, u32 size)
 	else                *p++ = PPC_STBZX (PPC_R11, 0, PPC_R10);
 }
 
-// P16: full ARM9 single store. See jit_trace.h. EA in PPC_R12, value at 100(r1).
-void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn)
+// P16: full ARM9 single store. See jit_trace.h. EA in PPC_R12; the value is in
+// hVal, a pinned guest register (it survives the guard and the C calls).
+//
+// Same layout as emitArm9Load: each region hit stores straight from hVal and
+// branches to the join, the slowWrite C path is the fall-through. The main-RAM
+// hit's SMC-page test branches forward to its bail block only on a hit on
+// compiled code, so the common path is guard + test + store + one taken
+// branch, with no stack stashes. Differential-testing builds (whose journal
+// call clobbers r10/r11 between the guard and the store) keep the original
+// sequence, emitArm9StoreJournaled().
+namespace {
+struct Arm9StoreHit { JitTraceCtx* c; u32 size; u8 hVal; u32* ends[4]; int nEnd; };
+}
+static void emitArm9StoreOp(u32*& p, u32 size, u8 hVal)
+{
+	if (size == 4)      *p++ = PPC_STWBRX(hVal, PPC_R10, PPC_R11);
+	else if (size == 2) *p++ = PPC_STHBRX(hVal, PPC_R10, PPC_R11);
+	else                *p++ = PPC_STBZX (hVal, PPC_R10, PPC_R11);
+}
+static void arm9StoreHit(JitTraceCtx& c, void* a, int region)
+{
+	Arm9StoreHit& h = *(Arm9StoreHit*)a;
+	u32*& p = c.emitPtr;
+	u32* toBail = nullptr;
+	if (region == 1) {                                             // main RAM: SMC page guard
+		const u32 fp = (u32)c.cache.smcPageFlags;
+		*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 22, 16, 31);            // (EA >> 10) & 0xFFFF
+		*p++ = PPC_LIS(PPC_R8, fp >> 16);
+		if (fp & 0xFFFF) *p++ = PPC_ORI(PPC_R8, PPC_R8, fp & 0xFFFF);
+		*p++ = PPC_LBZX(PPC_R8, PPC_R8, PPC_R9);
+		*p++ = PPC_CMPWI(0, PPC_R8, 0);
+		toBail = p++;                                              // BNE -> bail (below)
+	}
+	emitArm9StoreOp(p, h.size, h.hVal);
+	h.ends[h.nEnd++] = p++;                                        // B -> join
+	if (toBail) {
+		// Compiled code lives on this page: bail with smcHit set, resuming at
+		// this instruction (same exit as emitSmcCheckAndBail()).
+		*toBail = PPC_BNE((u32)((p - toBail) * 4));
+		*p++ = PPC_LWZ(PPC_R10, 1, 88);
+		*p++ = PPC_STW(PPC_R12, PPC_R10, 20);                      // out->smcAddress = EA
+		c.emitAddCycles(c.cyclesAccum);
+		c.emitResultMetadata(c.instrCount, 1, 1);
+		*p++ = PPC_LIS(PPC_R4, c.currentPC >> 16);
+		*p++ = PPC_ORI(PPC_R4, PPC_R4, c.currentPC & 0xFFFF);
+		s32 ret = (s32)((u8*)c.cache.linkerReturnAddress - (u8*)p);
+		*p++ = PPC_B(ret);
+	}
+}
+
+void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal)
+{
+	u32*& p = emitPtr;
+	if (cpu.journalNote) {                                         // differential build
+		*p++ = PPC_STW(hVal, 1, 100);
+		emitArm9StoreJournaled(size, writeback, rn);
+		return;
+	}
+	Arm9StoreHit h = { this, size, hVal, {}, 0 };
+	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
+	emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/false, arm9StoreHit, &h);
+
+	// ---- slow: SMC guard + slowWrite C call (EA in r12, value in hVal) ----
+	emitMemPrologue();
+	emitSmcCheckAndBail(PPC_R12);
+	emitSlowStore(PPC_R12, hVal, size);
+	emitMemEpilogue();
+
+	// ---- join ---- (writeback straight into the pinned base register)
+	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
+	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
+}
+
+// The original P16 store sequence (value at 100(r1)), kept for differential-
+// testing builds: its journal note sits between the region hit and the store.
+void JitTraceCtx::emitArm9StoreJournaled(u32 size, bool writeback, u8 rn)
 {
 	u32*& p = emitPtr;
 
@@ -1111,20 +1195,24 @@ void JitTraceCtx::registerBailout(u32* branchPtr, JitBailoutCond cond)
 // =========================================================================
 // Block exits -- shared by jit_thumb.cpp and jit_arm.cpp
 // =========================================================================
-void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
+void JitTraceCtx::emitChainTail(u32 targetPC)
 {
 	u32*& p = emitPtr;
-	const u32 pipe = targetPC + (thumbMode ? 4u : 8u);
-	emitAddCycles(cyclesAccum + termCycles);
-	emitResultMetadata(metaCount, 0);
-	*p++ = PPC_LIS(PPC_R29, pipe >> 16);
-	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R4, targetPC >> 16);
-	*p++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
 #if JIT_ENABLE_CHAINING
 	{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)p); *p++ = PPC_BL(o); }
-#endif
+	*p++ = targetPC;                                   // data word, read by the stub via LR
+#else
+	*p++ = PPC_LIS(PPC_R4, targetPC >> 16);
+	*p++ = PPC_ORI(PPC_R4, PPC_R4, targetPC & 0xFFFF);
 	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
+#endif
+}
+
+void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
+{
+	emitAddCycles(cyclesAccum + termCycles);
+	emitResultMetadata(metaCount, 0);
+	emitChainTail(targetPC);
 }
 
 void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb)
@@ -1285,6 +1373,217 @@ void JitTraceCtx::emitEvalCond(u8 cond)
 }
 
 // =========================================================================
+// Dead-flag elimination (THUMB and ARM)
+// =========================================================================
+// Nearly every THUMB ALU op sets flags, and most of those values are
+// overwritten by the next flag-setting op before anything reads them -- yet
+// each one costs a cntlzw/rlwimi pair for N/Z and an mfxer (execution-
+// serialising on the 750-class core) plus two rlwimi for C/V. A backward
+// liveness pass over the scan window finds, per instruction, the flags whose
+// value no later instruction can observe, and the flag helpers skip them.
+//
+// Soundness rests on the barrier set: any instruction that can read the
+// flags, leave the block (branch, bail, SMC guard on a store, interpreter
+// fallback that may return to C) or that the front end might refuse (which
+// turns it into a fallback) is a barrier -- every flag is live before it, and
+// its own flag writes are never elided. Only straight-line ALU ops and loads
+// (which never exit: out-of-window loads run slowRead in place) are
+// transparent. A block that ends early (the arena budget; see the caller)
+// gets no elision near its end.
+//
+// Classifies one THUMB opcode: returns true for a barrier, else the flags it
+// reads / definitely writes (JITF bit masks). A conditional write (LSL #0's C,
+// shift-by-register C for amount 0) is not a definite write and so is left
+// out, which keeps the flag live through it.
+static bool jitThumbFlagClass(u16 op, u8& rd, u8& wr)
+{
+	const u8 NZ = (1u << JITF_N) | (1u << JITF_Z), C = 1u << JITF_C, ALL = 0xF;
+	rd = wr = 0;
+	switch (op >> 11) {
+	case 0:          wr = NZ | (((op >> 6) & 0x1F) ? C : 0); return false; // LSL imm
+	case 1: case 2:  wr = NZ | C;  return false;                  // LSR / ASR imm
+	case 3:          wr = ALL;     return false;                  // ADD/SUB reg/imm3
+	case 4:          wr = NZ;      return false;                  // MOV imm8
+	case 5: case 6: case 7: wr = ALL; return false;               // CMP/ADD/SUB imm8
+	case 8:
+		if (op & 0x0400) {                                        // F5 hi-reg / BX
+			const u8 sub = (op >> 8) & 3;
+			if (sub == 3) return true;                            // BX / BLX
+			if (sub == 1) { wr = ALL; return false; }             // CMP
+			const u8 rdst = (op & 7) | ((op >> 4) & 8);
+			return rdst == 15;                                    // ADD/MOV pc: refused
+		}
+		switch ((op >> 6) & 0xF) {                                // F4 ALU
+		case 5: case 6:          rd = C; wr = ALL; return false;  // ADC / SBC
+		case 9: case 10: case 11:        wr = ALL; return false;  // NEG / CMP / CMN
+		default:                         wr = NZ;  return false;  // logic, MUL, shifts by reg
+		}
+	case 9:          return false;                                // LDR Rd,[pc,#]
+	case 10: case 11:                                             // F7/F8 reg offset
+		return (op & 0x0200) ? ((op & 0x0C00) == 0)               //   STRH
+		                     : ((op & 0x0800) == 0);              //   STR / STRB
+	case 12: case 13: case 14: case 15:                           // F9 word/byte imm
+	case 16: case 17: case 18: case 19:                           // F10 half, F11 sp
+		return (op & 0x0800) == 0;                                //   stores
+	case 20: case 21: return false;                               // ADD Rd, pc/sp
+	case 22: case 23:
+		if ((op & 0xFF00) == 0xB000) return false;                // ADD sp, #imm
+		if ((op & 0xFF00) == 0xBC00 && (op & 0xFF)) return false; // POP {rlist} (no pc)
+		return true;                                              // PUSH, POP pc, BKPT, ...
+	case 24: case 25: return !(op & 0x0800) || !(op & 0xFF);      // STMIA / empty LDMIA
+	default:          return true;                                // Bcc, SWI, B, BL/BLX
+	}
+}
+
+// ARM counterpart of jitThumbFlagClass(). Transparent: data-processing ops
+// the emitter compiles in place (no pc operand or destination -- those are
+// refused or exit) and plain LDR/LDRB (no pc destination, the literal form
+// only as the emitter accepts it). A predicated instruction reads every flag
+// and definitely writes none. S-form logical ops write C only when the
+// shifter produces a carry-out for sure (rotated immediate, non-zero
+// immediate shift, RRX); a register shift may leave C, so it is no write.
+static bool jitArmFlagClass(u32 op, bool v5, u8& rd, u8& wr)
+{
+	const u8 NZ = (1u << JITF_N) | (1u << JITF_Z), C = 1u << JITF_C, ALL = 0xF;
+	rd = wr = 0;
+	const u8 cond = op >> 28;
+	if (cond == 0xF) return true;
+	const bool al = (cond == 0xE);
+	if (!al) rd = ALL;
+
+	if ((op & 0x0C000000u) == 0) {                                // data processing
+		const bool immForm = (op >> 25) & 1;
+		if (!immForm && ((op >> 4) & 1) && ((op >> 7) & 1)) return true;   // mul / misc space
+		const u8 aluOp = (op >> 21) & 0xF;
+		const bool S = (op >> 20) & 1;
+		const bool testOnly = (aluOp >= 8 && aluOp <= 11);
+		if (testOnly && !S) return true;                          // MRS / MSR
+		if (((op >> 12) & 0xF) == 15) return true;                // pc destination
+		const bool ignoresRn = (aluOp == 13 || aluOp == 15);
+		const u8 rn = (op >> 16) & 0xF, rm = op & 0xF, rs = (op >> 8) & 0xF;
+		const bool regShift = !immForm && ((op >> 4) & 1);
+		if (!ignoresRn && rn == 15) return true;                  // pc operand (ADR folds, but keep it simple)
+		if (!immForm && (rm == 15 || (regShift && rs == 15))) return true;
+		if (aluOp == 5 || aluOp == 6 || aluOp == 7) rd |= C;      // ADC / SBC / RSC
+		const bool rrx = !immForm && !regShift && ((op >> 5) & 3) == 3 && ((op >> 7) & 0x1F) == 0;
+		if (rrx) rd |= C;
+		if (S && al) {
+			const bool isLogical = (aluOp <= 1) || (aluOp == 8) || (aluOp == 9) || (aluOp >= 12);
+			if (!isLogical) wr = ALL;
+			else {
+				bool cOut;
+				if (immForm)       cOut = ((op >> 8) & 0xF) != 0;
+				else if (regShift) cOut = false;
+				else               cOut = rrx || ((op >> 7) & 0x1F) != 0 || ((op >> 5) & 3) != 0;
+				wr = NZ | (cOut ? C : 0);
+			}
+		}
+		return false;
+	}
+	if ((op & 0x0C000000u) == 0x04000000u) {                      // LDR / STR
+		if (!((op >> 20) & 1)) return true;                       // store (SMC guard can bail)
+		if (!al && !v5) return true;                              // predicated: ARM9 only
+		if (((op >> 12) & 0xF) == 15) return true;                // LDR pc
+		const bool I = (op >> 25) & 1, P = (op >> 24) & 1, W = (op >> 21) & 1;
+		if (!P && W) return true;                                 // LDRT
+		if (I && ((op & 0x10) || (op & 0xF) == 15)) return true;
+		if (((op >> 16) & 0xF) == 15 && (I || W || !P || !al)) return true;
+		return false;
+	}
+	return true;
+}
+
+// dead[i] = flags dead after the i-th instruction from startPC (JITF masks).
+static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u8* dead)
+{
+	u8 rd[JIT_TRACE_MAX_INSTRUCTIONS], wr[JIT_TRACE_MAX_INSTRUCTIONS];
+	bool bar[JIT_TRACE_MAX_INSTRUCTIONS];
+	const bool v5 = cpu.isaLevel >= 5;
+	for (u32 i = 0; i < JIT_TRACE_MAX_INSTRUCTIONS; i++)
+		bar[i] = thumb ? jitThumbFlagClass((u16)cpu.fetch16(startPC + 2 * i), rd[i], wr[i])
+		               : jitArmFlagClass(cpu.fetch32(startPC + 4 * i), v5, rd[i], wr[i]);
+	u8 live = 0xF;                                   // everything live past the window
+	for (int i = JIT_TRACE_MAX_INSTRUCTIONS - 1; i >= 0; i--) {
+		if (bar[i]) { dead[i] = 0; live = 0xF; continue; }
+		dead[i] = (u8)(0xF & ~live);
+		live = (u8)((live & ~wr[i]) | rd[i]);
+	}
+}
+
+// =========================================================================
+// THUMB spin-loop detection
+// =========================================================================
+// A poll loop such as the DMA-busy wait `LDR r3,[r2] / CMP r3,#0 / BLT loop`
+// cannot see anything change inside one dispatch: scheduler events (DMA
+// progress, IRQs, timers, the ARM7) only run between dispatches, so every
+// iteration after the first re-reads the same value and takes the same branch
+// until the chain's quota guard trips. Such a loop used to run hundreds of
+// times per dispatch, each with a slowRead C call. When the body is provably
+// idempotent the taken back-edge instead adds, in one step, the cycles and
+// instruction count of all those iterations, so emulated state and timing are
+// exactly what running them would have produced.
+//
+// Idempotent body: 1..4 instructions from {LSL/LSR/ASR imm, ADD/SUB reg/imm3,
+// MOV/CMP imm8, the F4 ALU ops except ADC/SBC, one LDR/LDRB/LDRH imm}, then a
+// Bcc to the loop head. Every register an instruction reads is either never
+// written by the body or already written earlier in the same iteration, and
+// the load's base register is never written (so its address is invariant --
+// the emitted code still refuses to skip reads of side-effecting ports, see
+// jit_thumb.cpp). Returns the loop length including the Bcc, or 0.
+static u8 jitThumbSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, u8& imm)
+{
+	u16 ops[5];
+	u32 len = 0;
+	for (; len < 5; len++) {
+		ops[len] = (u16)cpu.fetch16(startPC + 2 * len);
+		if ((ops[len] & 0xF000) == 0xD000) break;
+	}
+	if (len == 0 || len > 4) return 0;
+	const u16 bcc = ops[len];
+	const u8 cond = (bcc >> 8) & 0xF;
+	if (cond >= 0xE) return 0;
+	if (startPC + 2 * len + 4 + ((s32)(s8)(bcc & 0xFF) << 1) != startPC) return 0;
+
+	u16 rd[4], wr[4];
+	int loads = 0;
+	for (u32 i = 0; i < len; i++) {
+		const u16 op = ops[i];
+		const u8 r0 = op & 7, r3 = (op >> 3) & 7, r6 = (op >> 6) & 7;
+		rd[i] = wr[i] = 0;
+		switch (op >> 11) {
+		case 0: case 1: case 2: rd[i] = 1 << r3; wr[i] = 1 << r0; break;           // shift imm
+		case 3: rd[i] = (1 << r3) | ((op & 0x0400) ? 0 : (1 << r6)); wr[i] = 1 << r0; break;
+		case 4: wr[i] = 1 << ((op >> 8) & 7); break;                                  // MOV imm8
+		case 5: rd[i] = 1 << ((op >> 8) & 7); break;                                  // CMP imm8
+		case 8: {
+			if (op & 0x0400) return 0;                                                // hi-reg / BX
+			const u8 alu = (op >> 6) & 0xF;
+			if (alu == 5 || alu == 6) return 0;                                       // ADC / SBC read C
+			rd[i] = (1 << r3) | ((alu == 9 || alu == 15) ? 0 : (1 << r0));
+			if (alu != 8 && alu != 10 && alu != 11) wr[i] = 1 << r0;                  // not TST/CMP/CMN
+			break;
+		}
+		case 13: case 15: case 17:                                                    // LDR/LDRB/LDRH imm
+			if (loads++) return 0;
+			rd[i] = 1 << r3; wr[i] = 1 << r0;
+			base = r3;
+			imm  = (u8)(((op >> 6) & 0x1F) << ((op >> 11) == 13 ? 2 : (op >> 11) == 17 ? 1 : 0));
+			break;
+		default: return 0;
+		}
+	}
+	if (loads != 1) return 0;
+	u16 all = 0, sofar = 0;
+	for (u32 i = 0; i < len; i++) all |= wr[i];
+	if (all & (1 << base)) return 0;
+	for (u32 i = 0; i < len; i++) {
+		if (rd[i] & all & ~sofar) return 0;
+		sofar |= wr[i];
+	}
+	return (u8)(len + 1);
+}
+
+// =========================================================================
 // Trace scanner + epilogue
 // =========================================================================
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb)
@@ -1296,6 +1595,14 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	JitTraceCtx ctx{ cpu, cache };
 	ctx.startPC = ctx.currentPC = startPC;
 	ctx.thumbMode = thumb;
+
+#if JIT_SPIN_SKIP
+	if (thumb) ctx.spinLoopLen = jitThumbSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinImm);
+#endif
+#if JIT_FLAG_ELIM
+	u8 flagDeadAt[JIT_TRACE_MAX_INSTRUCTIONS];
+	jitFlagLiveness(cpu, startPC, thumb, flagDeadAt);
+#endif
 
 	while (!ctx.endBlock && ctx.instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
 		if (ctx.arenaAllocated) {
@@ -1310,6 +1617,21 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			                            : JIT_MAX_INSTR_RESERVE_WORDS_ARM));
 			if (used > budget) { ctx.endBlock = true; break; }
 		}
+#if JIT_FLAG_ELIM
+		// Elision assumes the block runs on to the overwriting instruction. Near
+		// the arena budget the block may end after this one instead, so compute
+		// every flag there.
+		ctx.deadFlags = 0;
+		{
+			const u32 idx = (ctx.currentPC - startPC) >> (thumb ? 1 : 2);
+			const s32 reserve = thumb ? JIT_MAX_INSTR_RESERVE_WORDS : JIT_MAX_INSTR_RESERVE_WORDS_ARM;
+			const bool nearEnd = ctx.arenaAllocated &&
+				(s32)(ctx.emitPtr - ctx.blockStart) + 2 * reserve >
+				(s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
+				      - (s32)(ctx.bailoutCount + 4) * JIT_BAILOUT_STUB_WORDS - reserve);
+			if (idx < JIT_TRACE_MAX_INSTRUCTIONS && !nearEnd) ctx.deadFlags = flagDeadAt[idx];
+		}
+#endif
 
 		// Snapshot for the interpreter fallback below: a refusal may come after
 		// the emitter already wrote part of a sequence (or registered a deferred
@@ -1349,6 +1671,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			else if (ctx.arenaAllocated) ctx.emitPtr = ctx.quotaGuard + 1;   // just past ensureArena()'s guard
 			ctx.bailoutCount = bailMark;
 			ctx.endBlock = false;
+			ctx.deadFlags = 0;
 			ctx.emitInterpFallback(opcode);
 			ctx.instrCount++;
 			ctx.currentPC += thumb ? 2 : 4;
@@ -1426,15 +1749,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		ctx.emitAddCycles(ctx.cyclesAccum);
 		ctx.emitResultMetadata(ctx.instrCount, 0);
 
-		const u32 pipe = ctx.currentPC + (thumb ? 4u : 8u);
-		*ctx.emitPtr++ = PPC_LIS(PPC_R29, pipe >> 16);
-		*ctx.emitPtr++ = PPC_ORI(PPC_R29, PPC_R29, pipe & 0xFFFF);
-		*ctx.emitPtr++ = PPC_LIS(PPC_R4, ctx.currentPC >> 16);
-		*ctx.emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, ctx.currentPC & 0xFFFF);
-#if JIT_ENABLE_CHAINING
-		{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)ctx.emitPtr); *ctx.emitPtr++ = PPC_BL(o); }
-#endif
-		{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)ctx.emitPtr); *ctx.emitPtr++ = PPC_B(o); }
+		ctx.emitChainTail(ctx.currentPC);
 	}
 
 	// ---- quota-shield yield stub ----

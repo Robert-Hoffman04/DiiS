@@ -71,6 +71,7 @@
 #if defined(DESMUME_JIT)
 
 #include "jit_ppc_emitter.h"
+#include "../NDSSystem.h"
 
 // §16 predicated-branch coverage counters (defined in jit_exec.cpp). Declared at
 // file scope so the reference from the anonymous-namespace emitter below resolves
@@ -160,15 +161,7 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (isBL)                                            // guest R14 = return address
 		emitLoadImm32(p, ctx.hostRegFor(14), retLR);    // pinned reg; only the taken path runs this
 	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
-	const u32 pipe = target + 8;
-	*p++ = PPC_LIS(PPC_R29, pipe   >> 16);
-	*p++ = PPC_ORI(PPC_R29, PPC_R29, pipe   & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R4,  target >> 16);
-	*p++ = PPC_ORI(PPC_R4,  PPC_R4,  target & 0xFFFF);
-#if JIT_ENABLE_CHAINING
-	{ s32 o = (s32)((u8*)ctx.cache.linkerStubAddress   - (u8*)p); *p++ = PPC_BL(o); }
-#endif
-	{ s32 o = (s32)((u8*)ctx.cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o);  }
+	ctx.emitChainTail(target);
 
 	// --- cond-false falls through: keep compiling the block ---
 	*guard = PPC_BEQ((u32)((p - guard) * 4));
@@ -605,7 +598,8 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 		return;
 	}
 
-	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, S && isLogical);
+	// A dead C (dead-flag elimination) needs no shifter carry-out either.
+	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, S && isLogical && !ctx.flagDead(JITF_C));
 	emitAlu(ctx, aluOp, S, testOnly, isLogical, hRn, hRd, o2);
 
 	if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
@@ -627,11 +621,11 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// on a descriptor hit, load straight into rd's host register with the
 	// register cache intact. rd == rn + writeback is LDR-UNPREDICTABLE and the
 	// slow tail's "result last wins" ordering is easier to keep there, so only
-	// the non-aliased forms take the fast path. The predicated caller forces the
-	// slow path: it needs the unconditional cache invalidation (the fast path
-	// keeps the cache, which would then differ between the taken and cond-false
-	// runtime paths) and the direct gpr-slot store of the result.
-	if (!predicated && isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
+	// the non-aliased forms take the fast path. Predicated forms take it too:
+	// guest registers are pinned for the whole trace (no register cache), so the
+	// caller's BEQ skips the inline sequence wholesale on the cond-false path.
+	(void)predicated;
+	if (isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
@@ -645,7 +639,7 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// P16 (ARM9): inline main RAM / DTCM, slowRead C call for every other region
 	// (no interpreter round-trip). emitArm9Load does its own pre-guard dirty
 	// flush + post-op cache invalidation and commits the writeback itself.
-	if (!predicated && isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
+	if (isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
 		ctx.emitArm9Load(rd, size, signExt, wordRotate, writeback, rn);
@@ -655,11 +649,10 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// P16 (ARM9): inline main RAM / DTCM store (per-page SMC guard + differential
 	// journal note), slowWrite C call for every other region. emitArm9Store does
 	// its own dirty flush + cache invalidation and commits the writeback.
-	if (!predicated && !isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
-		*p++ = PPC_STW(hVal, 1, 100);                   // value
+	if (!isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
-		ctx.emitArm9Store(size, writeback, rn);
+		ctx.emitArm9Store(size, writeback, rn, hVal);   // value stays in its pinned reg
 		return;
 	}
 
@@ -975,6 +968,54 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 }
 
+// LDM{...,pc} exit: the raw popped pc is stashed at 100(r1), the base
+// writeback already committed. Interworks per the core's LDTBit and ends the
+// block. Shared by the inline and the slow LDM paths.
+static void emitLdmPcExit(JitTraceCtx& ctx, u32 op)
+{
+	u32*& p = ctx.emitPtr;
+	const u32 term = ctx.cpu.cyclesForArm(op);
+
+	// ARMv4 (ARM7, LDTBit == 0): `LDM {..,pc}` is MOV pc,(loaded) -- R15 = word &
+	// 0xFFFFFFFC, no interworking, T unchanged (OP_LDMIA's else branch).
+	if (ctx.cpu.isaLevel < 5) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 100);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);  // & ~3
+		ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+		ctx.instrCount++;
+		ctx.currentPC += 4;
+		ctx.endBlock = true;
+		ctx.blockTerminatedEarly = true;
+		return;
+	}
+
+	*p++ = PPC_LWZ(PPC_R12, 1, 100);                    // raw popped pc
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);     // R11 = bit0 (mode select)
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* toArm = p++;                                    // BEQ -> stay ARM (bit0 == 0)
+
+	// bit0 == 1: switch to THUMB -- set CPSR.T so the C++ resume path uses
+	// 16-bit fetch/pipeline math (the ARM7 POP{pc} bug: dropping this mode
+	// switch misdecodes the target and free-runs).
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);      // & ~1
+	ctx.ensureFlagsLoaded();
+	*p++ = PPC_LI(PPC_R10, 0x20);                        // CPSR.T (bit 5)
+	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
+	ctx.flagsDirty = true;
+	ctx.flushDirtyFlags();
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/true);
+
+	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
+	// bit0 == 0: stay ARM (CPSR.T already 0)
+	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);      // & ~3
+	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
+
+	ctx.instrCount++;
+	ctx.currentPC += 4;
+	ctx.endBlock = true;
+	ctx.blockTerminatedEarly = true;
+}
+
 // ------------------------------------------------ block data transfer (B4)
 // cond 100 P U S W L Rn register_list[16]
 //   P : 1 pre / 0 post   U : 1 increment / 0 decrement   W : writeback
@@ -1028,20 +1069,38 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// descriptor resolve, then n sequential lwbrx into the registers' host slots
 	// -- no prologue, no per-register C call, register cache intact.
 	// LDM{...,pc} keeps the slow path (block-terminator interworking).
-	if (!predicated && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && L && !pcInList) {
+	// Predicated (non-pc list): eval the condition and BEQ over the whole access,
+	// inline or slow -- guest registers are pinned, so both runtime paths share
+	// the same state and nothing needs flushing.
+	u32* guard = nullptr;
+	if (predicated) {
+		ctx.emitEvalCond(cond);
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		guard = p++;
+	}
+
+	// LDM{...,pc} (never predicated here) takes it too: the pc word lands in
+	// guest R15's pinned host register and is handed to emitLdmPcExit().
+	if ((ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) && L) {
 		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
 		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
 		if (W) {                                        // WB value from hRn, before any spill
 			*p++ = PPC_ADDI(PPC_R10, hRn, U ? (s32)(4 * n) : -(s32)(4 * n));
 			*p++ = PPC_STW(PPC_R10, 1, 104);
 		}
-		u8 regs[15]; u32 nn = 0;
-		for (int i = 0; i < 15; i++) if (list & (1u << i)) regs[nn++] = (u8)i;
+		u8 regs[16]; u32 nn = 0;
+		for (int i = 0; i < 16; i++) if (list & (1u << i)) regs[nn++] = (u8)i;
 		ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
 		if (W) {
 			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
 			*p++ = PPC_LWZ(hRnW, 1, 104);
 		}
+		if (pcInList) {
+			*p++ = PPC_STW(ctx.hostRegFor(15), 1, 100);                // raw popped pc
+			emitLdmPcExit(ctx, op);
+			return;
+		}
+		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 		return;
 	}
 
@@ -1050,7 +1109,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// the gpr slots, with a per-span SMC guard for main RAM and one differential
 	// journal note. STM{pc} already returned above; every other region falls back
 	// to the per-word slowWrite C loop inside emitArm9BlockStore.
-	if (!predicated && ctx.cpu.arm9DtcmBase && !L) {
+	if (ctx.cpu.arm9DtcmBase && !L) {
 		if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
 		else        *p++ = PPC_OR  (PPC_R12, hRn, hRn);
 		if (W) {
@@ -1064,14 +1123,8 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
 			*p++ = PPC_LWZ(hRnW, 1, 104);
 		}
+		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
 		return;
-	}
-
-	u32* guard = nullptr;
-	if (predicated) {
-		ctx.emitEvalCond(cond);
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		guard = p++;
 	}
 
 	if (lowOff) *p++ = PPC_ADDI(PPC_R12, hRn, lowOff);
@@ -1114,46 +1167,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	ctx.emitMemEpilogue();
 	if (W) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 
-	const u32 term = ctx.cpu.cyclesForArm(op);
-
-	// ARMv4 (ARM7, LDTBit == 0): `LDM {..,pc}` is MOV pc,(loaded) -- R15 = word &
-	// 0xFFFFFFFC, no interworking, T unchanged (OP_LDMIA's else branch).
-	if (ctx.cpu.isaLevel < 5) {
-		*p++ = PPC_LWZ(PPC_R12, 1, 100);
-		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);  // & ~3
-		ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
-		ctx.instrCount++;
-		ctx.currentPC += 4;
-		ctx.endBlock = true;
-		ctx.blockTerminatedEarly = true;
-		return;
-	}
-
-	*p++ = PPC_LWZ(PPC_R12, 1, 100);                    // raw popped pc
-	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 31, 31);     // R11 = bit0 (mode select)
-	*p++ = PPC_CMPWI(0, PPC_R11, 0);
-	u32* toArm = p++;                                    // BEQ -> stay ARM (bit0 == 0)
-
-	// bit0 == 1: switch to THUMB -- set CPSR.T so the C++ resume path uses
-	// 16-bit fetch/pipeline math (the ARM7 POP{pc} bug: dropping this mode
-	// switch misdecodes the target and free-runs).
-	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 30);      // & ~1
-	ctx.ensureFlagsLoaded();
-	*p++ = PPC_LI(PPC_R10, 0x20);                        // CPSR.T (bit 5)
-	*p++ = PPC_OR(PPC_REG_FLAGS, PPC_REG_FLAGS, PPC_R10);
-	ctx.flagsDirty = true;
-	ctx.flushDirtyFlags();
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/true);
-
-	*toArm = PPC_BEQ((u32)((p - toArm) * 4));
-	// bit0 == 0: stay ARM (CPSR.T already 0)
-	*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);      // & ~3
-	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
-
-	ctx.instrCount++;
-	ctx.currentPC += 4;
-	ctx.endBlock = true;
-	ctx.blockTerminatedEarly = true;
+	emitLdmPcExit(ctx, op);
 }
 
 // -------------------------------------------------------------- multiply (B5)
@@ -1389,7 +1403,6 @@ void emitSwap(JitTraceCtx& ctx, u32 op)
 // entry; only BX / MSR touch them and both are handled here). SPSR form -> interp.
 void emitMrs(JitTraceCtx& ctx, u32 op)
 {
-	if ((op >> 22) & 1) { ctx.endBlock = true; return; }    // MRS SPSR -> interp
 	const u8 rd = (op >> 12) & 0xF;
 	if (rd == 15) { ctx.endBlock = true; return; }
 
@@ -1398,6 +1411,12 @@ void emitMrs(JitTraceCtx& ctx, u32 op)
 	u32 lockedMask = 0;
 
 	const u8 hRd = ctx.writeReg(rd, true, lockedMask);
+	if ((op >> 22) & 1) {                                    // MRS Rd, SPSR (OP_MRS_SPSR)
+		// SPSR is never pinned: cpu.SPSR (&R[0] + 68) is authoritative mid-trace.
+		*p++ = PPC_LWZ(PPC_R10, 1, 80);
+		*p++ = PPC_LWZ(hRd, PPC_R10, 68);
+		return;
+	}
 	ctx.ensureFlagsLoaded();
 	*p++ = PPC_OR(hRd, PPC_REG_FLAGS, PPC_REG_FLAGS);
 }
@@ -1408,9 +1427,71 @@ void emitMrs(JitTraceCtx& ctx, u32 op)
 // flags. The interpreter also calls changeCPSR() -> NDS_Reschedule() here; a
 // flags-only write can't touch I/F/mode so there is no IRQ-unmask edge -- only a
 // scheduler nudge the outer emulation loop performs regularly anyway.
+// MSR SPSR_<fields>, <Rm | #imm> -- OP_MSR_SPSR / OP_MSR_SPSR_IMM_VAL exactly:
+// the c/x/s bytes only outside USR mode (runtime test on the pinned CPSR), the
+// f byte always, then changeCPSR()'s reschedule request (a byte store of 1,
+// see NDS_RescheduleFlagPtr()). SPSR is not pinned, so this is a plain
+// read-modify-write of cpu.SPSR (&R[0] + 68). The immediate form reproduces
+// OP_MSR_SPSR_IMM_VAL's f-byte expression as written -- (SPSR & 0xFF000000) |
+// (imm & 0xFF000000), which also clears SPSR bits 0..23 -- so JIT and
+// interpreter stay identical.
+static void emitMsrSpsr(JitTraceCtx& ctx, u32 op, bool immForm)
+{
+	u8 rm = 0;
+	if (!immForm) { rm = op & 0xF; if (rm == 15) { ctx.endBlock = true; return; } }
+	ctx.ensureArena();
+	u32*& p = ctx.emitPtr;
+	u32 lockedMask = 0;
+	const u32 fields = (op >> 16) & 0xF;
+	u8 src;
+	if (immForm) {
+		emitLoadImm32(p, PPC_R12, ror32(op & 0xFF, ((op >> 8) & 0xF) * 2));
+		src = PPC_R12;
+	} else {
+		src = ctx.readReg(rm, lockedMask);
+	}
+	*p++ = PPC_LWZ(PPC_R10, 1, 80);                          // &cpu.R[0]
+	*p++ = PPC_LWZ(PPC_R11, PPC_R10, 68);                    // SPSR
+	if (fields & 7) {
+		ctx.ensureFlagsLoaded();
+		*p++ = PPC_RLWINM(PPC_R8, PPC_REG_FLAGS, 0, 27, 31);    // CPSR.mode
+		*p++ = PPC_CMPWI(0, PPC_R8, 0x10);                     // USR
+		u32* skip = p++;
+		if (fields & 1) *p++ = PPC_RLWIMI(PPC_R11, src, 0, 24, 31);
+		if (fields & 2) *p++ = PPC_RLWIMI(PPC_R11, src, 0, 16, 23);
+		if (fields & 4) *p++ = PPC_RLWIMI(PPC_R11, src, 0, 8, 15);
+		*skip = PPC_BEQ((u32)((p - skip) * 4));
+	}
+	if (fields & 8) {
+		if (immForm) *p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, 7);   // interpreter quirk, see above
+		*p++ = PPC_RLWIMI(PPC_R11, src, 0, 0, 7);
+	}
+	*p++ = PPC_STW(PPC_R11, PPC_R10, 68);
+
+	// changeCPSR(): request a reschedule. If none was pending, return to the
+	// dispatcher after this instruction -- exactly what the in-block interpreter
+	// fallback did for it (jitInterpFallback()'s "newly requested reschedule,
+	// CPSR unchanged" TO_C rule), so emulated timing is unchanged.
+	const u32 fp = (u32)(uintptr_t)NDS_RescheduleFlagPtr();
+	const s32 lo = (s32)(s16)(fp & 0xFFFF);
+	*p++ = PPC_LIS(PPC_R10, (fp - lo) >> 16);
+	*p++ = PPC_LBZ(PPC_R11, PPC_R10, lo);
+	*p++ = PPC_CMPWI(0, PPC_R11, 0);
+	*p++ = PPC_LI(PPC_R11, 1);
+	*p++ = PPC_STB(PPC_R11, PPC_R10, lo);
+	u32* cont = p++;                                         // BNE: already pending
+	const u32 next = ctx.currentPC + 4;
+	ctx.emitAddCycles(ctx.cyclesAccum + ctx.cpu.cyclesForArm(op));
+	ctx.emitResultMetadata(ctx.instrCount + 1, 0);
+	*p++ = PPC_LIS(PPC_R4, next >> 16);
+	*p++ = PPC_ORI(PPC_R4, PPC_R4, next & 0xFFFF);
+	{ s32 o = (s32)((u8*)ctx.cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
+	*cont = PPC_BNE((u32)((p - cont) * 4));
+}
+
 void emitMsr(JitTraceCtx& ctx, u32 op, bool immForm)
 {
-	if ((op >> 22) & 1)            { ctx.endBlock = true; return; }   // SPSR
+	if ((op >> 22) & 1)            { emitMsrSpsr(ctx, op, immForm); return; }
 	if (((op >> 16) & 0xF) != 0x8) { ctx.endBlock = true; return; }   // not flags-only
 
 	u8 rm = 0;

@@ -1641,6 +1641,11 @@ bool NDS_ReschedulePending()
 	return sequencer.reschedule;
 }
 
+bool* NDS_RescheduleFlagPtr()
+{
+	return &sequencer.reschedule;
+}
+
 FORCEINLINE u32 _fast_min32(u32 a, u32 b, u32 c, u32 d)
 {
 	return ((( ((s32)(a-b)) >> (32-1)) & (c^d)) ^ d);
