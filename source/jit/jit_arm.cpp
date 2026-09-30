@@ -154,9 +154,7 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	// untouched, exactly like the register-write-free THUMB F16 path.
 	(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
 
-	ctx.emitEvalCond(cond);                              // r11 = (cond holds) ? 1 : 0
-	*p++ = PPC_CMPWI(0, PPC_R11, 0);
-	u32* guard = p++;                                    // BEQ over the taken exit
+	u32* guard = ctx.emitCondSkip(cond);
 
 	// --- taken path: exit the block at `target` (byte-for-byte the THUMB F16 shape) ---
 	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND / OP_BL taken cost
@@ -166,7 +164,7 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	ctx.emitChainTail(target);
 
 	// --- cond-false falls through: keep compiling the block ---
-	*guard = PPC_BEQ((u32)((p - guard) * 4));
+	ctx.patchCondSkip(guard);
 }
 
 // -------------------------------------- operand2 = Rm shifted by a register
@@ -382,19 +380,19 @@ Op2 emitOp2(JitTraceCtx& ctx, u32 op, bool immForm, u8 hRm, u8 hRs, bool wantCar
 // Shared by the immediate (bit25==1) and register-shifted-by-immediate
 // (bit25==0, bit4==0) forms. operand2 is already in PPC_R12 (`o2`).
 void emitAlu(JitTraceCtx& ctx, u8 aluOp, bool S, bool testOnly, bool isLogical,
-             u8 hRn, u8 hRd, const Op2& o2)
+             u8 hRn, u8 hRd, const Op2& o2, u8 opnd = PPC_R12)
 {
 	u32*& p = ctx.emitPtr;
 	const u8 res = testOnly ? PPC_R11 : hRd;
 
 	if (isLogical) {
 		switch (aluOp) {
-			case 0: case 8:  *p++ = PPC_AND (res, hRn, PPC_R12); break;   // AND / TST
-			case 1: case 9:  *p++ = PPC_XOR (res, hRn, PPC_R12); break;   // EOR / TEQ
-			case 12:         *p++ = PPC_OR  (res, hRn, PPC_R12); break;   // ORR
-			case 14:         *p++ = PPC_ANDC(res, hRn, PPC_R12); break;   // BIC
-			case 13:         *p++ = PPC_OR  (res, PPC_R12, PPC_R12); break; // MOV
-			case 15:         *p++ = PPC_NOR (res, PPC_R12, PPC_R12); break; // MVN
+			case 0: case 8:  *p++ = PPC_AND (res, hRn, opnd); break;   // AND / TST
+			case 1: case 9:  *p++ = PPC_XOR (res, hRn, opnd); break;   // EOR / TEQ
+			case 12:         *p++ = PPC_OR  (res, hRn, opnd); break;   // ORR
+			case 14:         *p++ = PPC_ANDC(res, hRn, opnd); break;   // BIC
+			case 13:         *p++ = PPC_OR  (res, opnd, opnd); break; // MOV
+			case 15:         *p++ = PPC_NOR (res, opnd, opnd); break; // MVN
 		}
 		if (S) {
 			ctx.emitNZ(res);
@@ -407,12 +405,12 @@ void emitAlu(JitTraceCtx& ctx, u8 aluOp, bool S, bool testOnly, bool isLogical,
 			*p++ = PPC_ADDIC(PPC_R10, fC, -1);
 		}
 		switch (aluOp) {
-			case 2: case 10: *p++ = PPC_SUBFCO(res, PPC_R12, hRn); break; // SUB / CMP
-			case 3:          *p++ = PPC_SUBFCO(res, hRn, PPC_R12); break; // RSB
-			case 4: case 11: *p++ = PPC_ADDCO (res, hRn, PPC_R12); break; // ADD / CMN
-			case 5:          *p++ = PPC_ADDEO (res, hRn, PPC_R12); break; // ADC
-			case 6:          *p++ = PPC_SUBFEO(res, PPC_R12, hRn); break; // SBC
-			case 7:          *p++ = PPC_SUBFEO(res, hRn, PPC_R12); break; // RSC
+			case 2: case 10: *p++ = PPC_SUBFCO(res, opnd, hRn); break; // SUB / CMP
+			case 3:          *p++ = PPC_SUBFCO(res, hRn, opnd); break; // RSB
+			case 4: case 11: *p++ = PPC_ADDCO (res, hRn, opnd); break; // ADD / CMN
+			case 5:          *p++ = PPC_ADDEO (res, hRn, opnd); break; // ADC
+			case 6:          *p++ = PPC_SUBFEO(res, opnd, hRn); break; // SBC
+			case 7:          *p++ = PPC_SUBFEO(res, hRn, opnd); break; // RSC
 		}
 		if (S) {
 			ctx.emitCVfromXER(res == PPC_R11 ? PPC_R10 : PPC_R11);
@@ -579,9 +577,7 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	u32* skip = nullptr;
 	if (predicated) {
-		ctx.emitEvalCond(cond);
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		skip = p++;
+		skip = ctx.emitCondSkip(cond);
 	}
 
 	if (constResult) {
@@ -596,15 +592,39 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 			ctx.emitFlagConst(JITF_Z, val == 0);
 			if (rot != 0) ctx.emitFlagConst(JITF_C, (k >> 31) & 1);
 		}
-		if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
+		if (skip) ctx.patchCondSkip(skip);
 		return;
 	}
 
 	// A dead C (dead-flag elimination) needs no shifter carry-out either.
+	u32* const o2Start = p;
 	const Op2 o2 = emitOp2(ctx, op, immForm, hRm, hRs, S && isLogical && !ctx.flagDead(JITF_C));
-	emitAlu(ctx, aluOp, S, testOnly, isLogical, hRn, hRd, o2);
 
-	if (skip) *skip = PPC_BEQ((u32)((p - skip) * 4));
+	// Peepholes on a one-instruction operand2. `mr r12,Rm` (unshifted
+	// register): let the ALU op read Rm in place. `li r12,k` for a non-S
+	// ADD/SUB: a single addi of +-k.
+	u8 opnd = PPC_R12;
+	if (p == o2Start + 1) {
+		const u32 w = *o2Start;
+		const bool isMr = (w & 0xFC0007FFu) == ((31u << 26) | (444u << 1)) &&
+		                  ((w >> 16) & 31) == PPC_R12 && ((w >> 21) & 31) == ((w >> 11) & 31);
+		const bool isLi = (w >> 26) == 14 && ((w >> 16) & 31) == 0 && ((w >> 21) & 31) == PPC_R12;
+		if (isMr) {
+			opnd = (u8)((w >> 21) & 31);
+			p = o2Start;
+		} else if (isLi && !S && (aluOp == 2 || aluOp == 4) && hRn != 0) {
+			const s32 k = (s32)(s16)(w & 0xFFFF);
+			if (aluOp == 4 || k != -32768) {
+				p = o2Start;
+				*p++ = PPC_ADDI(hRd, hRn, aluOp == 4 ? k : -k);
+				if (skip) ctx.patchCondSkip(skip);
+				return;
+			}
+		}
+	}
+	emitAlu(ctx, aluOp, S, testOnly, isLogical, hRn, hRd, o2, opnd);
+
+	if (skip) ctx.patchCondSkip(skip);
 }
 
 // The shared load/store tail: EA is already in PPC_R11, the writeback value (if
@@ -889,9 +909,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// it wholesale on the false path.
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.emitEvalCond(cond);                          // r11 = cond ? 1 : 0
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		guard = p++;                                     // BEQ over the access
+		guard = ctx.emitCondSkip(cond);
 	}
 
 	// offset -> PPC_R12 (register form); the immediate form folds into ADDI
@@ -917,7 +935,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	                  /*wordRotate=*/(L && size == 4), writeback, rn, rd, lockedMask,
 	                  predicated);
 
-	if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
+	if (guard) ctx.patchCondSkip(guard);
 }
 
 // ------------------------------------------------ extra load/store (B3b)
@@ -963,9 +981,7 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.emitEvalCond(cond);
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		guard = p++;
+		guard = ctx.emitCondSkip(cond);
 	}
 
 	// EA -> R11, WB -> R10 (register offset is unshifted: EA = U ? Rn+Rm : Rn-Rm)
@@ -984,7 +1000,7 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	emitLoadStoreTail(ctx, hVal, size, L, signExt, /*wordRotate=*/false, writeback, rn, rd,
 	                  lockedMask, predicated);
 
-	if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
+	if (guard) ctx.patchCondSkip(guard);
 }
 
 // LDM{...,pc} exit: the raw popped pc is stashed at 100(r1), the base
@@ -1093,9 +1109,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// the same state and nothing needs flushing.
 	u32* guard = nullptr;
 	if (predicated) {
-		ctx.emitEvalCond(cond);
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		guard = p++;
+		guard = ctx.emitCondSkip(cond);
 	}
 
 	// LDM{...,pc} (never predicated here) takes it too: the pc word lands in
@@ -1119,7 +1133,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 			emitLdmPcExit(ctx, op);
 			return;
 		}
-		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
+		if (guard) ctx.patchCondSkip(guard);
 		return;
 	}
 
@@ -1142,7 +1156,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 			const u8 hRnW = ctx.writeReg(rn, /*fullOverwrite=*/true, lockedMask);
 			*p++ = PPC_LWZ(hRnW, 1, 104);
 		}
-		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
+		if (guard) ctx.patchCondSkip(guard);
 		return;
 	}
 
@@ -1174,7 +1188,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (!pcInList) {
 		ctx.emitMemEpilogue();
 		if (W) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);   // base writeback (pinned)
-		if (guard) *guard = PPC_BEQ((u32)((p - guard) * 4));
+		if (guard) ctx.patchCondSkip(guard);
 		return;                                 // not a terminator: block continues
 	}
 
@@ -1332,9 +1346,7 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 	u32* guard = nullptr;
 	if (predicated) {
 		(ctx.cpu.isaLevel >= 5 ? g_jitPredBcc9 : g_jitPredBcc7)++;
-		ctx.emitEvalCond(cond);                              // r11 = cond ? 1 : 0 (r12 target survives)
-		*p++ = PPC_CMPWI(0, PPC_R11, 0);
-		guard = p++;                                         // BEQ over the taken exit
+		guard = ctx.emitCondSkip(cond);
 	}
 
 	const u32 term = ctx.cpu.cyclesForArm(op);
@@ -1357,7 +1369,7 @@ void emitBranchExchange(JitTraceCtx& ctx, u32 op, bool isBlx, u8 cond)
 	ctx.emitDynamicExit(PPC_R12, ctx.instrCount + 1, term, /*targetThumb=*/false);
 
 	if (predicated) {
-		*guard = PPC_BEQ((u32)((p - guard) * 4));            // cond-false: keep compiling
+		ctx.patchCondSkip(guard);            // cond-false: keep compiling
 		return;
 	}
 

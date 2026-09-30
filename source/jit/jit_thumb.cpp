@@ -785,7 +785,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		if (ctx.endBlock) break;
 
 		if (!composite) {
-			*emitPtr++ = PPC_CMPWI(0, flagReg, 0);
+			// the readFlag rlwinm just emitted becomes record-form (rlwinm.):
+			// cr0.eq <=> flag clear, no separate cmpwi
+			(void)flagReg;
+			emitPtr[-1] |= 1;
 			guard = emitPtr++;
 		} else {
 			if (cond == 0x8 || cond == 0x9) {

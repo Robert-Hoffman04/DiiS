@@ -1330,6 +1330,24 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 	*cont = PPC_BEQ((u32)((p - cont) * 4));
 }
 
+u32* JitTraceCtx::emitCondSkip(u8 cond)
+{
+	if (cond < 8) {
+		static const u8 kFlag[4] = { JITF_Z, JITF_C, JITF_N, JITF_V };
+		const u8 f = kFlag[cond >> 1];
+		ensureFlagsLoaded();
+		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_REG_FLAGS, 0, f, f) | 1;  // rlwinm.: eq <=> flag clear
+		u32* slot = emitPtr;
+		*emitPtr++ = (cond & 1) ? PPC_BNE(0) : PPC_BEQ(0);   // EQ/CS/MI/VS need the flag set
+		return slot;
+	}
+	emitEvalCond(cond);
+	*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
+	u32* slot = emitPtr;
+	*emitPtr++ = PPC_BEQ(0);
+	return slot;
+}
+
 // ARM predication: 0/1 "condition holds" -> PPC_R11. cond is 0..13. Clobbers
 // r10, r11. Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
 void JitTraceCtx::emitEvalCond(u8 cond)
