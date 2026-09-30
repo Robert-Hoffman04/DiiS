@@ -4,6 +4,7 @@
 #include "../gfx3d.h"
 #include "../MMU.h"
 #include "../texcache.h"
+#include "../NDSSystem.h"   // CommonSettings (gxDs3dClipFast)
 #include <stdio.h>
 #include <gccore.h>
 #include <malloc.h>
@@ -136,9 +137,9 @@ static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, f
 			if (fabsf(gxDs3dM(P, 3, c)) > fabsf(gxDs3dM(P, 3, k))) k = c;
 		const float alpha = gxDs3dM(P, 2, k) / gxDs3dM(P, 3, k);
 		float scale = 0;
-		for (int c = 0; c < 3; ++c) scale = fmaxf(scale, fabsf(gxDs3dM(P, 2, c)));
+		for (int c = 0; c < 3; ++c) { const float a = fabsf(gxDs3dM(P, 2, c)); scale = a > scale ? a : scale; }   // fmaxf without the libm call (a NaN is ignored by both)
 		for (int c = 0; c < 3; ++c)
-			if (fabsf(gxDs3dM(P, 2, c) - alpha * gxDs3dM(P, 3, c)) > eps * fmaxf(1.0f, scale))
+			if (fabsf(gxDs3dM(P, 2, c) - alpha * gxDs3dM(P, 3, c)) > eps * (scale > 1.0f ? scale : 1.0f))
 				return false;
 		const float beta = gxDs3dM(P, 2, 3) - alpha * gxDs3dM(P, 3, 3);
 		for (int c = 0; c < 4; ++c) {
@@ -454,9 +455,10 @@ static GFX3D_Clipper::TClippedPoly s_clipOut;
 
 static inline bool gxDs3dVertOutside(const VERT &v)
 {
+	// x < -w || x > w  ==  fabsf(x) > w for every input, w < 0 / NaN / inf included (one compare
+	// and one branch per axis instead of two).
 	const float w = v.coord[3];
-	return v.coord[0] < -w || v.coord[0] > w || v.coord[1] < -w || v.coord[1] > w ||
-	       v.coord[2] < -w || v.coord[2] > w;
+	return fabsf(v.coord[0]) > w || fabsf(v.coord[1]) > w || fabsf(v.coord[2]) > w;
 }
 
 // Task recordcost: the clipper's result for a polygon it clips away entirely, without
@@ -480,6 +482,97 @@ static inline bool gxDs3dClipTrivialReject(const VERT *const *v, int n)
 	return false;
 }
 
+// GFX3D_Clipper::clipPoly() for GxFast, same output vertices in the same order, bit for bit,
+// when CommonSettings.GFX3D_HighResolutionInterpolateColor is on (the default; gxDs3dPolyVerts
+// falls back to the real clipper otherwise). Sutherland-Hodgman against x<-w, x>w, y<-w, y>w,
+// z<-w, z>w in that order, each plane emitting for the segments (v0,v1), (v1,v2) .. (vn-1,v0):
+// both in -> v1; leaving -> clipPoint(v0, v1); entering -> clipPoint(v1, v0) then v1
+// (gfx3d.cpp ClipperPlane). What it saves over the real one (Task recordcost, ~half of g3rec):
+// the in/out tests once per vertex instead of twice, no 52-byte VERT copies between the six
+// stages (they pass pointers; only interpolated vertices are built), and a plane none of the
+// vertices is outside of costs a rotation of the pointer list (the real stage re-emits every
+// vertex, starting from v1, i.e. rotated left by one) instead of a full pass.
+struct GxDs3dClipV { float c[4], t[2], f[3]; const VERT *src; };   // clip coords, texcoord, fcolor; src: the vertex-list entry, NULL if interpolated
+static const int kClipCap = 24;   // a convex polygon of <= 4 vertices never exceeds MAX_CLIPPED_VERTS (10)
+
+template<int coord, int which>
+static inline int gxDs3dClipStage(const GxDs3dClipV *const *in, int n, const GxDs3dClipV **out, GxDs3dClipV *pool, int &np)
+{
+	bool o[kClipCap];
+	bool any = false;
+	for (int i = 0; i < n; ++i) {
+		o[i] = which == -1 ? in[i]->c[coord] < -in[i]->c[3] : in[i]->c[coord] > in[i]->c[3];
+		any |= o[i];
+	}
+	if (!any) {   // pass-through, rotated left by one (see above)
+		for (int i = 0; i + 1 < n; ++i) out[i] = in[i + 1];
+		if (n) out[n - 1] = in[0];
+		return n;
+	}
+	int m = 0;
+	for (int k = 1; k <= n; ++k) {
+		const int i0 = k - 1, i1 = k == n ? 0 : k;
+		if (o[i0] && o[i1]) continue;
+		if (!o[i0] && !o[i1]) { if (m < kClipCap) out[m++] = in[i1]; continue; }
+		// clipPoint(inside, outside): the interpolated vertex on the plane
+		const GxDs3dClipV *ins = o[i0] ? in[i1] : in[i0], *outs = o[i0] ? in[i0] : in[i1];
+		if (np >= kClipCap * 2 || m + 2 > kClipCap) continue;   // unreachable for a polygon of <= 4 vertices
+		float wi = ins->c[3], wo = outs->c[3];
+		if (which == -1) { wo = -wo; wi = -wi; }
+		const float ci = ins->c[coord], co = outs->c[coord];
+		const float t = (ci - wi) / ((wo - wi) - (co - ci));
+		GxDs3dClipV &r = pool[np++];
+		for (int j = 0; j < 4; ++j) r.c[j] = ins->c[j] + (float)(outs->c[j] - ins->c[j]) * t;
+		r.t[0] = ins->t[0] + (float)(outs->t[0] - ins->t[0]) * t;
+		r.t[1] = ins->t[1] + (float)(outs->t[1] - ins->t[1]) * t;
+		for (int j = 0; j < 3; ++j) r.f[j] = ins->f[j] + (float)(outs->f[j] - ins->f[j]) * t;
+		r.c[coord] = which == -1 ? -r.c[3] : r.c[3];   // keep the point on the plane
+		r.src = NULL;
+		if (o[i0]) { out[m++] = &r; out[m++] = in[i1]; }   // entering: the point, then v1
+		else out[m++] = &r;                                // leaving
+	}
+	return m;
+}
+
+// in: the polygon's own vertices (n <= 4, from the vertex list). Fills s_clipOut.clipVerts;
+// returns the clipped vertex count, 0 if it has fewer than 3.
+static int gxDs3dClipFast(const VERT *const *in, int n)
+{
+	GxDs3dClipV base[4], pool[kClipCap * 2];
+	const GxDs3dClipV *a[kClipCap], *b[kClipCap];
+	int np = 0;
+	for (int j = 0; j < n; ++j) {
+		const VERT &v = *in[j];
+		GxDs3dClipV &d = base[j];
+		d.c[0] = v.coord[0]; d.c[1] = v.coord[1]; d.c[2] = v.coord[2]; d.c[3] = v.coord[3];
+		d.t[0] = v.texcoord[0]; d.t[1] = v.texcoord[1];
+		d.f[0] = v.color[0]; d.f[1] = v.color[1]; d.f[2] = v.color[2];   // color_to_float()
+		d.src = &v;
+		a[j] = &d;
+	}
+	int m = n;
+	m = gxDs3dClipStage<0, -1>(a, m, b, pool, np);
+	m = gxDs3dClipStage<0,  1>(b, m, a, pool, np);
+	m = gxDs3dClipStage<1, -1>(a, m, b, pool, np);
+	m = gxDs3dClipStage<1,  1>(b, m, a, pool, np);
+	m = gxDs3dClipStage<2, -1>(a, m, b, pool, np);
+	m = gxDs3dClipStage<2,  1>(b, m, a, pool, np);
+	if (m < 3) return 0;
+	if (m > MAX_CLIPPED_VERTS) m = MAX_CLIPPED_VERTS;
+	for (int j = 0; j < m; ++j) {
+		const GxDs3dClipV &s = *a[j];
+		VERT &d = s_clipOut.clipVerts[j];
+		if (s.src) { d = *s.src; d.color_to_float(); }
+		else {
+			d.coord[0] = s.c[0]; d.coord[1] = s.c[1]; d.coord[2] = s.c[2]; d.coord[3] = s.c[3];
+			d.texcoord[0] = s.t[0]; d.texcoord[1] = s.t[1];
+			d.fcolor[0] = s.f[0]; d.fcolor[1] = s.f[1]; d.fcolor[2] = s.f[2];   // color: the real clipper leaves it unset too
+		}
+	}
+	s_clipOut.type = m;
+	return m;
+}
+
 // The polygon as rasterize.cpp draws it, in clip space, as pointers into out[MAX_CLIPPED_VERTS]:
 // its own vertices, read in place from the vertex list, when none is outside, else the
 // clipper's N-gon (s_clipOut, valid until the next call). Returns the vertex count (< 3:
@@ -496,6 +589,13 @@ static int gxDs3dPolyVerts(POLY &p, const VERT **out, bool &clipped)
 	if (!clipped) return n;
 #ifndef DSA_GXGEOM_NOTRIVREJECT
 	if (gxDs3dClipTrivialReject(out, n)) return 0;
+#endif
+#ifndef DSA_GXGEOM_MUTATE_CLIPUV
+	if (CommonSettings.GFX3D_HighResolutionInterpolateColor) {
+		const int m = gxDs3dClipFast(out, n);
+		for (int j = 0; j < m; ++j) out[j] = &s_clipOut.clipVerts[j];
+		return m;
+	}
 #endif
 	VERT in[4];
 	VERT *pin[4];
@@ -543,7 +643,7 @@ static inline void gxDs3dScreenXY(const VERT &v, const VIEWPORT &vp, float &x, f
 // fcolor (0-63, fractional at clipper-made vertices) to 8 bits, = gxDs3d6To8Tex on integers.
 static inline u8 gxDs3dF6To8(float f)
 {
-	f = fmaxf(0.0f, fminf(63.0f, f));
+	f = gxDs3dClampF(f, 63.0f);   // = fmaxf(0, fminf(63, f)) without the two libm calls per component (see gxDs3dClampF)
 	const int lo = (int)f;
 	const float a = gxDs3d6To8Tex((u8)lo), b = gxDs3d6To8Tex((u8)(lo < 63 ? lo + 1 : 63));
 	return (u8)(a + (f - (float)lo) * (b - a) + 0.5f);
@@ -595,6 +695,42 @@ static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *const *cv, int n, G
 		sh.y0 = sh.y[j] < sh.y0 ? sh.y[j] : sh.y0; sh.y1 = sh.y[j] > sh.y1 ? sh.y[j] : sh.y1;
 	}
 	return true;
+}
+
+// GxFast's per-polygon "is any face of it drawn" test, same answer as gxDs3dTransShapeBuild()'s
+// return value but without its outline (which gxDs3dFastPoly needs only for the shadow boxes).
+// TransShapeBuild does four float divides per vertex ((x+w)/(2w), (y+w)/(2w), each once per
+// axis) and the divide is unpipelined (~17 cycles on Broadway). Here the facing sign is taken
+// from one divide per vertex (r = 0.5/w, then multiplies): those coordinates differ from the
+// exact ones by a few 1e-5 px (all within [0,256] x [0,192]), so facing moves by < 1 px^2
+// (2 x area, four terms at most), and when |facing| > 4 its sign is certain and equal to the
+// exact one; anything closer to zero (and any NaN/inf/w <= 0) falls back to the exact build.
+static bool gxDs3dFacingVisible(const POLY &p, const VERT *const *cv, int n)
+{
+	if (n < 3) return false;
+	const int cull = gxDs3dShadowDraw(p) ? 2 : (p.polyAttr >> 6) & 3;
+	if (cull == 0) return false;
+	if (cull == 3) return true;   // both faces: TransShapeBuild's facing test can't reject
+	VIEWPORT vp;
+	vp.decode(p.viewport);
+	const float vw = (float)vp.width, vh = (float)vp.height, vx = (float)vp.x, vy = (float)vp.y;
+	float fx[MAX_CLIPPED_VERTS], fy[MAX_CLIPPED_VERTS];
+	bool ok = true;
+	for (int j = 0; j < n; ++j) {
+		const float w = cv[j]->coord[3];
+		ok &= w > 0.0f;
+		const float r = 0.5f / w;
+		fx[j] = gxDs3dClampF((cv[j]->coord[0] + w) * r * vw + vx, 256.0f);
+		fy[j] = gxDs3dClampF(192.0f - ((cv[j]->coord[1] + w) * r * vh + vy), 192.0f);
+	}
+	float facing = (fy[0] + fy[n - 1]) * (fx[0] - fx[n - 1]);
+	for (int j = 0; j < n - 1; ++j) facing += (fy[j + 1] + fy[j]) * (fx[j + 1] - fx[j]);
+	if (ok && (facing > 4.0f || facing < -4.0f)) {
+		const bool back = facing < 0;
+		return !((cull == 1 && !back) || (cull == 2 && back));
+	}
+	GxDs3dTransShape sh;
+	return gxDs3dTransShapeBuild(p, cv, n, sh);
 }
 
 // Separating-axis test on two convex outlines: true if some edge normal of either separates
@@ -1415,6 +1551,10 @@ static float s_wK = 1.0f;
 
 static void gxDs3dWSetup()
 {
+	// s_wK is read only by W-buffer frames (gxDs3dFastXformBuild's wbuf branches, gxDs3dClearDepth's
+	// wbuffer branch), so the pass over every polygon (with a full clip for each one the near plane
+	// cuts) is skipped otherwise.
+	if (!gfx3d.wbuffer) return;
 	float k = 0;
 	bool any = false;
 	const int polycount = gfx3d.polylist->count;
@@ -2028,16 +2168,21 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
 	// outline; false also when clipped away. Already known for a polygon the plan cached.
 	if (!slot) {
-		GxDs3dTransShape shape;
 		GXDS3D_TP_BEGIN(tps);
-		const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, shape);
-		GXDS3D_TP_END(kTpDShape, tps);
 		if (s_shRec && !c.shIdPass) {
+			GxDs3dTransShape shape;
+			const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, shape);
+			GXDS3D_TP_END(kTpDShape, tps);
 			const int i = (int)(&p - gfx3d.polylist->list);
 			s_shBoxState[i] = shOk ? kShBoxDraws : kShBoxNone;
 			if (shOk) { s_shPolyBox[i][0] = shape.x0; s_shPolyBox[i][1] = shape.y0; s_shPolyBox[i][2] = shape.x1; s_shPolyBox[i][3] = shape.y1; }
+			if (!shOk) return;
+		} else {
+			// Only the verdict is used (the outline matters for the shadow boxes alone).
+			const bool shOk = gxDs3dFacingVisible(p, cv, nv);
+			GXDS3D_TP_END(kTpDShape, tps);
+			if (!shOk) return;
 		}
-		if (!shOk) return;
 	}
 	GXDS3D_TP_BEGIN(tpsu);
 	const bool tagWrite = tag < 0;

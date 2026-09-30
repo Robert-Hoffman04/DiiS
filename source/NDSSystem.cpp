@@ -1244,6 +1244,15 @@ struct Sequencer
 {
 	bool nds_vblankEnded;
 	bool reschedule;
+	// Scan cache for everything except dispcnt (which is always enabled and fires every ~1000
+	// cycles): othersNext is the earliest trigger time among the divider, sqrt, gxfifo, DMA and
+	// timer items as of the last findNext(). It stays a valid lower bound until something that
+	// creates or moves an item's event earlier runs, and every such path goes through
+	// NDS_RescheduleEvents() / NDS_RescheduleGXFIFO/Timers/DMA(), which set eventsDirty. Most
+	// NDS_Reschedule() requests (IRQ flag/mask writes, CPSR writes, setIF) don't touch events
+	// and used to cost two full 20-item scans each.
+	bool eventsDirty;
+	u64 othersNext;
 	TSequenceItem dispcnt;
 	TSequenceItem wifi;
 	TSequenceItem_divider divider;
@@ -1303,8 +1312,15 @@ struct Sequencer
 
 } sequencer;
 
+void NDS_RescheduleEvents()
+{
+	sequencer.eventsDirty = true;
+	NDS_Reschedule();
+}
+
 void NDS_RescheduleGXFIFO(u32 cost)
 {
+	sequencer.eventsDirty = true;
 	if(!sequencer.gxfifo.enabled) {
 		MMU.gfx3dCycles = nds_timer;
 		sequencer.gxfifo.enabled = true;
@@ -1315,6 +1331,7 @@ void NDS_RescheduleGXFIFO(u32 cost)
 
 void NDS_RescheduleTimers()
 {
+	sequencer.eventsDirty = true;
 #define check(X,Y) sequencer.timer_##X##_##Y .schedule();
 	check(0,0); check(0,1); check(0,2); check(0,3);
 	check(1,0); check(1,1); check(1,2); check(1,3);
@@ -1325,6 +1342,7 @@ void NDS_RescheduleTimers()
 
 void NDS_RescheduleDMA()
 {
+	sequencer.eventsDirty = true;
 	//TBD
 	NDS_Reschedule();
 
@@ -1358,6 +1376,7 @@ void Sequencer::init()
 	NDS_RescheduleDMA();
 
 	reschedule = false;
+	eventsDirty = true;
 	nds_timer = 0;
 	nds_arm9_timer = 0;
 	nds_arm7_timer = 0;
@@ -1681,24 +1700,29 @@ u64 Sequencer::findNext()
 	//this one is always enabled so dont bother to check it
 	u64 next = dispcnt.next();
 
-	if(divider.isEnabled()) next = _fast_min(next,divider.next());
-	if(sqrtunit.isEnabled()) next = _fast_min(next,sqrtunit.next());
-	if(gxfifo.enabled) next = _fast_min(next,gxfifo.next());
+	if(!eventsDirty) return _fast_min(next,othersNext);
+	eventsDirty = false;
+
+	u64 n = kNever;
+	if(divider.isEnabled()) n = _fast_min(n,divider.next());
+	if(sqrtunit.isEnabled()) n = _fast_min(n,sqrtunit.next());
+	if(gxfifo.enabled) n = _fast_min(n,gxfifo.next());
 
 #ifdef EXPERIMENTAL_WIFI_COMM
-	next = _fast_min(next,wifi.next());
+	n = _fast_min(n,wifi.next());
 #endif
 
-#define test(X,Y) if(dma_##X##_##Y .isEnabled()) next = _fast_min(next,dma_##X##_##Y .next());
+#define test(X,Y) if(dma_##X##_##Y .isEnabled()) n = _fast_min(n,dma_##X##_##Y .next());
 	test(0,0); test(0,1); test(0,2); test(0,3);
 	test(1,0); test(1,1); test(1,2); test(1,3);
 #undef test
-#define test(X,Y) if(timer_##X##_##Y .enabled) next = _fast_min(next,timer_##X##_##Y .next());
+#define test(X,Y) if(timer_##X##_##Y .enabled) n = _fast_min(n,timer_##X##_##Y .next());
 	test(0,0); test(0,1); test(0,2); test(0,3);
 	test(1,0); test(1,1); test(1,2); test(1,3);
 #undef test
 
-	return next;
+	othersNext = n;
+	return _fast_min(next,n);
 }
 
 void Sequencer::execHardware()
@@ -1722,6 +1746,10 @@ void Sequencer::execHardware()
 			break;
 		}
 	}
+
+	// Nothing but dispcnt can be due, and nothing has changed since findNext() (see othersNext).
+	if(!eventsDirty && nds_timer < othersNext) return;
+	eventsDirty = true;   // an item's exec() moves its own (or another item's) event: rescan in findNext()
 
 #ifdef EXPERIMENTAL_WIFI_COMM
 	if(wifi.isTriggered())
@@ -2180,6 +2208,7 @@ void NDS_exec(s32 nb)
 	}
 	else
 	{
+		sequencer.eventsDirty = true;   // savestate load / reset since the last frame
 		for(;;)
 		{
 			//--DCN: START

@@ -1187,7 +1187,7 @@ static void execsqrt() {
 	MMU.sqrtResult = ret;
 	MMU.sqrtCnt = (cnt & 0x7FFF);
 	MMU.sqrtRunning = TRUE;
-	NDS_Reschedule();
+	NDS_RescheduleEvents();   // a new sequencer event (NDSSystem.cpp Sequencer::othersNext)
 }
 
 static void execdiv() {
@@ -1244,7 +1244,7 @@ static void execdiv() {
 	MMU.divMod = mod;
 	MMU.divCnt = (cnt & 0x7FFF);
 	MMU.divRunning = TRUE;
-	NDS_Reschedule();
+	NDS_RescheduleEvents();
 }
 
 // TODO: 

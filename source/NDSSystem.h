@@ -144,6 +144,7 @@ void emu_halt();
 
 extern u64 nds_timer;
 void NDS_Reschedule();
+void NDS_RescheduleEvents();   // NDS_Reschedule() + a sequencer item (div/sqrt/gxfifo/DMA/timer) event was created or moved
 bool NDS_ReschedulePending();
 // Address of the sequencer's reschedule flag, for JIT-emitted code that must
 // request a reschedule exactly like NDS_Reschedule() (a plain byte store of 1).
