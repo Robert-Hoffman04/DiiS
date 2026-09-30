@@ -2103,6 +2103,36 @@ struct YSortCompare {
 	FORCEINLINE bool operator()(int num1, int num2) const { return gfx3d_ysort_compare(list, num1, num2); }
 };
 
+// Task gesort: the same std::sort over the same sequence, on compact (maxy, miny, index) keys
+// instead of indices into the 44-byte POLY array. gfx3d_ysort_compare() reads exactly these
+// three values of its two polys (num == the index), and YSortKeyCompare applies the same tests in
+// the same order to the same floats, so it returns the same bool for every pair; std::sort's
+// moves depend only on those results, so the permutation is identical (ties and NaNs included).
+struct YSortKey { float maxy, miny; int idx; };
+struct YSortKeyCompare {
+	FORCEINLINE bool operator()(const YSortKey &a, const YSortKey &b) const {
+		if (a.maxy < b.maxy) return true;
+		if (a.maxy > b.maxy) return false;
+		if (a.miny > b.miny) return true;
+		if (a.miny < b.miny) return false;
+		return a.idx < b.idx;
+	}
+};
+static YSortKey *s_ysortKeys;
+static int s_ysortKeyCap;
+static void gfx3d_ysortRange(int *idx, int n, const POLY *list){
+	if (n < 2) return;
+	if (n > s_ysortKeyCap) {
+		YSortKey *k = (YSortKey *)realloc(s_ysortKeys, (size_t)n * sizeof(YSortKey));
+		if (!k) { std::sort(idx, idx + n, YSortCompare(list)); return; }
+		s_ysortKeys = k; s_ysortKeyCap = n;
+	}
+	YSortKey *keys = s_ysortKeys;
+	for (int i = 0; i < n; i++) { const POLY &p = list[idx[i]]; keys[i].maxy = p.maxy; keys[i].miny = p.miny; keys[i].idx = idx[i]; }
+	std::sort(keys, keys + n, YSortKeyCompare());
+	for (int i = 0; i < n; i++) idx[i] = keys[i].idx;
+}
+
 static void gfx3d_doFlush(){
 	// The lists/state below are the deferred raster's inputs: resolve it first (see gfx3d_VBlankEndSignal).
 	gfx3d_resolveDeferredRender(s_flushFromVBlank);
@@ -2178,13 +2208,13 @@ static void gfx3d_doFlush(){
 	//now we have to sort the opaque polys by y-value.
 	//(test case: harvest moon island of happiness character cretor UI)
 	//should this be done after clipping??
-	std::sort(idxlist, idxlist + opaqueCount, YSortCompare(plist));
+	gfx3d_ysortRange(idxlist, opaqueCount, plist);
 	
 	if(!gfx3d.sortmode)
 	{
 		//if we are autosorting translucent polys, we need to do this also
 		//TODO - this is unverified behavior. need a test case
-		std::sort(idxlist + opaqueCount, idxlist + polycount, YSortCompare(plist));
+		gfx3d_ysortRange(idxlist + opaqueCount, polycount - opaqueCount, plist);
 	}
 
 	//switch to the new lists
