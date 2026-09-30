@@ -423,11 +423,24 @@ CACHE_ALIGN const u8 material_3bit_to_6bit[] = {
 };
 
 //private acceleration tables
-static float float16table[65536];
 static float float10Table[1024];
 static float float10RelTable[1024];
 static float normalTable[1024];
 
+// Task gevtx2: the s16 (20.12 fixed point) coordinate -> float conversion the 256KB float16table
+// held. (float)(s16)v / 4096 is exact (a 16 bit integer times 2^-12), so this gives the table's bits.
+// GE_S16Q12_GQR: quantised-load register 7 = s16 type, scale 12 (LD_SCALE = 12 << 8, LD_TYPE = 7,
+// both in the load half), so psq_l dequantises a big-endian s16 in memory in one instruction;
+// set by ge_setGqr() (start of every gfx3d_execute3D()).
+static FORCEINLINE float ge_f16(u16 v){ return (float)(s16)v * (1.0f/4096.0f); }
+#if defined(__PPC__) && defined(ENABLE_PAIRED_SINGLE)
+#define GE_S16Q12_GQR 0x0C070000u
+static FORCEINLINE void ge_setGqr(){ __asm__ volatile("mtspr 919,%0" : : "r"(GE_S16Q12_GQR)); }
+static FORCEINLINE float ge_f16m(const u16 *p){ float r; __asm__("psq_l %0,0(%1),1,7" : "=f"(r) : "b"(p), "m"(*p)); return r; }
+#else
+static FORCEINLINE void ge_setGqr(){}
+static FORCEINLINE float ge_f16m(const u16 *p){ return ge_f16(*p); }
+#endif
 #define fix2float(v)    (((float)((s32)(v))) / (float)(1<<12))
 #define fix10_2float(v) (((float)((s32)(v))) / (float)(1<<9))
 
@@ -589,9 +602,6 @@ static void makeTables() {
 		color_15bit_to_16bit_reverse[i] = (((i & 0x001F) << 11) | (material_5bit_to_6bit[(i & 0x03E0) >> 5] << 5) | ((i & 0x7C00) >> 10));
 	}
 	
-	for (int i = 0; i < 65536; i++)
-		float16table[i] = fix2float((signed short)i);
-	
 	for (int i = 0; i < 1024; i++)
 		float10Table[i] = ((signed short)(i<<6)) / (float)(1<<12);
 	
@@ -719,9 +729,9 @@ static void SetVertex(){
 	int polygonListCompleted;
 
 	float coord[3] = {
-		float16table[u16coord[0]],
-		float16table[u16coord[1]],
-		float16table[u16coord[2]]
+		ge_f16m(&u16coord[0]),
+		ge_f16m(&u16coord[1]),
+		ge_f16m(&u16coord[2])
 	};
 
 	DS_ALIGN(16) float coordTransformed[4] = { coord[0], coord[1], coord[2], 1.f };
@@ -1620,12 +1630,12 @@ static GE_NOINLINE void gfx3d_glBoxTest(u32 v){
 	u16 ud = BTcoords[5];
 
 	//craft the coords by adding extents to startpoint
-	float x = float16table[ux];
-	float y = float16table[uy];
-	float z = float16table[uz];
-	float xw = float16table[(ux+uw)&0xFFFF]; //&0xFFFF not necessary for u16+u16 addition but added for emphasis
-	float yh = float16table[(uy+uh)&0xFFFF];
-	float zd = float16table[(uz+ud)&0xFFFF];
+	float x = ge_f16(ux);
+	float y = ge_f16(uy);
+	float z = ge_f16(uz);
+	float xw = ge_f16((ux+uw)&0xFFFF); //&0xFFFF not necessary for u16+u16 addition but added for emphasis
+	float yh = ge_f16((uy+uh)&0xFFFF);
+	float zd = ge_f16((uz+ud)&0xFFFF);
 
 	//eight corners of cube
 	VERT verts[8];
@@ -1716,8 +1726,8 @@ static GE_NOINLINE void gfx3d_glPosTest(u32 v){
 	//printf("POSTEST\n");
 	MMU_new.gxstat.tb = 1;
 
-	PTcoords[PTind++] = float16table[v & 0xFFFF];
-	PTcoords[PTind++] = float16table[v >> 16];
+	PTcoords[PTind++] = ge_f16(v & 0xFFFF);
+	PTcoords[PTind++] = ge_f16(v >> 16);
 
 	if (PTind < 3) return;
 	PTind = 0;
@@ -1974,6 +1984,7 @@ static void gfx3d_execute(u8 cmd, u32 param){
 
 void gfx3d_execute3D(){
 	PZ_SCOPE(PZ_GPU_GE);
+	ge_setGqr();
 	u8	cmd = 0;
 	u32	param = 0;
 
@@ -2007,6 +2018,19 @@ void gfx3d_execute3D(){
 			//(Task gespeed: that GFX_DELAY and the handlers' own ones are folded into
 			//the one NDS_RescheduleGXFIFO() after the loop; see GFX_DELAY.)
 			//printf("%05d:%03d:%12lld: executed 3d: %02X %08X\n",currFrameCounter, nds.VCount, nds_timer , cmd, param);
+			// Task gevtx2: a VTX_16 pair (the two entries of one vertex) straight into SetVertex():
+			// what gfx3d_glVertex16b() does for the two, without the second dispatch. (Both
+			// count toward the batch, and only when the vertex starts a pair: coordind == 0.)
+			if (cmd == 0x23 && i > 1 && coordind == 0 && gxFIFO.cmd[head] == 0x23) {
+				const u32 param2 = gxFIFO.param[head];
+				if (++head > HACK_GXIFO_SIZE-1) head = 0;
+				u16coord[0] = (u16)param;
+				u16coord[1] = (u16)(param >> 16);
+				u16coord[2] = (u16)param2;
+				SetVertex();
+				i--;
+				continue;
+			}
 			gfx3d_execute(cmd, param);
 		} while (--i);
 		gxFIFO.head = head;
