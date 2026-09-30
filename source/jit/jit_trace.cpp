@@ -744,6 +744,52 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
 	return nFast;
 }
 
+// Main-RAM-first variant of emitArm9RegionGuard() for single accesses
+// (spanBytes 0) with an onHit callback, used when the DTCM window lies outside
+// main RAM (then the two regions are disjoint and the order is free). Returns
+// false (nothing emitted) when that does not hold.
+static bool emitArm9RegionGuardMainFirst(JitTraceCtx& c, u8 alignMe, bool withItcm,
+                                         void (*onHit)(JitTraceCtx&, void*, int), void* arg)
+{
+	const u32 dtcmRegion = *(const volatile u32*)(uintptr_t)c.cpu.arm9DtcmRegionPtr;
+	const bool dtcmReach = (dtcmRegion & 0x3FFFu) == 0;
+	if (dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u) return false;
+	u32*& p = c.emitPtr;
+	const u32 mainMb = (u32)__builtin_clz(c.cpu.arm9MainMask);
+
+	*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);               // main: (EA >> 24) & 0xF == 2
+	*p++ = PPC_CMPWI(0, PPC_R10, 2);
+	u32* notMain = p++;
+	*p++ = PPC_LIS(PPC_R10, c.cpu.mainMemBase >> 16);
+	if (c.cpu.mainMemBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.mainMemBase & 0xFFFF);
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);
+	onHit(c, arg, 1);
+	*notMain = PPC_BNE((u32)((p - notMain) * 4));
+
+	u32* slow[2]; int nSlow = 0;
+	if (dtcmReach) {                                               // DTCM: (EA >> 14) == tag
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 14);
+		*p++ = PPC_CMPWI(0, PPC_R10, (s32)(dtcmRegion >> 14));
+		u32* notDtcm = p++;
+		*p++ = PPC_LIS(PPC_R10, c.cpu.arm9DtcmBase >> 16);
+		if (c.cpu.arm9DtcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.arm9DtcmBase & 0xFFFF);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, alignMe);
+		onHit(c, arg, 0);
+		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
+	}
+	if (withItcm) {                                                // ITCM: EA < 0x02000000 (after DTCM)
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);
+		*p++ = PPC_CMPWI(0, PPC_R10, 0);
+		slow[nSlow++] = p++;
+		*p++ = PPC_LIS(PPC_R10, c.cpu.arm9ItcmBase >> 16);
+		if (c.cpu.arm9ItcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.arm9ItcmBase & 0xFFFF);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, alignMe);
+		onHit(c, arg, 2);
+	}
+	for (int i = 0; i < nSlow; i++) *slow[i] = PPC_BNE((u32)((p - slow[i]) * 4));
+	return true;
+}
+
 // P16: full ARM9 single load. See jit_trace.h. EA in PPC_R12.
 //
 // Layout: each region hit loads straight into rd's pinned host register and
@@ -780,7 +826,10 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 	u32*& p = emitPtr;
 	Arm9LoadHit h = { hostRegFor(rd), size, signExt, wordRotate, {}, 0 };
 	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/true, arm9LoadHit, &h);
+	const bool mainFirst = memMainFirst;
+	memMainFirst = false;
+	if (!mainFirst || !emitArm9RegionGuardMainFirst(*this, alignMe, /*withItcm=*/true, arm9LoadHit, &h))
+		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/true, arm9LoadHit, &h);
 
 	// ---- slow: slowRead C call (EA still in r12) ----
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // EA survives the call here
@@ -1016,13 +1065,17 @@ void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal)
 {
 	u32*& p = emitPtr;
 	if (cpu.journalNote) {                                         // differential build
+		memMainFirst = false;
 		*p++ = PPC_STW(hVal, 1, 100);
 		emitArm9StoreJournaled(size, writeback, rn);
 		return;
 	}
 	Arm9StoreHit h = { this, size, hVal, {}, 0 };
 	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/false, arm9StoreHit, &h);
+	const bool mainFirst = memMainFirst;
+	memMainFirst = false;
+	if (!mainFirst || !emitArm9RegionGuardMainFirst(*this, alignMe, /*withItcm=*/false, arm9StoreHit, &h))
+		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/false, arm9StoreHit, &h);
 
 	// ---- slow: SMC guard + slowWrite C call (EA in r12, value in hVal) ----
 	emitMemPrologue();
@@ -1641,6 +1694,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		// the arena budget the block may end after this one instead, so compute
 		// every flag there.
 		ctx.deadFlags = 0;
+		ctx.memMainFirst = false;
 		{
 			const u32 idx = (ctx.currentPC - startPC) >> (thumb ? 1 : 2);
 			const s32 reserve = thumb ? JIT_MAX_INSTR_RESERVE_WORDS : JIT_MAX_INSTR_RESERVE_WORDS_ARM;

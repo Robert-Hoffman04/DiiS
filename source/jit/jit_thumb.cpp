@@ -410,6 +410,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// THUMB LDR test, which deliberately misaligns the EA, caught it).
 		const bool wordRotate = isLoad && size == 4;
 
+		ctx.memMainFirst = true;                         // lo-register base: rarely the stack
 		if (isLoad && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase)) {   // P14/P16 inline RAM load
 			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
 			break;

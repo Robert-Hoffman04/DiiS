@@ -371,6 +371,12 @@ struct JitTraceCtx {
 	// not end the block. Clobbers r10, r11, r12.
 	void emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn);
 
+	// Region-test order hint for the next emitArm9Load/emitArm9Store: true when
+	// the base register is not the stack pointer, so main RAM is the likely
+	// hit and is tested before DTCM (only when DTCM does not overlay main RAM,
+	// where DTCM must win). Reset by those two emitters.
+	bool memMainFirst;
+
 	// ARM9 inline block load (LDM / POP / LDMIA, non-pc). Low guest address of
 	// the contiguous word run in PPC_R12; regs the ascending destination list
 	// (0..14), n its length. Region guard covering the whole run -> n sequential
