@@ -1869,7 +1869,6 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 			if (cond != COND_AL || !v5) { ctx.endBlock = true; return; }   // LDRD/STRD: AL, ARMv5E
 			emitDoubleDataTransfer(ctx, op);
 		}
-		else if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }  // predicated: ARM9 only
 		else                             emitExtraDataTransfer(ctx, op, cond);
 		return;
 	}
@@ -1937,14 +1936,12 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 
 	// LDR / STR single data transfer : bits 27..26 == 01
 	if ((op & 0x0C000000u) == 0x04000000u) {
-		if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }   // predicated: ARM9 only
 		emitSingleDataTransfer(ctx, op, cond);
 		return;
 	}
 
 	// LDM / STM block data transfer : bits 27..25 == 100
 	if ((op & 0x0E000000u) == 0x08000000u) {
-		if (cond != COND_AL && !v5) { ctx.endBlock = true; return; }   // predicated: ARM9 only
 		emitBlockDataTransfer(ctx, op, cond);
 		return;
 	}

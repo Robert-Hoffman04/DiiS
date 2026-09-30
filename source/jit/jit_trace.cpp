@@ -1442,7 +1442,7 @@ static bool jitThumbFlagClass(u16 op, u8& rd, u8& wr)
 // and definitely writes none. S-form logical ops write C only when the
 // shifter produces a carry-out for sure (rotated immediate, non-zero
 // immediate shift, RRX); a register shift may leave C, so it is no write.
-static bool jitArmFlagClass(u32 op, bool v5, u8& rd, u8& wr)
+static bool jitArmFlagClass(u32 op, bool /*v5*/, u8& rd, u8& wr)
 {
 	const u8 NZ = (1u << JITF_N) | (1u << JITF_Z), C = 1u << JITF_C, ALL = 0xF;
 	rd = wr = 0;
@@ -1482,7 +1482,6 @@ static bool jitArmFlagClass(u32 op, bool v5, u8& rd, u8& wr)
 	}
 	if ((op & 0x0C000000u) == 0x04000000u) {                      // LDR / STR
 		if (!((op >> 20) & 1)) return true;                       // store (SMC guard can bail)
-		if (!al && !v5) return true;                              // predicated: ARM9 only
 		if (((op >> 12) & 0xF) == 15) return true;                // LDR pc
 		const bool I = (op >> 25) & 1, P = (op >> 24) & 1, W = (op >> 21) & 1;
 		if (!P && W) return true;                                 // LDRT
