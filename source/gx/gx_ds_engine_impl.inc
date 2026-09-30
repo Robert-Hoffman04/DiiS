@@ -38,6 +38,7 @@
 #include <malloc.h>
 #include <string.h>
 #include <stdio.h>
+#include <algorithm>
 #include <stddef.h>
 #if (defined(DSB_STATS) || defined(DSLZ_STATS)) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
 #include "../harness/harness_profile.h"
@@ -2492,6 +2493,44 @@ static bool gxDsBBoxOverlap(const GxDsBObjDraw &a, const GxDsBObjDraw &b)
 	return a.x < b.x + b.boxW && b.x < a.x + a.boxW && a.y < b.y + b.boxH && b.y < a.y + a.boxH;
 }
 
+// Task gxfast-perf: raw palette index of a plain (non-affine) sprite's on-screen pixel
+// (sx, sy): the same flip / 1D-2D mapping / per-row MMU_gpu_map() reads as
+// gxDsBBakeObjTexture. 0 = transparent.
+static int gxDsBObjIndexAt(const GxDsBObjDraw &d, int sx, int sy)
+{
+	GPU *gpu = GXDS_SCREEN.gpu;
+	const bool oneDim = (gpu->spriteRenderMode == GPU::SPRITE_1D);
+	const int rowBytes = d.depth ? 8 : 4;
+	int x = sx - d.x, y = sy - d.y;
+	if (d.hflip) x = d.w - 1 - x;
+	if (d.vflip) y = d.h - 1 - y;
+	const u8 *src;
+	if (oneDim)
+		src = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << gpu->sprBoundary)
+		                              + (u32)(y >> 3) * (u32)d.w * rowBytes + (u32)(y & 7) * rowBytes);
+	else
+		src = (const u8 *)MMU_gpu_map(gpu->sprMem + ((u32)d.tileIndex << 5) + ((u32)(y >> 3) << 10) + (u32)(y & 7) * rowBytes);
+	if (d.depth) return src[(x & 7) + ((x & 0xFFF8) << 3)];
+	const int x1 = x >> 1;
+	const u8 b = src[(x1 & 3) + ((x1 & 0xFFFC) << 3)];
+	return (x & 1) ? (b >> 4) : (b & 0xF);
+}
+
+// True if two box-overlapping sprites have an opaque texel on a common on-screen pixel
+// of lines [y0,y1). Affine sprites: assumed true (not modelled).
+static bool gxDsBObjOpaqueOverlap(const GxDsBObjDraw &a, const GxDsBObjDraw &b, int y0, int y1)
+{
+	if (a.affine || b.affine) return true;
+	const int xs = std::max(std::max((int)a.x, (int)b.x), 0);
+	const int xe = std::min(std::min(a.x + a.boxW, b.x + b.boxW), kDsBScreenW);
+	const int ys = std::max(std::max((int)a.y, (int)b.y), y0);
+	const int ye = std::min(std::min(a.y + a.boxH, b.y + b.boxH), y1);
+	for (int y = ys; y < ye; ++y)
+		for (int x = xs; x < xe; ++x)
+			if (gxDsBObjIndexAt(a, x, y) && gxDsBObjIndexAt(b, x, y)) return true;
+	return false;
+}
+
 // Builds and validates one band's plan. Returns false (with DSB_WHY set) when
 // the band needs something GX can't do exactly -> the whole frame bails.
 static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan &p)
@@ -2669,7 +2708,21 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				if (j == i) continue;
 				const GxDsBObjDraw &o = s_objDraws[j];
 				if (o.y >= y1 || o.y + o.boxH <= y0) continue;
-				if (gxDsBBoxOverlap(a, o)) { DSB_WHY("blendobjoverlap"); return false; }
+				// Task gxfast-perf (exact): a sprite drawn AFTER `a` (higher priority, or the same
+				// tier and a lower OAM index) also wins the CPU's sprite-vs-sprite resolution, so
+				// its opaque texels overwrite `a` in both renderers and `a` only shows (and
+				// blends with the layer beneath) where it is transparent -- no mismatch. Only a
+				// sprite drawn BEFORE `a` would be blended with instead of the BG. GxFast only:
+				// in GxAccurate it would put these frames on the +-1 LSB alpha path (SM64DS
+				// cutscene: == Software before, 5150 px 1 step after), which stays a bail there.
+				if (gxRenderModeIsFast() && (o.priority < a.priority || (o.priority == a.priority && o.oamIndex < a.oamIndex))) continue;
+				if (gxDsBBoxOverlap(a, o) && (!gxRenderModeIsFast() || gxDsBObjOpaqueOverlap(a, o, y0, y1))) {
+					DSB_WHY("blendobjoverlap");
+#ifdef DSB_STATS
+					snprintf(s_dsbNote, sizeof(s_dsbNote), "bo a=%d(%d,%d %dx%d s%d p%d) o=%d(%d,%d %dx%d s%d p%d) mode=%d t1=%02x t2=%02x eva=%d evb=%d", a.oamIndex, a.x, a.y, a.boxW, a.boxH, a.semi, a.priority, o.oamIndex, o.x, o.y, o.boxW, o.boxH, o.semi, o.priority, p.mode, p.t1, p.t2, p.eva, p.evb);
+#endif
+					return false;
+				}
 			}
 		}
 	}
