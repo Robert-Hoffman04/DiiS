@@ -72,6 +72,8 @@
 
 #include "jit_ppc_emitter.h"
 #include "../NDSSystem.h"
+#include "../cp15.h"
+#include "../armcpu.h"
 
 // §16 predicated-branch coverage counters (defined in jit_exec.cpp). Declared at
 // file scope so the reference from the anonymous-namespace emitter below resolves
@@ -1857,6 +1859,30 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	if (v5 && cond == COND_AL && (op & 0x0FFF0F10u) == 0x0E070F10u &&
 	    !((op & 0x0Fu) == 0 && ((op >> 5) & 7) == 4))
 		return;
+
+	// MRC p15, 0, Rd, c9, c1, {0,1} -- read the DTCM / ITCM region register (the
+	// libnds IRQ dispatcher does this on every IRQ). armcp15_moveCP2ARM() returns
+	// the stored register (0 in USR mode, where it refuses); every write to it
+	// (MCR c9,c1 -- cp15.cpp) flushes jitCacheArm9, so the value is baked at
+	// compile time. OP_MRC costs 4 (arm9_cyclesForArm).
+	if (v5 && cond == COND_AL && (op & 0x0FFF0FDFu) == 0x0E190F11u && ((op >> 12) & 0xF) != 15 &&
+	    NDS_ARM9.coproc[15]) {
+		const armcp15_t* cp = (const armcp15_t*)NDS_ARM9.coproc[15];
+		const u32 val = ((op >> 5) & 1) ? cp->ITCMRegion : cp->DTCMRegion;
+		ctx.ensureArena();
+		u32*& p = ctx.emitPtr;
+		u32 lockedMask = 0;
+		const u8 hRd = ctx.writeReg((op >> 12) & 0xF, true, lockedMask);
+		emitLoadImm32(p, hRd, val);
+		if (val) {
+			ctx.ensureFlagsLoaded();
+			*p++ = PPC_RLWINM(PPC_R8, PPC_REG_FLAGS, 0, 27, 31);    // CPSR.mode
+			*p++ = PPC_CMPWI(0, PPC_R8, 0x10);                     // USR -> 0
+			*p++ = PPC_BNE(8);
+			*p++ = PPC_LI(hRd, 0);
+		}
+		return;
+	}
 
 	// B / BL : bits 27..25 == 101
 	if ((op & 0x0E000000u) == 0x0A000000u) { emitBranch(ctx, op, cond); return; }

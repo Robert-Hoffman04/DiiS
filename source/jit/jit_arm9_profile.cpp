@@ -197,6 +197,8 @@ static u8 arm9_cyclesForArm(u32 op)
 	if ((op & 0x0F900090u) == 0x01000080u) return 2;
 	// MCR (coprocessor register transfer, L=0): OP_MCR returns 2.
 	if ((op & 0x0F100010u) == 0x0E000010u) return 2;
+	// MRC (L=1): OP_MRC returns 4.
+	if ((op & 0x0F100010u) == 0x0E100010u) return 4;
 
 	if (((op >> 26) & 3) == 1) {              // LDR / STR single data transfer
 		const bool B = (op >> 22) & 1;
