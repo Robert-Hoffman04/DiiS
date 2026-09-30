@@ -69,6 +69,7 @@ in this function: */
 static void gfx3d_doFlush();
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
 static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
+static bool s_rasterGx = false;          // gfx3d_convertedScreen is this frame's GX readback (gfx3d_ensureRendered)
 static bool s_rasterLatchValid = false;  // see gfx3d_rasterLatch; false until the first VBlank end after a reset/load
 static bool s_flushFromVBlank = false;
 #ifdef DSA_RASTERSKIP_STATS
@@ -597,6 +598,7 @@ void gfx3d_reset(){
 	
 	memset(gfx3d_convertedScreen,0,sizeof(gfx3d_convertedScreen));
 	s_rasterDeferred = false;
+	s_rasterGx = false;
 	s_rasterLatchValid = false;
 
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(0x7FFF);
@@ -2026,11 +2028,23 @@ u32 gfx3d_rasterClearColor(){ return s_rasterLatchValid ? s_rasterLatch.clearCol
 u32 gfx3d_rasterClearDepth(){ return s_rasterLatchValid ? s_rasterLatch.clearDepth : gfx3d.clearDepth; }
 u16 gfx3d_rasterToon(int i){ return s_rasterLatchValid ? s_rasterLatch.toon[i] : gfx3d.u16ToonTable[i]; }
 
+// Task P1-6a-flicker: a deferred raster (GxFast, a frame the GX geometry pass draws) is
+// resolved by that pass's readback (gxDsEngineA3dReadback) rather than rasterize.cpp, so a
+// 60 Hz frame that needs the buffer (a compositor bail, capture) shows the same 3D as the GX
+// overlay on the other frame of the seq, and skips the ~60 ms CPU raster. The CPU raster
+// stays the fallback (the pass's gate refuses, or the call comes from under vidmutex).
 void gfx3d_ensureRendered(){
 	if (!s_rasterDeferred) return;
 	s_rasterDeferred = false;
 #ifdef DSA_RASTERSKIP_STATS
 	++s_rsResolved;
+#endif
+#ifndef DSA_RASTER_NOGXREADBACK
+	{
+		bool gx;
+		{ PZ_SCOPE(PZ_GPU_RENDER); PZ_SUB_CLS(4); gx = gxDsEngineA3dReadback(); }
+		if (gx) { s_rasterGx = true; return; }
+	}
 #endif
 	gfx3d_rasterLatchSwap();   // the values the eager raster would have read at VBlank end
 	{ PZ_SCOPE(PZ_GPU_RENDER); PZ_SUB_CLS(4); gpu3D->NDS_3D_Render(); }
@@ -2039,6 +2053,10 @@ void gfx3d_ensureRendered(){
 
 bool gfx3d_renderDeferred(){
 	return s_rasterDeferred;
+}
+
+bool gfx3d_renderedByGx(){
+	return s_rasterGx;
 }
 
 // Texture and palette VRAM can only change under the raster through a bank remap
@@ -2071,6 +2089,7 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 	// rasterizer run only after this point).
 	++g_gfx3dRenderSeq;
 	s_rasterDeferred = false;
+	s_rasterGx = false;
 	gfx3d_rasterLatch();
 
 	//if the null 3d core is chosen, then we need to clear out the 3d buffers to keep old data from being rendered
@@ -2448,6 +2467,7 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 
 	// The loaded G3CX is the frame to show; the snapshot is retaken at the next VBlank end.
 	s_rasterDeferred = false;
+	s_rasterGx = false;
 	s_rasterLatchValid = false;
 
 	return true;

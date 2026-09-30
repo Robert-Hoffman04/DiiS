@@ -439,6 +439,9 @@ void gfx3d_VBlankEndSignal(bool skipFrame);
 // gfx3d_ensureRendered() first; gfx3d_GetLineData*() already do.
 void gfx3d_ensureRendered();
 bool gfx3d_renderDeferred();
+// gfx3d_convertedScreen holds the GX geometry pass's readback of the current frame (a
+// deferred GxFast raster resolved on the GPU, gfx3d_ensureRendered), not rasterize.cpp's.
+bool gfx3d_renderedByGx();
 // CLEAR_COLOR / CLEAR_DEPTH as the raster of the current frame read them (snapshot at
 // VBlank end, see gfx3d_rasterLatch in gfx3d.cpp); the GX geometry pass uses these, not
 // the live registers a game may already have rewritten for the next frame.

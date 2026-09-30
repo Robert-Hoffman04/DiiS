@@ -2185,7 +2185,8 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 // top of the overlay's own 15; a3_c27: none; see the log's Task 1a-rasterskip section).
 // That is a characterized, edge-bounded inexactness, so this is GxFast only: GxAccurate
 // keeps the eager raster underneath the overlay. Every other consumer (a bail to the CPU compositor, savestates, capture) goes
-// through gfx3d_ensureRendered() and gets the real raster.
+// through gfx3d_ensureRendered() and gets the real raster -- since Task P1-6a-flicker, the GX
+// pass's readback of it (gxDsEngineA3dReadback) whenever the pass can draw the frame.
 //
 // Task a3layer: a clear-only layer depends on nothing but the latched clear colour, so it is
 // keyed on (clear colour, clear alpha) instead of the render counter: s_3dClearGen only
@@ -3508,6 +3509,107 @@ static void gxDsA3dRenderGeomTex()
 	if (holes) GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
 	GX_InvalidateTexAll();
 }
+
+// Task P1-6a-flicker: set while the compositor holds vidmutex (not recursive), so a raster
+// resolved from inside that section never tries to take it again (it gets the CPU raster).
+static bool s_inVidLock;
+
+// Task P1-6a-flicker (gx_ds_3d_render.h): a deferred GxFast raster resolved by the GX
+// geometry pass instead of rasterize.cpp. Each 3D frame is shown on two 60 Hz frames, and a
+// compositor bail (`midframewrite`: SM64DS gameplay, every other frame) used to show the CPU
+// raster on one of them and the GX overlay on the other. Rendered like the texture form
+// (gxDsA3dRenderGeomTex) over a flat clear-colour background, copied out as RGB5A3 and
+// written into gfx3d_convertedScreen in the raster's layout. Per pixel that is what the
+// overlay shows: the final copy is RGB5A3 too, so both keep the top 5 bits of the same EFB
+// colour, and a translucent frame (clear alpha 31, gxDs3dFrameGate) blends over the clear
+// colour in both. Alpha: a polygon pixel is 31 (opaque polygons, or anything over a 31
+// clear); with clear alpha < 31 (opaque polygons only) the pass runs in RGBA6 over an
+// alpha-0 background, so the copy's opaque bit is the coverage and uncovered pixels get the
+// exact clear fragment. Not exact (the GX pass's own GxFast error), so GxFast only; nothing
+// else ever defers the raster.
+bool gxDsEngineA3dReadback()
+{
+#ifdef GXDS_FORCE_CPU
+	return false;
+#else
+	if (!gxRenderModeIsFast() || s_inVidLock || vidmutex == LWP_MUTEX_NULL) return false;
+	if (!GXDS_API(RenderInit)() || !gxDs3dGeomFrameSupported()) return false;
+	const u32 cb = (u32)k3dW * k3dH * sizeof(u16);
+	if (!s_3dScratch) s_3dScratch = (u16 *)memalign(32, (size_t)k3dW * k3dTexH * sizeof(u16));
+	if (!s_3dScratch) return false;
+	const u32 cc = gfx3d_rasterClearColor();
+	const u8 ca = (u8)((cc >> 16) & 0x1F);
+	const u8 c5[3] = { (u8)(cc & 0x1F), (u8)((cc >> 5) & 0x1F), (u8)((cc >> 10) & 0x1F) };   // r, g, b
+	const bool cover = ca != 31;
+
+	LWP_MutexLock(vidmutex);
+	gxDsBSetup2DState();
+	if (cover) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
+	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
+	// Background: the clear colour (the overlay's clear-only BG0 texel), or alpha 0 for coverage.
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+	GX_SetNumTexGens(0);
+	GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	{
+		const u8 r = (u8)((c5[0] << 3) | (c5[0] >> 2)), g = (u8)((c5[1] << 3) | (c5[1] >> 2)),
+		         b = (u8)((c5[2] << 3) | (c5[2] >> 2)), a = cover ? 0 : 255;
+		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+			GX_Position2f32(0, 0);                                   GX_Color4u8(r, g, b, a);
+			GX_Position2f32((f32)kDsBScreenW, 0);                    GX_Color4u8(r, g, b, a);
+			GX_Position2f32((f32)kDsBScreenW, (f32)kDsBScreenH);     GX_Color4u8(r, g, b, a);
+			GX_Position2f32(0, (f32)kDsBScreenH);                    GX_Color4u8(r, g, b, a);
+		GX_End();
+	}
+	gxDsBSetup2DState();
+	gxDsA3dGeomDraw();
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
+	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
+	DCFlushRange(s_3dScratch, cb);   // no dirty line may be written back over the copy
+	// clear=GX_TRUE as the compositor's own copy (the corner must not ghost under draw_thread);
+	// an RGBA6 pass is cleared by a second copy once the format is back.
+	GX_CopyTex(s_3dScratch, cover ? GX_FALSE : GX_TRUE);
+	GX_PixModeSync();
+	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+	DCInvalidateRange(s_3dScratch, cb);
+	{
+		// RGB5A3, 4x4 texel blocks; out: gfx3d_convertedScreen's (a, b, g, r) bytes, 6-bit colour.
+		const u8 cf[4] = { ca, (u8)GFX3D_5TO6(c5[2]), (u8)GFX3D_5TO6(c5[1]), (u8)GFX3D_5TO6(c5[0]) };
+		const u16 *t = s_3dScratch;
+		for (int by = 0; by < k3dH; by += 4)
+			for (int bx = 0; bx < k3dW; bx += 4)
+				for (int y = by; y < by + 4; ++y) {
+					u8 *o = gfx3d_convertedScreen + ((size_t)y * k3dW + bx) * 4;
+					for (int x = 0; x < 4; ++x, ++t, o += 4) {
+						const u16 v = *t;
+						if (!(v & 0x8000)) { memcpy(o, cf, 4); continue; }
+						o[0] = 31;
+						o[1] = (u8)GFX3D_5TO6(v & 0x1F);
+						o[2] = (u8)GFX3D_5TO6((v >> 5) & 0x1F);
+						o[3] = (u8)GFX3D_5TO6((v >> 10) & 0x1F);
+					}
+				}
+	}
+	if (cover) {
+		GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
+		DCFlushRange(s_3dScratch, cb);
+		GX_CopyTex(s_3dScratch, GX_TRUE);
+		GX_PixModeSync();
+		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }   // before the CPU reuses s_3dScratch
+	}
+	GX_InvalidateTexAll();
+	GxRestorePresentState();
+	LWP_MutexUnlock(vidmutex);
+	return true;
+#endif
+}
 #endif
 
 static bool gxDsBRenderFrameImpl()
@@ -3718,8 +3820,11 @@ static bool gxDsBRenderFrameImpl()
 		bool pzScanOk;
 		{
 			PZ_SUB_SCOPE(PZ_2DA_3DSCAN);
+			// Task P1-6a-flicker: a raster resolved by the GX readback is this pass's own output,
+			// so the overlay still goes over the clear-only layer (same pixels, no re-scan).
 			pzScanOk = !any3dBand || gxDsA3dScan(geomPass && gxRenderModeIsFast() &&
-			                                     (gfx3d_renderDeferred() || gxDs3dGeomFrameHasTranslucent()));
+			                                     (gfx3d_renderDeferred() || gfx3d_renderedByGx() ||
+			                                      gxDs3dGeomFrameHasTranslucent()));
 		}
 		if (!pzScanOk) { DSB_WHY("3dscan"); return false; }
 #endif
@@ -3834,6 +3939,9 @@ static bool gxDsBRenderFrameImpl()
 	// mutex; taking it here extends that same contract to cover Engine B's
 	// composite pass rather than inventing a new one.
 	{ PZ_SUB_SCOPE(PZ_VIDLOCK); LWP_MutexLock(vidmutex); }
+#if GXDS_CORE == 0
+	s_inVidLock = true;
+#endif
 
 	gxDsBSetup2DState();
 	gxDsBTlutReset();   // task 11: assume nothing about TMEM's TLUT contents from an earlier frame / another engine
@@ -3956,6 +4064,9 @@ static bool gxDsBRenderFrameImpl()
 	// changed, before draw_thread's next present pass can observe it.
 	GxRestorePresentState();
 
+#if GXDS_CORE == 0
+	s_inVidLock = false;
+#endif
 	LWP_MutexUnlock(vidmutex);
 
 	// Readback + MASTER_BRIGHT. GPU_RenderLine_MasterBrightness() runs on the
