@@ -104,6 +104,20 @@
 //  48  case 47 with the textured quads at indexes 20/9 (arbitrary entries): GxFast only.
 //  49  case 47 in highlight mode (DISP3DCNT bit 1) without the textured quads (untextured
 //      highlight = toon on the CPU rasterizer) -> engaged; 50: with them -> BAIL toon.
+//  51  shadow volumes (POLYGON_ATTR mode 3, gx-remaining-work.md items 6a/12), SM64DS's
+//      layout: a box of mask polygons (ID 0, back faces) then the same box as draw polygons
+//      (front faces, alpha 15), straddling an opaque floor (ID 1) and an opaque block (ID 3).
+//      Cover, blending on, Z-buffer, manual sort, isolated like 30. GxFast engaged.
+//  52  counter > 1 and carried between groups: masks of two overlapping boxes, the draws of
+//      the first (ID 5), then the draws of the second (ID 6, overlapping the first's: GX
+//      splits them into a group of their own that sees the leftover counter); a translucent
+//      triangle; then a third box (masks + draws, ID 7) over the first.
+//  53  receivers with the draw's polygon ID: the floor's left half has ID 5 = the draw's ID
+//      (the shadow must be rejected there, opaque-ID texture), the right half ID 1.
+//  54  shadow colour: draws of alpha 24 with Gouraud vertex colours, depth write (bit 11),
+//      an A5I3 texture set (ignored by shadow shading), then a translucent quad inside the volume.
+//  55  bail control: masks of two boxes, then the draws of both in ONE run with overlapping
+//      outlines -> GxFast BAILs `shadow`.
 
 #include <nds.h>
 #include <stdio.h>
@@ -146,6 +160,24 @@
 // (-1: no textured quads). A3_HILITE: DISP3DCNT highlight mode.
 #define A3_TOONIDX 31, 0
 #define A3_HILITE 0
+// 51-55: shadow volumes (see the header). A3_SHADOW: the variant (1-5).
+#define A3_SHADOW 0
+#if A3_CASE >= 51 && A3_CASE <= 55
+#undef A3_SHADOW
+#if A3_CASE == 51
+#define A3_SHADOW 1
+#elif A3_CASE == 52
+#define A3_SHADOW 2
+#elif A3_CASE == 53
+#define A3_SHADOW 3
+#elif A3_CASE == 54
+#define A3_SHADOW 4
+#else
+#define A3_SHADOW 5
+#endif
+#undef A3_CASE
+#define A3_CASE 51
+#endif
 #if A3_CASE >= 47 && A3_CASE <= 50
 #if A3_CASE == 48
 #undef A3_TOONIDX
@@ -477,7 +509,7 @@ static void clipScene(void)
 }
 #endif
 
-#if A3_CASE == 34
+#if A3_CASE == 34 || A3_CASE == 51
 // Translucent-polygon fixture (see the header, cases 34-36). Textures straight to LCDC VRAM
 // like case 30: bank C = texture slot 0, bank E = palettes.
 #define TEXP(addr, sz, tz, fmt) ((u32)((addr) >> 3) | ((u32)(sz) << 20) | ((u32)(tz) << 23) | ((u32)(fmt) << 26))
@@ -643,6 +675,109 @@ static void transScene(void)
 }
 #endif
 
+#if A3_CASE == 51
+// Shadow-volume fixture (see the header, cases 51-55). Boxes as six quads wound CCW from
+// outside; masks show back faces (POLY_CULL_FRONT), draws front faces.
+static void box(float x0, float y0, float z0, float x1, float y1, float z1, int r, int g, int b)
+{
+	static const float f[6][4][3] = {
+		{ { 0, 0, 1 }, { 1, 0, 1 }, { 1, 1, 1 }, { 0, 1, 1 } },   // +z
+		{ { 1, 0, 0 }, { 0, 0, 0 }, { 0, 1, 0 }, { 1, 1, 0 } },   // -z
+		{ { 1, 0, 1 }, { 1, 0, 0 }, { 1, 1, 0 }, { 1, 1, 1 } },   // +x
+		{ { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 1 }, { 0, 1, 0 } },   // -x
+		{ { 0, 1, 1 }, { 1, 1, 1 }, { 1, 1, 0 }, { 0, 1, 0 } },   // +y
+		{ { 0, 0, 0 }, { 1, 0, 0 }, { 1, 0, 1 }, { 0, 0, 1 } },   // -y
+	};
+	glBegin(GL_QUADS);
+	for (int k = 0; k < 6; k++)
+		for (int j = 0; j < 4; j++) {
+#if A3_SHADOW == 4
+			glColor3b((r + 60 * j) & 255, (g + 90 * k) & 255, (b + 40 * (j + k)) & 255);
+#else
+			glColor3b(r, g, b);
+#endif
+			glVertex3f(f[k][j][0] ? x1 : x0, f[k][j][1] ? y1 : y0, f[k][j][2] ? z1 : z0);
+		}
+	glEnd();
+}
+
+static void opaqueQuad(float x0, float z0, float x1, float z1, float y, int id, int r, int g, int b)
+{
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(id));
+	glBegin(GL_QUADS);
+		glColor3b(r, g, b); glVertex3f(x0, y, z1);
+		glColor3b(r, g, b); glVertex3f(x1, y, z1);
+		glColor3b(r, g, b); glVertex3f(x1, y, z0);
+		glColor3b(r, g, b); glVertex3f(x0, y, z0);
+	glEnd();
+}
+
+#ifdef A3_NOSHADOW
+// control build (not in build_enga.sh): the volumes as invisible alpha-0 polygons
+#define SH_ATTR(a, cull, id) glPolyFmt(POLY_ALPHA(0) | POLY_CULL_NONE)
+#else
+#define SH_ATTR(a, cull, id) glPolyFmt(POLY_ALPHA(a) | (cull) | POLY_ID(id) | POLY_SHADOW)
+#endif
+#define SH_MASK(a) SH_ATTR(a, POLY_CULL_FRONT, 0)
+#define SH_DRAW(a, id) SH_ATTR(a, POLY_CULL_BACK, id)
+
+static void shadowScene(void)
+{
+	glRotateX(35.0f);
+	GFX_TEX_FORMAT = 0;
+	// floor (split in two for case 53) and an opaque block standing on it
+#if A3_SHADOW == 3
+	opaqueQuad(-1.6f, -1.2f, 0.0f, 1.2f, -0.5f, 5, 170, 170, 150);
+	opaqueQuad( 0.0f, -1.2f, 1.6f, 1.2f, -0.5f, 1, 150, 170, 170);
+#else
+	opaqueQuad(-1.6f, -1.2f, 1.6f, 1.2f, -0.5f, 1, 170, 170, 150);
+#endif
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_BACK | POLY_ID(3));
+	box(0.15f, -0.5f, -0.35f, 0.55f, 0.1f, 0.05f, 60, 200, 90);
+	// volume 1: over the floor and the block's left side
+#if A3_SHADOW == 5
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_MASK(15); box(-0.1f, -0.9f, -0.5f, 0.6f, 0.3f, 0.1f, 0, 0, 0);
+	SH_DRAW(15, 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
+	SH_DRAW(15, 5); box(-0.1f, -0.9f, -0.5f, 0.6f, 0.3f, 0.1f, 20, 20, 40);
+#elif A3_SHADOW == 2
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_MASK(15); box(-0.1f, -0.9f, -0.5f, 0.6f, 0.3f, 0.1f, 0, 0, 0);
+	SH_DRAW(15, 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
+	SH_DRAW(12, 6); box(-0.1f, -0.9f, -0.5f, 0.6f, 0.3f, 0.1f, 80, 10, 10);
+	// a separate translucent polygon between groups (ends the draw run)
+	glPolyFmt(POLY_ALPHA(10) | POLY_CULL_NONE | POLY_ID(9));
+	glBegin(GL_TRIANGLES);
+		glColor3b(250, 250, 60); glVertex3f(-1.4f, 0.4f, 0.8f);
+		glColor3b(250, 250, 60); glVertex3f(-1.0f, 0.4f, 0.8f);
+		glColor3b(250, 250, 60); glVertex3f(-1.2f, 0.8f, 0.8f);
+	glEnd();
+	SH_MASK(15); box(-0.8f, -0.9f, -0.1f, -0.2f, 0.0f, 0.5f, 0, 0, 0);
+	SH_DRAW(15, 7); box(-0.8f, -0.9f, -0.1f, -0.2f, 0.0f, 0.5f, 10, 40, 10);
+#elif A3_SHADOW == 4
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_ATTR(24, POLY_CULL_BACK | T_ZW, 5);
+	GFX_TEX_FORMAT = texA5I3;
+	GFX_PAL_FORMAT = 0;
+	box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 30, 60, 200);
+	GFX_TEX_FORMAT = 0;
+	// translucent quad inside the volume, drawn after it: rejected where the draws shaded
+	// (they wrote nearer depth), blended elsewhere
+	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(8));
+	glBegin(GL_QUADS);
+		glColor3b(240, 120, 40); glVertex3f(-0.4f,  0.1f, 0.0f);
+		glColor3b(240, 120, 40); glVertex3f(-0.4f, -0.6f, 0.0f);
+		glColor3b(240, 120, 40); glVertex3f( 0.2f, -0.6f, 0.0f);
+		glColor3b(240, 120, 40); glVertex3f( 0.2f,  0.1f, 0.0f);
+	glEnd();
+#else
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_DRAW(15, 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
+#endif
+	glFlush(GL_TRANS_MANUALSORT);   // Z-buffer mode
+}
+#endif
+
 // --- the 3D scene ---
 static int polyAlpha = 31;
 static void draw3D(void)
@@ -749,6 +884,10 @@ static void draw3D(void)
 #endif
 #if A3_CASE == 34
 	transScene();
+	return;
+#endif
+#if A3_CASE == 51
+	shadowScene();
 	return;
 #endif
 #if A3_ZBUF
@@ -896,7 +1035,7 @@ int main(void)
 #elif A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38 || A3_CASE == 47
 	// textured fixture: same isolation as 27/28 (backdrop + BG0/3D only).
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
-#elif A3_CASE == 34
+#elif A3_CASE == 34 || A3_CASE == 51
 	// translucent fixture: same isolation, clear colour alpha 31 (GxFast's translucent scope).
 	cover = 1;
 	dcnt &= ~(DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_BG3_ACTIVE | DISPLAY_SPR_ACTIVE);
@@ -940,6 +1079,9 @@ int main(void)
 #elif A3_CASE == 34
 	glEnable(GL_TEXTURE_2D | GL_BLEND | GL_ALPHA_TEST);
 	glAlphaFunc(5);
+	texSetup34();
+#elif A3_CASE == 51
+	glEnable(GL_TEXTURE_2D | GL_BLEND);
 	texSetup34();
 #else
 	glEnable(GL_ANTIALIAS);
