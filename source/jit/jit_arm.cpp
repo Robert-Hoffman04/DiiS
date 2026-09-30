@@ -744,6 +744,16 @@ void emitLdrPcExit(JitTraceCtx& ctx, u8 valReg, u32 op)
 void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 {
 	u32*& p = ctx.emitPtr;
+	// ARM9: the region-guarded inline load (slowRead off the RAM regions), into
+	// guest R15's pinned r29 -- about to be rewritten by the exit anyway. The
+	// BIOS IRQ vector `LDR pc,[r0,#-4]` (DTCM) used to be a slowRead every IRQ.
+	if (ctx.cpu.arm9DtcmBase) {
+		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
+		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);        // EA -> r12
+		ctx.emitArm9Load(15, 4, /*signExt=*/false, /*wordRotate=*/true, writeback, rn);
+		emitLdrPcExit(ctx, ctx.hostRegFor(15), op);
+		return;
+	}
 	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 
@@ -813,12 +823,19 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 		// memory prologue, no slowRead C call, no reg-cache flush, no runtime
 		// region guard (the region is known now). ARM7 only: mainMemBase is 0 on
 		// the ARM9, whose CP15-relocatable TCM windows overlay this range.
-		if (L && rd != 15 && ctx.cpu.mainMemBase != 0 &&
-		    (ea & 0x0F000000u) == 0x02000000u) {
+		// Compile-time EA: main RAM, or (ARM9) ITCM -- the ITCM IRQ stub's literal
+		// pool. Not when the ARM9 DTCM window overlays the address (it has
+		// priority in _MMU_read*<ARM9>; its base is baked, any move flushes).
+		const u32 dtcmR = ctx.cpu.arm9DtcmRegionPtr ? *(const volatile u32*)(uintptr_t)ctx.cpu.arm9DtcmRegionPtr : 1;
+		const bool inDtcm = ((dtcmR & 0x3FFFu) == 0) && ((ea & ~0x3FFFu) == dtcmR);
+		const bool litMain = ctx.cpu.mainMemBase != 0 && (ea & 0x0F000000u) == 0x02000000u;
+		const bool litItcm = ctx.cpu.arm9ItcmBase != 0 && ea < 0x02000000u;
+		if (L && rd != 15 && !inDtcm && (litMain || litItcm)) {
 			const u32 m = (size == 4) ? 0x3FFFFCu : (size == 2) ? 0x3FFFFEu : 0x3FFFFFu;
 			u32 lockedMask = 0;
 			const u8 hRd = ctx.writeReg(rd, /*fullOverwrite=*/true, lockedMask);
-			emitLoadImm32(p, PPC_R12, ctx.cpu.mainMemBase + (ea & m));
+			emitLoadImm32(p, PPC_R12, litMain ? ctx.cpu.mainMemBase + (ea & m)
+			                                  : ctx.cpu.arm9ItcmBase + (ea & m & 0x7FFFu));
 			if (size == 4) {
 				*p++ = PPC_LWBRX(hRd, 0, PPC_R12);
 				if (ea & 3)                                     // OP_LDR's ROR(word, 8*(adr&3))
