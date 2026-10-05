@@ -509,6 +509,20 @@ void JITCache::flushCache() {
 	PROFILER_CACHE_FLUSH_END();
 }
 
+// Every compiled block opens with the quota guard `cmpwi r3,N ; bge yieldStub`
+// (JitTraceCtx::ensureArena(), after the optional JIT_CODE_STATS counter), and
+// its yield stub sets r4 = startPC before the shared yield tail. Returns that
+// stub, or nullptr if the guard is not found.
+static u32* jitBlockYieldStub(u32* code)
+{
+	for (int i = 0; i < 8; i++) {
+		if ((code[i] & 0xFFFF0000u) == (u32)PPC_CMPWI(0, PPC_R3, 0) &&
+		    (code[i + 1] & 0xFFFF0003u) == (u32)PPC_BGE(0))
+			return code + i + 1 + ((s32)(s16)(code[i + 1] & 0xFFFCu) >> 2);
+	}
+	return nullptr;
+}
+
 // SMC eviction handler
 void JITCache::invalidateSMCTarget(u32 targetEA) {
 	// Reachable from MMU write hooks that can fire before jitInit() (and, with
@@ -547,9 +561,16 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 			// Overlap Detection: Write Range vs Block Range
 			if (targetEA < blockEndPC && endEA > blockStartPC) {
 				if (curr->execute) {
-					// Surgical Trampoline Patch: Overwrite first instruction with PPC_B to exit handler
+					// Surgical Trampoline Patch: overwrite the first instruction with a
+					// branch to the block's own quota-yield stub (r4 = startPC, then the
+					// shared yield tail). Chained predecessors jump here directly (their
+					// patched `b`, no linker stub), so r4 is not the resume PC on entry:
+					// a plain branch to linkerReturn exited with whatever r4 held -- a
+					// host pointer left by a C call -- as the guest's next PC.
 					u32* codePtr = (u32*)curr->execute;
-					s32 branchOffset = (s32)((u8*)linkerReturnAddress - (u8*)codePtr);
+					u32* exitTo = jitBlockYieldStub(codePtr);
+					if (!exitTo) exitTo = linkerReturnAddress;
+					s32 branchOffset = (s32)((u8*)exitTo - (u8*)codePtr);
 					*codePtr = PPC_B(branchOffset);
 
 					// Hardware Cache Sync on 4-byte patched instruction
