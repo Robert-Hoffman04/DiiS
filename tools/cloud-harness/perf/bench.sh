@@ -43,7 +43,8 @@ echo "[run] host time $(( $(date +%s) - S ))s"
 mcopy -o -i $I@@$OFF ::/perfzones.log $P/results/$L.raw
 python3 - $P/results/$L.raw $P/results/$L.csv <<'P'
 import sys; L=open(sys.argv[1],'rb').read().decode('latin1').split('\n')
-n=L[1].count(','); keep=[l for l in L if l.startswith('#') or l.startswith('frame') or (l and l.count(',')==n)]
+n=next(l for l in L if l.startswith('frame,')).count(',')   # header; a -DDESMUME_PERFZONES_PMC log has a '# pmc sets' line first
+keep=[l for l in L if l.startswith('#') or l.startswith('frame') or (l and l.count(',')==n)]
 open(sys.argv[2],'w').write('\n'.join(keep)+'\n')
 P
 rm -f $P/results/$L.raw

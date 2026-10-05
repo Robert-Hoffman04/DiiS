@@ -44,6 +44,7 @@
 #include "saves.h"
 #include "rasterize.h"
 #include "perf_zones.h"
+#include "gxstats_log.h"   // Task hw-measure: -DDESMUME_GXSTATS sd:/gxstats.log (no-op otherwise)
 #include "fps_overlay.h"
 #include "harness/harness.h"
 #include "gx/gx_gba_render.h"
@@ -1731,6 +1732,7 @@ void DSExec(){
 #endif
 	pzFrameTick();
 	pzSet(PZ_HOST);   // Task pzones: loop glue until the next NDS_exec() re-anchors to PZ_OTHER
+	gxStatsFrameTick();
 
 #ifdef DESMUME_GBA_IRQ_SOAK
 	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.

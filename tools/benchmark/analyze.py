@@ -66,8 +66,8 @@ def parse_profile_log(path):
                 continue
             if line.startswith("frame,wall_us"):
                 cols = line.split(",")[2:]              # drop frame, wall_us
-                half = len(cols) // 2
-                zone_names = [c[:-3] for c in cols[:half]]   # strip "_us"
+                # strip "_us"; -DDESMUME_PERFZONES_PMC appends pmcset + <zone>_pmcN columns
+                zone_names = [c[:-3] for c in cols if c.endswith("_us")]
                 continue
             m = FRAMETIME_RE.match(line)
             if m:
@@ -97,7 +97,7 @@ def parse_profile_log(path):
             if not CSV_ROW_RE.match(line):
                 continue                                  # foreign profile line (jit probes etc)
             parts = line.split(",")
-            if not zone_names or len(parts) != 2 + 2 * len(zone_names):
+            if not zone_names or len(parts) not in (2 + 2 * len(zone_names), 3 + 6 * len(zone_names)):
                 continue
             try:
                 nums = [int(x) for x in parts]

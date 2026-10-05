@@ -40,8 +40,14 @@
 #include <stdio.h>
 #include <algorithm>
 #include <stddef.h>
-#if (defined(DSB_STATS) || defined(DSLZ_STATS)) && defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
-#include "../harness/harness_profile.h"
+#if defined(DSB_STATS) || defined(DSLZ_STATS)
+#include "../harness/harness_profile.h"   // sets HARNESS_PROFILE_SINK when the lines go anywhere
+#endif
+// -DDSB_STATS's per-band / per-frame debug dumps (planband, mask3d, transdbg, ...) are
+// harness investigation aids; the -DDESMUME_GXSTATS hardware log keeps only the
+// periodic counter lines (Task hw-measure).
+#if defined(DSB_STATS) && !defined(DESMUME_GXSTATS)
+#define DSB_STATS_DBG 1
 #endif
 #include "gx_mask.h"
 #include "gx_rendermode.h"
@@ -2455,7 +2461,7 @@ static bool gxDsA3dScan(bool clearOnly = false)
 	}
 	s_3dScanSeq = key;
 	s_3dScanValid = true;
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 	if (!clearOnly) {
 		u32 nonzeroA = 0;
 		const u8 *cc = gfx3d_convertedScreen;
@@ -2553,7 +2559,7 @@ static void gxDsA3dEnsureAlphaTex()
 	GX_InitTexObjFilterMode(&s_3dAlphaTexObj, GX_NEAR, GX_NEAR);
 	s_3dAlphaSeq = s_3dScanSeq;
 	s_3dAlphaValid = true;
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 	{
 		u32 nonzero = 0;
 		const u8 *ad = (const u8 *)s_3dAlphaTexData;
@@ -2804,7 +2810,7 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 							if (s_3dLineTrans[y]) { trans = true; ++transLines; }
 							if (s_3dLineHole[y]) ++holeLines;
 						}
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 						harness_profile_emitf(GXDS_TAG "transdbg under=%02x t2=%02x trans=%d transLines=%d holeLines=%d y0=%d y1=%d scanValid=%d scanSeq=%u renderSeq=%u",
 						                       under, p.t2, (int)trans, transLines, holeLines, y0, y1,
 						                       (int)s_3dScanValid, s_3dScanSeq, g_gfx3dRenderSeq);
@@ -2944,7 +2950,7 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 			}
 		}
 	}
-#if defined(DSB_STATS) && GXDS_CORE == 0
+#if defined(DSB_STATS_DBG) && GXDS_CORE == 0
 	// Task 13d-statefix follow-up lead: dump the per-cfg planning outputs
 	// (mask3dCfg, blendLive, fade3dCfg/fadeBg/fadeObj) directly, not just the
 	// final draw-time `alpha` bool, to check for a planning miscomputation
@@ -3372,7 +3378,7 @@ static void gxDsBBuildUnder3DMask(int b, const GxDsBBandRegs &r, const GxDsBBand
 
 	gxMaskEnd(&s_3dMask, k3dMaskEfbX, k3dMaskEfbY);
 	s_tevK = -2;   // gxDsBTevMaskConst() calls above never kept s_tevK in sync
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 	{
 		const u8 *td = (const u8 *)s_3dMask.texData;
 		u32 zero = 0, full = 0, other = 0;
@@ -3483,7 +3489,7 @@ static void gxDsA3dDrawTwoPassQuad(const GxDsA3dTex &tB, f32 x0, f32 y0, f32 x1,
 static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y1)
 {
 	gxDsA3dEnsureAlphaTex();
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 	harness_profile_emitf(GXDS_TAG "mask3ddraw avalid=%d tbvalid=%d s3valid=%d hofs=%d y0=%d y1=%d",
 	                       (int)s_3dAlphaValid, (int)tB.valid, (int)s_3d.valid, hofs, y0, y1);
 #endif
@@ -3535,7 +3541,7 @@ static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y
 // renderer does not need.
 static void gxDsA3dStampOpaqueAlpha()
 {
-#ifdef DSB_STATS
+#ifdef DSB_STATS_DBG
 	// Task 13d-blendleaklead (2026-09-22): confirms this runs every frame
 	// (87/90 a3_c8 frames) -- see gx-next-steps-log.md for why that matters
 	// (this pass proved the stamp's own effect on `dsaabd`'s printed value
@@ -3990,7 +3996,7 @@ static bool gxDsBRenderFrameImpl()
 			}
 			if (s_dsb3dSeen) { ++s_dsb3dEnabled; s_dsb3dSeen = false; }
 			if (((s_dsbOk + s_dsbBail) % 30) == 0) {
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#ifdef HARNESS_PROFILE_SINK
 				harness_profile_emitf(GXDS_TAG " n=%u ok=%u bail=%u affbg=%u affobj=%u win=%u fade=%u alpha=%u semi=%u mb=%u d3=%u d3en=%u dispcnt=%08x types=%04x why=%s %s",
 				                      (unsigned)(s_dsbOk + s_dsbBail), (unsigned)s_dsbOk, (unsigned)s_dsbBail,
 				                      (unsigned)s_dsbAffOk, (unsigned)s_dsbAffObjOk,
@@ -4526,7 +4532,7 @@ bool GXDS_API(RenderFrame)()
 #ifdef DSLZ_STATS
 	++s_lzStFrames;
 	if ((s_lzStFrames % 30) == 0) {
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#ifdef HARNESS_PROFILE_SINK
 		harness_profile_emitf(GXDS_TAG "lz n=%u defer=%u eager=%u disc=%u flushreg=%u flushdata=%u flushbail=%u flushoos=%u barrio=%u barrdata=%u databail=%u",
 		                      (unsigned)s_lzStFrames, (unsigned)s_lzStDeferredLines, (unsigned)s_lzStEagerLines, (unsigned)s_lzStDiscardFrames,
 		                      (unsigned)s_lzStFlushRegLines, (unsigned)s_lzStFlushDataLines, (unsigned)s_lzStFlushBailLines, (unsigned)s_lzStFlushOosLines,

@@ -1310,6 +1310,7 @@ bool gxDs3dGeomFramePrepare()
 	static u32 s_tagRunsSum, s_tagMax, s_tagArea;
 	++s_gate[g];
 	++s_frames;
+#ifndef DESMUME_GXSTATS   // Task hw-measure: the hardware log skips this extra ID-plan pass (it would inflate g3prep)
 	if (gfx3d.polylist && gfx3d.vertlist && gfx3d.polylist->count > 0) {
 		const int nt = gxDs3dTransIdPlan();
 		if (nt < 0) ++s_tidClash; else s_tidPolys += (u32)nt;
@@ -1321,6 +1322,7 @@ bool gxDs3dGeomFramePrepare()
 				s_tagArea += (u32)(((t.x1 - t.x0) >> 4) * ((t.y1 - t.y0) >> 4));
 			}
 	}
+#endif
 	if (gfx3d.polylist && gfx3d.vertlist)
 		for (int i = 0; i < gfx3d.polylist->count; ++i) {
 			const POLY &p = gfx3d.polylist->list[i];

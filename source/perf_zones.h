@@ -16,7 +16,8 @@
  *
  * Entirely compiled out unless -DDESMUME_PERFZONES is defined (the benchmark's
  * `profile` mode sets it; see tools/benchmark/). Zero cost, zero symbols
- * otherwise.
+ * otherwise. -DDESMUME_PERFZONES_PMC (on top) also banks the CPU's hardware
+ * performance counters per zone (cycles / instructions / cache misses).
  ***************************************************************************/
 #ifndef DESMUME_PERF_ZONES_H
 #define DESMUME_PERF_ZONES_H
@@ -99,6 +100,13 @@ void     pzSet(PerfZone z);           // bank elapsed to the old zone iff z chan
 void pzHarvest(u64 out_ticks[PZ_COUNT], u64 out_hits[PZ_COUNT]);
 
 const char* pzName(int z);
+
+#ifdef DESMUME_PERFZONES_PMC
+// Task hw-measure: Broadway performance-monitor counts per zone, banked at the same
+// zone switches as the timebase (see perf_zones.cpp for the event sets). PMC1..PMC4
+// deltas since the last block row; the event set rotates every block.
+extern u64 g_pzPmc[PZ_COUNT][4];
+#endif
 
 // -DDESMUME_BENCH frame loop calls this once per emulated frame; every 60th
 // call it appends a CSV row (ticks, converted to us) to sd:/perfzones.log.

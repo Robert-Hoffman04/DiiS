@@ -35,9 +35,13 @@ void harness_profile_log(const char *line);
 static inline void harness_profile_log(const char *line) { (void)line; }
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if (defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)) || defined(DESMUME_GXSTATS)
 
 // One already-formatted profile record (CSV row, stat block, ...) as PKT_PROFILE.
+// Task hw-measure: without the harness, -DDESMUME_GXSTATS gives these a body that
+// appends to sd:/gxstats.log instead (source/gxstats_log.cpp), so the -DDSB_STATS /
+// -DDSA_GXGEOM_TEXSTATS / ... stat lines can be collected on real hardware.
+#define HARNESS_PROFILE_SINK 1
 void harness_profile_emit(const char *text);
 
 // printf-style, emitted as one PKT_PROFILE frame (truncated at 511 bytes).
