@@ -778,7 +778,11 @@ static void emitDtcmTest(u32*& p, const Arm9Regions& g, u8 src)
 // window when it overlays that range. With span, both ends must be inside (and
 // for main RAM, inside one 1 MB page -- the run is <= 60 bytes, so a window
 // that misses both ends misses the run). alignTest also sends an unaligned EA
-// out (word loads, whose rotate the thunk does). Every way out is a placeholder
+// out (word loads, whose rotate the thunk does); for DTCM and main RAM it is
+// folded into the region compare (one rotate keeps the region field and EA
+// bits 0..1 side by side). Main RAM then compares the whole top byte, not just
+// its low nibble: a 0x12..0xF2 mirror word load goes to the thunk, which reads
+// the same main-RAM word. Every way out is a placeholder
 // branch in s.miss; on the fall-through r10 = host base, r11 = the EA's offset
 // in the region cleared to alignMe. Returns the region emitted.
 static int emitArm9Predicted(JitTraceCtx& c, int pred, u8 alignMe, u32 span, bool alignTest, JitColdStub& s)
@@ -791,7 +795,14 @@ static int emitArm9Predicted(JitTraceCtx& c, int pred, u8 alignMe, u32 span, boo
 	auto miss = [&](u32 w) { s.miss[s.nMiss++] = p; *p++ = w; };
 	u32 base; u8 mb;
 	if (pred == JIT_MEMP_DTCM) {
-		emitDtcmTest(p, g, PPC_R12);
+		if (alignTest && !span && g.tag <= 0x7FFF) {
+			// (EA >> 14) | (EA & 3) << 18 == tag: in the window and aligned
+			*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 18, 12, 31);
+			*p++ = PPC_CMPWI(0, PPC_R10, g.tag);
+			alignTest = false;
+		} else {
+			emitDtcmTest(p, g, PPC_R12);
+		}
 		miss(PPC_BNE(0));
 		if (span) {
 			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)span);
@@ -807,7 +818,12 @@ static int emitArm9Predicted(JitTraceCtx& c, int pred, u8 alignMe, u32 span, boo
 		base = c.cpu.arm9ItcmBase; mb = 17;
 	} else {
 		if (g.inMain) { emitDtcmTest(p, g, PPC_R12); miss(PPC_BEQ(0)); }
-		*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);             // (EA >> 24) & 0xF == 2
+		if (alignTest && !span) {
+			*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 22, 31);         // (EA >> 24) | (EA & 3) << 8 == 2
+			alignTest = false;
+		} else {
+			*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);         // (EA >> 24) & 0xF == 2
+		}
 		*p++ = PPC_CMPWI(0, PPC_R10, 2);
 		miss(PPC_BNE(0));
 		if (span) {
