@@ -195,6 +195,11 @@ class JITCache {
 		// out->smcAddress, bailedOut, smcHit and leaves through
 		// linkerReturnAddress. The per-site part sits in the block's cold stubs.
 		u32* smcTailAddress;
+		// Shared quota-yield tail (both caches): r4 already holds the block's
+		// start PC (its per-block stub is `lis/ori r4 ; b yieldTail`); sets
+		// out->bailedOut = 1 and leaves through linkerReturnAddress, exactly
+		// what the old 6-word per-block stub did.
+		u32* yieldTailAddress;
 		// Memory thunks (see JitMemThunk) for thunkProfile's core; emitted only
 		// when it is set (before initialize()), else null.
 		const JitCpuProfile* thunkProfile;

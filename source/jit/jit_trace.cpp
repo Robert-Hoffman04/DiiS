@@ -2342,14 +2342,14 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		ctx.emitChainTail(ctx.currentPC);
 	}
 
-	// ---- quota-shield yield stub ----
+	// ---- quota-shield yield stub: resume PC, then the shared yield tail ----
+	// (bailedOut = 1 and the exit live there; see JITCache::yieldTailAddress.)
 	u32* yieldTarget = ctx.emitPtr;
 	{
 	JIT_STAT_SCOPE(ctx, JCS_YIELD, true);
-	ctx.emitResultMetadata(0, 1);
 	*ctx.emitPtr++ = PPC_LIS(PPC_R4, startPC >> 16);
 	*ctx.emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, startPC & 0xFFFF);
-	s32 yieldOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)ctx.emitPtr);
+	s32 yieldOff = (s32)((u8*)cache.yieldTailAddress - (u8*)ctx.emitPtr);
 	*ctx.emitPtr++ = PPC_B(yieldOff);
 	}
 	*ctx.quotaGuard = PPC_BGE((u32)((yieldTarget - ctx.quotaGuard) * 4));

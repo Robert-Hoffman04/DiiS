@@ -84,6 +84,7 @@ JITCache::JITCache() {
 	linkerStubDynamicThumbAddress = nullptr;
 	linkerStubDynamicArmAddress = nullptr;
 	smcTailAddress = nullptr;
+	yieldTailAddress = nullptr;
 	thunkProfile = nullptr;
 	memset(memThunk, 0, sizeof memThunk);
 	thunkWords = 0;
@@ -480,7 +481,8 @@ void JITCache::flushCache() {
 		linkerStubDynamicArmAddress =
 			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/false);
 
-		// Shared SMC-bail tail (see jit_cache.h), then the ARM9 memory thunks.
+		// Shared SMC-bail and quota-yield tails (see jit_cache.h), then the
+		// memory thunks.
 		u32* const thunkStart = emitPtr;
 		smcTailAddress = emitPtr;
 		*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);              // JITResult* out
@@ -488,6 +490,11 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_LI(PPC_R11, 1);
 		*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 12);        // bailedOut
 		*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 16);        // smcHit
+		*emitPtr = PPC_B((s32)((u8*)linkerReturnAddress - (u8*)emitPtr)); emitPtr++;
+		yieldTailAddress = emitPtr;
+		*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);              // JITResult* out
+		*emitPtr++ = PPC_LI(PPC_R11, 1);
+		*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 12);        // bailedOut
 		*emitPtr = PPC_B((s32)((u8*)linkerReturnAddress - (u8*)emitPtr)); emitPtr++;
 		if (thunkProfile) jitEmitMemThunks(*this, emitPtr);
 		thunkWords = (u32)(emitPtr - thunkStart);
