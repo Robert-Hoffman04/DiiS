@@ -392,7 +392,7 @@ void JitTraceCtx::ensureArena()
 	arenaAllocated = true;
 
 	arenaOffsetStart = cache.getArenaOffset();
-	emitPtr = cache.allocateJITMemory(JIT_MAX_WORDS * sizeof(u32));
+	emitPtr = cache.allocateJITMemory(JIT_BLOCK_RESERVE_WORDS * sizeof(u32));
 	blockStart = emitPtr;
 
 #ifdef JIT_CODE_STATS
@@ -1537,8 +1537,8 @@ void JitTraceCtx::emitEvalCond(u8 cond)
 // turns it into a fallback) is a barrier -- every flag is live before it, and
 // its own flag writes are never elided. Only straight-line ALU ops and loads
 // (which never exit: out-of-window loads run slowRead in place) are
-// transparent. A block that ends early (the arena budget; see the caller)
-// gets no elision near its end.
+// transparent. The window is the block as jitCutLimit() bounds it, so a
+// block cut short still materialises every flag its last instructions write.
 //
 // Classifies one THUMB opcode: returns true for a barrier, else the flags it
 // reads / definitely writes (JITF bit masks). A conditional write (LSL #0's C,
@@ -1642,15 +1642,19 @@ static bool jitArmFlagClass(u32 op, bool /*v5*/, u8& rd, u8& wr)
 }
 
 // dead[i] = flags dead after the i-th instruction from startPC (JITF masks);
-// liveIn[i] (optional) = flags live on entry to it.
-static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u8* dead, u8* liveIn = nullptr)
+// liveIn[i] (optional) = flags live on entry to it. Instructions at or past
+// `limit` (the block's cut, jitCutLimit()) are outside the block: everything
+// is live there.
+static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u32 limit, u8* dead, u8* liveIn = nullptr)
 {
 	u8 rd[JIT_TRACE_MAX_INSTRUCTIONS], wr[JIT_TRACE_MAX_INSTRUCTIONS];
 	bool bar[JIT_TRACE_MAX_INSTRUCTIONS];
 	const bool v5 = cpu.isaLevel >= 5;
-	for (u32 i = 0; i < JIT_TRACE_MAX_INSTRUCTIONS; i++)
+	for (u32 i = 0; i < JIT_TRACE_MAX_INSTRUCTIONS; i++) {
+		if (i >= limit) { bar[i] = true; continue; }
 		bar[i] = thumb ? jitThumbFlagClass((u16)cpu.fetch16(startPC + 2 * i), rd[i], wr[i])
 		               : jitArmFlagClass(cpu.fetch32(startPC + 4 * i), v5, rd[i], wr[i]);
+	}
 	u8 live = 0xF;                                   // everything live past the window
 	for (int i = JIT_TRACE_MAX_INSTRUCTIONS - 1; i >= 0; i--) {
 		if (bar[i]) { dead[i] = 0; live = 0xF; if (liveIn) liveIn[i] = live; continue; }
@@ -1847,6 +1851,85 @@ void JitTraceCtx::emitSpinSkip(u32 targetPC)
 }
 
 // =========================================================================
+// Guest-side block cut (see JIT_CUT_BUDGET_ARM in jit_trace.h)
+// =========================================================================
+// Weight of one guest instruction: the PPC words the pre-thunk emitters
+// (HEAD 439c262) produced for it, modelled per instruction class from a
+// -DJIT_CUT_PROBE capture of every block the gate scenarios compile (SM64DS
+// boot + gameplay, the three wrestlers). Only memory-heavy blocks ever come
+// near the budget (32 instructions at <= 80 words each never can), so the
+// memory classes are modelled closely -- block transfers per register --
+// and everything else coarsely. Depends on the opcode and the core only;
+// what the emitters actually produce no longer matters.
+static u32 jitCutWeightArm(u32 op, bool arm9)
+{
+	const u32 cond = op >> 28;
+	const u32 pred = (cond != 0xE && cond != 0xF) ? 2 : 0;
+	if ((op & 0x0E000000u) == 0x0A000000u) return 6;                         // B / BL
+	if ((op & 0x0E000000u) == 0x08000000u) {                                  // LDM / STM
+		const u32 n  = (u32)__builtin_popcount(op & 0xFFFF);
+		const u32 wb = (op >> 21) & 1 ? 3 : 0;
+		if ((op >> 20) & 1)
+			return (arm9 ? 46 : 24) + 11 * n + wb + ((op >> 15) & 1 ? (arm9 ? 19 : 8) : 0) + pred;
+		if (arm9) return (n == 1 ? 75 : 117 + 11 * n) + wb + pred;
+		return 24 + 9 * n + wb + pred;
+	}
+	if ((op & 0x0C000000u) == 0x04000000u) {                                  // LDR / STR
+		const bool L = (op >> 20) & 1, B = (op >> 22) & 1;
+		const u32 rn = (op >> 16) & 0xF, rd = (op >> 12) & 0xF;
+		if (rn == 15) return L ? (pred ? 31 : arm9 ? 3 : 14) : 33;
+		if (L && rd == 15) return arm9 ? 75 : 30;
+		if (L) return (B ? (arm9 ? 39 : 28) : (arm9 ? 54 : 37)) + pred;
+		return (arm9 ? 65 : 35) + pred;
+	}
+	if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60))                    // LDRH / STRH / LDRS*
+		return ((op >> 20) & 1 ? (arm9 ? 39 : 29) : (arm9 ? 65 : 35)) + pred;
+	return 2 + pred;
+}
+
+static u32 jitCutWeightThumb(u16 op, bool arm9)
+{
+	if ((op & 0xF800) == 0x4800) return arm9 ? 39 : 29;                     // LDR Rd,[PC,#]
+	const u32 fmt = op & 0xF000;
+	if (fmt >= 0x5000 && fmt <= 0x9000) {                                     // F7..F11 load / store
+		const bool L    = (op & 0x0800) != 0;
+		const bool word = fmt == 0x5000 ? ((op & 0x0E00) == 0x0000 || (op & 0x0E00) == 0x0800)
+		                                : (fmt == 0x6000 || fmt == 0x9000);
+		if (!L) return arm9 ? 64 : 35;
+		return word ? (arm9 ? 53 : 36) : (arm9 ? 38 : 28);
+	}
+	if ((op & 0xF600) == 0xB400) {                                            // PUSH / POP
+		const bool R = (op >> 8) & 1;
+		const u32 n = (u32)__builtin_popcount(op & 0xFF) + (R ? 1 : 0);
+		if (op & 0x0800) return arm9 ? (R ? 32 + 13 * n : 31 + 11 * n) : (R ? 25 + 12 * n : 21 + 11 * n);
+		return arm9 ? (n == 1 ? 79 : 119 + 11 * n) : 26 + 9 * n;
+	}
+	if (fmt == 0xC000) {                                                      // LDMIA / STMIA
+		const u32 n = (u32)__builtin_popcount(op & 0xFF);
+		if (op & 0x0800) return (arm9 ? 31 : 26) + 11 * n;
+		return arm9 ? (n == 1 ? 77 : 119 + 11 * n) : 26 + 9 * n;
+	}
+	return 3;
+}
+
+// Number of guest instructions the block starting at startPC may hold: the
+// first index at which 2 (the entry guard) plus the weights of the
+// instructions before it exceeds the budget, else JIT_TRACE_MAX_INSTRUCTIONS.
+// Terminators and the instruction cap still end a block earlier.
+static u32 jitCutLimit(const JitCpuProfile& cpu, u32 startPC, bool thumb)
+{
+	const bool arm9 = cpu.arm9DtcmBase != 0;
+	const u32 budget = thumb ? JIT_CUT_BUDGET_THUMB : JIT_CUT_BUDGET_ARM;
+	u32 w = 2;
+	for (u32 i = 0; i < JIT_TRACE_MAX_INSTRUCTIONS; i++) {
+		if (w > budget) return i;
+		w += thumb ? jitCutWeightThumb((u16)cpu.fetch16(startPC + 2 * i), arm9)
+		           : jitCutWeightArm(cpu.fetch32(startPC + 4 * i), arm9);
+	}
+	return JIT_TRACE_MAX_INSTRUCTIONS;
+}
+
+// =========================================================================
 // Trace scanner + epilogue
 // =========================================================================
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb)
@@ -1863,48 +1946,27 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	ctx.spinLoopLen = thumb ? jitThumbSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinOff)
 	                        : jitArmSpinLoop(cpu, startPC, ctx.spinBase, ctx.spinOff);
 #endif
+	// Guest-side length cut, fixed before anything is emitted.
+	const u32 cutLimit = jitCutLimit(cpu, startPC, thumb);
 #if JIT_FLAG_ELIM
 	u8 flagDeadAt[JIT_TRACE_MAX_INSTRUCTIONS], flagLiveIn[JIT_TRACE_MAX_INSTRUCTIONS];
-	jitFlagLiveness(cpu, startPC, thumb, flagDeadAt, flagLiveIn);
+	jitFlagLiveness(cpu, startPC, thumb, cutLimit, flagDeadAt, flagLiveIn);
 #endif
 
-	while (!ctx.endBlock && ctx.instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
-		if (ctx.arenaAllocated) {
-			s32 used = (s32)(ctx.emitPtr - ctx.blockStart);
-			// Must reserve room for the epilogue/bailout stubs AND the worst-case
-			// size of the instruction we're about to scan -- this check runs
-			// BEFORE the emitter, so "used" only reflects instructions already
-			// emitted. See JIT_MAX_INSTR_RESERVE_WORDS[_ARM] for why.
-			s32 budget = (s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
-			                   - (s32)ctx.bailoutCount * JIT_BAILOUT_STUB_WORDS
-			                   - (thumb ? JIT_MAX_INSTR_RESERVE_WORDS
-			                            : JIT_MAX_INSTR_RESERVE_WORDS_ARM));
-			if (used > budget) {
-#ifdef JIT_CODE_STATS
-				jitCodeStatsBudgetEnd(cache);
-#endif
-				ctx.endBlock = true; break;
-			}
-		}
+	while (!ctx.endBlock && ctx.instrCount < cutLimit) {
 #if JIT_FLAG_ELIM
-		// Elision assumes the block runs on to the overwriting instruction. Near
-		// the arena budget the block may end after this one instead, so compute
-		// every flag there.
+		// Elision assumes the block runs on to the overwriting instruction; the
+		// liveness window above ends at the cut, so it does.
 		ctx.deadFlags = 0;
 		ctx.memMainFirst = false;
 		{
 			const u32 idx = (ctx.currentPC - startPC) >> (thumb ? 1 : 2);
-			const s32 reserve = thumb ? JIT_MAX_INSTR_RESERVE_WORDS : JIT_MAX_INSTR_RESERVE_WORDS_ARM;
-			const bool nearEnd = ctx.arenaAllocated &&
-				(s32)(ctx.emitPtr - ctx.blockStart) + 2 * reserve >
-				(s32)(JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS
-				      - (s32)(ctx.bailoutCount + 4) * JIT_BAILOUT_STUB_WORDS - reserve);
-			if (idx < JIT_TRACE_MAX_INSTRUCTIONS && !nearEnd) ctx.deadFlags = flagDeadAt[idx];
+			if (idx < JIT_TRACE_MAX_INSTRUCTIONS) ctx.deadFlags = flagDeadAt[idx];
 			// CMP+Bcc fusion (THUMB): this is CMP #imm8 / CMP lo,lo, the next
 			// instruction a Bcc on a relational condition (not MI/PL/VS/VC,
 			// SWI, AL), and no flag is live after that Bcc's fall-through.
 			ctx.fuseCmp = false;
-			if (thumb && !nearEnd && idx + 2 < JIT_TRACE_MAX_INSTRUCTIONS && flagLiveIn[idx + 2] == 0) {
+			if (thumb && idx + 2 < JIT_TRACE_MAX_INSTRUCTIONS && flagLiveIn[idx + 2] == 0) {
 				const u16 op0 = (u16)cpu.fetch16(ctx.currentPC), op1 = (u16)cpu.fetch16(ctx.currentPC + 2);
 				const u8 bc = (op1 >> 8) & 0xF;
 				ctx.fuseCmp = ((op0 & 0xF800) == 0x2800 || (op0 & 0xFFC0) == 0x4280) &&
@@ -1971,10 +2033,15 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 #endif
 	}
 
+#ifdef JIT_CODE_STATS
+	if (!ctx.endBlock && ctx.instrCount >= cutLimit && cutLimit < JIT_TRACE_MAX_INSTRUCTIONS)
+		jitCodeStatsBudgetEnd(cache);
+#endif
+
 #if JIT_FLAG_ELIM
 	// A fused CMP whose Bcc never got emitted (cannot happen by construction:
-	// the Bcc always follows and is never refused, and fusion is off near the
-	// budget) would leave its flags unwritten -- materialise them.
+	// the Bcc always follows and is never refused, and fusion needs the Bcc's
+	// successor inside the cut) would leave its flags unwritten -- materialise them.
 	if (ctx.fusedCmpValid) {
 		ctx.fusedCmpValid = false;
 		ctx.deadFlags = 0;
@@ -2015,9 +2082,9 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		}
 #endif
 		// Give back the slot ensureArena() reserved, if the scan got that far,
-		// or every marker leaks JIT_MAX_WORDS of arena until the next flush.
+		// or every marker leaks JIT_BLOCK_RESERVE_WORDS of arena until the next flush.
 		if (ctx.arenaAllocated)
-			cache.rewindJITMemory((JIT_MAX_WORDS * sizeof(u32) + 31) & ~31u);
+			cache.rewindJITMemory((JIT_BLOCK_RESERVE_WORDS * sizeof(u32) + 31) & ~31u);
 #ifdef JIT_CODE_STATS
 		if (ctx.statCounter) jitCodeStatsDropRecord(cache);
 #endif
@@ -2075,7 +2142,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	u32 emittedWords = (u32)(ctx.emitPtr - ctx.blockStart);
 	u32 actualBytes  = emittedWords * sizeof(u32);
 	u32 committed    = (actualBytes + 31) & ~31u;
-	s32 diff         = (s32)(JIT_MAX_WORDS * sizeof(u32) - committed);
+	s32 diff         = (s32)(JIT_BLOCK_RESERVE_WORDS * sizeof(u32) - committed);
 	u32 rewind       = diff & ~(diff >> 31);
 
 	// Hard invariant: the per-instruction budget check above must guarantee
@@ -2179,7 +2246,7 @@ static void jitCodeStatsCommit(const JitTraceCtx& ctx, u32 emittedWords, u32 com
 
 static void jitCodeStatsBudgetEnd(const JITCache& cache)
 {
-	s_jcs[jcsCore(cache)].budgetEnds++;      // block cut by the JIT_MAX_WORDS budget, not the insn cap
+	s_jcs[jcsCore(cache)].budgetEnds++;      // block cut by jitCutLimit(), not the insn cap / a terminator
 }
 
 void jitCodeStatsOnFlush(const JITCache* cache)

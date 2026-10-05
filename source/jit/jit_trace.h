@@ -89,6 +89,26 @@ static inline u32 jitQuotaStart(s32 quota)
 #define JIT_EPILOGUE_RESERVE_WORDS 64
 #define JIT_BAILOUT_STUB_WORDS     20
 
+// Block length cut. A block used to end once its *emitted* PPC size crossed
+// JIT_MAX_WORDS minus the reserves below, which made guest timing (where the
+// chain's quota-yield checks fall) depend on how big the generated code is.
+// The cut is now decided from the guest code alone, before anything is
+// emitted: jitCutWeight() (jit_trace.cpp) gives every guest instruction a
+// weight that models the PPC words the pre-thunk emitters produced for it,
+// and the block ends before the first instruction at which the running sum
+// (plus the 2-word entry guard) exceeds these budgets -- the same thresholds
+// the emitted-size check used, so blocks are cut where they always were
+// (checked on every block the gate scenarios compile) while code size is
+// free to change. registerBailout() has no callers, so its per-stub budget
+// term was always 0 and is gone.
+#define JIT_CUT_BUDGET_ARM         (JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS - JIT_MAX_INSTR_RESERVE_WORDS_ARM)
+#define JIT_CUT_BUDGET_THUMB       (JIT_MAX_WORDS - JIT_EPILOGUE_RESERVE_WORDS - JIT_MAX_INSTR_RESERVE_WORDS)
+// Arena reserved per compile (the unused tail is rewound): with the cut no
+// longer watching the emitted size, room for the worst case of every
+// instruction, the epilogue and the maximum deferred-bailout stubs.
+#define JIT_BLOCK_RESERVE_WORDS    (JIT_TRACE_MAX_INSTRUCTIONS * JIT_MAX_INSTR_RESERVE_WORDS_ARM \
+                                    + JIT_EPILOGUE_RESERVE_WORDS + JIT_MAX_BAILOUTS * JIT_BAILOUT_STUB_WORDS)
+
 // Worst-case PPC words a single THUMB instruction's emitter can produce before
 // the scanner's next per-iteration budget check runs again. The heaviest
 // formats are PUSH/POP and LDMIA/STMIA with a full 8-9 register list, each
