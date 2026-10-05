@@ -633,28 +633,29 @@ void emitDataProc(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (skip) ctx.patchCondSkip(skip);
 }
 
-// The shared load/store tail: EA is already in PPC_R11, the writeback value (if
-// any) in PPC_R10, and the store source pre-read into hVal. Stashes them on the
-// host stack, flushes state, does the slow C-call access (+ optional word
-// rotate / sign-extend), then writes the result and the Rn writeback straight
-// to guest memory -- writeback committed AFTER the access so a store's SMC
-// guard bail is a clean interpreter re-run (no double-writeback).
+// The shared load/store tail: EA is already in PPC_R12 (the register every
+// access helper and thunk takes it in; the callers compute it there, so no
+// `mr r12,r11` per access), the writeback value (if any) in PPC_R10, and the
+// store source pre-read into hVal. Stashes them on the host stack, flushes
+// state, does the slow C-call access (+ optional word rotate / sign-extend),
+// then writes the result and the Rn writeback straight to guest memory --
+// writeback committed AFTER the access so a store's SMC guard bail is a clean
+// interpreter re-run (no double-writeback).
 void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
                        bool signExt, bool wordRotate, bool writeback, u8 rn, u8 rd,
                        u32& lockedMask, bool predicated = false)
 {
 	u32*& p = ctx.emitPtr;
 
-	// P14: inline RAM load. EA is in PPC_R11; move it to the helper's r12 and,
-	// on a descriptor hit, load straight into rd's host register with the
-	// register cache intact. rd == rn + writeback is LDR-UNPREDICTABLE and the
-	// slow tail's "result last wins" ordering is easier to keep there, so only
-	// the non-aliased forms take the fast path. Predicated forms take it too:
-	// guest registers are pinned for the whole trace (no register cache), so the
-	// caller's BEQ skips the inline sequence wholesale on the cond-false path.
+	// P14: inline RAM load. EA is in the helper's r12; on a descriptor hit,
+	// load straight into rd's host register with the register cache intact.
+	// rd == rn + writeback is LDR-UNPREDICTABLE and the slow tail's "result
+	// last wins" ordering is easier to keep there, so only the non-aliased
+	// forms take the fast path. Predicated forms take it too: guest registers
+	// are pinned for the whole trace (no register cache), so the caller's BEQ
+	// skips the inline sequence wholesale on the cond-false path.
 	(void)predicated;
 	if (isLoad && ctx.cpu.pageDescBase && !(writeback && rd == rn)) {
-		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
 		if (writeback) {
@@ -670,7 +671,6 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	ctx.memPredict = rn == 13 ? JIT_MEMP_DTCM : JIT_MEMP_MAIN;   // stack base: DTCM, else main RAM
 	if (isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
-		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
 		ctx.emitArm9Load(rd, size, signExt, wordRotate, writeback, rn);
 		return;
 	}
@@ -680,7 +680,6 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// its own dirty flush + cache invalidation and commits the writeback.
 	if (!isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
-		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
 		ctx.emitArm9Store(size, writeback, rn, hVal);   // value stays in its pinned reg
 		return;
 	}
@@ -688,13 +687,12 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// ARM7: the SMC guard + slowWrite live in the shared ST thunk.
 	if (!isLoad && ctx.arm7Thunks()) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
-		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
 		ctx.emitArm7ThunkStore(hVal, size);
 		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
 		return;
 	}
 
-	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
+	*p++ = PPC_STW(PPC_R12, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value
 
@@ -776,7 +774,7 @@ void emitLdrPcExit(JitTraceCtx& ctx, u8 valReg, u32 op)
 
 // LDR into PC, general (non-literal) form: the load half of emitLoadStoreTail
 // (word access, always rotate) but the loaded word interworks instead of being
-// written to a GPR slot. EA in PPC_R11, writeback value (if any) in PPC_R10.
+// written to a GPR slot. EA in PPC_R12, writeback value (if any) in PPC_R10.
 void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 {
 	u32*& p = ctx.emitPtr;
@@ -785,13 +783,12 @@ void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 	// BIOS IRQ vector `LDR pc,[r0,#-4]` (DTCM) used to be a slowRead every IRQ.
 	if (ctx.cpu.arm9DtcmBase) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
-		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);        // EA -> r12
 		ctx.memPredict = rn == 13 ? JIT_MEMP_DTCM : JIT_MEMP_MAIN;
 		ctx.emitArm9Load(15, 4, /*signExt=*/false, /*wordRotate=*/true, writeback, rn);
 		emitLdrPcExit(ctx, ctx.hostRegFor(15), op);
 		return;
 	}
-	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
+	*p++ = PPC_STW(PPC_R12, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 
 	ctx.emitMemPrologue();
@@ -937,18 +934,18 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	// offset -> PPC_R12 (register form); the immediate form folds into ADDI
 	if (I) (void)emitOp2(ctx, op, /*immForm=*/false, hRm, /*hRs=*/0, /*wantCarry=*/false);
 
-	// EA (access address) -> R11 ; WB (writeback into Rn) -> R10.
+	// EA (access address) -> R12 ; WB (writeback into Rn) -> R10.
 	// register offset in R12: EA = U ? Rn + R12 : Rn - R12  (SUBF rD,rA,rB = rB-rA)
 	if (P) {                                   // pre-index
-		if      (!I) *p++ = PPC_ADDI(PPC_R11, hRn, immOff);
-		else if (U)  *p++ = PPC_ADD (PPC_R11, hRn, PPC_R12);
-		else         *p++ = PPC_SUBF(PPC_R11, PPC_R12, hRn);
-		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R11, PPC_R11);
+		if      (!I) *p++ = PPC_ADDI(PPC_R12, hRn, immOff);
+		else if (U)  *p++ = PPC_ADD (PPC_R12, hRn, PPC_R12);
+		else         *p++ = PPC_SUBF(PPC_R12, PPC_R12, hRn);
+		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R12, PPC_R12);
 	} else {                                   // post-index (always writes back)
-		*p++ = PPC_OR(PPC_R11, hRn, hRn);
 		if      (!I) *p++ = PPC_ADDI(PPC_R10, hRn, immOff);
 		else if (U)  *p++ = PPC_ADD (PPC_R10, hRn, PPC_R12);
 		else         *p++ = PPC_SUBF(PPC_R10, PPC_R12, hRn);
+		*p++ = PPC_OR(PPC_R12, hRn, hRn);      // after the WB: the offset was in r12
 	}
 
 	if (rd == 15) { emitLoadPcTail(ctx, writeback, rn, op); return; }   // LDR pc (B7c)
@@ -1006,14 +1003,14 @@ void emitExtraDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 		guard = ctx.emitCondSkip(cond);
 	}
 
-	// EA -> R11, WB -> R10 (register offset is unshifted: EA = U ? Rn+Rm : Rn-Rm)
+	// EA -> R12, WB -> R10 (register offset is unshifted: EA = U ? Rn+Rm : Rn-Rm)
 	if (P) {
-		if      (I) *p++ = PPC_ADDI(PPC_R11, hRn, soff);
-		else if (U) *p++ = PPC_ADD (PPC_R11, hRn, hRm);
-		else        *p++ = PPC_SUBF(PPC_R11, hRm, hRn);
-		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R11, PPC_R11);
+		if      (I) *p++ = PPC_ADDI(PPC_R12, hRn, soff);
+		else if (U) *p++ = PPC_ADD (PPC_R12, hRn, hRm);
+		else        *p++ = PPC_SUBF(PPC_R12, hRm, hRn);
+		if (writeback) *p++ = PPC_OR(PPC_R10, PPC_R12, PPC_R12);
 	} else {
-		*p++ = PPC_OR(PPC_R11, hRn, hRn);
+		*p++ = PPC_OR(PPC_R12, hRn, hRn);
 		if      (I) *p++ = PPC_ADDI(PPC_R10, hRn, soff);
 		else if (U) *p++ = PPC_ADD (PPC_R10, hRn, hRm);
 		else        *p++ = PPC_SUBF(PPC_R10, hRm, hRn);

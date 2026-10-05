@@ -2206,6 +2206,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 #ifdef JIT_CODE_STATS
 		u32 statMark[JCS_N]; memcpy(statMark, ctx.statWords, sizeof statMark);
 		const u32 statColdMark = ctx.statCold;
+		u32 statColdCatMark[JCS_N]; memcpy(statColdCatMark, ctx.statColdCat, sizeof statColdCatMark);
 #endif
 
 		u32 opcode;
@@ -2243,6 +2244,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 				memcpy(ctx.statWords, statMark, sizeof statMark);
 				ctx.statWords[JCS_STATCTR] = ctr;
 				ctx.statCold = statColdMark;
+				memcpy(ctx.statColdCat, statColdCatMark, sizeof statColdCatMark);
 			}
 #endif
 			ctx.bailoutCount = bailMark;
@@ -2427,6 +2429,7 @@ struct JitStatRec {
 	u16 words;          // emitted words, entry counter excluded
 	u16 cold;           // of which in cold scopes
 	u16 cat[JCS_N];     // words per category
+	u16 hotCat[JCS_N];  // of which outside cold scopes
 	u8  inWindow;       // executed in the current report window
 	u8  pad[3];
 };
@@ -2437,6 +2440,8 @@ struct JitStatCore {
 	u64 blocks, insns, words, pad, cold, cat[JCS_N], flushes, budgetEnds;
 	// current window
 	u64 fBlocks, fWords, fCold, fEntries, fInsnsRun, frames;
+	u64 fHotCat[JCS_N];   // hot words per category of the blocks executed in a frame (summed over frames)
+	u64 fExecCat[JCS_N];  // hot words per category x entries (upper bound on fetched words)
 	u64 wBlocks, wWords, wLines, wCold, wInsns, wCat[JCS_N];
 };
 JitStatCore s_jcs[2];
@@ -2476,6 +2481,8 @@ static void jitCodeStatsCommit(const JitTraceCtx& ctx, u32 emittedWords, u32 com
 	cat[JCS_PAD]   = committedBytes / 4 - emittedWords;
 	r.insns = ctx.instrCount; r.words = (u16)words; r.cold = (u16)ctx.statCold;
 	for (int i = 0; i < JCS_N; i++) r.cat[i] = (u16)cat[i];
+	for (int i = 0; i < JCS_N; i++) r.hotCat[i] = (u16)(cat[i] - ctx.statColdCat[i]);
+	r.hotCat[JCS_PAD] = 0;
 	S.blocks++; S.insns += ctx.instrCount; S.words += words; S.pad += cat[JCS_PAD]; S.cold += ctx.statCold;
 	for (int i = 0; i < JCS_N; i++) S.cat[i] += cat[i];
 }
@@ -2508,6 +2515,7 @@ void jitCodeStatsTick(u32 frame)
 			if (!d) continue;
 			r.seen = r.execs;
 			S.fBlocks++; S.fWords += r.words; S.fCold += r.cold; S.fEntries += d; S.fInsnsRun += (u64)d * r.insns;
+			for (int k = 0; k < JCS_N; k++) { S.fHotCat[k] += r.hotCat[k]; S.fExecCat[k] += (u64)d * r.hotCat[k]; }
 			if (!r.inWindow) {
 				r.inWindow = 1;
 				S.wBlocks++; S.wWords += r.words; S.wLines += (r.words * 4 + 31) / 32; S.wCold += r.cold; S.wInsns += r.insns;
@@ -2550,9 +2558,14 @@ void jitCodeStatsTick(u32 frame)
 			        (unsigned long long)S.wBlocks, (unsigned long long)S.wInsns, (unsigned long long)S.wWords * 4,
 			        (unsigned long long)S.wLines * 32, (unsigned long long)(S.wWords - S.wCold) * 4);
 			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)S.wCat[k] * 4);
+			fprintf(f, "\nframe=%u core=%d hotcat: per-frame hot bytes |", frame, c ? 7 : 9);
+			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR && k != JCS_PAD) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)(S.fHotCat[k] * 4 / fr));
+			fprintf(f, "\nframe=%u core=%d execcat: per-frame hot bytes x entries |", frame, c ? 7 : 9);
+			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR && k != JCS_PAD) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)(S.fExecCat[k] * 4 / fr));
 			fprintf(f, "\n");
 		}
 		S.fBlocks = S.fWords = S.fCold = S.fEntries = S.fInsnsRun = S.frames = 0;
+		memset(S.fHotCat, 0, sizeof S.fHotCat); memset(S.fExecCat, 0, sizeof S.fExecCat);
 		S.wBlocks = S.wWords = S.wLines = S.wCold = S.wInsns = 0;
 		memset(S.wCat, 0, sizeof S.wCat);
 		for (u32 i = 0; i < S.n; i++) S.rec[i].inWindow = 0;

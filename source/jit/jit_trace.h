@@ -377,6 +377,7 @@ struct JitTraceCtx {
 #ifdef JIT_CODE_STATS
 	u32  statWords[JCS_N];     // words charged per category (JCS_OTHER filled at finalize)
 	u32  statCold;             // words inside cold scopes
+	u32  statColdCat[JCS_N];   // of which per category (hot bytes by category = statWords - statColdCat)
 	u32  statChild;            // words of nested scopes, for the active scope
 	u8   statColdDepth;
 	u32* statCounter;          // this block's execution counter (jit_trace.cpp)
@@ -594,6 +595,7 @@ struct JitStatScope {
 	~JitStatScope() {
 		const u32 total = (u32)(c.emitPtr - start);
 		c.statWords[cat] += total - c.statChild;
+		if (c.statColdDepth) c.statColdCat[cat] += total - c.statChild;
 		if (cold && --c.statColdDepth == 0) c.statCold += total;
 		c.statChild = savedChild + total;
 	}
