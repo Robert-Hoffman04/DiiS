@@ -16,6 +16,7 @@
 #if defined(DESMUME_JIT)
 
 #include <malloc.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <ogc/cache.h>
@@ -375,6 +376,13 @@ void jitSetArm7GBAMode(bool enable)
 		jitProfile[JIT_ARM7] = enable ? s_arm7GbaProfile : s_arm7DsProfile;
 }
 
+#ifdef JIT_CODE_STATS
+static u32* jitCodeStatsNewRecord(const JITCache& cache);
+static void jitCodeStatsDropRecord(const JITCache& cache);
+static void jitCodeStatsCommit(const JitTraceCtx& ctx, u32 emittedWords, u32 committedBytes);
+static void jitCodeStatsBudgetEnd(const JITCache& cache);
+#endif
+
 // =========================================================================
 // JitTraceCtx helpers
 // =========================================================================
@@ -386,6 +394,18 @@ void JitTraceCtx::ensureArena()
 	arenaOffsetStart = cache.getArenaOffset();
 	emitPtr = cache.allocateJITMemory(JIT_MAX_WORDS * sizeof(u32));
 	blockStart = emitPtr;
+
+#ifdef JIT_CODE_STATS
+	statCounter = jitCodeStatsNewRecord(cache);
+	if (statCounter) {                                   // ++*statCounter (r11/r12 are free at entry)
+		const u32 a = (u32)statCounter, ha = (a + 0x8000) >> 16;
+		*emitPtr++ = PPC_LIS(PPC_R12, ha);
+		*emitPtr++ = PPC_LWZ(PPC_R11, PPC_R12, (s32)(s16)(a & 0xFFFF));
+		*emitPtr++ = PPC_ADDI(PPC_R11, PPC_R11, 1);
+		*emitPtr++ = PPC_STW(PPC_R11, PPC_R12, (s32)(s16)(a & 0xFFFF));
+		statWords[JCS_STATCTR] += 4;
+	}
+#endif
 
 	// Event quota shield: on entry r3 is the accumulated cycle count across any
 	// chained blocks; bail to the yield stub once it crosses the threshold.
@@ -407,6 +427,7 @@ void JitTraceCtx::ensureFlagsLoaded()
 void JitTraceCtx::emitFlagBit(u8 targetBit, u32 srcReg, u8 sh)
 {
 	if (flagDead(targetBit)) return;
+	JIT_STAT_SCOPE(*this, JCS_FLAGS, false);
 	ensureFlagsLoaded();
 	*emitPtr++ = PPC_MERGE_FLAG_BIT(targetBit, srcReg, sh);
 	flagsDirty = true;
@@ -415,6 +436,7 @@ void JitTraceCtx::emitFlagBit(u8 targetBit, u32 srcReg, u8 sh)
 void JitTraceCtx::emitFlagConst(u8 targetBit, bool value)
 {
 	if (flagDead(targetBit)) return;
+	JIT_STAT_SCOPE(*this, JCS_FLAGS, false);
 	ensureFlagsLoaded();
 	*emitPtr++ = PPC_LI(PPC_R8, value ? 1 : 0);
 	*emitPtr++ = PPC_MERGE_FLAG_BIT(targetBit, PPC_R8, 0);
@@ -438,6 +460,7 @@ void JitTraceCtx::emitDirtyFlagFlush() {}
 
 void JitTraceCtx::emitNZ(u32 srcReg)
 {
+	JIT_STAT_SCOPE(*this, JCS_FLAGS, false);
 	emitFlagBit(JITF_N, srcReg, 1);
 	if (flagDead(JITF_Z)) return;
 	*emitPtr++ = PPC_CNTLZW(PPC_R8, srcReg);
@@ -447,6 +470,7 @@ void JitTraceCtx::emitNZ(u32 srcReg)
 void JitTraceCtx::emitCVfromXER(u32 scratchReg)
 {
 	if (cvDead()) return;                        // skips the mfxer too
+	JIT_STAT_SCOPE(*this, JCS_FLAGS, false);
 	*emitPtr++ = PPC_MFXER(scratchReg);
 	emitFlagBit(JITF_C, scratchReg, 3);
 	emitFlagBit(JITF_V, scratchReg, 2);
@@ -472,6 +496,7 @@ void JitTraceCtx::emitCVfromXER(u32 scratchReg)
 // stashed.
 void JitTraceCtx::emitMemPrologue()
 {
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
 	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 80);        // gpr base
 	*emitPtr++ = PPC_STW(PPC_R29, PPC_R10, 15 * 4);   // guest PC -> gpr[15]
 	*emitPtr++ = PPC_STW(PPC_R3, 1, 92);         // save cycle accumulator
@@ -479,11 +504,13 @@ void JitTraceCtx::emitMemPrologue()
 
 void JitTraceCtx::emitMemEpilogue()
 {
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
 	*emitPtr++ = PPC_LWZ(PPC_R3, 1, 92);
 }
 
 void JitTraceCtx::emitSlowLoad(u8 destReg, u8 eaReg, u32 size, bool signExtend)
 {
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
 	u32 fn = (u32)cpu.slowRead;
 	*emitPtr++ = PPC_OR(PPC_R3, eaReg, eaReg);            // arg1 = addr
 	*emitPtr++ = PPC_LI(PPC_R4, (s32)size);               // arg2 = size
@@ -498,6 +525,7 @@ void JitTraceCtx::emitSlowLoad(u8 destReg, u8 eaReg, u32 size, bool signExtend)
 
 void JitTraceCtx::emitSlowStore(u8 eaReg, u8 valReg, u32 size)
 {
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
 	u32 fn = (u32)cpu.slowWrite;
 	*emitPtr++ = PPC_OR(PPC_R3, eaReg, eaReg);            // arg1 = addr
 	*emitPtr++ = PPC_OR(PPC_R4, valReg, valReg);          // arg2 = value
@@ -519,13 +547,18 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 	(void)eaReg; return;   // GO-FIX-PH diagnostic: skip the inline SMC guard
 #endif
 	u32 fp = (u32)cache.smcPageFlags;
+	u32* skip;
+	{
+	JIT_STAT_SCOPE(*this, JCS_SMCGUARD, false);
 	*emitPtr++ = PPC_RLWINM(PPC_R11, eaReg, 22, 16, 31);   // r11 = (EA>>10) & 0xFFFF
 	*emitPtr++ = PPC_LIS(PPC_R10, fp >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, fp & 0xFFFF);
 	*emitPtr++ = PPC_LBZX(PPC_R10, PPC_R10, PPC_R11);      // r10 = smcPageFlags[page]
 	*emitPtr++ = PPC_CMPWI(0, PPC_R10, 0);
-	u32* skip = emitPtr++;
+	skip = emitPtr++;
+	}
 
+	JIT_STAT_SCOPE(*this, JCS_SMCBAIL, true);
 	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);
 	*emitPtr++ = PPC_STW(eaReg, PPC_R10, 20);              // out->smcAddress = EA
 	emitAddCycles(cyclesAccum);
@@ -577,6 +610,7 @@ void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
 // into missSlots[].
 int JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots)
 {
+	JIT_STAT_SCOPE(*this, JCS_MEMGUARD, false);
 	u32*& p = emitPtr;
 	int nMiss = 0;
 	const u32 lo   = cpu.pageDescLo;
@@ -630,6 +664,7 @@ int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** 
                                      void (*onHit)(JitTraceCtx&, void*, int), void* hitArg)
 {
 	(void)size;
+	JIT_STAT_SCOPE(*this, JCS_MEMGUARD, false);
 	u32*& p = emitPtr;
 	int nFast = 0;
 	u32* slow[6]; int nSlow = 0; bool slowIsBeq[6] = { false };
@@ -754,6 +789,7 @@ static bool emitArm9RegionGuardMainFirst(JitTraceCtx& c, u8 alignMe, bool withIt
 	const u32 dtcmRegion = *(const volatile u32*)(uintptr_t)c.cpu.arm9DtcmRegionPtr;
 	const bool dtcmReach = (dtcmRegion & 0x3FFFu) == 0;
 	if (dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u) return false;
+	JIT_STAT_SCOPE(c, JCS_MEMGUARD, false);
 	u32*& p = c.emitPtr;
 	const u32 mainMb = (u32)__builtin_clz(c.cpu.arm9MainMask);
 
@@ -802,6 +838,7 @@ struct Arm9LoadHit { u8 hRd; u32 size; bool signExt, wordRotate; u32* ends[3]; i
 static void arm9LoadHit(JitTraceCtx& c, void* a, int /*region*/)
 {
 	Arm9LoadHit& h = *(Arm9LoadHit*)a;
+	JIT_STAT_SCOPE(c, JCS_MEMHIT, false);
 	u32*& p = c.emitPtr;
 	if (h.size == 4) {
 		*p++ = PPC_LWBRX(h.hRd, PPC_R10, PPC_R11);
@@ -832,6 +869,8 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/true, arm9LoadHit, &h);
 
 	// ---- slow: slowRead C call (EA still in r12) ----
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	*p++ = PPC_STW(PPC_R12, 1, 96);                                // EA survives the call here
 	emitMemPrologue();
 	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
@@ -845,6 +884,7 @@ void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, b
 	}
 	emitMemEpilogue();
 	*p++ = PPC_OR(h.hRd, PPC_R10, PPC_R10);
+	}
 
 	// ---- join ---- (the caller excludes rd == rn with writeback)
 	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
@@ -871,6 +911,9 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	const u8 hDst = writeReg(rd, /*fullOverwrite=*/true, lockedMask);
 
 	// ---- fast: descriptor hit, inline load ----
+	u32* toEnd;
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	if (size == 4) {
 		*p++ = PPC_LWBRX(hDst, PPC_R10, PPC_R11);
 		// ARM OP_LDR rotates an unaligned word: ROR(word, 8 * (EA & 3)). The
@@ -888,7 +931,8 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 		*p++ = PPC_LBZX(hDst, PPC_R10, PPC_R11);
 		if (signExt) *p++ = PPC_EXTSB(hDst, hDst);
 	}
-	u32* toEnd = p++;                                   // B over the slow path
+	toEnd = p++;                                        // B over the slow path
+	}
 
 	// ---- slow: EA outside the RAM page window -- I/O,
 	// VRAM, BIOS, GBA slot, open bus. Do the access in place through the
@@ -901,6 +945,8 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	// own slow tail), so the ordering is unchanged. Clobbers r10..r12, as the
 	// helper's contract already allows.
 	patchMissSlots(miss, nMiss, p);
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	*p++ = PPC_STW(PPC_R12, 1, 96);                     // stash EA across the call
 	emitMemPrologue();
 	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
@@ -913,6 +959,7 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	}
 	emitMemEpilogue();
 	*p++ = PPC_OR(hDst, PPC_R10, PPC_R10);
+	}
 
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	return true;
@@ -929,6 +976,9 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast, /*withItcm=*/true);
 
 	// ---- slow: per-word slowRead C loop, straight into the pinned regs ----
+	u32* toEnd;
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	emitMemPrologue();
 	for (u32 k = 0; k < n; k++) {
 		*p++ = PPC_LWZ(PPC_R12, 1, 96);
@@ -936,14 +986,18 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 		emitSlowLoad(hostRegFor(regs[k]), PPC_R12, 4, false);
 	}
 	emitMemEpilogue();
-	u32* toEnd = p++;                                              // B over the fast block
+	toEnd = p++;                                                   // B over the fast block
+	}
 
 	// ---- fast: n sequential inline lwbrx into the pinned regs ----
 	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // r10 = host addr of the low word
 	for (u32 k = 0; k < n; k++) {
 		*p++ = PPC_LWBRX(hostRegFor(regs[k]), 0, PPC_R10);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
+	}
 	}
 
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
@@ -966,12 +1020,16 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	const int nMiss = emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29, miss);   // LDM: no unaligned rotate
 
 	// ---- fast: r10 = hostBase, r11 = aligned page offset of the low word ----
+	u32* toEnd;
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	for (u32 k = 0; k < n; k++) {
 		const u8 hgi = writeReg(regs[k], /*fullOverwrite=*/true, lockedMask);
 		*p++ = PPC_LWBRX(hgi, PPC_R10, PPC_R11);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R11, PPC_R11, 4);
 	}
-	u32* toEnd = p++;                                   // B over the slow path
+	toEnd = p++;                                        // B over the slow path
+	}
 
 	// ---- slow: the run is outside the RAM page window or
 	// straddles a 1 MB page. Per-word slowRead C loop over the whole run,
@@ -988,6 +1046,8 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	// JIT_MAX_INSTR_RESERVE_WORDS. The ARM9 block load already emits the same
 	// per-word loop for the same list sizes.
 	patchMissSlots(miss, nMiss, p);
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	*p++ = PPC_STW(PPC_R12, 1, 96);                     // stash low EA
 	emitMemPrologue();
 	for (u32 k = 0; k < n; k++) {
@@ -997,6 +1057,7 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	}
 	emitMemEpilogue();
 	*p++ = PPC_LWZ(PPC_R12, 1, 96);                     // restore low EA
+	}
 
 	*toEnd = PPC_B((u32)((p - toEnd) * 4));
 	return true;
@@ -1032,9 +1093,11 @@ static void emitArm9StoreOp(u32*& p, u32 size, u8 hVal)
 static void arm9StoreHit(JitTraceCtx& c, void* a, int region)
 {
 	Arm9StoreHit& h = *(Arm9StoreHit*)a;
+	JIT_STAT_SCOPE(c, JCS_MEMHIT, false);
 	u32*& p = c.emitPtr;
 	u32* toBail = nullptr;
 	if (region == 1) {                                             // main RAM: SMC page guard
+		JIT_STAT_SCOPE(c, JCS_SMCGUARD, false);
 		const u32 fp = (u32)c.cache.smcPageFlags;
 		*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 22, 16, 31);            // (EA >> 10) & 0xFFFF
 		*p++ = PPC_LIS(PPC_R8, fp >> 16);
@@ -1048,6 +1111,7 @@ static void arm9StoreHit(JitTraceCtx& c, void* a, int region)
 	if (toBail) {
 		// Compiled code lives on this page: bail with smcHit set, resuming at
 		// this instruction (same exit as emitSmcCheckAndBail()).
+		JIT_STAT_SCOPE(c, JCS_SMCBAIL, true);
 		*toBail = PPC_BNE((u32)((p - toBail) * 4));
 		*p++ = PPC_LWZ(PPC_R10, 1, 88);
 		*p++ = PPC_STW(PPC_R12, PPC_R10, 20);                      // out->smcAddress = EA
@@ -1077,10 +1141,13 @@ void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal)
 		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/false, arm9StoreHit, &h);
 
 	// ---- slow: SMC guard + slowWrite C call (EA in r12, value in hVal) ----
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	emitMemPrologue();
 	emitSmcCheckAndBail(PPC_R12);
 	emitSlowStore(PPC_R12, hVal, size);
 	emitMemEpilogue();
+	}
 
 	// ---- join ---- (writeback straight into the pinned base register)
 	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
@@ -1154,6 +1221,9 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/span, fast, /*withItcm=*/false);
 
 	// ---- slow: SMC guard (whole span) + per-word slowWrite C loop ----
+	u32* toEnd;
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
 	emitMemPrologue();
 	*p++ = PPC_LWZ(PPC_R12, 1, 96);
 	emitSmcCheckAndBail(PPC_R12);
@@ -1165,9 +1235,11 @@ void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 		emitSlowStore(PPC_R12, hostRegFor(regs[k]), 4);
 	}
 	emitMemEpilogue();
-	u32* toEnd = p++;                                              // B over the fast block(s)
+	toEnd = p++;                                                   // B over the fast block(s)
+	}
 
 	// ---- fast: main RAM (SMC-guard both ends of the span) ----
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	const bool haveDtcm = (nFast == 2);
 	*fast[nFast - 1] = PPC_B((u32)((p - fast[nFast - 1]) * 4));
 	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // host addr of the low word
@@ -1249,6 +1321,7 @@ void JitTraceCtx::registerBailout(u32* branchPtr, JitBailoutCond cond)
 // =========================================================================
 void JitTraceCtx::emitChainTail(u32 targetPC)
 {
+	JIT_STAT_SCOPE(*this, JCS_EXIT, false);
 	u32*& p = emitPtr;
 #if JIT_ENABLE_CHAINING
 	{ s32 o = (s32)((u8*)cache.linkerStubAddress - (u8*)p); *p++ = PPC_BL(o); }
@@ -1262,6 +1335,7 @@ void JitTraceCtx::emitChainTail(u32 targetPC)
 
 void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
 {
+	JIT_STAT_SCOPE(*this, JCS_EXIT, false);
 	emitAddCycles(cyclesAccum + termCycles);
 	emitResultMetadata(metaCount, 0);
 	emitChainTail(targetPC);
@@ -1269,6 +1343,7 @@ void JitTraceCtx::emitStaticExit(u32 targetPC, u32 metaCount, u32 termCycles)
 
 void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool targetThumb)
 {
+	JIT_STAT_SCOPE(*this, JCS_EXIT, false);
 	u32*& p = emitPtr;
 	emitAddCycles(cyclesAccum + termCycles);
 	emitResultMetadata(metaCount, 0);
@@ -1293,6 +1368,7 @@ void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool 
 
 void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 {
+	JIT_STAT_SCOPE(*this, JCS_EXIT, false);
 	u32*& p = emitPtr;
 	// No state flush here: guest R0..R15 + flags are resident and the single
 	// trampoline landing pad this branch reaches writes them back to cpu.R[]
@@ -1329,6 +1405,7 @@ void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 void JitTraceCtx::emitInterpFallback(u32 opcode)
 {
 	ensureArena();
+	JIT_STAT_SCOPE(*this, JCS_FALLBACK, false);
 	u32*& p = emitPtr;
 	const bool arm9 = (cpu.isaLevel >= 5);
 	const u32 fn = arm9 ? (thumbMode ? (u32)&jitInterpFallbackArm9Thumb : (u32)&jitInterpFallbackArm9Arm)
@@ -1384,6 +1461,7 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 
 u32* JitTraceCtx::emitCondSkip(u8 cond)
 {
+	JIT_STAT_SCOPE(*this, JCS_PRED, false);
 	if (cond < 8) {
 		static const u8 kFlag[4] = { JITF_Z, JITF_C, JITF_N, JITF_V };
 		const u8 f = kFlag[cond >> 1];
@@ -1404,6 +1482,7 @@ u32* JitTraceCtx::emitCondSkip(u8 cond)
 // r10, r11. Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
 void JitTraceCtx::emitEvalCond(u8 cond)
 {
+	JIT_STAT_SCOPE(*this, JCS_PRED, false);
 	switch (cond) {
 	case 0x0: readFlag(JITF_Z, PPC_R11); break;                                           // EQ  Z
 	case 0x1: readFlag(JITF_Z, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// NE  !Z
@@ -1742,6 +1821,7 @@ static u8 jitArmSpinLoop(const JitCpuProfile& cpu, u32 startPC, u8& base, s32& o
 void JitTraceCtx::emitSpinSkip(u32 targetPC)
 {
 	if (!spinLoopLen || instrCount + 1 != spinLoopLen || targetPC != startPC) return;
+	JIT_STAT_SCOPE(*this, JCS_SPIN, false);
 	u32*& p = emitPtr;
 	const u32 c = cyclesAccum + 3;                                    // + the taken branch
 	*p++ = PPC_ADDI(PPC_R12, hostRegFor(spinBase), spinOff);
@@ -1799,7 +1879,12 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			                   - (s32)ctx.bailoutCount * JIT_BAILOUT_STUB_WORDS
 			                   - (thumb ? JIT_MAX_INSTR_RESERVE_WORDS
 			                            : JIT_MAX_INSTR_RESERVE_WORDS_ARM));
-			if (used > budget) { ctx.endBlock = true; break; }
+			if (used > budget) {
+#ifdef JIT_CODE_STATS
+				jitCodeStatsBudgetEnd(cache);
+#endif
+				ctx.endBlock = true; break;
+			}
 		}
 #if JIT_FLAG_ELIM
 		// Elision assumes the block runs on to the overwriting instruction. Near
@@ -1834,6 +1919,10 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		// exactly here before the fallback call replaces it.
 		u32* const emitMark = ctx.arenaAllocated ? ctx.emitPtr : nullptr;
 		const u32  bailMark = ctx.bailoutCount;
+#ifdef JIT_CODE_STATS
+		u32 statMark[JCS_N]; memcpy(statMark, ctx.statWords, sizeof statMark);
+		const u32 statColdMark = ctx.statCold;
+#endif
 
 		u32 opcode;
 		if (thumb) {
@@ -1864,6 +1953,14 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		if (ctx.endBlock && !ctx.blockTerminatedEarly) {
 			if (emitMark)                ctx.emitPtr = emitMark;
 			else if (ctx.arenaAllocated) ctx.emitPtr = ctx.quotaGuard + 1;   // just past ensureArena()'s guard
+#ifdef JIT_CODE_STATS
+			{   // the rewound words are gone; keep the entry counter ensureArena() may just have charged
+				const u32 ctr = ctx.statWords[JCS_STATCTR];
+				memcpy(ctx.statWords, statMark, sizeof statMark);
+				ctx.statWords[JCS_STATCTR] = ctr;
+				ctx.statCold = statColdMark;
+			}
+#endif
 			ctx.bailoutCount = bailMark;
 			ctx.endBlock = false;
 			ctx.deadFlags = 0;
@@ -1921,6 +2018,9 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		// or every marker leaks JIT_MAX_WORDS of arena until the next flush.
 		if (ctx.arenaAllocated)
 			cache.rewindJITMemory((JIT_MAX_WORDS * sizeof(u32) + 31) & ~31u);
+#ifdef JIT_CODE_STATS
+		if (ctx.statCounter) jitCodeStatsDropRecord(cache);
+#endif
 		return cache.registerBlock(startPC, 1, nullptr, thumb);
 	}
 
@@ -1952,6 +2052,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 
 	// ---- default epilogue: fall off the end of the block ----
 	if (!ctx.blockTerminatedEarly) {
+		JIT_STAT_SCOPE(ctx, JCS_EXIT, false);
 		ctx.emitAddCycles(ctx.cyclesAccum);
 		ctx.emitResultMetadata(ctx.instrCount, 0);
 
@@ -1960,11 +2061,14 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 
 	// ---- quota-shield yield stub ----
 	u32* yieldTarget = ctx.emitPtr;
+	{
+	JIT_STAT_SCOPE(ctx, JCS_YIELD, true);
 	ctx.emitResultMetadata(0, 1);
 	*ctx.emitPtr++ = PPC_LIS(PPC_R4, startPC >> 16);
 	*ctx.emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, startPC & 0xFFFF);
 	s32 yieldOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)ctx.emitPtr);
 	*ctx.emitPtr++ = PPC_B(yieldOff);
+	}
 	*ctx.quotaGuard = PPC_BGE((u32)((yieldTarget - ctx.quotaGuard) * 4));
 
 	// ---- finalize: rewind unused reservation, sync caches, register ----
@@ -1990,6 +2094,9 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 #endif
 
 	cache.rewindJITMemory(rewind);
+#ifdef JIT_CODE_STATS
+	if (ctx.statCounter) jitCodeStatsCommit(ctx, emittedWords, committed);
+#endif
 	DCStoreRange(ctx.blockStart, actualBytes);
 	ICInvalidateRange(ctx.blockStart, actualBytes);
 
@@ -2001,5 +2108,147 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 
 	return cache.registerBlock(startPC, ctx.instrCount, (JITBlockFunc)ctx.blockStart, thumb);
 }
+
+// =========================================================================
+// -DJIT_CODE_STATS: generated-code footprint report (see jit_trace.h)
+// =========================================================================
+#ifdef JIT_CODE_STATS
+namespace {
+// One record per compiled block, in compile order since the core's last
+// cache flush (a flush discards all code, so it resets the list). The block's
+// entry counter is `execs`; the frame scan diffs it against `seen`.
+struct JitStatRec {
+	u32 execs;          // incremented by the block's own entry code
+	u32 seen;           // execs at the previous frame scan
+	u32 insns;          // guest instructions compiled
+	u16 words;          // emitted words, entry counter excluded
+	u16 cold;           // of which in cold scopes
+	u16 cat[JCS_N];     // words per category
+	u8  inWindow;       // executed in the current report window
+	u8  pad[3];
+};
+enum { JCS_REC_ARM9 = 49152, JCS_REC_ARM7 = 16384, JCS_WINDOW = 60 };
+struct JitStatCore {
+	JitStatRec* rec; u32 cap, n;
+	// cumulative over the run (all compiles, flushed or not)
+	u64 blocks, insns, words, pad, cold, cat[JCS_N], flushes, budgetEnds;
+	// current window
+	u64 fBlocks, fWords, fCold, fEntries, fInsnsRun, frames;
+	u64 wBlocks, wWords, wLines, wCold, wInsns, wCat[JCS_N];
+};
+JitStatCore s_jcs[2];
+int jcsCore(const JITCache& c) { return &c == &jitCacheArm9 ? JIT_ARM9 : JIT_ARM7; }
+}
+
+static u32* jitCodeStatsNewRecord(const JITCache& cache)
+{
+	JitStatCore& S = s_jcs[jcsCore(cache)];
+	if (!S.rec) {
+		S.cap = jcsCore(cache) == JIT_ARM9 ? JCS_REC_ARM9 : JCS_REC_ARM7;
+		S.rec = (JitStatRec*)calloc(S.cap, sizeof(JitStatRec));
+		if (!S.rec) { S.cap = 0; return nullptr; }
+	}
+	if (S.n >= S.cap) return nullptr;
+	JitStatRec& r = S.rec[S.n++];
+	memset(&r, 0, sizeof r);
+	return &r.execs;
+}
+
+static void jitCodeStatsDropRecord(const JITCache& cache)
+{
+	JitStatCore& S = s_jcs[jcsCore(cache)];
+	if (S.n) S.n--;
+}
+
+static void jitCodeStatsCommit(const JitTraceCtx& ctx, u32 emittedWords, u32 committedBytes)
+{
+	JitStatCore& S = s_jcs[jcsCore(ctx.cache)];
+	JitStatRec& r = *(JitStatRec*)ctx.statCounter;
+	u32 cat[JCS_N]; memcpy(cat, ctx.statWords, sizeof cat);
+	cat[JCS_ENTRY] += 2;                                       // ensureArena()'s quota guard
+	const u32 words = emittedWords - cat[JCS_STATCTR];
+	u32 named = 0;
+	for (int i = 0; i < JCS_N; i++) if (i != JCS_OTHER && i != JCS_PAD && i != JCS_STATCTR) named += cat[i];
+	cat[JCS_OTHER] = words - named;
+	cat[JCS_PAD]   = committedBytes / 4 - emittedWords;
+	r.insns = ctx.instrCount; r.words = (u16)words; r.cold = (u16)ctx.statCold;
+	for (int i = 0; i < JCS_N; i++) r.cat[i] = (u16)cat[i];
+	S.blocks++; S.insns += ctx.instrCount; S.words += words; S.pad += cat[JCS_PAD]; S.cold += ctx.statCold;
+	for (int i = 0; i < JCS_N; i++) S.cat[i] += cat[i];
+}
+
+static void jitCodeStatsBudgetEnd(const JITCache& cache)
+{
+	s_jcs[jcsCore(cache)].budgetEnds++;      // block cut by the JIT_MAX_WORDS budget, not the insn cap
+}
+
+void jitCodeStatsOnFlush(const JITCache* cache)
+{
+	if (cache != &jitCacheArm9 && cache != &jitCacheArm7) return;
+	JitStatCore& S = s_jcs[jcsCore(*cache)];
+	S.flushes++;
+	S.n = 0;
+}
+
+static const char* const k_jcsName[JCS_N] = {
+	"entry", "memguard", "memhit", "memslow", "smcguard", "smcbail", "flags", "pred",
+	"exit", "yield", "fallback", "spin", "other", "pad", "statctr" };
+
+void jitCodeStatsTick(u32 frame)
+{
+	for (int c = 0; c < 2; c++) {
+		JitStatCore& S = s_jcs[c];
+		S.frames++;
+		for (u32 i = 0; i < S.n; i++) {
+			JitStatRec& r = S.rec[i];
+			const u32 d = r.execs - r.seen;
+			if (!d) continue;
+			r.seen = r.execs;
+			S.fBlocks++; S.fWords += r.words; S.fCold += r.cold; S.fEntries += d; S.fInsnsRun += (u64)d * r.insns;
+			if (!r.inWindow) {
+				r.inWindow = 1;
+				S.wBlocks++; S.wWords += r.words; S.wLines += (r.words * 4 + 31) / 32; S.wCold += r.cold; S.wInsns += r.insns;
+				for (int k = 0; k < JCS_N; k++) S.wCat[k] += r.cat[k];
+			}
+		}
+	}
+	if (frame % JCS_WINDOW) return;
+	static bool s_init = false;
+	FILE* f = fopen("sd:/jitstats.log", s_init ? "a" : "w");
+	if (f && !s_init) {
+		s_init = true;
+		fprintf(f, "# jitstats: arena9=%p (%u KiB) arena7=%p (%u KiB) table9=%p smcflags9=%p dtcmregion=%08x\n",
+		        (void*)s_arena[JIT_ARM9], (unsigned)(JIT_ARENA_SIZE_ARM9 >> 10),
+		        (void*)s_arena[JIT_ARM7], (unsigned)(JIT_ARENA_SIZE >> 10), (void*)s_blockTable[JIT_ARM9],
+		        (void*)s_smcPageFlags[JIT_ARM9],
+		        jitProfile[JIT_ARM9] ? (unsigned)*(const volatile u32*)(uintptr_t)jitProfile[JIT_ARM9]->arm9DtcmRegionPtr : 0u);
+	}
+	for (int c = 0; c < 2; c++) {
+		JitStatCore& S = s_jcs[c];
+		const u64 fr = S.frames ? S.frames : 1;
+		if (f) {
+			fprintf(f, "frame=%u core=%d cum: blocks=%llu insns=%llu bytes=%llu pad=%llu cold=%llu flushes=%llu budgetends=%llu live=%u |",
+			        frame, c ? 7 : 9, (unsigned long long)S.blocks, (unsigned long long)S.insns,
+			        (unsigned long long)S.words * 4, (unsigned long long)S.pad * 4, (unsigned long long)S.cold * 4,
+			        (unsigned long long)S.flushes, (unsigned long long)S.budgetEnds, (unsigned)S.n);
+			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)S.cat[k] * 4);
+			fprintf(f, "\nframe=%u core=%d perframe: blocks=%llu bytes=%llu hotbytes=%llu entries=%llu insnsrun=%llu"
+			           " | window%u: blocks=%llu insns=%llu bytes=%llu lines32=%llu hotbytes=%llu |",
+			        frame, c ? 7 : 9, (unsigned long long)(S.fBlocks / fr), (unsigned long long)(S.fWords * 4 / fr),
+			        (unsigned long long)((S.fWords - S.fCold) * 4 / fr), (unsigned long long)(S.fEntries / fr),
+			        (unsigned long long)(S.fInsnsRun / fr), (unsigned)JCS_WINDOW,
+			        (unsigned long long)S.wBlocks, (unsigned long long)S.wInsns, (unsigned long long)S.wWords * 4,
+			        (unsigned long long)S.wLines * 32, (unsigned long long)(S.wWords - S.wCold) * 4);
+			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)S.wCat[k] * 4);
+			fprintf(f, "\n");
+		}
+		S.fBlocks = S.fWords = S.fCold = S.fEntries = S.fInsnsRun = S.frames = 0;
+		S.wBlocks = S.wWords = S.wLines = S.wCold = S.wInsns = 0;
+		memset(S.wCat, 0, sizeof S.wCat);
+		for (u32 i = 0; i < S.n; i++) S.rec[i].inWindow = 0;
+	}
+	if (f) fclose(f);
+}
+#endif // JIT_CODE_STATS
 
 #endif // DESMUME_JIT

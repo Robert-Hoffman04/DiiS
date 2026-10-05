@@ -157,6 +157,8 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	u32* guard = ctx.emitCondSkip(cond);
 
 	// --- taken path: exit the block at `target` (byte-for-byte the THUMB F16 shape) ---
+	{
+	JIT_STAT_SCOPE(ctx, JCS_EXIT, false);
 	ctx.emitAddCycles(ctx.cyclesAccum + 3);             // OP_B_COND / OP_BL taken cost
 	if (isBL)                                            // guest R14 = return address
 		emitLoadImm32(p, ctx.hostRegFor(14), retLR);    // pinned reg; only the taken path runs this
@@ -165,6 +167,7 @@ void emitBranch(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (!isBL) ctx.emitSpinSkip(target);                // ARM poll loop back-edge (jit_trace.cpp)
 #endif
 	ctx.emitChainTail(target);
+	}
 
 	// --- cond-false falls through: keep compiling the block ---
 	ctx.patchCondSkip(guard);

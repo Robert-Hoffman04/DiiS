@@ -232,6 +232,35 @@ struct JitDeferredBailout {
 	u32 instructions;
 };
 
+// -DJIT_CODE_STATS (JITDEFS; compiled out by default): generated-code footprint
+// accounting. Emitters bracket their sequences with JIT_STAT_SCOPE(ctx, cat,
+// cold); words not inside any scope count as JCS_OTHER. A cold scope marks a
+// sequence that is executed rarely (slow C-call paths, bail stubs); nested
+// scopes charge their words to the innermost category. Every block also gets
+// a 4-word execution counter at its entry (JCS_STATCTR, excluded from every
+// reported size), which jitCodeStatsTick() (main.cpp bench_tick) turns into a
+// per-frame executed-code working set. Report: sd:/jitstats.log.
+#ifdef JIT_CODE_STATS
+enum JitCodeStatCat {
+	JCS_ENTRY,      // quota guard at the block entry
+	JCS_MEMGUARD,   // inline memory region / page-window checks
+	JCS_MEMHIT,     // inline access + branch to the join
+	JCS_MEMSLOW,    // slowRead/slowWrite C-call sequences (+ stash / rotate fix-up)
+	JCS_SMCGUARD,   // inline SMC page-flag test on stores
+	JCS_SMCBAIL,    // SMC bail sequence
+	JCS_FLAGS,      // N/Z/C/V materialisation
+	JCS_PRED,       // ARM predication / Bcc condition tests
+	JCS_EXIT,       // block exits: cycles, icount, chain tail / dynamic dispatch
+	JCS_YIELD,      // quota-yield stub
+	JCS_FALLBACK,   // interpreter fallback calls
+	JCS_SPIN,       // spin-loop fast-forward
+	JCS_OTHER,      // everything else (ALU, address arithmetic, ...)
+	JCS_PAD,        // 32-byte block alignment padding
+	JCS_STATCTR,    // the stats build's own entry counter (not reported)
+	JCS_N
+};
+#endif
+
 // Per-compile state, threaded through the scanner and the emitter table.
 struct JitTraceCtx {
 	const JitCpuProfile& cpu;
@@ -289,6 +318,14 @@ struct JitTraceCtx {
 
 	JitDeferredBailout bailouts[JIT_MAX_BAILOUTS];
 	u32                bailoutCount;
+
+#ifdef JIT_CODE_STATS
+	u32  statWords[JCS_N];     // words charged per category (JCS_OTHER filled at finalize)
+	u32  statCold;             // words inside cold scopes
+	u32  statChild;            // words of nested scopes, for the active scope
+	u8   statColdDepth;
+	u32* statCounter;          // this block's execution counter (jit_trace.cpp)
+#endif
 
 	// ---- lifecycle ----
 	void ensureArena();
@@ -482,6 +519,28 @@ struct JitTraceCtx {
 	u32* emitCondSkip(u8 cond);
 	void patchCondSkip(u32* slot) { *slot |= (u32)((emitPtr - slot) * 4) & 0xFFFC; }
 };
+
+#ifdef JIT_CODE_STATS
+struct JitStatScope {
+	JitTraceCtx& c; u8 cat; bool cold; u32* start; u32 savedChild;
+	JitStatScope(JitTraceCtx& c_, u8 cat_, bool cold_)
+		: c(c_), cat(cat_), cold(cold_), start(c_.emitPtr), savedChild(c_.statChild)
+	{ c.statChild = 0; if (cold) c.statColdDepth++; }
+	~JitStatScope() {
+		const u32 total = (u32)(c.emitPtr - start);
+		c.statWords[cat] += total - c.statChild;
+		if (cold && --c.statColdDepth == 0) c.statCold += total;
+		c.statChild = savedChild + total;
+	}
+};
+#define JIT_STAT_CAT2(a, b) a##b
+#define JIT_STAT_CAT(a, b)  JIT_STAT_CAT2(a, b)
+#define JIT_STAT_SCOPE(ctx, cat, cold) JitStatScope JIT_STAT_CAT(jitStatScope_, __LINE__)((ctx), (cat), (cold))
+void jitCodeStatsTick(u32 frame);                   // main.cpp bench_tick
+void jitCodeStatsOnFlush(const JITCache* cache);    // jit_cache.cpp flushCache
+#else
+#define JIT_STAT_SCOPE(ctx, cat, cold) ((void)0)
+#endif
 
 // Emit one guest instruction at ctx.currentPC (opcode already fetched). Sets
 // ctx.endBlock when the trace must stop here.

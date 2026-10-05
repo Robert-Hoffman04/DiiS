@@ -763,6 +763,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		u32* guard = nullptr;
 		bool guardIsBEQ = false;
 		if (!fusedSkip) {
+		JIT_STAT_SCOPE(ctx, JCS_PRED, false);
 
 		bool composite = false, branchIfZero = false;
 		u32 flagReg = 0;
@@ -817,12 +818,15 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// return value) rather than going through cyclesForThumb(), which
 		// now reports the NOT-taken/fall-through cost (1) for this opcode
 		// range -- see the comment on jit_arm7_profile.cpp's case 0xD.
+		{
+		JIT_STAT_SCOPE(ctx, JCS_EXIT, false);
 		ctx.emitAddCycles(ctx.cyclesAccum + 3);
 		ctx.emitResultMetadata(ctx.instrCount + 1, 0);
 #if JIT_SPIN_SKIP
 		ctx.emitSpinSkip(targetPC);                                  // jit_trace.cpp
 #endif
 		ctx.emitChainTail(targetPC);
+		}
 		if (guard) {
 			u32 skip = (u32)((emitPtr - guard) * 4);
 			*guard = guardIsBEQ ? PPC_BEQ(skip) : PPC_BNE(skip);

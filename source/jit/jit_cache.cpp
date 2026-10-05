@@ -349,8 +349,15 @@ static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
 	return entry;
 }
 
+#ifdef JIT_CODE_STATS
+void jitCodeStatsOnFlush(const JITCache* cache);   // jit_trace.cpp
+#endif
+
 void JITCache::flushCache() {
 	PROFILER_CACHE_FLUSH_START();
+#ifdef JIT_CODE_STATS
+	jitCodeStatsOnFlush(this);
+#endif
 	JIT_LOG_CACHE_FLUSH();
 
 	arenaOffset = 0;
