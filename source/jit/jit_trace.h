@@ -574,14 +574,11 @@ struct JitTraceCtx {
 	// straight into r3 at run time).
 	void emitInterpFallback(u32 opcode);
 
-	// ARM predication: emit a 0/1 "condition holds" value into PPC_R11 for one of
-	// the 14 real ARM condition codes (0..13; not AL/NV). Clobbers r10, r11.
-	void emitEvalCond(u8 cond);
-	// ARM predication skip: emit the condition test and a placeholder branch
+	// ARM predication / Bcc skip: emit the condition test and a placeholder branch
 	// (displacement 0) that is taken when `cond` FAILS; patchCondSkip() aims
-	// it at the current emit position. Single-flag conditions (EQ..VC) are one
-	// record-form rlwinm. on the packed flags + the branch; the compound ones
-	// go through emitEvalCond(). Clobbers r10, r11.
+	// it at the current emit position. Every condition is a short record-form
+	// test of the packed flags (1..3 words, see jit_trace.cpp) + the branch.
+	// Clobbers r11 and cr0.
 	u32* emitCondSkip(u8 cond);
 	void patchCondSkip(u32* slot) { *slot |= (u32)((emitPtr - slot) * 4) & 0xFFFC; }
 };

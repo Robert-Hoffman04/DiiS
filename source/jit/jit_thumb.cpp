@@ -24,7 +24,7 @@
 #endif
 
 // The block-exit helpers (emitStaticExit / emitDynamicExit / emitInterpreterBail)
-// and the ARM predication helper (emitEvalCond) are JitTraceCtx methods shared
+// and the condition skip (emitCondSkip) are JitTraceCtx methods shared
 // with jit_arm.cpp -- see jit_trace.cpp.
 
 // Flags of THUMB CMP Rd,#imm8 (0x28xx) / CMP Rd,Rs (0x428x) into the packed
@@ -777,57 +777,9 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			jitThumbEmitCmpFlags(ctx, cop);                             // taken path: flags for the exit
 		}
 		u32* guard = nullptr;
-		bool guardIsBEQ = false;
 		if (!fusedSkip) {
-		JIT_STAT_SCOPE(ctx, JCS_PRED, false);
-
-		bool composite = false, branchIfZero = false;
-		u32 flagReg = 0;
-		switch (cond) {
-			case 0x0: flagReg = ctx.readFlag(JITF_Z, PPC_R12); guardIsBEQ = true;  break;
-			case 0x1: flagReg = ctx.readFlag(JITF_Z, PPC_R12); guardIsBEQ = false; break;
-			case 0x2: flagReg = ctx.readFlag(JITF_C, PPC_R12); guardIsBEQ = true;  break;
-			case 0x3: flagReg = ctx.readFlag(JITF_C, PPC_R12); guardIsBEQ = false; break;
-			case 0x4: flagReg = ctx.readFlag(JITF_N, PPC_R12); guardIsBEQ = true;  break;
-			case 0x5: flagReg = ctx.readFlag(JITF_N, PPC_R12); guardIsBEQ = false; break;
-			case 0x6: flagReg = ctx.readFlag(JITF_V, PPC_R12); guardIsBEQ = true;  break;
-			case 0x7: flagReg = ctx.readFlag(JITF_V, PPC_R12); guardIsBEQ = false; break;
-			case 0x8: composite = true; branchIfZero = false; break;
-			case 0x9: composite = true; branchIfZero = true;  break;
-			case 0xA: composite = true; branchIfZero = true;  break;
-			case 0xB: composite = true; branchIfZero = false; break;
-			case 0xC: composite = true; branchIfZero = true;  break;
-			case 0xD: composite = true; branchIfZero = false; break;
-			default:  ctx.endBlock = true; break;
-		}
-		if (ctx.endBlock) break;
-
-		if (!composite) {
-			// the readFlag rlwinm just emitted becomes record-form (rlwinm.):
-			// cr0.eq <=> flag clear, no separate cmpwi
-			(void)flagReg;
-			emitPtr[-1] |= 1;
-			guard = emitPtr++;
-		} else {
-			if (cond == 0x8 || cond == 0x9) {
-				u8 fC = ctx.readFlag(JITF_C, PPC_R10);
-				u8 fZ = ctx.readFlag(JITF_Z, PPC_R12);
-				*emitPtr++ = PPC_ANDC(PPC_R11, fC, fZ);
-			} else if (cond == 0xA || cond == 0xB) {
-				u8 fN = ctx.readFlag(JITF_N, PPC_R10);
-				u8 fV = ctx.readFlag(JITF_V, PPC_R12);
-				*emitPtr++ = PPC_XOR(PPC_R11, fN, fV);
-			} else {
-				u8 fN = ctx.readFlag(JITF_N, PPC_R10);
-				u8 fV = ctx.readFlag(JITF_V, PPC_R12);
-				*emitPtr++ = PPC_XOR(PPC_R11, fN, fV);
-				u8 fZ = ctx.readFlag(JITF_Z, PPC_R10);
-				*emitPtr++ = PPC_OR(PPC_R11, PPC_R11, fZ);
-			}
-			*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
-			guard = emitPtr++;
-			guardIsBEQ = !branchIfZero;
-		}
+			if (cond == 0xE) { ctx.endBlock = true; break; }        // undefined
+			guard = ctx.emitCondSkip(cond);                          // branch over the taken path
 		}
 
 		// Taken cost is hardcoded to 3 here (matching OP_B_COND's taken
@@ -843,10 +795,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 #endif
 		ctx.emitChainTail(targetPC);
 		}
-		if (guard) {
-			u32 skip = (u32)((emitPtr - guard) * 4);
-			*guard = guardIsBEQ ? PPC_BEQ(skip) : PPC_BNE(skip);
-		}
+		if (guard) ctx.patchCondSkip(guard);
 		if (fusedSkip) *fusedSkip |= (u32)((emitPtr - fusedSkip) * 4) & 0xFFFC;
 		break;
 	}

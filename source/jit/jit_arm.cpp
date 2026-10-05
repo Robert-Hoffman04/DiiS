@@ -1989,7 +1989,7 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 		if (isBlx && !v5) { ctx.endBlock = true; return; }   // BLX reg: ARMv5 only
 		// Predicated: `BXcc lr` (the conditional return) gets the taken-exit +
 		// cond-false fall-through path on EITHER core -- nothing in
-		// emitBranchExchange()'s guarded-dispatch mechanism (emitEvalCond /
+		// emitBranchExchange()'s guarded-dispatch mechanism (emitCondSkip /
 		// dynamic exit / CPSR.T bit-0 interworking) is ARMv5-specific;
 		// predicated execution applies to every ARM instruction back to
 		// ARMv4T. Other predicated BX (polymorphic Rm) and all predicated BLX

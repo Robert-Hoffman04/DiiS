@@ -1696,66 +1696,55 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 	*cont = PPC_BEQ((u32)((p - cont) * 4));
 }
 
+// Every condition is a test on the packed flags in r30 (N Z C V = PPC bits
+// 0..3) that leaves its answer in cr0, then one bc taken when it FAILS:
+//   EQ..VC  rlwinm. r11,r30,0,f,f                        eq <=> flag clear
+//   HI/LS   rlwinm r11,r30,1,1,1 ; andc. r11,r11,r30      C -> bit 1, & ~Z: ne <=> HI
+//   GE/LT   rotlwi r11,r30,3 ; xor. r11,r11,r30           V -> bit 0, ^ N: lt <=> LT
+//   GT/LE   rlwinm r11,r30,3,0,0 ; xor r11,r11,r30 ;
+//           rlwinm. r11,r11,0,0,1                         bits 0/1 = N^V, Z: ne <=> LE
+// Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
 u32* JitTraceCtx::emitCondSkip(u8 cond)
 {
 	JIT_STAT_SCOPE(*this, JCS_PRED, false);
-	if (cond < 8) {
+	ensureFlagsLoaded();
+	u32*& p = emitPtr;
+	const u32 F = PPC_REG_FLAGS;
+	u32 skip;                                                      // taken when cond fails
+	switch (cond) {
+	case 0x0: case 0x1: case 0x2: case 0x3:
+	case 0x4: case 0x5: case 0x6: case 0x7: {
 		static const u8 kFlag[4] = { JITF_Z, JITF_C, JITF_N, JITF_V };
 		const u8 f = kFlag[cond >> 1];
-		ensureFlagsLoaded();
-		*emitPtr++ = PPC_RLWINM(PPC_R11, PPC_REG_FLAGS, 0, f, f) | 1;  // rlwinm.: eq <=> flag clear
-		u32* slot = emitPtr;
-		*emitPtr++ = (cond & 1) ? PPC_BNE(0) : PPC_BEQ(0);   // EQ/CS/MI/VS need the flag set
-		return slot;
+		*p++ = PPC_RLWINM(PPC_R11, F, 0, f, f) | 1;
+		skip = (cond & 1) ? PPC_BNE(0) : PPC_BEQ(0);               // EQ/CS/MI/VS need the flag set
+		break;
 	}
-	emitEvalCond(cond);
-	*emitPtr++ = PPC_CMPWI(0, PPC_R11, 0);
-	u32* slot = emitPtr;
-	*emitPtr++ = PPC_BEQ(0);
+	case 0x8: case 0x9:                                            // HI  C & ~Z / LS
+		*p++ = PPC_RLWINM(PPC_R11, F, 1, JITF_Z, JITF_Z);
+		*p++ = PPC_ANDC(PPC_R11, PPC_R11, F) | 1;
+		skip = (cond == 0x8) ? PPC_BEQ(0) : PPC_BNE(0);
+		break;
+	case 0xA: case 0xB:                                            // GE  ~(N ^ V) / LT
+		*p++ = PPC_RLWINM(PPC_R11, F, 3, 0, 31);
+		*p++ = PPC_XOR(PPC_R11, PPC_R11, F) | 1;
+		skip = (cond == 0xA) ? PPC_BLT(0) : PPC_BGE(0);
+		break;
+	case 0xC: case 0xD:                                            // GT  ~Z & ~(N ^ V) / LE
+		*p++ = PPC_RLWINM(PPC_R11, F, 3, 0, 0);
+		*p++ = PPC_XOR(PPC_R11, PPC_R11, F);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, 1) | 1;
+		skip = (cond == 0xC) ? PPC_BNE(0) : PPC_BEQ(0);
+		break;
+	default:                                                       // AL: never skips
+		*p++ = PPC_LI(PPC_R11, 1);
+		*p++ = PPC_CMPWI(0, PPC_R11, 0);
+		skip = PPC_BEQ(0);
+		break;
+	}
+	u32* slot = p;
+	*p++ = skip;
 	return slot;
-}
-
-// ARM predication: 0/1 "condition holds" -> PPC_R11. cond is 0..13. Clobbers
-// r10, r11. Mirrors the CONDITION() table in armcpu.h / arm_instructions.cpp.
-void JitTraceCtx::emitEvalCond(u8 cond)
-{
-	JIT_STAT_SCOPE(*this, JCS_PRED, false);
-	switch (cond) {
-	case 0x0: readFlag(JITF_Z, PPC_R11); break;                                           // EQ  Z
-	case 0x1: readFlag(JITF_Z, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// NE  !Z
-	case 0x2: readFlag(JITF_C, PPC_R11); break;                                           // CS  C
-	case 0x3: readFlag(JITF_C, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// CC  !C
-	case 0x4: readFlag(JITF_N, PPC_R11); break;                                           // MI  N
-	case 0x5: readFlag(JITF_N, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// PL  !N
-	case 0x6: readFlag(JITF_V, PPC_R11); break;                                           // VS  V
-	case 0x7: readFlag(JITF_V, PPC_R11); *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1); break;// VC  !V
-	case 0x8:                                                                             // HI  C & ~Z
-		readFlag(JITF_C, PPC_R10); readFlag(JITF_Z, PPC_R11);
-		*emitPtr++ = PPC_ANDC(PPC_R11, PPC_R10, PPC_R11);
-		break;
-	case 0x9:                                                                             // LS  ~(C & ~Z)
-		readFlag(JITF_C, PPC_R10); readFlag(JITF_Z, PPC_R11);
-		*emitPtr++ = PPC_ANDC(PPC_R11, PPC_R10, PPC_R11);
-		*emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
-		break;
-	case 0xA:                                                                             // GE  ~(N ^ V)
-		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
-		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
-		*emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
-		break;
-	case 0xB:                                                                             // LT  N ^ V
-		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
-		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
-		break;
-	case 0xC: case 0xD:                                                                   // GT=~LE, LE=Z|(N^V)
-		readFlag(JITF_N, PPC_R10); readFlag(JITF_V, PPC_R11);
-		*emitPtr++ = PPC_XOR(PPC_R11, PPC_R10, PPC_R11);
-		readFlag(JITF_Z, PPC_R10);
-		*emitPtr++ = PPC_OR(PPC_R11, PPC_R11, PPC_R10);
-		if (cond == 0xC) *emitPtr++ = PPC_XORI(PPC_R11, PPC_R11, 1);
-		break;
-	default:  *emitPtr++ = PPC_LI(PPC_R11, 1); break;
-	}
 }
 
 // =========================================================================
