@@ -267,9 +267,10 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 	jitCanaryArm(s_smcRegistry[i],  smcRegistryBytes,   i == JIT_ARM9 ? "arm9.smcRegistry" : "arm7.smcRegistry");
 	jitCanaryArm(s_smcPageFlags[i], smcFlagsBytes,      i == JIT_ARM9 ? "arm9.smcPageFlags": "arm7.smcPageFlags");
 
-	// The ARM9 profile (the one with the TCM region descriptors) gets the
-	// shared memory thunks; initialize()'s flushCache() emits them.
-	cache.thunkProfile = profile->arm9DtcmBase ? profile : nullptr;
+	// Both caches get their profile's shared memory thunks (ARM9: full region
+	// resolution; ARM7: SMC guard + slowWrite); initialize()'s flushCache()
+	// emits them. The ARM7 cache is built against the DS profile.
+	cache.thunkProfile = profile;
 	cache.initialize(s_arena[i], arenaBytes, s_blockTable[i], s_smcRegistry[i],
 	                 s_smcPageFlags[i], profile->smcBankMask);
 	jitProfile[i] = profile;
@@ -581,6 +582,30 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 	s.smc[s.nSmc++] = emitPtr; *emitPtr++ = PPC_BNE(0);    // compiled code on the page -> bail
 }
 
+// ARM7 store through the cache's ST thunk. See jit_trace.h. The bail is the
+// same cold JCOLD_SMCBAIL stub emitSmcCheckAndBail registers (r12 = the EA);
+// the thunk has done nothing on that path but the page test.
+void JitTraceCtx::emitArm7ThunkStore(u8 valReg, u32 size)
+{
+	{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
+	if (valReg != PPC_R11) *emitPtr++ = PPC_OR(PPC_R11, valReg, valReg);
+	const int t = size == 4 ? JTH_ST_U32 : size == 2 ? JTH_ST_U16 : JTH_ST_U8;
+	*emitPtr = PPC_BL((s32)((u8*)cache.memThunk[t] - (u8*)emitPtr)); emitPtr++;
+	}
+	JIT_STAT_SCOPE(*this, JCS_SMCGUARD, false);
+	JitColdStub& s = addCold(JCOLD_SMCBAIL);
+	s.reg = PPC_R12;
+	s.smc[s.nSmc++] = emitPtr; *emitPtr++ = PPC_BNE(0);    // SMC refusal -> bail
+}
+
+void JitTraceCtx::emitArm7ThunkStoreWord(u8 valReg)
+{
+	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, false);
+	if (valReg != PPC_R11) *emitPtr++ = PPC_OR(PPC_R11, valReg, valReg);
+	*emitPtr = PPC_BL((s32)((u8*)cache.memThunk[JTH_STSLOW_U32] - (u8*)emitPtr)); emitPtr++;
+}
+
 // Differential-harness store journal. See jit_trace.h. eaReg holds the guest
 // address; the call records `size` pre-write bytes so jitRunArm*Checked()'s
 // interpreter reference run can be rolled back. Compiles to nothing in a
@@ -832,7 +857,7 @@ void jitEmitMemThunks(JITCache& c, u32*& p)
 {
 	const JitCpuProfile& cpu = *c.thunkProfile;
 	const u32 regionPtr = cpu.arm9DtcmRegionPtr;
-	const u32 mainMb    = (u32)__builtin_clz(cpu.arm9MainMask);
+	const u32 mainMb    = cpu.arm9MainMask ? (u32)__builtin_clz(cpu.arm9MainMask) : 0;
 	const u32 flags     = (u32)c.smcPageFlags;
 
 	// cr0 EQ <=> EA (r12) is in the DTCM window, read live. Clobbers r10, rTmp.
@@ -868,6 +893,52 @@ void jitEmitMemThunks(JITCache& c, u32*& p)
 		*p++ = PPC_LWZ(0, 1, 112);
 		*p++ = PPC_MTLR(0);
 	};
+
+	if (!cpu.arm9DtcmBase) {
+		// ARM7 (no TCM): loads are the old out-of-window slowRead path of
+		// emitInlineLoad / emitInlineBlockLoad (reached from their cold stubs),
+		// stores the old SMC page test + slowWrite (emitArm7ThunkStore).
+		for (int k = JTH_LD_U8; k <= JTH_LD_U32ROT; k++) {
+			const u32  size = k <= JTH_LD_S8 ? 1 : k <= JTH_LD_S16 ? 2 : 4;
+			const bool sx   = k == JTH_LD_S8 || k == JTH_LD_S16;
+			const bool rot  = k == JTH_LD_U32ROT;
+			c.memThunk[k] = p;
+			callPrologue();
+			if (rot) *p++ = PPC_STW(PPC_R12, 1, 116);
+			*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
+			*p++ = PPC_LI(PPC_R4, (s32)size);
+			jitCallC(p, (u32)cpu.slowRead);
+			*p++ = PPC_OR(PPC_R10, PPC_R3, PPC_R3);
+			if (sx && size == 1) *p++ = PPC_EXTSB(PPC_R10, PPC_R10);
+			if (sx && size == 2) *p++ = PPC_EXTSH(PPC_R10, PPC_R10);
+			if (rot) {                                          // ROR(R10, 8 * (EA & 3))
+				*p++ = PPC_LWZ(PPC_R12, 1, 116);
+				*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
+				*p++ = PPC_SUBFIC(PPC_R12, PPC_R12, 4);
+				*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
+				*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+			}
+			callEpilogue();
+			*p++ = PPC_BLR();
+		}
+		for (int k = JTH_ST_U8; k <= JTH_STSLOW_U32; k++) {
+			const u32 size = k == JTH_ST_U8 ? 1 : k == JTH_ST_U16 ? 2 : 4;
+			c.memThunk[k] = p;
+			if (k != JTH_STSLOW_U32) {
+				emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R10, flags);
+				*p++ = PPC_BNELR();
+			}
+			callPrologue();
+			*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
+			*p++ = PPC_OR(PPC_R4, PPC_R11, PPC_R11);
+			*p++ = PPC_LI(PPC_R5, (s32)size);
+			jitCallC(p, (u32)cpu.slowWrite);
+			callEpilogue();
+			*p++ = PPC_CMPW(0, PPC_R3, PPC_R3);
+			*p++ = PPC_BLR();
+		}
+		return;
+	}
 
 	// ---- loads: value -> r10 ----
 	for (int k = JTH_LD_U8; k <= JTH_LD_U32ROT; k++) {
@@ -1029,8 +1100,18 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	// the fast and slow paths below both commit into this one register.
 	const u8 hDst = writeReg(rd, /*fullOverwrite=*/true, lockedMask);
 
+	// DS ARM7: the slow path below lives in the cache's LD thunk, reached from
+	// a cold stub at the block's tail (`bl LD thunk ; mr rd, r10 ; b back`).
+	JitColdStub* cs = nullptr;
+	if (arm7Thunks()) {
+		cs = &addCold(JCOLD_LOAD);
+		cs->thunk = (u8)jitLoadThunk(size, signExt, wordRotate);
+		cs->reg   = hDst;
+		for (int k = 0; k < nMiss; k++) cs->miss[cs->nMiss++] = miss[k];
+	}
+
 	// ---- fast: descriptor hit, inline load ----
-	u32* toEnd;
+	u32* toEnd = nullptr;
 	{
 	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	if (size == 4) {
@@ -1050,6 +1131,7 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 		*p++ = PPC_LBZX(hDst, PPC_R10, PPC_R11);
 		if (signExt) *p++ = PPC_EXTSB(hDst, hDst);
 	}
+	if (cs) { cs->back = p; return true; }
 	toEnd = p++;                                        // B over the slow path
 	}
 
@@ -1128,6 +1210,18 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	u32* miss[2];
 	const int nMiss = emitPageResolve(/*spanBytes=*/4 * (n - 1), /*alignMe=*/29, miss);   // LDM: no unaligned rotate
 
+	// DS ARM7: the per-word slow loop below is a cold JCOLD_BLOCKLOAD stub at
+	// the block's tail instead, one LD thunk call per word (same EA reloads,
+	// low EA back in r12).
+	JitColdStub* cs = nullptr;
+	if (arm7Thunks()) {
+		cs = &addCold(JCOLD_BLOCKLOAD);
+		cs->thunk = JTH_LD_U32;
+		cs->n     = (u8)n;
+		for (u32 k = 0; k < n; k++) cs->regs[k] = hostRegFor(regs[k]);
+		for (int k = 0; k < nMiss; k++) cs->miss[cs->nMiss++] = miss[k];
+	}
+
 	// ---- fast: r10 = hostBase, r11 = aligned page offset of the low word ----
 	u32* toEnd;
 	{
@@ -1137,6 +1231,7 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 		*p++ = PPC_LWBRX(hgi, PPC_R10, PPC_R11);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R11, PPC_R11, 4);
 	}
+	if (cs) { cs->back = p; return true; }
 	toEnd = p++;                                        // B over the slow path
 	}
 

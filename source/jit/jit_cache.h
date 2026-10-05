@@ -126,6 +126,9 @@ typedef void (*JITBlockFunc)();
 // return the value in r10; stores take the value in r11 and return cr0 EQ
 // (done) or NE (SMC refusal: compiled code on the page, nothing written, r12
 // still the EA). Clobber r0, r4..r12, CTR, cr0 (r3 is preserved).
+// The ARM7 cache (a profile without TCM regions) gets the same set and
+// contract without the region resolution: JTH_LD_* = slowRead (+ extension /
+// rotate), JTH_ST_* = SMC page test + slowWrite, JTH_STSLOW_U32 = slowWrite.
 enum JitMemThunk {
 	JTH_LD_U8, JTH_LD_S8, JTH_LD_U16, JTH_LD_S16, JTH_LD_U32, JTH_LD_U32ROT,   // full region resolution
 	JTH_ST_U8, JTH_ST_U16, JTH_ST_U32,                                         // full, SMC-guarded
@@ -192,8 +195,8 @@ class JITCache {
 		// out->smcAddress, bailedOut, smcHit and leaves through
 		// linkerReturnAddress. The per-site part sits in the block's cold stubs.
 		u32* smcTailAddress;
-		// ARM9 memory thunks (see JitMemThunk); emitted only when thunkProfile is
-		// set (before initialize()), else null.
+		// Memory thunks (see JitMemThunk) for thunkProfile's core; emitted only
+		// when it is set (before initialize()), else null.
 		const JitCpuProfile* thunkProfile;
 		u32* memThunk[JTH_N];
 		u32  thunkWords;       // words of SMC tail + memory thunks, for reports

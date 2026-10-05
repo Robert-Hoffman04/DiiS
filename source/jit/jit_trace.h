@@ -419,6 +419,20 @@ struct JitTraceCtx {
 	void emitSlowStore(u8 eaReg, u8 valReg, u32 size);
 	void emitSmcCheckAndBail(u8 eaReg);           // store paths: page-flag guard
 
+	// ARM7 (DS profile): the cache's shared thunks (JitMemThunk) carry the
+	// SMC guard + slowWrite sequence instead of every store site. True only
+	// when this cache's thunks were built for this profile and it has no TCM
+	// regions (the GBA ARM7 profile shares the cache: its sites stay inline).
+	bool arm7Thunks() const { return cache.thunkProfile == &cpu && !cpu.arm9DtcmBase; }
+	// EA in PPC_R12, value in valReg: `mr r11, val ; bl ST thunk ; bne` to a
+	// cold SMC bail (resume at this instruction, r12 = the EA), exactly the
+	// old prologue / page test / slowWrite / epilogue. No prologue or epilogue
+	// needed around it. Clobbers r0, r4..r12, CTR, cr0.
+	void emitArm7ThunkStore(u8 valReg, u32 size);
+	// Block-store word after the site's own SMC guard: `mr r11, val ; bl
+	// STSLOW thunk` (EA in PPC_R12; a plain slowWrite, r3 preserved).
+	void emitArm7ThunkStoreWord(u8 valReg);
+
 	// Differential-harness store journal: emit a call to JitCpuProfile::journalNote
 	// (jitDiffJournalNote) recording `size` bytes at the address in eaReg before an
 	// inline store mutates them. No-op unless the profile sets journalNote (only a
@@ -501,7 +515,8 @@ struct JitTraceCtx {
 	// emitSlowLoad's byte-swap / sign-extend / unaligned-word-rotate semantics.
 	// No memory prologue, no C call on a hit. Out of window (I/O, VRAM, ...)
 	// does the same access through the slowRead C call in place and the block
-	// continues (was an interpreter bail). Returns false without emitting
+	// continues (was an interpreter bail); for the DS ARM7 that call is the
+	// cache's LD thunk, reached from a cold stub at the block's tail. Returns false without emitting
 	// anything when the profile has no descriptor table -- the caller then emits
 	// its own slow path. wordRotate applies OP_LDR's unaligned-word ROR (ARM
 	// callers pass true for a word load; THUMB callers pass false to match
@@ -515,7 +530,8 @@ struct JitTraceCtx {
 	// length (>= 1). Emits a single page-window guard covering the whole run,
 	// one descriptor resolve, then n sequential lwbrx into the registers' host
 	// slots. Out of window, or a run that straddles a 1 MB page, takes a
-	// per-word slowRead C loop instead and the block continues (was one
+	// per-word slowRead C loop instead (DS ARM7: a cold stub calling the LD
+	// thunk per word) and the block continues (was one
 	// interpreter bail for the whole instruction). The low EA
 	// is back in r12 on return either way. LDM/LDMIA word loads do NOT rotate
 	// an unaligned base (matches OP_L_IA). Returns false without emitting when

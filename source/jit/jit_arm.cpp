@@ -685,6 +685,15 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 		return;
 	}
 
+	// ARM7: the SMC guard + slowWrite live in the shared ST thunk.
+	if (!isLoad && ctx.arm7Thunks()) {
+		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
+		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
+		ctx.emitArm7ThunkStore(hVal, size);
+		if (writeback) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);
+		return;
+	}
+
 	*p++ = PPC_STW(PPC_R11, 1, 96);                 // EA
 	if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104); // WB
 	if (!isLoad)   *p++ = PPC_STW(hVal,   1, 100);  // store value
@@ -876,6 +885,11 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 			return;
 		}
 
+		if (!L && ctx.arm7Thunks()) {                       // ARM7: shared ST thunk
+			emitLoadImm32(p, PPC_R12, ea);
+			ctx.emitArm7ThunkStore(ctx.hostRegFor(rd), size);
+			return;
+		}
 		ctx.emitMemPrologue();
 		if (L) {
 			emitLoadImm32(p, PPC_R12, ea);
@@ -1178,6 +1192,24 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (W) {
 		*p++ = PPC_ADDI(PPC_R12, hRn, U ? (s32)(4 * n) : -(s32)(4 * n));
 		*p++ = PPC_STW(PPC_R12, 1, 104);
+	}
+
+	// ARM7 STM: the low-EA SMC guard, then one STSLOW thunk call per word (the
+	// thunk carries the prologue / slowWrite / epilogue).
+	if (!L && ctx.arm7Thunks()) {
+		*p++ = PPC_LWZ(PPC_R12, 1, 96);
+		ctx.emitSmcCheckAndBail(PPC_R12);
+		u32 slot = 0;
+		for (int i = 0; i < 15; i++) {
+			if (!(list & (1u << i))) continue;
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);
+			if (slot) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
+			ctx.emitArm7ThunkStoreWord(ctx.hostRegFor(i));
+			slot++;
+		}
+		if (W) *p++ = PPC_LWZ(ctx.hostRegFor(rn), 1, 104);   // base writeback (pinned)
+		if (guard) ctx.patchCondSkip(guard);
+		return;
 	}
 
 	ctx.emitMemPrologue();

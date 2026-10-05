@@ -421,6 +421,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			ctx.emitArm9Store(size, /*writeback=*/false, /*rn=*/0, hVal);
 			break;
 		}
+		if (isStore && ctx.arm7Thunks()) {              // ARM7: shared ST thunk
+			ctx.emitArm7ThunkStore(hVal, size);
+			break;
+		}
 
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);           // save EA
 		if (isStore) *emitPtr++ = PPC_STW(hVal, 1, 100); // save value
@@ -466,6 +470,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 		if (!isLoad && ctx.cpu.arm9DtcmBase) {          // P16 inline RAM store
 			ctx.emitArm9Store(4, /*writeback=*/false, /*rn=*/0, hVal);
+			break;
+		}
+		if (!isLoad && ctx.arm7Thunks()) {              // ARM7: shared ST thunk
+			ctx.emitArm7ThunkStore(hVal, 4);
 			break;
 		}
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
@@ -579,6 +587,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			popPC = true;
 		} else {
 		u8 hSp;
+		const bool thk = !isPop && ctx.arm7Thunks();     // ARM7 PUSH: STSLOW thunk per word
 		if (!isPop) {
 			// Compute the prospective post-decrement, word-aligned base into a
 			// scratch register FIRST and run the SMC guard against it before
@@ -596,7 +605,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			*emitPtr++ = PPC_ADDI(PPC_R12, hSp, -4 * nregs);
 			*emitPtr++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 0, 29);
 			*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
-			ctx.emitMemPrologue();
+			if (!thk) ctx.emitMemPrologue();
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
 			ctx.emitSmcCheckAndBail(PPC_R12);
 			// guard passed -- commit the real decrement into the pinned SP now
@@ -620,13 +629,15 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 				if (isLR) { ctx.emitSlowLoad(PPC_R10, PPC_R12, 4, false);
 				            *emitPtr++ = PPC_STW(PPC_R10, 1, 100); popPC = true; }
 				else      { ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false); }
+			} else if (thk) {
+				ctx.emitArm7ThunkStoreWord(ctx.hostRegFor(isLR ? 14 : i));
 			} else {
 				ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(isLR ? 14 : i), 4);
 			}
 			slot++;
 		}
 
-		ctx.emitMemEpilogue();
+		if (!thk) ctx.emitMemEpilogue();
 
 		// SP writeback: PUSH already holds the decremented SP in the pinned reg;
 		// POP adds the popped size to it.
@@ -700,8 +711,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			break;
 		}
 
+		// ARM7 STMIA: no prologue / epilogue, one STSLOW thunk call per word.
+		const bool thk = !isLoad && ctx.arm7Thunks();
 		*emitPtr++ = PPC_STW(PPC_R12, 1, 96);
-		ctx.emitMemPrologue();
+		if (!thk) ctx.emitMemPrologue();
 		if (!isLoad) { *emitPtr++ = PPC_LWZ(PPC_R12, 1, 96); ctx.emitSmcCheckAndBail(PPC_R12); }
 
 		u32 slot = 0;
@@ -709,12 +722,13 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			if (!(list & (1 << i))) continue;
 			*emitPtr++ = PPC_LWZ(PPC_R12, 1, 96);
 			if (slot) *emitPtr++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(slot * 4));
-			if (isLoad) ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false);
-			else        ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(i), 4);
+			if (isLoad)   ctx.emitSlowLoad(ctx.hostRegFor(i), PPC_R12, 4, false);
+			else if (thk) ctx.emitArm7ThunkStoreWord(ctx.hostRegFor(i));
+			else          ctx.emitSlowStore(PPC_R12, ctx.hostRegFor(i), 4);
 			slot++;
 		}
 
-		ctx.emitMemEpilogue();
+		if (!thk) ctx.emitMemEpilogue();
 		// writeback: Rb = base + 4 * count  (raw base still stashed at 96(r1))
 		{
 			const u8 hRb2 = ctx.hostRegFor(rb);
