@@ -72,8 +72,13 @@ dolphin_launch() {
 	local slotb=()
 	[ -n "$DOLPHIN_SLOTB" ] && slotb=(-C "Dolphin.Core.SlotB=$DOLPHIN_SLOTB")
 
+	# Full texture hash (0 = every texel; Dolphin's default 128 samples serves a stale
+	# texture when an in-place re-bake, e.g. the GX compositor's 3D layer, changes no
+	# sampled texel: a3_c56 showed a blank 3D layer that way). The config system is
+	# "Graphics", not "GFX": `-C GFX.Settings...` is silently ignored.
 	setsid flatpak run org.DolphinEmu.dolphin-emu -b -e "$dol" \
 		-C Dolphin.Core.WiiSDCard=True -C Dolphin.DSP.Volume=0 \
+		-C "Graphics.Settings.SafeTextureCacheColorSamples=${DOLPHIN_SAFETEX:-0}" \
 		"${slotb[@]}" \
 		>"$log" 2>&1 &
 	disown 2>/dev/null || true   # reaped with pkill; suppress the job-control "Killed" line
