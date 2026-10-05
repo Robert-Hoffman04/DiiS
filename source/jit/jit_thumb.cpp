@@ -346,6 +346,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		const u8 rd = (opcode >> 8) & 0x07;
 		const u32 ea = ((currentPC + 4) & ~3u) + ((opcode & 0xFF) << 2);
 		if (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase) {   // P14/P16 inline RAM load
+			if (ctx.cpu.arm9DtcmBase) ctx.memPredict = ctx.arm9RegionOf(ea);   // constant EA
 			*emitPtr++ = PPC_LIS(PPC_R12, ea >> 16);
 			*emitPtr++ = PPC_ORI(PPC_R12, PPC_R12, ea & 0xFFFF);
 			(void)ctx.emitInlineLoad(rd, PPC_R12, 4, false, /*wordRotate=*/false, lockedMask);
@@ -410,7 +411,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		// THUMB LDR test, which deliberately misaligns the EA, caught it).
 		const bool wordRotate = isLoad && size == 4;
 
-		ctx.memMainFirst = true;                         // lo-register base: rarely the stack
+		ctx.memPredict = JIT_MEMP_MAIN;                  // lo-register base: rarely the stack
 		if (isLoad && (ctx.cpu.pageDescBase || ctx.cpu.arm9DtcmBase)) {   // P14/P16 inline RAM load
 			(void)ctx.emitInlineLoad(rd, PPC_R12, size, signExt, wordRotate, lockedMask);
 			break;
@@ -675,6 +676,7 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		ctx.ensureArena();
 		const u8 hRb = ctx.readReg(rb, lockedMask);
 		*emitPtr++ = PPC_OR(PPC_R12, hRb, hRb);
+		ctx.memPredict = JIT_MEMP_MAIN;                  // lo-register base: rarely the stack
 
 		// P15/P16: inline LDMIA / STMIA. One region guard for the run, then n
 		// sequential lwbrx / stwbrx; register cache intact. emitArm9BlockLoad /

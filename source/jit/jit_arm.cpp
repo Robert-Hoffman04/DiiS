@@ -667,7 +667,7 @@ void emitLoadStoreTail(JitTraceCtx& ctx, u8 hVal, u32 size, bool isLoad,
 	// P16 (ARM9): inline main RAM / DTCM, slowRead C call for every other region
 	// (no interpreter round-trip). emitArm9Load does its own pre-guard dirty
 	// flush + post-op cache invalidation and commits the writeback itself.
-	ctx.memMainFirst = (rn != 13);                      // non-stack base: main RAM likely
+	ctx.memPredict = rn == 13 ? JIT_MEMP_DTCM : JIT_MEMP_MAIN;   // stack base: DTCM, else main RAM
 	if (isLoad && ctx.cpu.arm9DtcmBase && !(writeback && rd == rn)) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);       // EA -> r12
@@ -777,6 +777,7 @@ void emitLoadPcTail(JitTraceCtx& ctx, bool writeback, u8 rn, u32 op)
 	if (ctx.cpu.arm9DtcmBase) {
 		if (writeback) *p++ = PPC_STW(PPC_R10, 1, 104);
 		*p++ = PPC_OR(PPC_R12, PPC_R11, PPC_R11);        // EA -> r12
+		ctx.memPredict = rn == 13 ? JIT_MEMP_DTCM : JIT_MEMP_MAIN;
 		ctx.emitArm9Load(15, 4, /*signExt=*/false, /*wordRotate=*/true, writeback, rn);
 		emitLdrPcExit(ctx, ctx.hostRegFor(15), op);
 		return;
@@ -1118,6 +1119,7 @@ void emitBlockDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 	if (predicated) {
 		guard = ctx.emitCondSkip(cond);
 	}
+	ctx.memPredict = rn == 13 ? JIT_MEMP_DTCM : JIT_MEMP_MAIN;   // ARM9 region prediction
 
 	// LDM{...,pc} (never predicated here) takes it too: the pc word lands in
 	// guest R15's pinned host register and is handed to emitLdmPcExit().

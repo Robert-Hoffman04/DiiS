@@ -117,6 +117,23 @@ static inline u32 jitHashPC(u32 pc) {
 // -------------------------------------------------------------------------
 typedef void (*JITBlockFunc)();
 
+// Shared ARM9 memory-access thunks, one set per cache (jitEmitMemThunks(),
+// jit_trace.cpp), emitted after the linker stubs. Each does the complete
+// region resolution an inline access site used to carry -- DTCM (window read
+// live from MMU.DTCMRegion) -> main RAM -> ITCM (loads) -> slowRead /
+// slowWrite -- so a site only inlines the region its base register predicts
+// and reaches these from a cold stub at its block's tail. EA in r12; loads
+// return the value in r10; stores take the value in r11 and return cr0 EQ
+// (done) or NE (SMC refusal: compiled code on the page, nothing written, r12
+// still the EA). Clobber r0, r4..r12, CTR, cr0 (r3 is preserved).
+enum JitMemThunk {
+	JTH_LD_U8, JTH_LD_S8, JTH_LD_U16, JTH_LD_S16, JTH_LD_U32, JTH_LD_U32ROT,   // full region resolution
+	JTH_ST_U8, JTH_ST_U16, JTH_ST_U32,                                         // full, SMC-guarded
+	JTH_STSLOW_U32,                                                            // slowWrite call only
+	JTH_N
+};
+struct JitCpuProfile;
+
 // Force 16-byte alignment to allow fast PowerPC bit-shifting
 struct __attribute__((aligned(16))) BasicBlock {
 	u32 startPC;
@@ -170,6 +187,16 @@ class JITCache {
 		u32* linkerStubDynamicThumbAddress;
 		u32* linkerStubDynamicArmAddress;
 		u8* smcPageFlags;
+		// Shared SMC-bail tail (both caches): r3/r31/r4 already hold the bail's
+		// cycles / instruction count / resume PC and r12 the refused EA; sets
+		// out->smcAddress, bailedOut, smcHit and leaves through
+		// linkerReturnAddress. The per-site part sits in the block's cold stubs.
+		u32* smcTailAddress;
+		// ARM9 memory thunks (see JitMemThunk); emitted only when thunkProfile is
+		// set (before initialize()), else null.
+		const JitCpuProfile* thunkProfile;
+		u32* memThunk[JTH_N];
+		u32  thunkWords;       // words of SMC tail + memory thunks, for reports
 
 		void initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr,
 		                BasicBlock** smcRegPtr, u8* smcFlagsPtr, u32 trackedBankMask);
@@ -285,6 +312,10 @@ class JITCache {
 // page-flag map and linker-stub pair.
 extern JITCache jitCacheArm7;
 extern JITCache jitCacheArm9;
+
+// Emits this cache's JitMemThunk set at p (jit_trace.cpp). Called by
+// flushCache() when thunkProfile is set.
+void jitEmitMemThunks(JITCache& cache, u32*& p);
 
 // SMC / coherency fan-out helpers. Shared regions (main RAM, shared WRAM) can
 // hold code for either core and can be written by either core or by DMA, so a

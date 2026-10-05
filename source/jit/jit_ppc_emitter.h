@@ -260,4 +260,11 @@
 #define PPC_BCTRL()            ((19 << 26) | (20 << 21) | (528 << 1) | 1)  // call via CTR
 #define PPC_BL(offset)         ((18 << 26) | ((offset) & 0x3FFFFFC) | 1)
 
+// Shared memory thunks (jitEmitMemThunks): called with bl, return with blr;
+// the store thunks report an SMC refusal in cr0 (beqlr / bnelr).
+#define PPC_ADDIS(rD, rA, val) ((15 << 26) | ((rD) << 21) | ((rA) << 16) | ((val) & 0xFFFF))
+#define PPC_MTLR(rS)           PPC_MTSPR(8, (rS))
+#define PPC_BEQLR()            0x4D820020
+#define PPC_BNELR()            0x4C820020
+
 #endif // JIT_PPC_EMITTER_H

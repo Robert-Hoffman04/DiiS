@@ -252,6 +252,35 @@ struct JitDeferredBailout {
 	u32 instructions;
 };
 
+// Out-of-line ("cold") stubs, emitted after a block's last exit by
+// JitTraceCtx::emitColdStubs(). An access site keeps only its predicted case
+// inline and branches here for everything else (and to the SMC bail): the
+// stub calls a shared memory thunk (JitMemThunk, jit_cache.h) or does the
+// rare full sequence, then branches back. Branch slots are placeholders
+// holding their condition with a zero displacement.
+enum JitColdType {
+	JCOLD_LOAD,        // bl LD thunk ; mr reg, r10 ; b back
+	JCOLD_STORE,       // mr r11, reg ; bl ST thunk ; beq back ; SMC bail
+	JCOLD_BLOCKLOAD,   // per-word LD thunk loop, r12 = low EA again ; b back
+	JCOLD_BLOCKSTORE,  // the whole-run region decision + its SMC bails
+	JCOLD_SMCBAIL      // SMC bail only (emitSmcCheckAndBail)
+};
+#define JIT_MAX_COLD 128   // <= 3 per guest instruction
+struct JitColdStub {
+	u8   type, thunk, reg, n;
+	u8   nMiss, nSmc, nSmcHigh;
+	u8   regs[16];         // block transfers: host registers, ascending address
+	u32  span;             // block stores: 4 * (n - 1)
+	u32* miss[6];          // -> stub entry
+	u32* smc[3];           // -> SMC bail, r12 = the refused EA (block store: hot 1 + cold 2)
+	u32* smcHigh[3];       // -> SMC bail reporting r12 + span (block store: hot 1 + cold 2)
+	u32* back;             // resume point in the hot path
+	u32  cycles, icount, pc;   // the bail's exit metadata
+};
+
+// Region an ARM9 access site inlines (JitTraceCtx::memPredict).
+enum { JIT_MEMP_DTCM, JIT_MEMP_MAIN, JIT_MEMP_ITCM };
+
 // -DJIT_CODE_STATS (JITDEFS; compiled out by default): generated-code footprint
 // accounting. Emitters bracket their sequences with JIT_STAT_SCOPE(ctx, cat,
 // cold); words not inside any scope count as JCS_OTHER. A cold scope marks a
@@ -339,6 +368,12 @@ struct JitTraceCtx {
 	JitDeferredBailout bailouts[JIT_MAX_BAILOUTS];
 	u32                bailoutCount;
 
+	JitColdStub cold[JIT_MAX_COLD];
+	u32         coldCount;
+	bool        coldOverflow;                     // the block cannot be used (see emitColdStubs())
+	JitColdStub& addCold(u8 type);                // records cycles / icount / pc for its bail
+	void emitColdStubs();                         // jitCompileTrace(), after the last exit
+
 #ifdef JIT_CODE_STATS
 	u32  statWords[JCS_N];     // words charged per category (JCS_OTHER filled at finalize)
 	u32  statCold;             // words inside cold scopes
@@ -401,68 +436,62 @@ struct JitTraceCtx {
 	// Clobbers r10, r11; EA stays in r12.
 	int  emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots);
 
-	// ---- P16 ARM9 two-region inline guard --------------------------------
-	// EA must be in PPC_R12 (any alignment). Emits a runtime guard for the two
-	// inline-able ARM9 data regions -- main RAM (0x02xxxxxx) and the CP15 DTCM
-	// window (base baked from *arm9DtcmRegionPtr at emit time). On a hit the
-	// emitted code sets PPC_R10 = host base, PPC_R11 = (EA & regionMask) cleared
-	// to `alignMe`, and branches forward; the caller patches those branch slots
-	// (returned in fastSlots[0..count-1]) to its inline-load block. A miss (or,
-	// for spanBytes > 0, a run that straddles a region edge / 1 MB page) falls
-	// through -- the caller emits the slowRead C path there. Clobbers r10, r11;
-	// EA stays in r12. Returns the number of fast-branch slots written (1-3).
-	// withItcm (loads only) adds a third region, the 32 KB
-	// ITCM mirrored over 0x00000000-0x01FFFFFF, tested on main RAM's miss
-	// branch so a main-RAM hit costs the same as before; its fast slot comes
-	// last. Stores pass false (ITCM holds JIT code; they keep slowWrite).
-	int  emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm,
-	                         void (*onHit)(JitTraceCtx&, void*, int) = nullptr, void* hitArg = nullptr);
-	// onHit (optional): instead of leaving a fast-branch slot, the guard calls
-	// onHit(ctx, hitArg, region) at each hit point (region 0 DTCM, 1 main RAM,
-	// 2 ITCM) with r10 = host base, r11 = aligned in-region offset, EA in r12,
-	// and the callback emits the access itself (ending in its own branch to
-	// the caller's join point). Returns 0 then.
+	// ---- P16 ARM9 accesses: predicted region inline, the rest via thunks ----
+	// The ARM9 data regions the JIT can access directly are the CP15 DTCM window
+	// (base baked from *arm9DtcmRegionPtr at emit time; a TCM move flushes the
+	// cache), main RAM (0x02xxxxxx) and, for loads, the 32 KB ITCM mirrored over
+	// 0x00000000-0x01FFFFFF, with that priority. A site tests only the region
+	// memPredict names (main RAM with a DTCM-exclusion test when the window
+	// overlays it, so the priority holds) and branches to a cold stub for any
+	// other address; the stub's thunk resolves DTCM -> main -> ITCM -> C call
+	// exactly as the old inline guard did.
 
-	// Full ARM9 single load: EA in PPC_R12. Unconditional dirty flush, then the
-	// region guard -> inline lwbrx (main RAM / DTCM / ITCM) or the slowRead C call
-	// (every other region, no interpreter round-trip); result -> gpr[rd] and the
-	// register cache is invalidated. When `writeback`, the caller has stashed the
-	// new base value at 104(r1) and it is committed to gpr[rn] afterwards. Does
-	// not end the block. Clobbers r10, r11, r12.
+	// Full ARM9 single load: EA in PPC_R12. Predicted-region test -> inline
+	// lwbrx/lhbrx/lbzx straight into rd's pinned register; anything else (and
+	// an unaligned word) -> cold stub -> LD thunk. When `writeback`, the caller
+	// has stashed the new base value at 104(r1) and it is committed to gpr[rn]
+	// afterwards. Does not end the block. Clobbers r0, r4..r12.
 	void emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn);
 
-	// Region-test order hint for the next emitArm9Load/emitArm9Store: true when
-	// the base register is not the stack pointer, so main RAM is the likely
-	// hit and is tested before DTCM (only when DTCM does not overlay main RAM,
-	// where DTCM must win). Reset by those two emitters.
-	bool memMainFirst;
+	// Region the next ARM9 access inlines (JIT_MEMP_*): DTCM for a stack-based
+	// access, main RAM otherwise; the region of a compile-time-constant EA.
+	// Callers set it just before the access; the scanner resets it to DTCM
+	// before every instruction. When the DTCM window cannot be matched with an
+	// immediate compare (unreachable, or above 0x1FFFC000) DTCM falls back to
+	// main RAM.
+	u8   memPredict;
+	// JIT_MEMP_* for a constant EA (baked DTCM window first), or MAIN when it
+	// is in none of the three regions.
+	u8   arm9RegionOf(u32 ea) const;
 
-	// ARM9 inline block load (LDM / POP / LDMIA, non-pc). Low guest address of
-	// the contiguous word run in PPC_R12; regs the ascending destination list
-	// (0..14), n its length. Region guard covering the whole run -> n sequential
-	// inline lwbrx, or the per-word slowRead C loop (no round-trip); results ->
-	// gpr slots, register cache invalidated. The caller still owns any base
-	// writeback (stash + post writeReg), exactly as the P15 path. Clobbers
-	// r10, r11; the low EA is restored to r12 on return.
+	// ARM9 inline block load (LDM / POP / LDMIA). Low guest address of the
+	// contiguous word run in PPC_R12; regs the ascending destination list, n its
+	// length. Predicted region covering the whole run -> n sequential inline
+	// lwbrx; otherwise a cold per-word LD-thunk loop (each word resolved on its
+	// own -- the same values the old whole-run guard's slowRead loop produced).
+	// The caller still owns any base writeback. Clobbers r0, r4..r11; the low
+	// EA is in r12 on return.
 	void emitArm9BlockLoad(const u8* regs, u32 n);
 
-	// Full ARM9 single store: EA in PPC_R12, the value already stashed at 100(r1)
-	// (and, when `writeback`, the new base at 104(r1)). Unconditional dirty flush,
-	// then the region guard -> inline stwbrx/sthbrx/stbx into main RAM or DTCM
-	// (each behind its own SMC-page guard for main RAM + differential journal
-	// note), or the slowWrite C call for every other region (no interpreter
-	// round-trip). Register cache invalidated; writeback committed to gpr[rn].
-	// Does not end the block. Clobbers r3, r4, r5, r10, r11, r12.
+	// Full ARM9 single store: EA in PPC_R12, the value in hVal (a pinned guest
+	// register; when `writeback`, the new base is at 104(r1)). Predicted-region
+	// test (+ for main RAM the SMC page test, whose hit goes to the site's cold
+	// SMC bail) -> inline stwbrx/sthbrx/stbx (differential builds journal it
+	// first); anything else -> cold stub -> ST thunk (DTCM / SMC-guarded main
+	// RAM / SMC guard + slowWrite). Writeback committed to gpr[rn]. Does not end
+	// the block. Clobbers r0, r4..r12.
 	void emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal);
-	void emitArm9StoreJournaled(u32 size, bool writeback, u8 rn);   // differential builds
 
 	// ARM9 inline block store (STM / PUSH / STMIA, non-pc). Low guest address of
 	// the contiguous word run in PPC_R12; regs the ascending source list (0..14),
-	// n its length. Region guard covering the whole run -> n sequential inline
-	// stwbrx (SMC-guarded for main RAM, one journal note for the span), or the
-	// per-word slowWrite C loop (no round-trip). Register cache invalidated; the
-	// caller still owns any base writeback. Clobbers r3, r4, r5, r10, r11, r12;
-	// the low EA is restored to r12 on return.
+	// n its length. Predicted region covering the whole run (main RAM: SMC test
+	// of both span ends) -> n sequential inline stwbrx, one journal note for the
+	// span. Any other case -> a cold stub that makes the old whole-run decision
+	// (whole run in DTCM / in one main-RAM page / else SMC test of both ends +
+	// a per-word slowWrite), so exactly the same stores take the slowWrite path
+	// (it also invalidates the ARM7 cache; the inline path does not). The caller
+	// still owns any base writeback. Clobbers r0, r4..r11; the low EA is in r12
+	// on return.
 	void emitArm9BlockStore(const u8* regs, u32 n);
 
 	// ---- P14 inline RAM load via cached page descriptors ------------------

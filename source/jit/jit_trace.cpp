@@ -267,6 +267,9 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 	jitCanaryArm(s_smcRegistry[i],  smcRegistryBytes,   i == JIT_ARM9 ? "arm9.smcRegistry" : "arm7.smcRegistry");
 	jitCanaryArm(s_smcPageFlags[i], smcFlagsBytes,      i == JIT_ARM9 ? "arm9.smcPageFlags": "arm7.smcPageFlags");
 
+	// The ARM9 profile (the one with the TCM region descriptors) gets the
+	// shared memory thunks; initialize()'s flushCache() emits them.
+	cache.thunkProfile = profile->arm9DtcmBase ? profile : nullptr;
 	cache.initialize(s_arena[i], arenaBytes, s_blockTable[i], s_smcRegistry[i],
 	                 s_smcPageFlags[i], profile->smcBankMask);
 	jitProfile[i] = profile;
@@ -536,39 +539,46 @@ void JitTraceCtx::emitSlowStore(u8 eaReg, u8 valReg, u32 size)
 	*emitPtr++ = PPC_BCTRL();
 }
 
+// ---- small shared emit helpers ----------------------------------------------
+static inline void jitImm32(u32*& p, u8 r, u32 v)
+{
+	*p++ = PPC_LIS(r, v >> 16);
+	if (v & 0xFFFF) *p++ = PPC_ORI(r, r, v & 0xFFFF);
+}
+static inline void jitCallC(u32*& p, u32 fn)                   // clobbers r12, CTR, LR
+{
+	*p++ = PPC_LIS(PPC_R12, fn >> 16);
+	*p++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+	*p++ = PPC_MTCTR(PPC_R12);
+	*p++ = PPC_BCTRL();
+}
+// cr0 <- smcPageFlags[(src >> 10) & 0xFFFF] vs 0 (NE: compiled code lives on
+// the page). rIdx / rVal are scratch; rIdx may be src, never r0.
+static inline void emitSmcPageTest(u32*& p, u8 src, u8 rIdx, u8 rVal, u32 flags)
+{
+	*p++ = PPC_RLWINM(rIdx, src, 22, 16, 31);
+	*p++ = PPC_ADDIS(rIdx, rIdx, (flags + 0x8000) >> 16);
+	*p++ = PPC_LBZ(rVal, rIdx, (s32)(s16)(flags & 0xFFFF));
+	*p++ = PPC_CMPWI(0, rVal, 0);
+}
+static inline u8 jitAlignBit(u32 size) { return size == 4 ? 29 : size == 2 ? 30 : 31; }
+
 // Store paths: if a compiled block currently lives on the written 1KB page,
 // bail (resume PC = this instruction) with smcHit set so the caller can call
-// JitCpuProfile::smcInvalidate. eaReg must still be live; state must already be
-// flushed (emitMemPrologue). Does not end the block -- the not-taken path
-// continues compiling.
+// JitCpuProfile::smcInvalidate. eaReg must still be live (it is reported as
+// smcAddress). The page test is inline; the bail sequence is a cold stub at the
+// block's tail (emitColdStubs()). Clobbers r10, r11. Does not end the block --
+// the not-taken path continues compiling.
 void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 {
 #ifdef JIT_GOFIXPH_NO_SMC
 	(void)eaReg; return;   // GO-FIX-PH diagnostic: skip the inline SMC guard
 #endif
-	u32 fp = (u32)cache.smcPageFlags;
-	u32* skip;
-	{
 	JIT_STAT_SCOPE(*this, JCS_SMCGUARD, false);
-	*emitPtr++ = PPC_RLWINM(PPC_R11, eaReg, 22, 16, 31);   // r11 = (EA>>10) & 0xFFFF
-	*emitPtr++ = PPC_LIS(PPC_R10, fp >> 16);
-	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, fp & 0xFFFF);
-	*emitPtr++ = PPC_LBZX(PPC_R10, PPC_R10, PPC_R11);      // r10 = smcPageFlags[page]
-	*emitPtr++ = PPC_CMPWI(0, PPC_R10, 0);
-	skip = emitPtr++;
-	}
-
-	JIT_STAT_SCOPE(*this, JCS_SMCBAIL, true);
-	*emitPtr++ = PPC_LWZ(PPC_R10, 1, 88);
-	*emitPtr++ = PPC_STW(eaReg, PPC_R10, 20);              // out->smcAddress = EA
-	emitAddCycles(cyclesAccum);
-	emitResultMetadata(instrCount, 1, 1);                  // bailedOut=1, smcHit=1
-	*emitPtr++ = PPC_LIS(PPC_R4, currentPC >> 16);
-	*emitPtr++ = PPC_ORI(PPC_R4, PPC_R4, currentPC & 0xFFFF);
-	s32 ret = (s32)((u8*)cache.linkerReturnAddress - (u8*)emitPtr);
-	*emitPtr++ = PPC_B(ret);
-
-	*skip = PPC_BEQ((u32)((emitPtr - skip) * 4));
+	JitColdStub& s = addCold(JCOLD_SMCBAIL);
+	s.reg = eaReg;
+	emitSmcPageTest(emitPtr, eaReg, PPC_R11, PPC_R10, (u32)cache.smcPageFlags);
+	s.smc[s.nSmc++] = emitPtr; *emitPtr++ = PPC_BNE(0);    // compiled code on the page -> bail
 }
 
 // Differential-harness store journal. See jit_trace.h. eaReg holds the guest
@@ -576,10 +586,8 @@ void JitTraceCtx::emitSmcCheckAndBail(u8 eaReg)
 // interpreter reference run can be rolled back. Compiles to nothing in a
 // shipping build (cpu.journalNote == 0). Clobbers the volatile registers
 // r3..r12 (and CTR / LR); r3 is saved to and restored from 92(r1).
-void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
+static void emitJournalCall(u32*& p, const JitCpuProfile& cpu, u8 eaReg, u32 size)
 {
-	if (!cpu.journalNote) return;
-	u32*& p = emitPtr;
 	const u32 fn = (u32)cpu.journalNote;
 	const s32 procnum = cpu.isaLevel >= 5 ? 0 : 1;   // ARMCPU_ARM9 : ARMCPU_ARM7
 
@@ -592,6 +600,27 @@ void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
 	*p++ = PPC_MTCTR(PPC_R12);
 	*p++ = PPC_BCTRL();
 	*p++ = PPC_LWZ(PPC_R3, 1, 92);
+}
+
+void JitTraceCtx::emitJournalNote(u8 eaReg, u32 size)
+{
+	if (!cpu.journalNote) return;
+	emitJournalCall(emitPtr, cpu, eaReg, size);
+}
+
+// The journal note of an inline ARM9 store (differential builds only), with
+// r10 / r11 / r12 (host base, offset, EA) kept across the call.
+static void emitJournalKeep(JitTraceCtx& c, u32 size)
+{
+	if (!c.cpu.journalNote) return;
+	u32*& p = c.emitPtr;
+	*p++ = PPC_STW(PPC_R10, 1, 108);
+	*p++ = PPC_STW(PPC_R11, 1, 120);
+	*p++ = PPC_STW(PPC_R12, 1, 124);
+	emitJournalCall(p, c.cpu, PPC_R12, size);
+	*p++ = PPC_LWZ(PPC_R10, 1, 108);
+	*p++ = PPC_LWZ(PPC_R11, 1, 120);
+	*p++ = PPC_LWZ(PPC_R12, 1, 124);
 }
 
 // P14/P15 shared: guard EA (PPC_R12) against the cached-descriptor page window,
@@ -658,236 +687,326 @@ static void patchMissSlots(u32* const* missSlots, int nMiss, const u32* target)
 		*missSlots[i] |= (u32)((target - missSlots[i]) * 4) & 0xFFFC;
 }
 
-// P16: ARM9 two-region inline guard (plus ITCM for loads).
-// See jit_trace.h. EA in PPC_R12.
-int JitTraceCtx::emitArm9RegionGuard(u32 size, u8 alignMe, u32 spanBytes, u32** fastSlots, bool withItcm,
-                                     void (*onHit)(JitTraceCtx&, void*, int), void* hitArg)
+// =========================================================================
+// P16 ARM9 accesses: predicted region inline, everything else out of line
+// =========================================================================
+// The old inline guard tested DTCM, main RAM and (loads) ITCM at every site
+// and carried the slowRead / slowWrite C call and SMC bail inline -- ~52 PPC
+// words per word LDR, ~64 per STR, most of it never executed. A site now
+// inlines only the region memPredict names and branches to a cold stub at the
+// block's tail for any other address; the stub calls the cache's shared thunk
+// (jitEmitMemThunks()), which resolves DTCM -> main RAM -> ITCM -> C call in
+// the old order, reading the DTCM window live. The access each address gets
+// is unchanged; only where the code sits is.
+
+// The ARM9 region decode baked at emit time (a TCM move flushes the cache).
+namespace {
+struct Arm9Regions { u32 region; s32 tag; bool reach, inMain, inItcm; u32 mainMb; };
+}
+static Arm9Regions jitArm9Regions(const JitCpuProfile& cpu)
 {
-	(void)size;
-	JIT_STAT_SCOPE(*this, JCS_MEMGUARD, false);
-	u32*& p = emitPtr;
-	int nFast = 0;
-	u32* slow[6]; int nSlow = 0; bool slowIsBeq[6] = { false };
-
-	// DTCM window base, read live at emit time and baked (see the profile note).
-	// _MMU_*<ARM9> compares (addr & ~0x3FFF) == MMU.DTCMRegion against the *full*
-	// value, so a window base with any of bits 0..13 set can never match -- DTCM
-	// is then unreachable and the whole branch is skipped at compile time. When
-	// it can match it is 16 KB aligned, so the shifted-tag compare is exact.
-	const u32 dtcmRegion   = *(const volatile u32*)(uintptr_t)cpu.arm9DtcmRegionPtr;
-	const bool dtcmReach   = (dtcmRegion & 0x3FFFu) == 0;
-	const s32 dtcmTag      = (s32)(dtcmRegion >> 14);
-	const bool dtcmInMain  = dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u;
-	const bool dtcmInItcm  = dtcmReach && dtcmRegion < 0x02000000u;
-	const u32 mainMb       = (u32)__builtin_clz(cpu.arm9MainMask); // top set bit of the mirror mask
-	const u32 dtcmBase     = cpu.arm9DtcmBase;
-	const u32 mainBase     = cpu.mainMemBase;
-
-	// ---- DTCM: (EA >> 14) == (dtcmRegion >> 14) ----
-	u32* notDtcm = nullptr;
-	if (dtcmReach) {
-		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 14);
-		*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
-		notDtcm = p++;                                             // BNE -> main check
-		if (spanBytes) {                                           // whole run in the 16 KB window
-			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
-			*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
-			*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
-			slow[nSlow++] = p++;                                   // BNE -> slow (straddles window)
-		}
-		*p++ = PPC_LIS(PPC_R10, dtcmBase >> 16);
-		if (dtcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, dtcmBase & 0xFFFF);
-		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, alignMe);       // EA & 0x3FFF, cleared to align
-		if (onHit) onHit(*this, hitArg, 0); else fastSlots[nFast++] = p++;                                  // B -> caller inline block
-
-		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
-	}
-
-	// ---- main RAM: (EA >> 24) & 0xF == 2 ----
-	*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);
-	*p++ = PPC_CMPWI(0, PPC_R10, 2);
-	u32* notMain = p++;                                            // BNE -> ITCM test / slow
-	if (spanBytes) {
-		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
-		*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
-		*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
-		*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
-		slow[nSlow++] = p++;                                       // BNE -> slow (crosses a 1 MB page)
-		if (dtcmInMain) {                                          // ...and not into the DTCM window
-			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
-			*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
-			*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
-			slowIsBeq[nSlow] = true;
-			slow[nSlow++] = p++;                                   // BEQ -> slow
-		}
-	}
-	*p++ = PPC_LIS(PPC_R10, mainBase >> 16);
-	if (mainBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, mainBase & 0xFFFF);
-	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);       // EA & mirrorMask, cleared to align
-	if (onHit) onHit(*this, hitArg, 1); else fastSlots[nFast++] = p++;                                      // B -> caller inline block
-
-	// ---- ITCM (loads only): EA < 0x02000000 ----
-	// Tested after main RAM, on main RAM's miss branch, so the common main-RAM
-	// hit pays nothing for it. The rule is exactly the interpreter's
-	// (_MMU_ARM9_read*, reached once the DTCM and main-RAM checks in _MMU_read*
-	// have missed): every address below 0x02000000 is the 32 KB ITCM, mirrored
-	// by `addr & 0x7FFF`. That decode ignores the CP15 ITCM size/enable
-	// register (cp15.cpp pins MMU.ITCMRegion to 0 and nothing reads the size),
-	// so there is nothing CP15-dependent to bake: the only emit-time constant is
-	// MMU.ARM9_ITCM, allocated with MAIN_MEM / ARM9_DTCM and never moved. DTCM
-	// keeps priority because its test above runs first; the span test below
-	// keeps a run inside one 32 KB mirror (the interpreter wraps each word
-	// separately at the edge, the inline lwbrx run would not -- and the last
-	// mirror's edge is 0x02000000 itself) and, when DTCM sits in the ITCM
-	// range, out of the DTCM window -- the same shape as the main-RAM span
-	// tests. Stores do not take this path: ITCM holds JIT code, and the
-	// measured ITCM store rate on the benchmark scene was zero, so they stay on
-	// slowWrite (whose _MMU_ARM9_write* does the SMC invalidate itself).
-	if (!withItcm) {
-		slow[nSlow++] = notMain;                                   // not main RAM -> slow
-	} else {
-		const u32 itcmBase = cpu.arm9ItcmBase;
-		*notMain = PPC_BNE((u32)((p - notMain) * 4));              // not main RAM -> here
-		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);
-		*p++ = PPC_CMPWI(0, PPC_R10, 0);
-		slow[nSlow++] = p++;                                       // BNE -> slow (not ITCM)
-		if (spanBytes) {
-			*p++ = PPC_SRWI(PPC_R10, PPC_R12, 15);
-			*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)spanBytes);
-			*p++ = PPC_SRWI(PPC_R11, PPC_R11, 15);
-			*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
-			slow[nSlow++] = p++;                                   // BNE -> slow (crosses a 32 KB mirror)
-			if (dtcmInItcm) {                                      // ...and not into the DTCM window
-				*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)spanBytes);
-				*p++ = PPC_SRWI(PPC_R10, PPC_R10, 14);
-				*p++ = PPC_CMPWI(0, PPC_R10, dtcmTag);
-				slowIsBeq[nSlow] = true;
-				slow[nSlow++] = p++;                               // BEQ -> slow
-			}
-		}
-		*p++ = PPC_LIS(PPC_R10, itcmBase >> 16);
-		if (itcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, itcmBase & 0xFFFF);
-		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, alignMe);       // EA & 0x7FFF, cleared to align
-		if (onHit) onHit(*this, hitArg, 2); else fastSlots[nFast++] = p++;                                  // B -> caller inline block
-	}
-
-	// slow fall-through starts here; retarget every miss branch to it
-	for (int i = 0; i < nSlow; i++) {
-		const u32 off = (u32)((p - slow[i]) * 4);
-		*slow[i] = slowIsBeq[i] ? PPC_BEQ(off) : PPC_BNE(off);
-	}
-	return nFast;
+	Arm9Regions g;
+	g.region = *(const volatile u32*)(uintptr_t)cpu.arm9DtcmRegionPtr;
+	// _MMU_*<ARM9> compares (addr & ~0x3FFF) == MMU.DTCMRegion against the
+	// full value, so a window base with any of bits 0..13 set never matches.
+	g.reach  = (g.region & 0x3FFFu) == 0;
+	g.tag    = (s32)(g.region >> 14);
+	g.inMain = g.reach && (g.region & 0x0F000000u) == 0x02000000u;
+	g.inItcm = g.reach && g.region < 0x02000000u;
+	g.mainMb = (u32)__builtin_clz(cpu.arm9MainMask);   // top set bit of the mirror mask
+	return g;
 }
 
-// Main-RAM-first variant of emitArm9RegionGuard() for single accesses
-// (spanBytes 0) with an onHit callback, used when the DTCM window lies outside
-// main RAM (then the two regions are disjoint and the order is free). Returns
-// false (nothing emitted) when that does not hold.
-static bool emitArm9RegionGuardMainFirst(JitTraceCtx& c, u8 alignMe, bool withItcm,
-                                         void (*onHit)(JitTraceCtx&, void*, int), void* arg)
+u8 JitTraceCtx::arm9RegionOf(u32 ea) const
 {
-	const u32 dtcmRegion = *(const volatile u32*)(uintptr_t)c.cpu.arm9DtcmRegionPtr;
-	const bool dtcmReach = (dtcmRegion & 0x3FFFu) == 0;
-	if (dtcmReach && (dtcmRegion & 0x0F000000u) == 0x02000000u) return false;
+	const u32 region = *(const volatile u32*)(uintptr_t)cpu.arm9DtcmRegionPtr;
+	if ((ea & ~0x3FFFu) == region) return JIT_MEMP_DTCM;
+	if ((ea & 0x0F000000u) == 0x02000000u) return JIT_MEMP_MAIN;
+	if (ea < 0x02000000u) return JIT_MEMP_ITCM;
+	return JIT_MEMP_MAIN;
+}
+
+// cr0 EQ <=> the address in src lies in the (baked, reachable) DTCM window.
+// Clobbers r10 (and r11 when the tag does not fit a cmpwi immediate).
+static void emitDtcmTest(u32*& p, const Arm9Regions& g, u8 src)
+{
+	if (g.tag <= 0x7FFF) {
+		*p++ = PPC_SRWI(PPC_R10, src, 14);
+		*p++ = PPC_CMPWI(0, PPC_R10, g.tag);
+	} else {
+		*p++ = PPC_RLWINM(PPC_R10, src, 0, 0, 17);
+		jitImm32(p, PPC_R11, g.region);
+		*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+	}
+}
+
+// Inline test for the one region `pred` (JIT_MEMP_*) of an access at EA (r12)
+// .. EA + span: DTCM; main RAM, excluding the DTCM window when it overlays
+// main RAM (DTCM has priority); ITCM (single constant-EA loads), excluding the
+// window when it overlays that range. With span, both ends must be inside (and
+// for main RAM, inside one 1 MB page -- the run is <= 60 bytes, so a window
+// that misses both ends misses the run). alignTest also sends an unaligned EA
+// out (word loads, whose rotate the thunk does). Every way out is a placeholder
+// branch in s.miss; on the fall-through r10 = host base, r11 = the EA's offset
+// in the region cleared to alignMe. Returns the region emitted.
+static int emitArm9Predicted(JitTraceCtx& c, int pred, u8 alignMe, u32 span, bool alignTest, JitColdStub& s)
+{
 	JIT_STAT_SCOPE(c, JCS_MEMGUARD, false);
 	u32*& p = c.emitPtr;
-	const u32 mainMb = (u32)__builtin_clz(c.cpu.arm9MainMask);
-
-	*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);               // main: (EA >> 24) & 0xF == 2
-	*p++ = PPC_CMPWI(0, PPC_R10, 2);
-	u32* notMain = p++;
-	*p++ = PPC_LIS(PPC_R10, c.cpu.mainMemBase >> 16);
-	if (c.cpu.mainMemBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.mainMemBase & 0xFFFF);
-	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, alignMe);
-	onHit(c, arg, 1);
-	*notMain = PPC_BNE((u32)((p - notMain) * 4));
-
-	u32* slow[2]; int nSlow = 0;
-	if (dtcmReach) {                                               // DTCM: (EA >> 14) == tag
-		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 14);
-		*p++ = PPC_CMPWI(0, PPC_R10, (s32)(dtcmRegion >> 14));
-		u32* notDtcm = p++;
-		*p++ = PPC_LIS(PPC_R10, c.cpu.arm9DtcmBase >> 16);
-		if (c.cpu.arm9DtcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.arm9DtcmBase & 0xFFFF);
-		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, alignMe);
-		onHit(c, arg, 0);
-		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
-	}
-	if (withItcm) {                                                // ITCM: EA < 0x02000000 (after DTCM)
-		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);
-		*p++ = PPC_CMPWI(0, PPC_R10, 0);
-		slow[nSlow++] = p++;
-		*p++ = PPC_LIS(PPC_R10, c.cpu.arm9ItcmBase >> 16);
-		if (c.cpu.arm9ItcmBase & 0xFFFF) *p++ = PPC_ORI(PPC_R10, PPC_R10, c.cpu.arm9ItcmBase & 0xFFFF);
-		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, alignMe);
-		onHit(c, arg, 2);
-	}
-	for (int i = 0; i < nSlow; i++) *slow[i] = PPC_BNE((u32)((p - slow[i]) * 4));
-	return true;
-}
-
-// P16: full ARM9 single load. See jit_trace.h. EA in PPC_R12.
-//
-// Layout: each region hit loads straight into rd's pinned host register and
-// branches to the join; the slowRead C path is the guard's fall-through. So a
-// hit costs the guard, one indexed load (+ fix-up) and one taken branch, with
-// no EA stash / register copy -- the stash only happens on the slow path.
-namespace {
-struct Arm9LoadHit { u8 hRd; u32 size; bool signExt, wordRotate; u32* ends[3]; int nEnd; };
-}
-static void arm9LoadHit(JitTraceCtx& c, void* a, int /*region*/)
-{
-	Arm9LoadHit& h = *(Arm9LoadHit*)a;
-	JIT_STAT_SCOPE(c, JCS_MEMHIT, false);
-	u32*& p = c.emitPtr;
-	if (h.size == 4) {
-		*p++ = PPC_LWBRX(h.hRd, PPC_R10, PPC_R11);
-		if (h.wordRotate) {
-			// ROR by 8x == ROL by (-8x) & 31 (rlwnm uses the low 5 bits)
-			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 3, 27, 28);        // 8 * (EA & 3)
-			*p++ = PPC_NEG(PPC_R11, PPC_R11);
-			*p++ = PPC_RLWNM(h.hRd, h.hRd, PPC_R11, 0, 31);
+	const Arm9Regions g = jitArm9Regions(c.cpu);
+	if (pred == JIT_MEMP_DTCM && !g.reach) pred = JIT_MEMP_MAIN;
+	if (pred == JIT_MEMP_ITCM && span)     pred = JIT_MEMP_MAIN;
+	auto miss = [&](u32 w) { s.miss[s.nMiss++] = p; *p++ = w; };
+	u32 base; u8 mb;
+	if (pred == JIT_MEMP_DTCM) {
+		emitDtcmTest(p, g, PPC_R12);
+		miss(PPC_BNE(0));
+		if (span) {
+			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)span);
+			emitDtcmTest(p, g, PPC_R10);
+			miss(PPC_BNE(0));
 		}
-	} else if (h.size == 2) {
-		*p++ = PPC_LHBRX(h.hRd, PPC_R10, PPC_R11);
-		if (h.signExt) *p++ = PPC_EXTSH(h.hRd, h.hRd);
+		base = c.cpu.arm9DtcmBase; mb = 18;
+	} else if (pred == JIT_MEMP_ITCM) {
+		if (g.inItcm) { emitDtcmTest(p, g, PPC_R12); miss(PPC_BEQ(0)); }
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);                      // EA < 0x02000000
+		*p++ = PPC_CMPWI(0, PPC_R10, 0);
+		miss(PPC_BNE(0));
+		base = c.cpu.arm9ItcmBase; mb = 17;
 	} else {
-		*p++ = PPC_LBZX(h.hRd, PPC_R10, PPC_R11);
-		if (h.signExt) *p++ = PPC_EXTSB(h.hRd, h.hRd);
+		if (g.inMain) { emitDtcmTest(p, g, PPC_R12); miss(PPC_BEQ(0)); }
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);             // (EA >> 24) & 0xF == 2
+		*p++ = PPC_CMPWI(0, PPC_R10, 2);
+		miss(PPC_BNE(0));
+		if (span) {
+			*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);                  // one 1 MB page
+			*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)span);
+			*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
+			*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+			miss(PPC_BNE(0));
+			if (g.inMain) {                                         // ...whose end is not DTCM
+				*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)span);
+				emitDtcmTest(p, g, PPC_R10);
+				miss(PPC_BEQ(0));
+			}
+		}
+		base = c.cpu.mainMemBase; mb = (u8)g.mainMb;
 	}
-	h.ends[h.nEnd++] = p++;                                        // B -> join
+	if (alignTest) { *p++ = PPC_ANDI_(0, PPC_R12, 3); miss(PPC_BNE(0)); }
+	jitImm32(p, PPC_R10, base);
+	*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mb, alignMe);
+	return pred;
 }
 
+// dst <- host [rA + rB], byte-swapped, with the access's sign extension.
+static void emitLoadOp(u32*& p, u8 dst, u8 rA, u8 rB, u32 size, bool signExt)
+{
+	if (size == 4) {
+		*p++ = PPC_LWBRX(dst, rA, rB);
+	} else if (size == 2) {
+		*p++ = PPC_LHBRX(dst, rA, rB);
+		if (signExt) *p++ = PPC_EXTSH(dst, dst);
+	} else {
+		*p++ = PPC_LBZX(dst, rA, rB);
+		if (signExt) *p++ = PPC_EXTSB(dst, dst);
+	}
+}
+static void emitStoreOp(u32*& p, u8 val, u8 rA, u8 rB, u32 size)
+{
+	if (size == 4)      *p++ = PPC_STWBRX(val, rA, rB);
+	else if (size == 2) *p++ = PPC_STHBRX(val, rA, rB);
+	else                *p++ = PPC_STBZX (val, rA, rB);
+}
+static inline int jitLoadThunk(u32 size, bool signExt, bool wordRotate)
+{
+	return size == 1 ? (signExt ? JTH_LD_S8 : JTH_LD_U8)
+	     : size == 2 ? (signExt ? JTH_LD_S16 : JTH_LD_U16)
+	     : (wordRotate ? JTH_LD_U32ROT : JTH_LD_U32);
+}
+
+// The shared thunks. See JitMemThunk (jit_cache.h) for the calling contract.
+// Their C-call paths do exactly what the old inline slow paths did (guest PC
+// -> gpr[15], r3 saved at 92(r1), slowRead / slowWrite, word ROR by 8*(EA&3)),
+// with LR at 112(r1) and the EA at 116(r1) across the call.
+void jitEmitMemThunks(JITCache& c, u32*& p)
+{
+	const JitCpuProfile& cpu = *c.thunkProfile;
+	const u32 regionPtr = cpu.arm9DtcmRegionPtr;
+	const u32 mainMb    = (u32)__builtin_clz(cpu.arm9MainMask);
+	const u32 flags     = (u32)c.smcPageFlags;
+
+	// cr0 EQ <=> EA (r12) is in the DTCM window, read live. Clobbers r10, rTmp.
+	auto liveDtcmTest = [&](u8 rTmp) {
+		*p++ = PPC_LIS(PPC_R10, (regionPtr + 0x8000) >> 16);
+		*p++ = PPC_LWZ(PPC_R10, PPC_R10, (s32)(s16)(regionPtr & 0xFFFF));
+		*p++ = PPC_RLWINM(rTmp, PPC_R12, 0, 0, 17);
+		*p++ = PPC_CMPW(0, rTmp, PPC_R10);
+	};
+	// The old emitMemPrologue(), plus LR.
+	auto callPrologue = [&]() {
+		*p++ = PPC_MFLR(0);
+		*p++ = PPC_STW(0, 1, 112);
+		*p++ = PPC_LWZ(PPC_R10, 1, 80);                    // gpr base
+		*p++ = PPC_STW(PPC_R29, PPC_R10, 15 * 4);          // guest PC -> gpr[15]
+		*p++ = PPC_STW(PPC_R3, 1, 92);                     // cycle accumulator
+	};
+	auto callEpilogue = [&]() {
+		*p++ = PPC_LWZ(PPC_R3, 1, 92);
+		*p++ = PPC_LWZ(0, 1, 112);
+		*p++ = PPC_MTLR(0);
+	};
+	// Differential builds: journal the store at r12, keeping r11 / r12 / LR.
+	auto journal = [&](u32 size) {
+		if (!cpu.journalNote) return;
+		*p++ = PPC_MFLR(0);
+		*p++ = PPC_STW(0, 1, 112);
+		*p++ = PPC_STW(PPC_R11, 1, 120);
+		*p++ = PPC_STW(PPC_R12, 1, 124);
+		emitJournalCall(p, cpu, PPC_R12, size);
+		*p++ = PPC_LWZ(PPC_R11, 1, 120);
+		*p++ = PPC_LWZ(PPC_R12, 1, 124);
+		*p++ = PPC_LWZ(0, 1, 112);
+		*p++ = PPC_MTLR(0);
+	};
+
+	// ---- loads: value -> r10 ----
+	for (int k = JTH_LD_U8; k <= JTH_LD_U32ROT; k++) {
+		const u32  size = k <= JTH_LD_S8 ? 1 : k <= JTH_LD_S16 ? 2 : 4;
+		const bool sx   = k == JTH_LD_S8 || k == JTH_LD_S16;
+		const bool rot  = k == JTH_LD_U32ROT;
+		const u8   al   = jitAlignBit(size);
+		c.memThunk[k] = p;
+		u32* toAcc[2];
+		liveDtcmTest(PPC_R11);
+		u32* notDtcm = p++;
+		jitImm32(p, PPC_R10, cpu.arm9DtcmBase);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, al);
+		toAcc[0] = p++;
+		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);         // main RAM
+		*p++ = PPC_CMPWI(0, PPC_R10, 2);
+		u32* notMain = p++;
+		jitImm32(p, PPC_R10, cpu.mainMemBase);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, mainMb, al);
+		toAcc[1] = p++;
+		*notMain = PPC_BNE((u32)((p - notMain) * 4));
+		*p++ = PPC_SRWI(PPC_R10, PPC_R12, 25);                  // ITCM: EA < 0x02000000
+		*p++ = PPC_CMPWI(0, PPC_R10, 0);
+		u32* toSlow = p++;
+		jitImm32(p, PPC_R10, cpu.arm9ItcmBase);
+		*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 17, al);
+		for (int i = 0; i < 2; i++) *toAcc[i] = PPC_B((u32)((p - toAcc[i]) * 4));
+		emitLoadOp(p, PPC_R10, PPC_R10, PPC_R11, size, sx);
+		if (rot) {                                              // ROR by 8x == ROL by (-8x) & 31
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 3, 27, 28);
+			*p++ = PPC_NEG(PPC_R11, PPC_R11);
+			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R11, 0, 31);
+		}
+		*p++ = PPC_BLR();
+		// slowRead C call
+		*toSlow = PPC_BNE((u32)((p - toSlow) * 4));
+		callPrologue();
+		if (rot) *p++ = PPC_STW(PPC_R12, 1, 116);
+		*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
+		*p++ = PPC_LI(PPC_R4, (s32)size);
+		jitCallC(p, (u32)cpu.slowRead);
+		*p++ = PPC_OR(PPC_R10, PPC_R3, PPC_R3);
+		if (sx && size == 1) *p++ = PPC_EXTSB(PPC_R10, PPC_R10);
+		if (sx && size == 2) *p++ = PPC_EXTSH(PPC_R10, PPC_R10);
+		if (rot) {                                              // ROR(R10, 8 * (EA & 3))
+			*p++ = PPC_LWZ(PPC_R12, 1, 116);
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
+			*p++ = PPC_SUBFIC(PPC_R12, PPC_R12, 4);
+			*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
+			*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+		}
+		callEpilogue();
+		*p++ = PPC_BLR();
+	}
+
+	// ---- stores: value in r11; cr0 EQ done / NE SMC refusal ----
+	for (int k = JTH_ST_U8; k <= JTH_ST_U32; k++) {
+		const u32 size = k == JTH_ST_U8 ? 1 : k == JTH_ST_U16 ? 2 : 4;
+		const u8  al   = jitAlignBit(size);
+		c.memThunk[k] = p;
+		liveDtcmTest(PPC_R9);                                   // DTCM: never holds JIT code
+		u32* notDtcm = p++;
+		journal(size);
+		jitImm32(p, PPC_R10, cpu.arm9DtcmBase);
+		*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 0, 18, al);
+		emitStoreOp(p, PPC_R11, PPC_R10, PPC_R9, size);
+		*p++ = PPC_CMPW(0, PPC_R12, PPC_R12);
+		*p++ = PPC_BLR();
+		*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
+		*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);         // main RAM, SMC-guarded
+		*p++ = PPC_CMPWI(0, PPC_R10, 2);
+		u32* toSlow = p++;
+		emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R10, flags);
+		*p++ = PPC_BNELR();
+		journal(size);
+		jitImm32(p, PPC_R10, cpu.mainMemBase);
+		*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 0, mainMb, al);
+		emitStoreOp(p, PPC_R11, PPC_R10, PPC_R9, size);
+		*p++ = PPC_CMPW(0, PPC_R12, PPC_R12);
+		*p++ = PPC_BLR();
+		// SMC guard + slowWrite C call (every other region, ITCM included)
+		*toSlow = PPC_BNE((u32)((p - toSlow) * 4));
+		emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R10, flags);
+		*p++ = PPC_BNELR();
+		callPrologue();
+		*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
+		*p++ = PPC_OR(PPC_R4, PPC_R11, PPC_R11);
+		*p++ = PPC_LI(PPC_R5, (s32)size);
+		jitCallC(p, (u32)cpu.slowWrite);
+		callEpilogue();
+		*p++ = PPC_CMPW(0, PPC_R3, PPC_R3);
+		*p++ = PPC_BLR();
+	}
+
+	// ---- slowWrite only (block-store slow loop; its SMC tests ran already) ----
+	c.memThunk[JTH_STSLOW_U32] = p;
+	callPrologue();
+	*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
+	*p++ = PPC_OR(PPC_R4, PPC_R11, PPC_R11);
+	*p++ = PPC_LI(PPC_R5, 4);
+	jitCallC(p, (u32)cpu.slowWrite);
+	callEpilogue();
+	*p++ = PPC_BLR();
+}
+
+JitColdStub& JitTraceCtx::addCold(u8 type)
+{
+	static JitColdStub s_spill;                      // overflow sink (block is then dropped)
+	JitColdStub& s = coldCount < JIT_MAX_COLD ? cold[coldCount] : (coldOverflow = true, s_spill);
+	coldCount += coldCount < JIT_MAX_COLD;
+	memset(&s, 0, sizeof s);
+	s.type   = type;
+	s.cycles = cyclesAccum;
+	s.icount = instrCount;
+	s.pc     = currentPC;
+	return s;
+}
+
+// P16: full ARM9 single load. See jit_trace.h. EA in PPC_R12. Hit: the
+// predicted region's test and one indexed load straight into rd's pinned
+// register; anything else (or an unaligned rotating word load) goes to the
+// cold stub, `bl LD thunk ; mr rd, r10 ; b back`.
 void JitTraceCtx::emitArm9Load(u8 rd, u32 size, bool signExt, bool wordRotate, bool writeback, u8 rn)
 {
 	u32*& p = emitPtr;
-	Arm9LoadHit h = { hostRegFor(rd), size, signExt, wordRotate, {}, 0 };
-	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const bool mainFirst = memMainFirst;
-	memMainFirst = false;
-	if (!mainFirst || !emitArm9RegionGuardMainFirst(*this, alignMe, /*withItcm=*/true, arm9LoadHit, &h))
-		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/true, arm9LoadHit, &h);
-
-	// ---- slow: slowRead C call (EA still in r12) ----
+	const u8 hRd = hostRegFor(rd);
+	const int pred = memPredict;
+	memPredict = JIT_MEMP_DTCM;
+	JitColdStub& s = addCold(JCOLD_LOAD);
+	s.thunk = (u8)jitLoadThunk(size, signExt, wordRotate);
+	s.reg   = hRd;
+	emitArm9Predicted(*this, pred, jitAlignBit(size), 0, size == 4 && wordRotate, s);
 	{
-	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
-	*p++ = PPC_STW(PPC_R12, 1, 96);                                // EA survives the call here
-	emitMemPrologue();
-	emitSlowLoad(PPC_R10, PPC_R12, size, signExt);
-	if (wordRotate) {                                              // ROR(R10, 8 * (EA & 3))
-		*p++ = PPC_LWZ(PPC_R12, 1, 96);
-		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 0, 30, 31);
-		*p++ = PPC_LI(PPC_R11, 4);
-		*p++ = PPC_SUBF(PPC_R12, PPC_R12, PPC_R11);
-		*p++ = PPC_RLWINM(PPC_R12, PPC_R12, 3, 27, 28);
-		*p++ = PPC_RLWNM(PPC_R10, PPC_R10, PPC_R12, 0, 31);
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
+	emitLoadOp(p, hRd, PPC_R10, PPC_R11, size, signExt);
 	}
-	emitMemEpilogue();
-	*p++ = PPC_OR(h.hRd, PPC_R10, PPC_R10);
-	}
-
-	// ---- join ---- (the caller excludes rd == rn with writeback)
-	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
+	s.back = p;
+	// (the caller excludes rd == rn with writeback)
 	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
 }
 
@@ -965,32 +1084,24 @@ bool JitTraceCtx::emitInlineLoad(u8 rd, u8 eaReg, u32 size, bool signExt, bool w
 	return true;
 }
 
-// P16: ARM9 inline block load. See jit_trace.h. Low EA in PPC_R12.
+// P16: ARM9 inline block load. See jit_trace.h. Low EA in PPC_R12 (and still
+// there afterwards). Hit: the predicted region covering the whole run, then n
+// sequential lwbrx into the pinned registers. Otherwise the cold stub loads
+// each word through the LD thunk -- per word, which yields what the old
+// whole-run guard's per-word slowRead fallback did (reads have no side
+// effects in the inline-able regions, and slowRead resolves DTCM priority
+// per word itself).
 void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 {
 	u32*& p = emitPtr;
-
-	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
-
-	u32* fast[3];
-	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/4 * (n - 1), fast, /*withItcm=*/true);
-
-	// ---- slow: per-word slowRead C loop, straight into the pinned regs ----
-	u32* toEnd;
-	{
-	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
-	emitMemPrologue();
-	for (u32 k = 0; k < n; k++) {
-		*p++ = PPC_LWZ(PPC_R12, 1, 96);
-		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
-		emitSlowLoad(hostRegFor(regs[k]), PPC_R12, 4, false);
-	}
-	emitMemEpilogue();
-	toEnd = p++;                                                   // B over the fast block
-	}
-
-	// ---- fast: n sequential inline lwbrx into the pinned regs ----
-	for (int i = 0; i < nFast; i++) *fast[i] = PPC_B((u32)((p - fast[i]) * 4));
+	int pred = memPredict;
+	memPredict = JIT_MEMP_DTCM;
+	if (pred == JIT_MEMP_ITCM) pred = JIT_MEMP_MAIN;
+	JitColdStub& s = addCold(JCOLD_BLOCKLOAD);
+	s.thunk = JTH_LD_U32;
+	s.n     = (u8)n;
+	for (u32 k = 0; k < n; k++) s.regs[k] = hostRegFor(regs[k]);
+	emitArm9Predicted(*this, pred, /*alignMe=*/29, 4 * (n - 1), false, s);
 	{
 	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
 	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // r10 = host addr of the low word
@@ -999,9 +1110,7 @@ void JitTraceCtx::emitArm9BlockLoad(const u8* regs, u32 n)
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
 	}
 	}
-
-	*toEnd = PPC_B((u32)((p - toEnd) * 4));
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);               // restore low EA (THUMB LDMIA reads it back)
+	s.back = p;
 }
 
 // P15: inline sequential block load (LDM / POP / LDMIA). See jit_trace.h.
@@ -1063,212 +1172,222 @@ bool JitTraceCtx::emitInlineBlockLoad(const u8* regs, u32 n, u8 eaReg, u32& lock
 	return true;
 }
 
-// value in PPC_R11, host address in PPC_R10.
-static inline void emitArm9Stw(u32*& p, u32 size)
-{
-	if (size == 4)      *p++ = PPC_STWBRX(PPC_R11, 0, PPC_R10);
-	else if (size == 2) *p++ = PPC_STHBRX(PPC_R11, 0, PPC_R10);
-	else                *p++ = PPC_STBZX (PPC_R11, 0, PPC_R10);
-}
-
 // P16: full ARM9 single store. See jit_trace.h. EA in PPC_R12; the value is in
-// hVal, a pinned guest register (it survives the guard and the C calls).
-//
-// Same layout as emitArm9Load: each region hit stores straight from hVal and
-// branches to the join, the slowWrite C path is the fall-through. The main-RAM
-// hit's SMC-page test branches forward to its bail block only on a hit on
-// compiled code, so the common path is guard + test + store + one taken
-// branch, with no stack stashes. Differential-testing builds (whose journal
-// call clobbers r10/r11 between the guard and the store) keep the original
-// sequence, emitArm9StoreJournaled().
-namespace {
-struct Arm9StoreHit { JitTraceCtx* c; u32 size; u8 hVal; u32* ends[4]; int nEnd; };
-}
-static void emitArm9StoreOp(u32*& p, u32 size, u8 hVal)
-{
-	if (size == 4)      *p++ = PPC_STWBRX(hVal, PPC_R10, PPC_R11);
-	else if (size == 2) *p++ = PPC_STHBRX(hVal, PPC_R10, PPC_R11);
-	else                *p++ = PPC_STBZX (hVal, PPC_R10, PPC_R11);
-}
-static void arm9StoreHit(JitTraceCtx& c, void* a, int region)
-{
-	Arm9StoreHit& h = *(Arm9StoreHit*)a;
-	JIT_STAT_SCOPE(c, JCS_MEMHIT, false);
-	u32*& p = c.emitPtr;
-	u32* toBail = nullptr;
-	if (region == 1) {                                             // main RAM: SMC page guard
-		JIT_STAT_SCOPE(c, JCS_SMCGUARD, false);
-		const u32 fp = (u32)c.cache.smcPageFlags;
-		*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 22, 16, 31);            // (EA >> 10) & 0xFFFF
-		*p++ = PPC_LIS(PPC_R8, fp >> 16);
-		if (fp & 0xFFFF) *p++ = PPC_ORI(PPC_R8, PPC_R8, fp & 0xFFFF);
-		*p++ = PPC_LBZX(PPC_R8, PPC_R8, PPC_R9);
-		*p++ = PPC_CMPWI(0, PPC_R8, 0);
-		toBail = p++;                                              // BNE -> bail (below)
-	}
-	emitArm9StoreOp(p, h.size, h.hVal);
-	h.ends[h.nEnd++] = p++;                                        // B -> join
-	if (toBail) {
-		// Compiled code lives on this page: bail with smcHit set, resuming at
-		// this instruction (same exit as emitSmcCheckAndBail()).
-		JIT_STAT_SCOPE(c, JCS_SMCBAIL, true);
-		*toBail = PPC_BNE((u32)((p - toBail) * 4));
-		*p++ = PPC_LWZ(PPC_R10, 1, 88);
-		*p++ = PPC_STW(PPC_R12, PPC_R10, 20);                      // out->smcAddress = EA
-		c.emitAddCycles(c.cyclesAccum);
-		c.emitResultMetadata(c.instrCount, 1, 1);
-		*p++ = PPC_LIS(PPC_R4, c.currentPC >> 16);
-		*p++ = PPC_ORI(PPC_R4, PPC_R4, c.currentPC & 0xFFFF);
-		s32 ret = (s32)((u8*)c.cache.linkerReturnAddress - (u8*)p);
-		*p++ = PPC_B(ret);
-	}
-}
-
+// hVal, a pinned guest register. Hit: the predicted region's test, for main
+// RAM the SMC page test (compiled code on the page -> the site's cold SMC
+// bail), the journal note in differential builds, one indexed store. Any other
+// region: the cold stub, `mr r11, hVal ; bl ST thunk ; beq back`, falling into
+// the same bail when the thunk refuses.
 void JitTraceCtx::emitArm9Store(u32 size, bool writeback, u8 rn, u8 hVal)
 {
 	u32*& p = emitPtr;
-	if (cpu.journalNote) {                                         // differential build
-		memMainFirst = false;
-		*p++ = PPC_STW(hVal, 1, 100);
-		emitArm9StoreJournaled(size, writeback, rn);
-		return;
+	int pred = memPredict;
+	memPredict = JIT_MEMP_DTCM;
+	if (pred == JIT_MEMP_ITCM) pred = JIT_MEMP_MAIN;              // ITCM stores keep slowWrite
+	JitColdStub& s = addCold(JCOLD_STORE);
+	s.thunk = (u8)(size == 4 ? JTH_ST_U32 : size == 2 ? JTH_ST_U16 : JTH_ST_U8);
+	s.reg   = hVal;
+	const int region = emitArm9Predicted(*this, pred, jitAlignBit(size), 0, false, s);
+	if (region == JIT_MEMP_MAIN) {
+		JIT_STAT_SCOPE(*this, JCS_SMCGUARD, false);
+		emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R8, (u32)cache.smcPageFlags);
+		s.smc[s.nSmc++] = p; *p++ = PPC_BNE(0);
 	}
-	Arm9StoreHit h = { this, size, hVal, {}, 0 };
-	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const bool mainFirst = memMainFirst;
-	memMainFirst = false;
-	if (!mainFirst || !emitArm9RegionGuardMainFirst(*this, alignMe, /*withItcm=*/false, arm9StoreHit, &h))
-		emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, nullptr, /*withItcm=*/false, arm9StoreHit, &h);
-
-	// ---- slow: SMC guard + slowWrite C call (EA in r12, value in hVal) ----
 	{
-	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
-	emitMemPrologue();
-	emitSmcCheckAndBail(PPC_R12);
-	emitSlowStore(PPC_R12, hVal, size);
-	emitMemEpilogue();
+	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
+	emitJournalKeep(*this, size);
+	emitStoreOp(p, hVal, PPC_R10, PPC_R11, size);
 	}
-
-	// ---- join ---- (writeback straight into the pinned base register)
-	for (int i = 0; i < h.nEnd; i++) *h.ends[i] = PPC_B((u32)((p - h.ends[i]) * 4));
-	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
-}
-
-// The original P16 store sequence (value at 100(r1)), kept for differential-
-// testing builds: its journal note sits between the region hit and the store.
-void JitTraceCtx::emitArm9StoreJournaled(u32 size, bool writeback, u8 rn)
-{
-	u32*& p = emitPtr;
-
-	// Guest state is resident, so the SMC-bail / slowWrite / inline paths all
-	// see coherent registers -- same shape as emitArm9Load.
-	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash EA
-
-	u32* fast[2];
-	const u8 alignMe = size == 4 ? 29 : size == 2 ? 30 : 31;
-	const int nFast = emitArm9RegionGuard(size, alignMe, /*spanBytes=*/0, fast, /*withItcm=*/false);
-
-	// ---- slow: SMC guard + slowWrite C call (no interpreter round-trip) ----
-	emitMemPrologue();
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
-	emitSmcCheckAndBail(PPC_R12);
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
-	*p++ = PPC_LWZ(PPC_R10, 1, 100);
-	emitSlowStore(PPC_R12, PPC_R10, size);
-	emitMemEpilogue();
-	u32* toEnd = p++;                                              // B over the fast block(s)
-
-	// ---- fast: main RAM (SMC-guard the written page) ----
-	// r10 = region host base, r11 = aligned in-region offset, r12 = EA.
-	const bool haveDtcm = (nFast == 2);
-	*fast[nFast - 1] = PPC_B((u32)((p - fast[nFast - 1]) * 4));
-	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // host store address
-	*p++ = PPC_STW(PPC_R10, 1, 108);                               // stash across SMC / journal
-	emitSmcCheckAndBail(PPC_R12);                                  // EA still in r12
-	u32* toShared = haveDtcm ? p++ : nullptr;                      // B over the DTCM entry
-
-	// ---- fast: DTCM (never holds JIT code -> no SMC guard) ----
-	if (haveDtcm) {
-		*fast[0] = PPC_B((u32)((p - fast[0]) * 4));
-		*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
-		*p++ = PPC_STW(PPC_R10, 1, 108);
-	}
-
-	// ---- shared fast tail: differential journal note + the inline store ----
-	if (toShared) *toShared = PPC_B((u32)((p - toShared) * 4));
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);                                // EA (journal arg)
-	emitJournalNote(PPC_R12, size);
-	*p++ = PPC_LWZ(PPC_R10, 1, 108);                               // host store address
-	*p++ = PPC_LWZ(PPC_R11, 1, 100);                               // value
-	emitArm9Stw(p, size);
-
-	// ---- converge ---- (writeback straight into the pinned base register)
-	*toEnd = PPC_B((u32)((p - toEnd) * 4));
+	s.back = p;
+	// writeback straight into the pinned base register
 	if (writeback) *p++ = PPC_LWZ(hostRegFor(rn), 1, 104);
 }
 
 // P16: ARM9 inline block store (STM / PUSH / STMIA, non-pc). See jit_trace.h.
-// Low EA in PPC_R12; each source register is read straight from its pinned host
-// register (r14..r29).
+// Low EA in PPC_R12 (and still there afterwards); each source register is read
+// straight from its pinned host register. Hit: the predicted region covering
+// the whole run (main RAM: SMC test of the low end, then of the high end, whose
+// bail reports EA + span as the old one did), one journal note for the span,
+// n sequential stwbrx. Everything else: the cold stub repeats the old
+// whole-run decision (see emitColdStubs()).
 void JitTraceCtx::emitArm9BlockStore(const u8* regs, u32 n)
 {
 	u32*& p = emitPtr;
 	const u32 span = 4 * (n - 1);
-
-	*p++ = PPC_STW(PPC_R12, 1, 96);                                // stash low EA
-
-	u32* fast[2];
-	const int nFast = emitArm9RegionGuard(4, /*alignMe=*/29, /*spanBytes=*/span, fast, /*withItcm=*/false);
-
-	// ---- slow: SMC guard (whole span) + per-word slowWrite C loop ----
-	u32* toEnd;
+	int pred = memPredict;
+	memPredict = JIT_MEMP_DTCM;
+	if (pred == JIT_MEMP_ITCM) pred = JIT_MEMP_MAIN;
+	JitColdStub& s = addCold(JCOLD_BLOCKSTORE);
+	s.n    = (u8)n;
+	s.span = span;
+	for (u32 k = 0; k < n; k++) s.regs[k] = hostRegFor(regs[k]);
+	const int region = emitArm9Predicted(*this, pred, /*alignMe=*/29, span, false, s);
+	if (region == JIT_MEMP_MAIN) {
+		JIT_STAT_SCOPE(*this, JCS_SMCGUARD, false);
+		const u32 fp = (u32)cache.smcPageFlags;
+		emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R8, fp);              // low end
+		s.smc[s.nSmc++] = p; *p++ = PPC_BNE(0);
+		if (span) {                                                    // the run may cross a 1 KB page
+			*p++ = PPC_ADDI(PPC_R9, PPC_R12, (s32)span);
+			emitSmcPageTest(p, PPC_R9, PPC_R9, PPC_R8, fp);
+			s.smcHigh[s.nSmcHigh++] = p; *p++ = PPC_BNE(0);
+		}
+	}
 	{
-	JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
-	emitMemPrologue();
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
-	emitSmcCheckAndBail(PPC_R12);
-	if (span) { *p++ = PPC_LWZ(PPC_R12, 1, 96); *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)span);
-	            emitSmcCheckAndBail(PPC_R12); }                     // the run may cross a 1 KB page
-	for (u32 k = 0; k < n; k++) {
-		*p++ = PPC_LWZ(PPC_R12, 1, 96);
-		if (k) *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
-		emitSlowStore(PPC_R12, hostRegFor(regs[k]), 4);
-	}
-	emitMemEpilogue();
-	toEnd = p++;                                                   // B over the fast block(s)
-	}
-
-	// ---- fast: main RAM (SMC-guard both ends of the span) ----
 	JIT_STAT_SCOPE(*this, JCS_MEMHIT, false);
-	const bool haveDtcm = (nFast == 2);
-	*fast[nFast - 1] = PPC_B((u32)((p - fast[nFast - 1]) * 4));
 	*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);                     // host addr of the low word
-	*p++ = PPC_STW(PPC_R10, 1, 108);
-	emitSmcCheckAndBail(PPC_R12);                                  // low end (EA in r12)
-	if (span) { *p++ = PPC_LWZ(PPC_R12, 1, 96); *p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)span);
-	            emitSmcCheckAndBail(PPC_R12); }                     // the run may cross a 1 KB page
-	u32* toShared = haveDtcm ? p++ : nullptr;                      // B over the DTCM entry
-
-	// ---- fast: DTCM (no SMC guard) ----
-	if (haveDtcm) {
-		*fast[0] = PPC_B((u32)((p - fast[0]) * 4));
-		*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
-		*p++ = PPC_STW(PPC_R10, 1, 108);
-	}
-
-	// ---- shared fast tail: one journal note for the span + n inline stwbrx ----
-	if (toShared) *toShared = PPC_B((u32)((p - toShared) * 4));
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);
-	emitJournalNote(PPC_R12, 4 * n);
-	*p++ = PPC_LWZ(PPC_R10, 1, 108);
+	emitJournalKeep(*this, 4 * n);
 	for (u32 k = 0; k < n; k++) {
 		*p++ = PPC_STWBRX(hostRegFor(regs[k]), 0, PPC_R10);
 		if (k + 1 < n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
 	}
+	}
+	s.back = p;
+}
 
-	// ---- converge ----
-	*toEnd = PPC_B((u32)((p - toEnd) * 4));
-	*p++ = PPC_LWZ(PPC_R12, 1, 96);                                // restore low EA for the caller
+// Emitted by jitCompileTrace() after the block's last exit (the yield stub):
+// every cold stub registered during the scan, with its branch slots aimed at
+// it. Fails (sets coldOverflow, the block is then not used) if a slot's
+// conditional branch cannot reach -- never for a block within the cut budget.
+void JitTraceCtx::emitColdStubs()
+{
+	u32*& p = emitPtr;
+	auto aim = [&](u32* slot) {
+		const s32 off = (s32)((p - slot) * 4);
+		if (off >= 0x8000) coldOverflow = true;
+		*slot |= (u32)off & 0xFFFC;
+	};
+	auto branchTo = [&](u32 w, const u32* target) {                  // b / beq back into the hot path
+		const s32 off = (s32)((target - p) * 4);
+		if ((w >> 26) == 16 && off < -0x8000) coldOverflow = true;
+		*p = w | ((u32)off & ((w >> 26) == 16 ? 0xFFFCu : 0x3FFFFFCu)); p++;
+	};
+	auto call = [&](int t) { *p = PPC_BL((s32)((u8*)cache.memThunk[t] - (u8*)p)); p++; };
+	const u32 fp = (u32)cache.smcPageFlags;
+
+	for (u32 i = 0; i < coldCount; i++) {
+		JitColdStub& s = cold[i];
+		JIT_STAT_SCOPE(*this, JCS_MEMSLOW, true);
+		for (u32 k = 0; k < s.nMiss; k++) aim(s.miss[k]);
+		switch (s.type) {
+		case JCOLD_LOAD:
+			call(s.thunk);
+			*p++ = PPC_OR(s.reg, PPC_R10, PPC_R10);
+			branchTo(PPC_B(0), s.back);
+			break;
+		case JCOLD_STORE:
+			*p++ = PPC_OR(PPC_R11, s.reg, s.reg);
+			call(s.thunk);
+			branchTo(PPC_BEQ(0), s.back);                             // NE: SMC refusal -> bail below
+			break;
+		case JCOLD_BLOCKLOAD:
+			*p++ = PPC_STW(PPC_R12, 1, 96);                           // low EA
+			for (u32 k = 0; k < s.n; k++) {
+				if (k) {
+					*p++ = PPC_LWZ(PPC_R12, 1, 96);
+					*p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
+				}
+				call(JTH_LD_U32);
+				*p++ = PPC_OR(s.regs[k], PPC_R10, PPC_R10);
+			}
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);
+			branchTo(PPC_B(0), s.back);
+			break;
+		case JCOLD_BLOCKSTORE: {
+			// The old whole-run decision: the whole run in the DTCM window ->
+			// inline stores; else in main RAM within one 1 MB page and not
+			// ending in DTCM -> SMC test of both ends, inline stores; else SMC
+			// test of both ends and a slowWrite per word.
+			const Arm9Regions g = jitArm9Regions(cpu);
+			u32* toSlow[4]; int nSlow = 0;
+			u32* toStore = nullptr;
+			*p++ = PPC_STW(PPC_R12, 1, 96);                           // low EA
+			if (g.reach) {
+				emitDtcmTest(p, g, PPC_R12);
+				u32* notDtcm = p++;
+				if (s.span) {
+					*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)s.span);
+					emitDtcmTest(p, g, PPC_R10);
+					toSlow[nSlow++] = p; *p++ = PPC_BNE(0);
+				}
+				jitImm32(p, PPC_R10, cpu.arm9DtcmBase);
+				*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, 18, 29);
+				toStore = p++;
+				*notDtcm = PPC_BNE((u32)((p - notDtcm) * 4));
+			}
+			*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 8, 28, 31);
+			*p++ = PPC_CMPWI(0, PPC_R10, 2);
+			toSlow[nSlow++] = p; *p++ = PPC_BNE(0);
+			if (s.span) {
+				*p++ = PPC_SRWI(PPC_R10, PPC_R12, 20);
+				*p++ = PPC_ADDI(PPC_R11, PPC_R12, (s32)s.span);
+				*p++ = PPC_SRWI(PPC_R11, PPC_R11, 20);
+				*p++ = PPC_CMPW(0, PPC_R10, PPC_R11);
+				toSlow[nSlow++] = p; *p++ = PPC_BNE(0);
+				if (g.inMain) {
+					*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)s.span);
+					emitDtcmTest(p, g, PPC_R10);
+					toSlow[nSlow++] = p; *p++ = PPC_BEQ(0);
+				}
+			}
+			emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R8, fp);
+			s.smc[s.nSmc++] = p; *p++ = PPC_BNE(0);
+			if (s.span) {
+				*p++ = PPC_ADDI(PPC_R9, PPC_R12, (s32)s.span);
+				emitSmcPageTest(p, PPC_R9, PPC_R9, PPC_R8, fp);
+				s.smcHigh[s.nSmcHigh++] = p; *p++ = PPC_BNE(0);
+			}
+			jitImm32(p, PPC_R10, cpu.mainMemBase);
+			*p++ = PPC_RLWINM(PPC_R11, PPC_R12, 0, g.mainMb, 29);
+			if (toStore) *toStore = PPC_B((u32)((p - toStore) * 4));
+			*p++ = PPC_ADD(PPC_R10, PPC_R10, PPC_R11);
+			emitJournalKeep(*this, 4 * s.n);
+			for (u32 k = 0; k < s.n; k++) {
+				*p++ = PPC_STWBRX(s.regs[k], 0, PPC_R10);
+				if (k + 1 < s.n) *p++ = PPC_ADDI(PPC_R10, PPC_R10, 4);
+			}
+			u32* toDone = p++;
+			for (int k = 0; k < nSlow; k++) aim(toSlow[k]);
+			emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R8, fp);
+			s.smc[s.nSmc++] = p; *p++ = PPC_BNE(0);
+			if (s.span) {
+				*p++ = PPC_ADDI(PPC_R9, PPC_R12, (s32)s.span);
+				emitSmcPageTest(p, PPC_R9, PPC_R9, PPC_R8, fp);
+				s.smcHigh[s.nSmcHigh++] = p; *p++ = PPC_BNE(0);
+			}
+			for (u32 k = 0; k < s.n; k++) {
+				if (k) {
+					*p++ = PPC_LWZ(PPC_R12, 1, 96);
+					*p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)(k * 4));
+				}
+				*p++ = PPC_OR(PPC_R11, s.regs[k], s.regs[k]);
+				call(JTH_STSLOW_U32);
+			}
+			*toDone = PPC_B((u32)((p - toDone) * 4));
+			*p++ = PPC_LWZ(PPC_R12, 1, 96);                           // low EA, as the hot path leaves it
+			branchTo(PPC_B(0), s.back);
+			break;
+		}
+		default:   // JCOLD_SMCBAIL: the bail only
+			break;
+		}
+		if (s.type == JCOLD_LOAD || s.type == JCOLD_BLOCKLOAD) continue;
+
+		// ---- SMC bail: resume at the store with the cycles / instructions
+		// before it, r12 = the refused EA (reported as smcAddress) ----
+		JIT_STAT_SCOPE(*this, JCS_SMCBAIL, true);
+		if (s.nSmcHigh) {                                              // high end: report EA + span
+			for (u32 k = 0; k < s.nSmcHigh; k++) aim(s.smcHigh[k]);
+			*p++ = PPC_ADDI(PPC_R12, PPC_R12, (s32)s.span);
+		}
+		for (u32 k = 0; k < s.nSmc; k++) aim(s.smc[k]);
+		if (s.type == JCOLD_SMCBAIL && s.reg != PPC_R12) *p++ = PPC_OR(PPC_R12, s.reg, s.reg);
+		if (s.cycles) *p++ = PPC_ADDI(PPC_R3, PPC_R3, (s32)s.cycles);
+		if (s.icount) *p++ = PPC_ADDI(PPC_R31, PPC_R31, (s32)s.icount);
+		*p++ = PPC_LIS(PPC_R4, s.pc >> 16);
+		*p++ = PPC_ORI(PPC_R4, PPC_R4, s.pc & 0xFFFF);
+		*p = PPC_B((s32)((u8*)cache.smcTailAddress - (u8*)p)); p++;
+	}
 }
 
 void JitTraceCtx::emitResultMetadata(u32 count, u32 bailedOut, u32 smcHit)
@@ -1954,11 +2073,11 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 #endif
 
 	while (!ctx.endBlock && ctx.instrCount < cutLimit) {
+		ctx.memPredict = JIT_MEMP_DTCM;
 #if JIT_FLAG_ELIM
 		// Elision assumes the block runs on to the overwriting instruction; the
 		// liveness window above ends at the cut, so it does.
 		ctx.deadFlags = 0;
-		ctx.memMainFirst = false;
 		{
 			const u32 idx = (ctx.currentPC - startPC) >> (thumb ? 1 : 2);
 			if (idx < JIT_TRACE_MAX_INSTRUCTIONS) ctx.deadFlags = flagDeadAt[idx];
@@ -1981,6 +2100,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		// exactly here before the fallback call replaces it.
 		u32* const emitMark = ctx.arenaAllocated ? ctx.emitPtr : nullptr;
 		const u32  bailMark = ctx.bailoutCount;
+		const u32  coldMark = ctx.coldCount;
 #ifdef JIT_CODE_STATS
 		u32 statMark[JCS_N]; memcpy(statMark, ctx.statWords, sizeof statMark);
 		const u32 statColdMark = ctx.statCold;
@@ -2024,6 +2144,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 			}
 #endif
 			ctx.bailoutCount = bailMark;
+			ctx.coldCount = coldMark;
 			ctx.endBlock = false;
 			ctx.deadFlags = 0;
 			ctx.emitInterpFallback(opcode);
@@ -2137,6 +2258,19 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	*ctx.emitPtr++ = PPC_B(yieldOff);
 	}
 	*ctx.quotaGuard = PPC_BGE((u32)((yieldTarget - ctx.quotaGuard) * 4));
+
+	// ---- cold stubs: memory accesses off their predicted region, SMC bails ----
+	ctx.emitColdStubs();
+	if (ctx.coldOverflow) {
+		// Cannot happen for a block within the cut budget (<= 3 stubs per
+		// instruction, conditional branches well inside +-32 KB); if it ever
+		// did, the interpreter runs this PC instead of broken code.
+		cache.rewindJITMemory((JIT_BLOCK_RESERVE_WORDS * sizeof(u32) + 31) & ~31u);
+#ifdef JIT_CODE_STATS
+		if (ctx.statCounter) jitCodeStatsDropRecord(cache);
+#endif
+		return cache.registerBlock(startPC, 1, nullptr, thumb);
+	}
 
 	// ---- finalize: rewind unused reservation, sync caches, register ----
 	u32 emittedWords = (u32)(ctx.emitPtr - ctx.blockStart);
@@ -2284,11 +2418,13 @@ void jitCodeStatsTick(u32 frame)
 	FILE* f = fopen("sd:/jitstats.log", s_init ? "a" : "w");
 	if (f && !s_init) {
 		s_init = true;
-		fprintf(f, "# jitstats: arena9=%p (%u KiB) arena7=%p (%u KiB) table9=%p smcflags9=%p dtcmregion=%08x\n",
+		fprintf(f, "# jitstats: arena9=%p (%u KiB) arena7=%p (%u KiB) table9=%p smcflags9=%p dtcmregion=%08x"
+		           " sharedstubs9=%u sharedstubs7=%u (bytes: SMC tail + memory thunks)\n",
 		        (void*)s_arena[JIT_ARM9], (unsigned)(JIT_ARENA_SIZE_ARM9 >> 10),
 		        (void*)s_arena[JIT_ARM7], (unsigned)(JIT_ARENA_SIZE >> 10), (void*)s_blockTable[JIT_ARM9],
 		        (void*)s_smcPageFlags[JIT_ARM9],
-		        jitProfile[JIT_ARM9] ? (unsigned)*(const volatile u32*)(uintptr_t)jitProfile[JIT_ARM9]->arm9DtcmRegionPtr : 0u);
+		        jitProfile[JIT_ARM9] ? (unsigned)*(const volatile u32*)(uintptr_t)jitProfile[JIT_ARM9]->arm9DtcmRegionPtr : 0u,
+		        (unsigned)jitCacheArm9.thunkWords * 4, (unsigned)jitCacheArm7.thunkWords * 4);
 	}
 	for (int c = 0; c < 2; c++) {
 		JitStatCore& S = s_jcs[c];
