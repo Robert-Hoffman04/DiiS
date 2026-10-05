@@ -36,10 +36,31 @@ export MTOOLS_SKIP_CHECK=1
 
 #--- Dolphin process lifecycle ----------------------------------------------
 
+# The guest's libfat never flushes its FAT before the kill, so the SD image is
+# usually left inconsistent (SIGTERM doesn't help: -b Dolphin ignores it). An
+# unrepaired image made later mtools calls spin forever, hence sd_check.
 dolphin_kill() {
+	local i
 	pkill -9 -x  dolphin-emu          2>/dev/null || true
 	pkill -9 -f  dolphin-emu-wrapper  2>/dev/null || true
+	for i in $(seq 1 25); do
+		pgrep -x dolphin-emu >/dev/null 2>&1 || break
+		sleep 0.2
+	done
 	gecko_close
+	sd_check
+}
+
+# Repairs $DOLPHIN_SD if a kill still left its FAT inconsistent; keeps the
+# damaged image as $DOLPHIN_SD.damaged so log contents can be recovered.
+sd_check() {
+	[ -f "$DOLPHIN_SD" ] && command -v fsck.fat >/dev/null 2>&1 || return 0
+	timeout 60 fsck.fat -n "$DOLPHIN_SD" >/dev/null 2>&1 && return 0
+	echo "dolphin_kill: SD image FAT damaged, repairing (copy kept as $DOLPHIN_SD.damaged)" >&2
+	cp --sparse=always "$DOLPHIN_SD" "$DOLPHIN_SD.damaged"
+	timeout 120 fsck.fat -a -F 1 "$DOLPHIN_SD" >/dev/null 2>&1
+	timeout 60 fsck.fat -n "$DOLPHIN_SD" >/dev/null 2>&1 \
+		|| echo "dolphin_kill: SD image still damaged after repair: $DOLPHIN_SD" >&2
 }
 
 # dolphin_launch <dol>  [logfile]
