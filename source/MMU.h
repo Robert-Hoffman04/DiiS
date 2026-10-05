@@ -412,7 +412,10 @@ struct MMU_struct
 		//ARM9 mem
 		ARM9_ITCM = ARM9_DTCM = MAIN_MEM = ARM9_REG = ARM9_BIOS = ARM9_VMEM = 0;
 
-		ARM9_ITCM = new u8[0x8000];
+		// ITCM / DTCM / main RAM are 64 KB aligned: the JIT's inline access
+		// path then forms each host base with a single lis (no ori). Same
+		// heap as before (memalign returns the unused head / tail slack).
+		ARM9_ITCM = (u8*)memalign(0x10000, 0x8000);
 		
 		if (!ARM9_ITCM)
 		{
@@ -420,7 +423,7 @@ struct MMU_struct
 			return -1;
 		}
     
-		ARM9_DTCM = new u8[0x4000];
+		ARM9_DTCM = (u8*)memalign(0x10000, 0x4000);
 
 		if (!ARM9_DTCM)
 		{
@@ -433,7 +436,7 @@ struct MMU_struct
 			-- nope sorry this is Wii you only get 4MB - Scanff
 			
 		*/
-		MAIN_MEM = new u8[0x400000]; 
+		MAIN_MEM = (u8*)memalign(0x10000, 0x400000);
 
 		if (!MAIN_MEM)
 		{
@@ -475,20 +478,20 @@ struct MMU_struct
 		
 		if (ARM9_ITCM)
 		{
-			delete [] ARM9_ITCM;
+			free(ARM9_ITCM);
 			ARM9_ITCM = 0;
 		}
     
 		if (ARM9_DTCM)
 		{
-			delete [] ARM9_DTCM;
+			free(ARM9_DTCM);
 			ARM9_DTCM = 0;
 		}
 
 		
 		if (MAIN_MEM)
 		{
-			delete [] MAIN_MEM;
+			free(MAIN_MEM);
 			MAIN_MEM = 0;
 		}
 

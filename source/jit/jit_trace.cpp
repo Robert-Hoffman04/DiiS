@@ -690,15 +690,22 @@ int JitTraceCtx::emitPageResolve(u32 spanBytes, u8 alignMe, u32** missSlots)
 
 	// descriptor = pageDescBase[(page - lo) * 8] : { hostBase@+0, mask@+4 }
 	*p++ = PPC_RLWINM(PPC_R10, PPC_R10, 3, 0, 28);      // (page - lo) * 8
+	// The table's low half folds into the two lwz displacements (ha/lo):
+	// addis r11, r10, ha ; lwz lo(r11) ; lwz lo+4(r11).
+	const s32 descLo = (s32)(s16)(cpu.pageDescBase & 0xFFFF);
+	s32 d = 0;
 	if ((s32)(s16)cpu.pageDescBase == (s32)cpu.pageDescBase) {
 		*p++ = PPC_ADDI(PPC_R11, PPC_R10, (s32)cpu.pageDescBase);
+	} else if (descLo <= 0x7FFF - 4) {
+		*p++ = PPC_ADDIS(PPC_R11, PPC_R10, (cpu.pageDescBase + 0x8000) >> 16);
+		d = descLo;
 	} else {
 		*p++ = PPC_LIS(PPC_R11, cpu.pageDescBase >> 16);
 		if (cpu.pageDescBase & 0xFFFF) *p++ = PPC_ORI(PPC_R11, PPC_R11, cpu.pageDescBase & 0xFFFF);
 		*p++ = PPC_ADD(PPC_R11, PPC_R11, PPC_R10);
 	}
-	*p++ = PPC_LWZ(PPC_R10, PPC_R11, 0);                // hostBase
-	*p++ = PPC_LWZ(PPC_R11, PPC_R11, 4);                // mask
+	*p++ = PPC_LWZ(PPC_R10, PPC_R11, d);                // hostBase
+	*p++ = PPC_LWZ(PPC_R11, PPC_R11, d + 4);            // mask
 	*p++ = PPC_AND(PPC_R11, PPC_R12, PPC_R11);          // EA & mask (unaligned)
 	if (alignMe < 31) *p++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 0, alignMe);
 	return nMiss;
@@ -2514,12 +2521,17 @@ void jitCodeStatsTick(u32 frame)
 	if (f && !s_init) {
 		s_init = true;
 		fprintf(f, "# jitstats: arena9=%p (%u KiB) arena7=%p (%u KiB) table9=%p smcflags9=%p dtcmregion=%08x"
-		           " sharedstubs9=%u sharedstubs7=%u (bytes: SMC tail + memory thunks)\n",
+		           " sharedstubs9=%u sharedstubs7=%u (bytes: SMC tail + memory thunks) main=%08x dtcm=%08x itcm=%08x"
+		           " pagedesc7=%08x\n",
 		        (void*)s_arena[JIT_ARM9], (unsigned)(JIT_ARENA_SIZE_ARM9 >> 10),
 		        (void*)s_arena[JIT_ARM7], (unsigned)(JIT_ARENA_SIZE >> 10), (void*)s_blockTable[JIT_ARM9],
 		        (void*)s_smcPageFlags[JIT_ARM9],
 		        jitProfile[JIT_ARM9] ? (unsigned)*(const volatile u32*)(uintptr_t)jitProfile[JIT_ARM9]->arm9DtcmRegionPtr : 0u,
-		        (unsigned)jitCacheArm9.thunkWords * 4, (unsigned)jitCacheArm7.thunkWords * 4);
+		        (unsigned)jitCacheArm9.thunkWords * 4, (unsigned)jitCacheArm7.thunkWords * 4,
+		        jitProfile[JIT_ARM9] ? (unsigned)jitProfile[JIT_ARM9]->mainMemBase : 0u,
+		        jitProfile[JIT_ARM9] ? (unsigned)jitProfile[JIT_ARM9]->arm9DtcmBase : 0u,
+		        jitProfile[JIT_ARM9] ? (unsigned)jitProfile[JIT_ARM9]->arm9ItcmBase : 0u,
+		        jitProfile[JIT_ARM7] ? (unsigned)jitProfile[JIT_ARM7]->pageDescBase : 0u);
 	}
 	for (int c = 0; c < 2; c++) {
 		JitStatCore& S = s_jcs[c];
