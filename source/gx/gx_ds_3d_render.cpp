@@ -225,7 +225,9 @@ static inline u32 gxDs3dTexKey(u32 texParam) { return texParam & 0x3FF0FFFF; }
 //  - alpha blending on (DISP3DCNT bit 3; `transblend`), for the same reason.
 //  - the polygon-ID rule has no GX dst compare: runs of same-ID polygons that overlap go
 //    through a tag pass (gxDs3dTransIdPlan, gxDs3dTagRunPrepass); overlap with a same-ID
-//    polygon of an earlier run, or an alpha-31 polygon in a tagged run, bails (`transid`).
+//    polygon of an earlier run carries the ID stamp through that pass. Bails (`transid`):
+//    a carried range that writes depth or holds shadow draws, a run polygon overlapping
+//    an earlier alpha-31 polygon of its tagged run.
 // Fragment alpha: untextured and opaque-format textures -> the polygon alpha as vertex
 // alpha (texel alpha is 255 or 0, the TEV multiply by 255 is exact). A3I5/A5I3 -> the
 // per-texel modulated alpha (modulate_table[5to6(tA)][5to6(pA)] >> 1), alpha test
@@ -772,32 +774,56 @@ static bool gxDs3dTransDraws(const POLY &p)
 // reproduces it per "run" (a maximal sequence of consecutive drawing translucent polygons
 // in indexlist order with one ID) with a tag pass (see gxDs3dTagRunPrepass): per pixel the
 // first polygon of the run whose fragment passes depth and alpha draws, the rest are dropped.
-// That is exact for a run as long as nothing before it stamped the same ID on its pixels,
-// so this returns -1 (bail) when a polygon's outline overlaps one of the same ID in an
-// EARLIER run (conservative: another ID may have restamped the pixel in between), or when
-// a run that needs tags contains an alpha-31 polygon (A3I5/A5I3 a == 31 texels: opaque
-// writes, whose depth writes would change later run polygons' winners). Runs whose outlines
-// are interior-disjoint (gxDs3dTransShapesDisjoint; mesh neighbours sharing an edge) need no
-// tags. Else returns the number of drawing translucent polygons and fills s_tagRun/s_tagIdx.
-// Clipped polygons use their clipped outline.
-struct GxDs3dTagRun { int n0, n1; int x0, y0, x1, y1; int count; };   // indexlist range, 1/16 px box
+// That is exact for a run as long as nothing before it stamped the same ID on its pixels.
+// When a polygon's outline overlaps one of the same ID in an EARLIER run (SM64DS: the
+// layers of one particle effect, depth-sorted between other effects' layers), the run
+// "carries" the ID state instead (Task gxfast-transid): its prepass also builds a mask of
+// the pixels whose last translucent stamp was its own ID, and its draw drops those. A
+// fragment that passes depth and alpha leaves the pixel stamped with its polygon's ID
+// whether or not the ID rule then rejects it (it is only rejected when the stamp already
+// is that ID), so the stamp before the run is the ID of the LAST polygon in [c0, n0)
+// (c0 = the earliest overlapping same-ID polygon; nothing earlier stamped the run's ID on
+// its pixels) whose fragment there passes depth and alpha. The prepass gets it by drawing
+// those polygons in order, no blend, depth test LESS without update against the depth
+// before the run, colour 1 for the run's ID and 0 for any other (a shadow draw with its
+// group's stencil test, gxDs3dCarryShadowKeep). That depth is the one they saw only if
+// none of them writes depth there, so this returns -1 (bail) when a polygon of the range
+// that meets the run's box writes depth (POLYGON_ATTR bit 11, or alpha-31 texels over an
+// earlier range polygon), or when the range polygons the carried runs redraw exceed
+// kCarryBudget. It also bails when a later polygon of a run
+// that needs tags (or a carry) overlaps an alpha-31 polygon of it (A3I5/A5I3 a == 31
+// texels: opaque writes, whose depth writes would change later run polygons' winners; see
+// the loop), or the alpha-31 polygon writes depth for all its fragments (bit 11).
+// Runs whose outlines are interior-disjoint (gxDs3dTransShapesDisjoint; mesh neighbours
+// sharing an edge) and carry nothing need no tags. Else returns the number of drawing
+// translucent polygons and fills s_tagRun/s_tagIdx. Clipped polygons use their clipped outline.
+struct GxDs3dTagRun {
+	int n0, n1;            // indexlist range
+	int x0, y0, x1, y1;    // 1/16 px box
+	int count;
+	int c0;                // carry: indexlist position the ID-stamp mask is drawn from, -1 none
+};
+static const int kCarryBudget = 4096;    // range polygons all carried runs of a frame may redraw
 static const int kMaxTrans = 2048;       // the DS's own per-frame polygon limit
 static u16 s_tagRun[POLYLIST_SIZE];      // per polylist index: tagged run (1-based), 0 = plain draw
 static u16 s_tagIdx[POLYLIST_SIZE];      // its 1-based position in that run (the tag it writes)
 static GxDs3dTagRun s_tagRuns[kMaxTrans + 1];
 static int s_tagRunCount = 0;
+static bool s_tagCarryAny = false;       // some run carries (needs s_tagCarryBuf)
+static bool s_tagCarrySh = false;        // a carried range has shadow draws (gxDs3dCarryShadowKeep)
 
 // Task tagcost: what the plan found per translucent polygon it visited, so the pass's draws
 // of it (the tag pass's and the real one) skip the clipper and gxDs3dTransShapeBuild. For
 // a clipped polygon, a copy of the clipper's N-gon in s_planVerts. Valid for the list the
 // plan ran on, which is the list the pass draws (gxDs3dGeomFrameSupported's guards), and
 // read only for translucent polygons: a frame with any has run the plan over all of them.
-struct GxDs3dPlanPoly { u32 vert; u8 n, state; };
+struct GxDs3dPlanPoly { u32 vert; u8 n, state; u16 sh; };   // sh: 1-based s_planSh entry (on-screen shapes), 0 = none
 enum { kPlanCulled = 1, kPlanInPlace, kPlanPooled };
 static u16 s_planSlot[POLYLIST_SIZE];    // per polylist index: 1-based s_planPoly entry, 0 = none
 static GxDs3dPlanPoly s_planPoly[kMaxTrans];
 static int s_planPolyCount = 0;
 static VERT *s_planVerts = nullptr;      // grow-only (~110 KB on SM64DS)
+static GxDs3dTransShape s_planSh[kMaxTrans];   // the plan's on-screen shapes, in indexlist order
 static u32 s_planVertCap = 0, s_planVertCount = 0;
 
 static void gxDs3dPlanStore(int i, const VERT *const *cv, int nv, bool clipped, bool draws)
@@ -805,6 +831,7 @@ static void gxDs3dPlanStore(int i, const VERT *const *cv, int nv, bool clipped, 
 	s_planSlot[i] = 0;
 	if (s_planPolyCount == kMaxTrans) return;
 	GxDs3dPlanPoly &e = s_planPoly[s_planPolyCount];
+	e.sh = 0;
 	if (!draws) e.state = kPlanCulled;
 	else if (!clipped) e.state = kPlanInPlace;
 	else {
@@ -823,17 +850,37 @@ static void gxDs3dPlanStore(int i, const VERT *const *cv, int nv, bool clipped, 
 	s_planSlot[i] = (u16)++s_planPolyCount;
 }
 
+// Which gxDs3dTransIdPlan bail (TEXSTATS `tidwhy=`): 1 too many translucent polygons, 2 carry
+// budget, carried range with 3 a depth-writing (bit 11) polygon, 4 a shadow draw, 5 an
+// alpha-31 polygon over an earlier one; 6 a run polygon over the run's alpha-31 one, 7 RGB565.
+#ifdef DSA_GXGEOM_TEXSTATS
+static int s_tidWhy;
+#define GXDS3D_TIDWHY(k) do { s_tidWhy = (k); return -1; } while (0)
+#else
+#define GXDS3D_TIDWHY(k) return -1
+#endif
+
+// A carried range polygon whose fragments write depth (bit 11) (see above).
+static inline bool gxDs3dCarryBlocks(const POLY &p)
+{
+	return (p.polyAttr >> 11) & 1;
+}
+
 static int gxDs3dTransIdPlan()
 {
-	static GxDs3dTransShape s_sh[kMaxTrans];
+	GxDs3dTransShape *const s_sh = s_planSh;
 	static s16 s_next[kMaxTrans];        // per-ID chains of shapes from closed runs
 	static u16 s_shPoly[kMaxTrans];
 	static int s_shN[kMaxTrans];
 	s16 head[64];
 	for (int k = 0; k < 64; ++k) head[k] = -1;
-	int nt = 0, runStart = 0, curId = -1;
+	int nt = 0, runStart = 0, curId = -1, runS0 = -1, carryCost = 0;
 	bool runTag = false, runA31 = false;
+	static u16 s_runA31[kMaxTrans];      // the open run's alpha-31 polygons (shape indices)
+	int runA31N = 0;
 	s_tagRunCount = 0;
+	s_tagCarryAny = false;
+	s_tagCarrySh = false;
 	s_planPolyCount = 0;
 	s_planVertCount = 0;
 	const int polycount = gfx3d.polylist->count;
@@ -847,7 +894,7 @@ static int gxDs3dTransIdPlan()
 			s_planSlot[i] = 0;
 			// shadow masks never read or stamp the translucent ID (rejected before, rasterize.cpp)
 			if (!p.isTranslucent() || !gxDs3dTransDraws(p) || gxDs3dShadowMask(p)) continue;
-			if (nt == kMaxTrans) return -1;
+			if (nt == kMaxTrans) GXDS3D_TIDWHY(1);
 			sh = &s_sh[nt];
 			const VERT *cv[MAX_CLIPPED_VERTS];
 			bool clipped;
@@ -869,10 +916,12 @@ static int gxDs3dTransIdPlan()
 #endif
 			s_shPoly[nt] = (u16)i;
 			s_shN[nt] = n;
+			if (s_planSlot[i]) s_planPoly[s_planSlot[i] - 1].sh = (u16)(nt + 1);
 		}
 		if (!pp || sh->id != curId) {
 			// close the current run [runStart, nt)
-			if (runTag && s_tagRunCount < kMaxTrans) {
+			if (runTag && s_tagRunCount == kMaxTrans) GXDS3D_TIDWHY(1);   // (unreachable: <= kMaxTrans shapes)
+			if (runTag) {
 				GxDs3dTagRun &r = s_tagRuns[++s_tagRunCount];
 				r.n0 = s_shN[runStart]; r.n1 = s_shN[nt - 1]; r.count = nt - runStart;
 				float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
@@ -883,30 +932,69 @@ static int gxDs3dTransIdPlan()
 					x1 = fmaxf(x1, s_sh[k].x1); y1 = fmaxf(y1, s_sh[k].y1);
 				}
 				r.x0 = (int)x0; r.y0 = (int)y0; r.x1 = (int)x1; r.y1 = (int)y1;
+				r.c0 = -1;
+				if (runS0 >= 0) {
+					// The carried range: shapes [runS0, runStart) that meet the run's box. An
+					// alpha-31 one's a == 31 fragments neither stamp (left out of the mask
+					// draw) nor may change an EARLIER range polygon's depth test: those must
+					// not overlap it.
+					r.c0 = s_shN[runS0];
+					s_tagCarryAny = true;
+					for (int k = runS0; k < runStart; ++k) {
+						if (s_sh[k].x1 < x0 || s_sh[k].x0 > x1 || s_sh[k].y1 < y0 || s_sh[k].y0 > y1) continue;
+						if (++carryCost > kCarryBudget) GXDS3D_TIDWHY(2);
+						bool block = gxDs3dCarryBlocks(gfx3d.polylist->list[s_shPoly[k]]);
+						if (!block && gxDs3dPolyAlpha(gfx3d.polylist->list[s_shPoly[k]]) == 31)
+							for (int j = runS0; j < k && !block; ++j) {
+								if (s_sh[j].x1 < x0 || s_sh[j].x0 > x1 || s_sh[j].y1 < y0 || s_sh[j].y0 > y1) continue;
+								if (++carryCost > kCarryBudget) GXDS3D_TIDWHY(2);
+								block = !gxDs3dTransShapesDisjoint(s_sh[j], s_sh[k]);
+							}
+						if (block) {
+#ifdef DSA_GXGEOM_TRANSIDDBG
+							const POLY &q = gfx3d.polylist->list[s_shPoly[k]];
+							harness_profile_emitf("transiddbg carryblock id=%d run=%d..%d c0=%d n=%d attr=%08x tex=%08x runattr=%08x",
+							                      curId, r.n0, r.n1, r.c0, s_shN[k], (unsigned)q.polyAttr, (unsigned)q.texParam,
+							                      (unsigned)gfx3d.polylist->list[s_shPoly[runStart]].polyAttr);
+#endif
+							GXDS3D_TIDWHY(gxDs3dCarryBlocks(gfx3d.polylist->list[s_shPoly[k]]) ? 3 : 5);
+						}
+						if (gxDs3dPolyMode(gfx3d.polylist->list[s_shPoly[k]]) == 3) s_tagCarrySh = true;
+					}
+				}
 			}
 			for (int k = runStart; k < nt; ++k) {
 				s_next[k] = head[s_sh[k].id];
 				head[s_sh[k].id] = (s16)k;
 			}
 			if (!pp) break;
-			runStart = nt; curId = sh->id; runTag = false; runA31 = false;
+			runStart = nt; curId = sh->id; runTag = false; runA31 = false; runS0 = -1; runA31N = 0;
 		}
-		for (int k = head[sh->id]; k >= 0; k = s_next[k])
+		// Same-ID shapes of closed runs (newest first): the earliest one this overlaps starts
+		// the run's carried range. Only an earlier one than the current start can move it.
+		for (int k = head[sh->id]; k >= 0; k = s_next[k]) {
+			if (runS0 >= 0 && k >= runS0) continue;
 #ifdef DSA_GXGEOM_TAGPROF
-			if (++s_tpChain, !gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
-#else
-			if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
+			++s_tpChain;
 #endif
+			if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) {
 #ifdef DSA_GXGEOM_TRANSIDDBG
 				static u32 s_dbg;
 				if ((s_dbg++ & 31) == 0)
-					harness_profile_emitf("transiddbg id=%d n=%d nv=%d attr=%08x tex=%08x box=%d,%d,%d,%d prev box=%d,%d,%d,%d ntrans=%d",
+					harness_profile_emitf("transiddbg carry id=%d n=%d nv=%d attr=%08x tex=%08x box=%d,%d,%d,%d prev n=%d attr=%08x tex=%08x box=%d,%d,%d,%d ntrans=%d sort=%d",
 					                      sh->id, n, sh->n, (unsigned)pp->polyAttr, (unsigned)pp->texParam,
 					                      (int)sh->x0 / 16, (int)sh->y0 / 16, (int)sh->x1 / 16, (int)sh->y1 / 16,
-					                      (int)s_sh[k].x0 / 16, (int)s_sh[k].y0 / 16, (int)s_sh[k].x1 / 16, (int)s_sh[k].y1 / 16, nt);
+					                      s_shN[k], (unsigned)gfx3d.polylist->list[s_shPoly[k]].polyAttr, (unsigned)gfx3d.polylist->list[s_shPoly[k]].texParam,
+					                      (int)s_sh[k].x0 / 16, (int)s_sh[k].y0 / 16, (int)s_sh[k].x1 / 16, (int)s_sh[k].y1 / 16, nt,
+					                      (int)gfx3d.sortmode);
 #endif
-				return -1;
+				runS0 = k;
 			}
+		}
+#ifdef DSA_GXGEOM_MUTATE_NOCARRY
+		if (runS0 >= 0) return -1;   // mutation: the pre-carry plan (bails), for A/B
+#endif
+		if (runS0 >= 0) runTag = true;   // a carried run is drawn through the tag pass
 		if (!runTag)
 			for (int k = runStart; k < nt; ++k)
 #ifdef DSA_GXGEOM_TAGPROF
@@ -914,8 +1002,27 @@ static int gxDs3dTransIdPlan()
 #else
 				if (!gxDs3dTransShapesDisjoint(s_sh[k], *sh)) { runTag = true; break; }
 #endif
-		runA31 |= gxDs3dPolyAlpha(*pp) == 31;
-		if (runTag && (runA31 || (rmode && rmode->aa))) return -1;
+		// An alpha-31 polygon in a tagged run: its a == 31 fragments (A3I5/A5I3) are opaque
+		// writes that neither test nor stamp the ID, drawn untested (gxDs3dFastPoly's pass 0)
+		// and left out of the tag pass. Their depth writes change what later run polygons
+		// draw, which the tags (taken against the depth before the run) do not see, so a
+		// later run polygon must not overlap one (runA31 = bail). One that writes depth for
+		// all its fragments (bit 11) has no separate pass: bail too.
+		for (int k = 0; k < runA31N && !runA31; ++k)
+			runA31 = !gxDs3dTransShapesDisjoint(s_sh[s_runA31[k]], *sh);
+		if (gxDs3dPolyAlpha(*pp) == 31) {
+			if ((pp->polyAttr >> 11) & 1) runA31 = true;
+			else s_runA31[runA31N++] = (u16)nt;
+		}
+#ifdef DSA_GXGEOM_MUTATE_A31BAIL
+		runA31 |= runA31N > 0;   // mutation: the pre-change rule (any alpha-31 polygon in a tagged run bails)
+#endif
+#ifdef DSA_GXGEOM_TRANSIDDBG
+		if (runTag && (runA31 || (rmode && rmode->aa)))
+			harness_profile_emitf("transiddbg a31 id=%d n=%d attr=%08x tex=%08x run=%d..%d aa=%d carry=%d", sh->id, n, (unsigned)pp->polyAttr,
+			                      (unsigned)pp->texParam, s_shN[runStart], n, (int)(rmode && rmode->aa), runS0 >= 0);
+#endif
+		if (runTag && (runA31 || (rmode && rmode->aa))) GXDS3D_TIDWHY(runA31 ? 6 : 7);
 		++nt;
 	}
 	return nt;
@@ -1094,6 +1201,53 @@ static bool gxDs3dShadowPlan()
 	return true;
 }
 
+// Task gxfast-transid: shadow draws in a carried range (gxDs3dTransIdPlan) stamp where they
+// pass their group's stencil test, so the run's mask draw redraws them with that test,
+// against a copy of the group's stencil texture its prepass keeps (s_shKeep: group ->
+// slot, -1 none). False (bail) for more than kShKeepMax such groups.
+static const int kShKeepMax = 4;
+static s8 s_shKeep[kMaxTrans];
+static int s_shKeepCount = 0;
+
+// The group (index) whose draws hold indexlist position n, -1 none.
+static int gxDs3dShadowGroupOf(int n)
+{
+	int lo = 0, hi = s_shGroupCount - 1;
+	while (lo <= hi) {
+		const int m = (lo + hi) >> 1;
+		if (n < s_shGroups[m].d0) hi = m - 1;
+		else if (n >= s_shGroups[m].d1) lo = m + 1;
+		else return m;
+	}
+	return -1;
+}
+
+static bool gxDs3dCarryShadowKeep()
+{
+	memset(s_shKeep, -1, s_shGroupCount);
+	s_shKeepCount = 0;
+	for (int r = 1; r <= s_tagRunCount; ++r) {
+		const GxDs3dTagRun &run = s_tagRuns[r];
+		if (run.c0 < 0) continue;
+		for (int n = run.c0; n < run.n0; ++n) {
+			const int i = gfx3d.indexlist[n];
+			const POLY &q = gfx3d.polylist->list[i];
+			if (!gxDs3dShadowDraw(q)) continue;
+			if (!s_planSlot[i]) return false;   // (plan cache full) its box is unknown here
+			const GxDs3dPlanPoly &e = s_planPoly[s_planSlot[i] - 1];
+			if (!e.sh) continue;
+			const GxDs3dTransShape &b = s_planSh[e.sh - 1];
+			if (b.x1 < run.x0 || b.x0 > run.x1 || b.y1 < run.y0 || b.y0 > run.y1) continue;
+			const int g = gxDs3dShadowGroupOf(n);
+			if (g < 0) return false;
+			if (s_shKeep[g] >= 0) continue;
+			if (s_shKeepCount == kShKeepMax) return false;
+			s_shKeep[g] = (s8)s_shKeepCount++;
+		}
+	}
+	return true;
+}
+
 // requireTex: textured polygons need a texture prepared for this frame (false only
 // for the VBlank-end call that decides whether to prepare them).
 static int gxDs3dFrameGate(bool requireTex)
@@ -1217,6 +1371,13 @@ static int gxDs3dFrameGate(bool requireTex)
 		s_gateHasTrans = nt > 0;
 	}
 	if (anyShadow && !gxDs3dShadowPlan()) return kGateShadow;
+	s_shKeepCount = 0;
+	if (s_tagCarrySh && !gxDs3dCarryShadowKeep()) {
+#ifdef DSA_GXGEOM_TEXSTATS
+		s_tidWhy = 4;
+#endif
+		return kGateTransId;
+	}
 
 	return kGateOk;
 }
@@ -1305,10 +1466,11 @@ bool gxDs3dGeomFramePrepare()
 	// transidclash: the ID-rule check on every 3D frame regardless of earlier gates.
 	// clippolys: polygons with a vertex outside the clip volume (clipped by the CPU clipper).
 	// tagruns: runs needing the tag pass (gxDs3dTransIdPlan), tagmax their largest polygon
-	// count, tagarea their summed box area in px.
+	// count, tagarea their summed box area in px, carryruns those that carry the ID stamp.
 	static u32 s_gate[kGateCount], s_fmt[8], s_frames, s_tidClash, s_tidPolys, s_clipPolys;
-	static u32 s_tagRunsSum, s_tagMax, s_tagArea;
+	static u32 s_tagRunsSum, s_tagMax, s_tagArea, s_carryRuns, s_tidWhyN[8];
 	++s_gate[g];
+	if (g == kGateTransId) ++s_tidWhyN[s_tidWhy & 7];
 	++s_frames;
 #ifndef DESMUME_GXSTATS   // Task hw-measure: the hardware log skips this extra ID-plan pass (it would inflate g3prep)
 	if (gfx3d.polylist && gfx3d.vertlist && gfx3d.polylist->count > 0) {
@@ -1320,6 +1482,7 @@ bool gxDs3dGeomFramePrepare()
 				++s_tagRunsSum;
 				if ((u32)t.count > s_tagMax) s_tagMax = (u32)t.count;
 				s_tagArea += (u32)(((t.x1 - t.x0) >> 4) * ((t.y1 - t.y0) >> 4));
+				s_carryRuns += t.c0 >= 0;
 			}
 	}
 #endif
@@ -1367,11 +1530,13 @@ bool gxDs3dGeomFramePrepare()
 		int n = 0;
 		for (int k = 0; k < kGateCount; ++k)
 			if (s_gate[k]) n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kGateNames[k], (unsigned)s_gate[k]);
-		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u tagruns=%u tagmax=%u tagarea=%u gates:%s",
+		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u tagruns=%u tagmax=%u tagarea=%u carryruns=%u tidwhy=%u,%u,%u,%u,%u,%u,%u gates:%s",
 		                      (unsigned)s_frames, (unsigned)s_fmt[0], (unsigned)s_fmt[1], (unsigned)s_fmt[2],
 		                      (unsigned)s_fmt[3], (unsigned)s_fmt[4], (unsigned)s_fmt[5], (unsigned)s_fmt[6],
 		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_clipPolys, (unsigned)s_tidClash, (unsigned)s_tidPolys,
-		                      (unsigned)s_tagRunsSum, (unsigned)s_tagMax, (unsigned)s_tagArea, buf);
+		                      (unsigned)s_tagRunsSum, (unsigned)s_tagMax, (unsigned)s_tagArea, (unsigned)s_carryRuns,
+		                      (unsigned)s_tidWhyN[1], (unsigned)s_tidWhyN[2], (unsigned)s_tidWhyN[3], (unsigned)s_tidWhyN[4],
+		                      (unsigned)s_tidWhyN[5], (unsigned)s_tidWhyN[6], (unsigned)s_tidWhyN[7], buf);
 	}
 #endif
 	s_prepSeq = g_gfx3dRenderSeq;
@@ -1926,7 +2091,8 @@ void gxDs3dRenderAccurate()
 // it stamped X on its pixels, the plan guarantees that), rasterize.cpp draws a pixel from
 // the FIRST run polygon whose fragment there passes depth (against the depth before the
 // run: the only earlier writer at that pixel would be that same first polygon) and alpha
-// (0 < a; the plan excludes a == 31), and drops every later one. So before the run:
+// (0 < a < 31: a == 31 fragments, drawn by pass 0, take no part), and drops every later one.
+// So before the run:
 //  1. copy the EFB colour out (RGBA8, exact for the RGB8 EFB), clear it to tag 0;
 //  2. draw the run in REVERSE order, no blend, depth test LESS without update, writing the
 //     polygon's 1-based position as colour (R = low byte, B = high byte), same alpha
@@ -1939,6 +2105,10 @@ void gxDs3dRenderAccurate()
 // same state, so coverage and depth results of the two draws are identical. Needs an 8-bit
 // R/B EFB (RGB8_Z24): RGB565 (rmode->aa) bails `transid`, RGBA6 only runs with holes, and a
 // frame with translucent polygons has none. Buffers (288 KB) live only for the render.
+// A carried run (gxDs3dTransIdPlan) first clears to 0 and draws its range [c0, n0) the same
+// way in FORWARD order, colour 1 for its own ID, 0 (tag 256) for others, and copies R out
+// as the stamp mask (s_tagCarryBuf, 48 KB more, TEXMAP6); its draw's last TEV stage zeroes
+// the alpha where the mask is set.
 // ---------------------------------------------------------------------------------
 struct GxDs3dFastCtx {
 	float lastMv[16], lastProj[16];
@@ -1950,6 +2120,7 @@ struct GxDs3dFastCtx {
 	VIEWPORT vp;
 	int tagMode;           // TEV/texgen set up for: 0 plain, 1 tag write, 2 tag test, 3 shadow test; -1 unknown
 	bool tagTextured, tagTwo;
+	bool tagCarry;         // the run's tag test also tests the stamp mask (TEXMAP6)
 	bool shCount;          // shadow prepass: count fragments (colour 1, no alpha/ID rules, see the shadow section)
 	bool shTest;           // this polygon is a shadow draw: stencil (and opaque-ID) test
 	bool shId;             // the opaque-ID texture is built (gxDs3dShadowIdPass): shadow draws test it
@@ -1958,6 +2129,8 @@ struct GxDs3dFastCtx {
 
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
 static GXTexObj s_tagSaveTex, s_tagLoTex, s_tagHiTex;
+static void *s_tagCarryBuf = nullptr;
+static GXTexObj s_tagCarryTex;
 
 // Task gxfast-perf: per polylist index, what the main pass's gxDs3dFastPoly found for a
 // polygon it ran gxDs3dTransShapeBuild on, so the shadow ID pass (which replays the
@@ -2008,10 +2181,44 @@ static bool gxDs3dTagBuffers()
 	return true;
 }
 
+// The carried runs' stamp mask (see the section comment), I8.
+static bool gxDs3dTagCarryBuffer()
+{
+	if (s_tagCarryBuf) return true;
+	const u32 ib = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0);
+	s_tagCarryBuf = memalign(32, ib);
+	if (!s_tagCarryBuf) return false;
+	DCInvalidateRange(s_tagCarryBuf, ib);
+	GX_InitTexObj(&s_tagCarryTex, s_tagCarryBuf, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_tagCarryTex, GX_NEAR, GX_NEAR);
+	return true;
+}
+
 // Shadow volumes (see the shadow section): the tag buffers (colour save, s in s_tagLoBuf)
 // plus the counter carried between groups and the opaque-ID texture, I8 each (96 KB more).
 static void *s_shCntBuf = nullptr, *s_shIdBuf = nullptr;
 static GXTexObj s_shCntTex, s_shIdTex;
+static void *s_shKeepBuf[kShKeepMax];   // gxDs3dCarryShadowKeep's stencil copies, I8 each
+static GXTexObj s_shKeepTex[kShKeepMax];
+
+static void gxDs3dShadowKeepFree()
+{
+	for (int k = 0; k < kShKeepMax; ++k) { free(s_shKeepBuf[k]); s_shKeepBuf[k] = nullptr; }
+}
+
+static bool gxDs3dShadowKeepBuffers(int n)
+{
+	const u32 ib = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0);
+	for (int k = 0; k < n; ++k) {
+		if (s_shKeepBuf[k]) continue;
+		s_shKeepBuf[k] = memalign(32, ib);
+		if (!s_shKeepBuf[k]) { gxDs3dShadowKeepFree(); return false; }
+		DCInvalidateRange(s_shKeepBuf[k], ib);
+		GX_InitTexObj(&s_shKeepTex[k], s_shKeepBuf[k], kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_shKeepTex[k], GX_NEAR, GX_NEAR);
+	}
+	return true;
+}
 
 static bool gxDs3dShadowBuffers()
 {
@@ -2038,18 +2245,21 @@ static void gxDs3dTagBuffersFree()
 {
 	if (!s_tagSaveBuf) return;
 	GX_DrawDone();   // the FIFO may still read them
-	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf);
-	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = nullptr;
+	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf); free(s_tagCarryBuf);
+	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = s_tagCarryBuf = nullptr;
 	free(s_shCntBuf); free(s_shIdBuf);
 	s_shCntBuf = s_shIdBuf = nullptr;
+	gxDs3dShadowKeepFree();
 	GX_InvalidateTexAll();
 }
 
 // TEV stage 1 (and 2) after gxDs3dBindPoly's stage 0, per tagMode (see the section comment).
 // Mode 3 (shadow draws, untextured; `two` = test the opaque ID too, see the shadow section).
-static void gxDs3dTagTev(int mode, bool textured, bool two)
+// Mode 2 with `carry`: one more stage for the stamp mask. Mode 4: mode 3 writing the tag
+// colour (K0), a carried run's mask draw of a shadow draw.
+static void gxDs3dTagTev(int mode, bool textured, bool two, bool carry = false)
 {
-	if (mode == 3) {
+	if (mode == 3 || mode == 4) {
 		GX_SetNumTexGens(1);
 		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_POS, GX_TEXMTX1);
 		GX_SetNumTevStages(two ? 4 : 2);
@@ -2059,6 +2269,10 @@ static void gxDs3dTagTev(int mode, bool textured, bool two)
 			GX_SetTevKAlphaSel(stage, k == 1 ? GX_TEV_KASEL_K2_A : GX_TEV_KASEL_K3_A);
 			GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
 			GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		}
+		if (mode == 4) {
+			GX_SetTevKColorSel(GX_TEVSTAGE1, GX_TEV_KCSEL_K0);
+			GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST);
 		}
 		// stage 1: alpha = (stencil texel == 0) ? alpha : 0
 		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_TEXA, GX_CA_KONST, GX_CA_APREV, GX_CA_ZERO);
@@ -2091,7 +2305,16 @@ static void gxDs3dTagTev(int mode, bool textured, bool two)
 	const u8 tc = textured ? GX_TEXCOORD1 : GX_TEXCOORD0;
 	GX_SetNumTexGens(textured ? 2 : 1);
 	GX_SetTexCoordGen(tc, GX_TG_MTX3x4, GX_TG_POS, GX_TEXMTX1);
-	GX_SetNumTevStages(two ? 3 : 2);
+	GX_SetNumTevStages((two ? 3 : 2) + (carry ? 1 : 0));
+	if (carry) {
+		// alpha = (stamp mask texel == 0) ? alpha : 0
+		const u8 stage = two ? GX_TEVSTAGE3 : GX_TEVSTAGE2;
+		GX_SetTevOrder(stage, tc, GX_TEXMAP6, GX_COLORNULL);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(stage, GX_CA_TEXA, GX_CA_ZERO, GX_CA_APREV, GX_CA_ZERO);
+		GX_SetTevAlphaOp(stage, GX_TEV_COMP_A8_EQ, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	}
 	for (int k = 0; k < (two ? 2 : 1); ++k) {
 		const u8 stage = k ? GX_TEVSTAGE2 : GX_TEVSTAGE1;
 		GX_SetTevOrder(stage, tc, k ? GX_TEXMAP2 : GX_TEXMAP1, GX_COLORNULL);
@@ -2236,17 +2459,21 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	const bool rebound = c.first || textured != c.st.textured;
 	gxDs3dBindPoly(p, false, c.st, c.first);
 	c.first = false;
-	const int mode = c.shTest ? 3 : tag == 0 ? 0 : (tagWrite ? 1 : 2);
+	const int mode = c.shTest ? (tagWrite ? 4 : 3) : tag == 0 ? 0 : (tagWrite ? 1 : 2);
 	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured)) {
-		gxDs3dTagTev(mode, textured, mode == 3 ? c.shId : c.tagTwo);
+		gxDs3dTagTev(mode, textured, mode >= 3 ? c.shId : c.tagTwo, mode == 2 && c.tagCarry);
 		c.tagMode = mode;
 		c.tagTextured = textured;
 	}
-	if (mode == 3) {
+	if (mode >= 3) {
 		const GXColor k2 = { 0, 0, 0, 0 };
 		const GXColor k3 = { 0, 0, 0, (u8)(gxDs3dPolyId(p) + 1) };
 		GX_SetTevKColor(GX_KCOLOR2, k2);
 		GX_SetTevKColor(GX_KCOLOR3, k3);
+		if (mode == 4) {
+			const GXColor k0 = { (u8)(-tag & 255), 0, (u8)(-tag >> 8), 0 };
+			GX_SetTevKColor(GX_KCOLOR0, k0);
+		}
 		gxDs3dTagTexMtx(c, clipped);
 	} else if (mode) {
 		const int t = tagWrite ? -tag : tag;
@@ -2259,6 +2486,10 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	GXDS3D_TP_END(kTpSetup, tpsu);
 	GXDS3D_TP_BEGIN(tpe);
 	for (int pass = twoPass ? 0 : 1; pass < (c.shIdPass && twoPass ? 1 : 2); ++pass) {   // ID pass: pass 0 only when there is one
+		// A tagged run's a == 31 fragments neither stamp (no tag written) nor test the ID
+		// (pass 0 without the tag stages; see gxDs3dTransIdPlan).
+		if (tagWrite && !c.shIdPass && pass == 0) continue;
+		if (mode == 2 && twoPass) GX_SetNumTevStages(pass == 0 ? 1 : (c.tagTwo ? 3 : 2) + (c.tagCarry ? 1 : 0));
 		if (trans && c.shIdPass) {
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
@@ -2351,8 +2582,40 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
 	c.tagTwo = run.count > 255;
+	c.tagCarry = run.c0 >= 0;
 	GX_SetBlendMode(GX_BM_NONE, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	c.blendOn = true;   // i.e. "blend state owned here": gxDs3dFastPoly must not turn it on
+	if (c.tagCarry) {
+		// The stamp mask: the range in order, the last passing fragment's colour stays.
+		const int id = gxDs3dPolyId(gfx3d.polylist->list[gfx3d.indexlist[run.n0]]);
+		for (int n = run.c0; n < run.n0; ++n) {
+			const int i = gfx3d.indexlist[n];
+			POLY &q = gfx3d.polylist->list[i];
+			if (!q.isTranslucent() || gxDs3dShadowMask(q)) continue;   // masks never stamp
+			const int slot = s_planSlot[i];
+			if (slot) {
+				const GxDs3dPlanPoly &e = s_planPoly[slot - 1];
+				if (!e.sh) continue;   // culled / off screen: no fragment
+				const GxDs3dTransShape &b = s_planSh[e.sh - 1];
+				if (b.x1 < run.x0 || b.x0 > run.x1 || b.y1 < run.y0 || b.y0 > run.y1) continue;   // never read
+			}
+			const int tg = gxDs3dPolyId(q) == id ? -1 : -256;
+			if (gxDs3dShadowDraw(q)) {
+				// with its group's stencil (kept by its prepass, gxDs3dCarryShadowKeep)
+				const int g = gxDs3dShadowGroupOf(n);
+				if (g < 0 || s_shKeep[g] < 0 || !s_shKeepBuf[(int)s_shKeep[g]]) continue;   // (unreachable)
+				GX_LoadTexObj(&s_shKeepTex[(int)s_shKeep[g]], GX_TEXMAP4);
+				c.shTest = true;
+				gxDs3dFastPoly(c, q, tg);
+				c.shTest = false;
+				continue;
+			}
+			gxDs3dFastPoly(c, q, tg);
+		}
+		gxDs3dTagCopy(s_tagCarryBuf, GX_CTF_R8);
+		gxDs3dTagScreenQuad(NULL);
+		c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1;
+	}
 #ifdef DSA_GXGEOM_MUTATE_TAGFWD
 	for (int n = run.n0; n <= run.n1; ++n) {   // mutation: the LAST winning polygon keeps the pixel
 #else
@@ -2368,6 +2631,7 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
 	GX_LoadTexObj(&s_tagLoTex, GX_TEXMAP1);
 	GX_LoadTexObj(&s_tagHiTex, GX_TEXMAP2);
+	if (c.tagCarry) GX_LoadTexObj(&s_tagCarryTex, GX_TEXMAP6);
 
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
 }
@@ -2443,8 +2707,9 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 
 // Steps 1-3 of the shadow section for group g; leaves c forcing a full rebind. cntValid: an
 // earlier group left a counter in s_shCntBuf.
-static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, const GxDs3dShGroup &g, bool &cntValid)
+static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 {
+	const GxDs3dShGroup &g = s_shGroups[gi];
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
 	if (cntValid) {
@@ -2465,6 +2730,7 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, const GxDs3dShGroup &g, bool &
 	for (int n = g.m0; n < g.m1; ++n) gxDs3dFastPoly(c, gfx3d.polylist->list[gfx3d.indexlist[n]], -1);
 	if (g.d1 > g.d0) {
 		gxDs3dTagCopy(s_tagLoBuf, GX_CTF_R8);
+		if (s_shKeepCount && s_shKeep[gi] >= 0) gxDs3dTagCopy(s_shKeepBuf[(int)s_shKeep[gi]], GX_CTF_R8);   // a carried range reads it
 		GX_SetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
 		for (int n = g.d0; n < g.d1; ++n) gxDs3dFastPoly(c, gfx3d.polylist->list[gfx3d.indexlist[n]], -1);
 	}
@@ -2499,12 +2765,12 @@ static void gxDs3dRenderFastDraw()
 		GX_LoadPosMtxImm(id, GX_PNMTX1);
 	}
 	int curRun = 0;
-	bool tags = s_tagRunCount > 0 && gxDs3dTagBuffers();
+	bool tags = s_tagRunCount > 0 && gxDs3dTagBuffers() && (!s_tagCarryAny || gxDs3dTagCarryBuffer());
 #ifdef DSA_GXGEOM_MUTATE_TAGOFF
 	tags = false;   // mutation: tagged runs drawn plainly (every same-ID layer blends), must fail a3_c36/46
 #endif
 	// Shadow volumes (see the shadow section). Without the buffers (heap) the draws are left out.
-	const bool sh = s_shGroupCount > 0 && gxDs3dShadowBuffers();
+	const bool sh = s_shGroupCount > 0 && gxDs3dShadowBuffers() && (!s_shKeepCount || gxDs3dShadowKeepBuffers(s_shKeepCount));
 	s_shRec = sh && s_shIdAt >= 0 && gxDs3dShBoxAlloc(gfx3d.polylist->count);
 	bool shCnt = false;
 	int sg = 0;
@@ -2516,7 +2782,7 @@ static void gxDs3dRenderFastDraw()
 		POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dPolyMode(p) == 3) {   // only in a frame the shadow plan passed
 			if (sh && n == s_shIdAt) gxDs3dShadowIdPass(c);
-			if (sh && sg < s_shGroupCount && n == s_shGroups[sg].m0) gxDs3dShadowPrepass(c, s_shGroups[sg++], shCnt);
+			if (sh && sg < s_shGroupCount && n == s_shGroups[sg].m0) gxDs3dShadowPrepass(c, sg++, shCnt);
 			if (!sh || gxDs3dShadowMask(p)) continue;
 			c.shTest = true;
 			gxDs3dFastPoly(c, p, 0);   // never in a tagged run (gxDs3dShadowPlan)
@@ -2575,10 +2841,11 @@ static void gxDs3dReplayDrop()
 {
 	s_dlSize = 0;
 	if (!s_tagSaveBuf) return;
-	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf);
-	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = nullptr;
+	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf); free(s_tagCarryBuf);
+	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = s_tagCarryBuf = nullptr;
 	free(s_shCntBuf); free(s_shIdBuf);
 	s_shCntBuf = s_shIdBuf = nullptr;
+	gxDs3dShadowKeepFree();
 }
 
 #ifdef DSA_GXGEOM_REPLAYSTATS

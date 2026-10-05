@@ -149,6 +149,15 @@
 #undef A3_CASE
 #define A3_CASE 34
 #endif
+// 56: interleaved same-ID runs (Task gxfast-transid): the translucent-ID stamp carried
+// across runs of other IDs, alpha-31 A5I3 polygons in a tagged run and in a carried range.
+#define A3_CARRY 0
+#if A3_CASE == 56
+#undef A3_CARRY
+#define A3_CARRY 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
 #if A3_CASE == 36
 #undef A3_SAMEID
 #define A3_SAMEID 1
@@ -545,7 +554,7 @@ static void tQuad(u32 tex, float x0, float y0, float x1, float y1, float zl, flo
 	glEnd();
 }
 
-#if A3_TAGRUN
+#if A3_TAGRUN || A3_CARRY
 static void tagTri(float x0, float y0, float x1, float y1, float x2, float y2, float z, int r, int g, int b)
 {
 	glBegin(GL_TRIANGLES);
@@ -596,11 +605,59 @@ static void tagScene(void)
 }
 #endif
 
+#if A3_CARRY
+static void carryScene(void)
+{
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_QUADS);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f,  0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f,  0.9f, 0.0f);
+	glEnd();
+	// left: ID 21 / 22 interleaved like SM64DS particle layers. P1 (21); Q1 (22) crossing
+	// the opaque quad's depth (its hidden part restamps nothing); P2 (21): drawn only where
+	// Q1 stamped 22 after P1, or P1 never was; Q2 (22) carries over P2's stamps.
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.3f, 0.8f, -1.3f, -0.4f, -0.1f, 0.2f, 0.2f, 250, 40, 40);
+	glPolyFmt(POLY_ALPHA(14) | POLY_CULL_NONE | POLY_ID(22));
+	tagTri(-1.0f, 0.9f, -0.9f, -0.6f, 0.0f, 0.5f, -0.1f, 40, 250, 120);
+	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.25f, 0.1f, -0.2f, -0.8f, -0.3f, 0.85f, 0.3f, 60, 60, 250);
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(22));
+	tagTri(-1.35f, -0.2f, -0.4f, -0.9f, -0.6f, 0.4f, 0.35f, 250, 250, 40);
+	// right top: ID 23 alpha-31 A5I3 quad (a == 31 texels: opaque writes, no stamp), ID 24
+	// over it, then ID 23 again over both (its carried range starts at the alpha-31 quad)
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(23));
+	tQuad(texA5I3, 0.15f, 0.1f, 1.0f, 0.9f, 0.2f, 0.25f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(15) | POLY_CULL_NONE | POLY_ID(24));
+	tagTri(0.5f, 0.95f, 0.6f, 0.0f, 1.4f, 0.5f, 0.3f, 250, 120, 250);
+	glPolyFmt(POLY_ALPHA(17) | POLY_CULL_NONE | POLY_ID(23));
+	tagTri(0.1f, 0.6f, 1.35f, 0.85f, 0.9f, 0.05f, 0.4f, 120, 250, 250);
+	// right bottom: ID 25 tagged run ending in an alpha-31 A5I3 quad over its first two
+	glPolyFmt(POLY_ALPHA(13) | POLY_CULL_NONE | POLY_ID(25));
+	tagTri(0.2f, -0.1f, 0.3f, -0.9f, 1.2f, -0.4f, 0.1f, 250, 40, 160);
+	tagTri(0.6f, -0.05f, 0.5f, -0.95f, 1.4f, -0.2f, 0.15f, 40, 160, 250);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(25));
+	tQuad(texA5I3, 0.4f, -0.8f, 1.1f, -0.2f, 0.3f, 0.3f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(19) | POLY_CULL_NONE | POLY_ID(26));
+	tagTri(0.3f, -0.3f, 1.3f, -0.6f, 0.7f, -0.98f, 0.5f, 160, 250, 40);
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+}
+#endif
+
 static void transScene(void)
 {
 	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
 #if A3_TAGRUN
 	tagScene();
+	return;
+#endif
+#if A3_CARRY
+	carryScene();
 	return;
 #endif
 	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
