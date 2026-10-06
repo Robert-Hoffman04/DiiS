@@ -24,7 +24,7 @@
  *     fetch; the heavier registerBlock()/flushCache()/invalidateSMCTarget()
  *     logic lives in JITCache.cpp.
  *
- * JIT_ARENA_SIZE (2 MB ARM7), JIT_ARENA_SIZE_ARM9 (12 MB), HASH_TABLE_SIZE
+ * JIT_ARENA_SIZE (1 MB ARM7), JIT_ARENA_SIZE_ARM9 (4 MB), HASH_TABLE_SIZE
  * (65536, indexed by the multiplicative jitHashPC()), and SMC_MAP_SIZE are the
  * tuning constants.
  ***************************************************************************/
@@ -44,28 +44,24 @@
 // the tracked banks happen to be the same nibbles -- 0x02xxxxxx main RAM and
 // 0x03xxxxxx WRAM / shared WRAM -- but the ARM9 (and DTCM) will differ.
 
-// Arena sized down from VBA's 8 MB: the Broadway has only 32 KB L1-I and
-// Dolphin doesn't model it, so a smaller, denser arena is the safer default
-// (see the plan, risk "Broadway I-cache vs arena"). Revisit with hardware.
+// Arena sizes. Both arenas are static .bss arrays in MEM1 (jitInitSlot(),
+// jit_trace.cpp); -DJIT_ARENA_HEAP memaligns them instead, which lands them in
+// MEM2. MEM1 is what bounds the size: the dol's .bss + heap leave ~0.9 MB of
+// MEM1 free with 4 MB + 1 MB here, so neither can grow without moving
+// something else out of MEM1 (and DS main RAM cannot go to MEM2 by lowering
+// SYS_SetArena2Hi: that crashed on real hardware at ROM select).
+// History: the heap arenas were 2 MB ARM7 / 12 MB ARM9 (3 and 6 MB ARM9 had
+// thrashed under the old 1-way block table, arenapeak pinned at 99%). With
+// the current JIT, SM64DS at 4 MB ARM9 shows ~0 steady-state recompiles on
+// hardware (arm9_build ~0 after warm-up), and the MEM1 placement beat the
+// 12 MB MEM2 arena by ~4 ms/frame (frame median 27.1 -> 23.0 ms, j9_exec
+// 5.19 -> 2.80 ms, j7_exec 3.07 -> 1.77 ms, gpu_ge +0.3 ms). Which pool the
+// buffers land in can be checked with a -DJIT_MEM_ACCOUNT build.
 #ifndef JIT_ARENA_SIZE
-#define JIT_ARENA_SIZE					(1024 * 1024 * 2) // 2 MB (ARM7)
+#define JIT_ARENA_SIZE					(1024 * 1024 * 1) // 1 MB (ARM7)
 #endif
-// ARM9 is the hot core. History: 3 MB thrashed (~90 flushes/3000 frames);
-// 6 MB still thrashed - a harness capture (SM64DS savestate) showed arenapeak
-// pinned at 99% with a full-cache flush every ~130 frames, ~15 over a
-// 1400-frame run, driving the JIT-build cost and the p99 frametime tail.
-// 12 MB (measured, same SM64DS capture to frame ~1200, vs the 6 MB numbers):
-//   p99 frame time   ~41-48 ms -> ~28-34 ms
-//   worst frame      ~49 ms    -> ~44 ms
-//   ARM9 JIT-build   0.53 ms/f -> 0.38 ms/f   (-28%)
-//   flush interval   ~1/130 fr -> ~1/175 fr
-// It does NOT fix the thrash: arena peak stays 99% and collision-misses stay
-// ~38k (bound by the 64K direct-mapped block table, independent of arena
-// size), so SM64DS's ARM9 working set still outgrows 12 MB - this buys the
-// latency tail, not saturation headroom. Which pool the arena lands in
-// (MEM1 vs MEM2) can be checked with a -DJIT_MEM_ACCOUNT build.
 #ifndef JIT_ARENA_SIZE_ARM9
-#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 12) // 12 MB (ARM9 is the hot core)
+#define JIT_ARENA_SIZE_ARM9				(1024 * 1024 * 4) // 4 MB (ARM9 is the hot core)
 #endif
 #define HASH_TABLE_SIZE					65536
 #define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)

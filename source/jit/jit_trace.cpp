@@ -224,7 +224,10 @@ void jitCheckCanaries() {}
 
 static void jitFreeSlot(int i)
 {
-	free(s_arena[i]);        s_arena[i]        = nullptr;
+#ifdef JIT_ARENA_HEAP
+	free(s_arena[i]);
+#endif
+	s_arena[i]        = nullptr;
 	free(s_blockTable[i]);   s_blockTable[i]   = nullptr;
 	free(s_smcRegistry[i]);  s_smcRegistry[i]  = nullptr;
 	free(s_smcPageFlags[i]); s_smcPageFlags[i] = nullptr;
@@ -254,7 +257,19 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 	size_t smcRegistryBytes = SMC_MAP_SIZE * sizeof(BasicBlock*);
 	size_t smcFlagsBytes    = SMC_MAP_SIZE;
 
+#ifdef JIT_ARENA_HEAP
 	s_arena[i]        = (u32*)        memalign(32, arenaBytes        + s_jitCanaryPad);
+#else
+	// Code arenas are static .bss arrays, which the dol loader places in MEM1
+	// (the heap would put them in MEM2). Hardware A/B (SM64DS GxFast, same
+	// 4 MB/1 MB sizes): frame median 27.1 -> 23.0 ms, j9_exec 5.19 -> 2.80 ms,
+	// j7_exec 3.07 -> 1.77 ms. The cost is 5 MB of MEM1 held for the whole
+	// session, JIT or not (Interpreter mode, GBA). -DJIT_ARENA_HEAP restores
+	// the memalign path.
+	static u32 s_bssArena9[(JIT_ARENA_SIZE_ARM9 + s_jitCanaryPad) / 4] __attribute__((aligned(32)));
+	static u32 s_bssArena7[(JIT_ARENA_SIZE      + s_jitCanaryPad) / 4] __attribute__((aligned(32)));
+	s_arena[i] = (i == JIT_ARM9) ? s_bssArena9 : s_bssArena7;
+#endif
 	s_blockTable[i]   = (BasicBlock*) memalign(16, blockTableBytes   + s_jitCanaryPad);
 	s_smcRegistry[i]  = (BasicBlock**)memalign(32, smcRegistryBytes  + s_jitCanaryPad);
 	s_smcPageFlags[i] = (u8*)         memalign(32, smcFlagsBytes     + s_jitCanaryPad);
@@ -303,15 +318,17 @@ void jitInit()
 #endif
 
 	// Neither core's slot is allocated here any more (F1). The ARM9 slot
-	// (~17 MB: 12 MB arena + ~4 MB block table + ~1 MB SMC tables) never was
+	// (~2.3 MB heap: 2 MB block table + ~320 KB SMC tables; the 4 MB code arena
+	// is a static MEM1 array unless JIT_ARENA_HEAP, see jitInitSlot()) never was
 	// -- see jitEnsureArm9() below. A GBA session never calls jitRunArm9() at
 	// all (gbaExecFrame() has no ARM9 side, JIT or interpreted -- GBA has no
 	// ARM9), so lazy allocation there means this slot simply never gets
 	// allocated for a GBA session, leaving that memory free for a GBA cart's
 	// own 16+ MB full-ROM buffer (NDSSystem.cpp's GBA branch). The ARM7 slot
-	// (~3.5 MB: 2 MB arena + tables) now follows the same rule via
+	// (the same ~2.3 MB of tables; 1 MB arena) now follows the same rule via
 	// jitEnsureArm7(), so a session in Interpreter mode (jit.h's runtime CPU
-	// mode) allocates no JIT memory at all.
+	// mode) allocates no JIT heap memory at all (the static arenas stay
+	// reserved in .bss either way).
 	//
 	// §12.3 step 5: build both ARM7 profiles up front (struct fill only, no
 	// cache/arena work) so jitSetArm7GBAMode() has both ready to swap between
