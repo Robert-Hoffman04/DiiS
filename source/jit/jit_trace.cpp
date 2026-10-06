@@ -841,15 +841,20 @@ static int emitArm9Predicted(JitTraceCtx& c, int pred, u8 alignMe, u32 span, boo
 			*p++ = PPC_RLWINM(PPC_R10, PPC_R12, 18, 12, 31);
 			*p++ = PPC_CMPWI(0, PPC_R10, g.tag);
 			alignTest = false;
+		} else if (span) {
+			// Both ends in the window <=> (u32)(EA - region) < 0x4000 - span
+			// (the window is 16 KB aligned and span < 0x4000, so the
+			// difference cannot wrap between the ends): one unsigned compare.
+			const u32 neg = 0u - g.region;
+			const u32 ha = (neg + 0x8000u) >> 16, lo = neg & 0xFFFFu;
+			if (ha) { *p++ = PPC_ADDIS(PPC_R10, PPC_R12, ha); if (lo) *p++ = PPC_ADDI(PPC_R10, PPC_R10, (s32)(s16)lo); }
+			else    *p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)(s16)lo);
+			*p++ = PPC_CMPLI(0, PPC_R10, 0x4000u - span);
+			miss(PPC_BGE(0));
 		} else {
 			emitDtcmTest(p, g, PPC_R12);
 		}
-		miss(PPC_BNE(0));
-		if (span) {
-			*p++ = PPC_ADDI(PPC_R10, PPC_R12, (s32)span);
-			emitDtcmTest(p, g, PPC_R10);
-			miss(PPC_BNE(0));
-		}
+		if (!span) miss(PPC_BNE(0));
 		base = c.cpu.arm9DtcmBase; mb = 18;
 	} else if (pred == JIT_MEMP_ITCM) {
 		if (g.inItcm) { emitDtcmTest(p, g, PPC_R12); miss(PPC_BEQ(0)); }
