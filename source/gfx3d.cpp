@@ -570,6 +570,49 @@ static const POLYMTX *s_polyMtx = NULL;
 static bool s_polyMtxDirty = true;
 static const POLYMTX s_polyMtxZero = {};
 
+// Task gpu-ge: allocate the output lines of the lists being built with dcbz instead of a
+// read from memory. The two POLYLIST/VERTLISTs alternate per frame and together far exceed
+// the 256KB L2, so every fresh 32 B line of a VERT / POLY / POLYMTX store used to be a
+// main-memory read (HW PMC: ~6.8 L2D misses / 1000 instr in gpu_ge). Each list is written
+// front to back; s_*Hw is a line-aligned high-water mark: no byte at or above it has been
+// written since the list was started, so those bytes are dead (stale from two frames ago,
+// or an abandoned in-progress vertex) and zeroing them changes nothing anyone reads.
+// Lines are only zeroed when they lie wholly inside the list's array (s_*Lim). Disabled
+// (Hw = Lim) after a savestate load until the next list twiddle.
+#if defined(__PPC__)
+struct GeLine { char b[32]; };
+static FORCEINLINE void ge_dcbz(char *a){ __asm__ volatile("dcbz 0,%1" : "=m"(*(GeLine *)a) : "r"(a)); }
+#define GE_ZEROFRESH 1
+#endif
+static char *s_vHw, *s_vLim, *s_pHw, *s_pLim, *s_mHw, *s_mLim;
+static FORCEINLINE char *ge_lineUp(void *p){ return (char *)(((uintptr_t)p + 31) & ~(uintptr_t)31); }
+static FORCEINLINE char *ge_lineDown(void *p){ return (char *)((uintptr_t)p & ~(uintptr_t)31); }
+// Make the lines up to `end` writable without a memory read. The inline part is one compare;
+// the zeroing runs ahead (GE_ZF_AHEAD bytes past `end`) so it is entered once per few records.
+// Zeroing ahead is safe for the same reason: everything at or above hw is dead.
+#define GE_ZF_AHEAD 224
+#ifdef GE_ZEROFRESH
+static GE_NOINLINE void ge_zeroAhead(char **hwp, const char *end, const char *lim){
+	char *h = *hwp;
+	const char *stop = end + GE_ZF_AHEAD;
+	if (stop > lim) stop = lim;
+#pragma GCC unroll 1
+	while (h < stop) { ge_dcbz(h); h += 32; }
+	*hwp = h;
+}
+#define GE_ZEROFRESH_TO(hw, end, lim) do { if ((const char *)(end) > (hw)) ge_zeroAhead(&(hw), (const char *)(end), (lim)); } while (0)
+#else
+#define GE_ZEROFRESH_TO(hw, end, lim) do { } while (0)
+#endif
+static void ge_zeroFreshReset(bool disable){
+	s_vLim = ge_lineDown(vertlist->list + VERTLIST_SIZE);
+	s_pLim = ge_lineDown(polylist->list + POLYLIST_SIZE);
+	s_mLim = ge_lineDown(polylist->mtx + POLYMTX_SIZE);
+	s_vHw = disable ? s_vLim : ge_lineUp(vertlist->list);
+	s_pHw = disable ? s_pLim : ge_lineUp(polylist->list);
+	s_mHw = disable ? s_mLim : ge_lineUp(polylist->mtx);
+}
+
 static void twiddleLists() {
 	listTwiddle++;
 	listTwiddle &= 1;
@@ -580,6 +623,7 @@ static void twiddleLists() {
 	polylist->mtxCount = 0;
 	polylist->mtxOverflow = false;
 	s_polyMtxDirty = true;
+	ge_zeroFreshReset(false);
 }
 
 static BOOL flushPending = FALSE;
@@ -721,6 +765,8 @@ void gfx3d_reset(){
 //=================================================================================
 
 #define vec3dot(a, b)           (((a[0]) * (b[0])) + ((a[1]) * (b[1])) + ((a[2]) * (b[2])))
+// Task gpu-ge: fresh output lines for the polygon about to be written (before SUBMITVERTEX).
+#define GE_POLYFRESH() GE_ZEROFRESH_TO(s_pHw, polylist->list + polylist->count + 1, s_pLim)
 #define SUBMITVERTEX(ii, nn) polylist->list[polylist->count].vertIndexes[ii] = tempVertInfo.map[nn];
 //Submit a vertex to the GE
 static void SetVertex(){
@@ -779,6 +825,8 @@ static void SetVertex(){
 		printf("What happened?\n");
 	}
 	VERT &vert = vertlist->list[vertIndex];
+	// Task gpu-ge: fresh output lines for this vertex.
+	GE_ZEROFRESH_TO(s_vHw, &vert + 1, s_vLim);
 
 	//--DCN: This is the ONLY place where lastTexCoord.s and lastTexCoord.t are used!
 	vert.texcoord[0] = lastTexCoord.s;
@@ -807,6 +855,7 @@ static void SetVertex(){
 				if(tempVertInfo.count!=3)
 					break;
 				polygonListCompleted = 1;
+				GE_POLYFRESH();
 				//vertlist->list[polylist->list[polylist->count].vertIndexes[i] = vertlist->count++] = tempVertList.list[n];
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
@@ -819,6 +868,7 @@ static void SetVertex(){
 				if(tempVertInfo.count!=4)
 					break;
 				polygonListCompleted = 1;
+				GE_POLYFRESH();
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
@@ -831,6 +881,7 @@ static void SetVertex(){
 				if(tempVertInfo.count!=3)
 					break;
 				polygonListCompleted = 1;
+				GE_POLYFRESH();
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
@@ -854,6 +905,7 @@ static void SetVertex(){
 				if(tempVertInfo.count!=4)
 					break;
 				polygonListCompleted = 1;
+				GE_POLYFRESH();
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,3);
@@ -877,6 +929,7 @@ static void SetVertex(){
 			if (s_polyMtxDirty) {
 				if (polylist->mtxCount < POLYMTX_SIZE) {
 					POLYMTX &m = polylist->mtx[polylist->mtxCount++];
+					GE_ZEROFRESH_TO(s_mHw, &m + 1, s_mLim);
 					MatrixCopy(m.proj, mtxCurrent[0]);
 					MatrixCopy(m.mv, mtxCurrent[1]);
 					s_polyMtx = &m;
@@ -2706,6 +2759,7 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 		if(vertOverflow)
 			vertlist->count = polylist->count = 0;
 	}
+	ge_zeroFreshReset(true);   // Task gpu-ge: the loaded lists' bytes above count are not ours to zero
 
 	if(version>=2){
 	
