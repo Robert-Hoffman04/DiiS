@@ -506,6 +506,7 @@ void JITCache::flushCache() {
 		*emitPtr++ = PPC_STW(PPC_R11, PPC_R10, 12);        // bailedOut
 		*emitPtr = PPC_B((s32)((u8*)linkerReturnAddress - (u8*)emitPtr)); emitPtr++;
 		if (thunkProfile) jitEmitMemThunks(*this, emitPtr);
+		jitEmitFallbackThunks(*this, emitPtr);
 		thunkWords = (u32)(emitPtr - thunkStart);
 
 		arenaOffset = ((emitPtr - jitArena) * sizeof(u32) + 31) & ~31;

@@ -207,6 +207,10 @@ class JITCache {
 		// when it is set (before initialize()), else null.
 		const JitCpuProfile* thunkProfile;
 		u32* memThunk[JTH_N];
+		// Shared interpreter-fallback thunks (task jit-fbthunk), one per
+		// jitInterpFallback{Arm9,Arm7}{Arm,Thumb}: index (arm7 ? 2 : 0) + thumb.
+		// Emitted in every cache; see jitEmitFallbackThunks().
+		u32* fbThunk[4];
 		u32  thunkWords;       // words of SMC tail + memory thunks, for reports
 
 		void initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr,
@@ -327,6 +331,8 @@ extern JITCache jitCacheArm9;
 // Emits this cache's JitMemThunk set at p (jit_trace.cpp). Called by
 // flushCache() when thunkProfile is set.
 void jitEmitMemThunks(JITCache& cache, u32*& p);
+// Emits the four interpreter-fallback thunks (cache.fbThunk) at p.
+void jitEmitFallbackThunks(JITCache& cache, u32*& p);
 
 // SMC / coherency fan-out helpers. Shared regions (main RAM, shared WRAM) can
 // hold code for either core and can be written by either core or by DMA, so a

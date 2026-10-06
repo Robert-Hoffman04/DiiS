@@ -1692,58 +1692,87 @@ void JitTraceCtx::emitInterpreterBail(u32 metaCount)
 //                                IRQ unmask, halt, SMC kill / cache flush,
 //                                a fresh reschedule request): plain return
 // Handler cycles go straight into r3; the instruction counts in r31 on both
-// exits (it has executed). ~31 words.
+// exits (it has executed).
+//
+// Task jit-fbthunk: everything but the arguments and the exit lives in one
+// shared thunk per handler (jitEmitFallbackThunks, called with bl: r5 =
+// opcode, r6 = PC). It returns with r3 = cycles + handler cycles, r4 =
+// cpu.next_instruction, cr0 EQ <=> fall through, cr1 EQ <=> CHAIN exit.
+// Site: 4 argument words + bl + beq + exit tail (~9-11 words, was ~31).
+void jitEmitFallbackThunks(JITCache& c, u32*& p)
+{
+	static const u32 fns[4] = {
+		(u32)&jitInterpFallbackArm9Arm, (u32)&jitInterpFallbackArm9Thumb,
+		(u32)&jitInterpFallbackArm7Arm, (u32)&jitInterpFallbackArm7Thumb };
+	for (int i = 0; i < 4; i++) {
+		const u32 fn = fns[i];
+		c.fbThunk[i] = p;
+		*p++ = PPC_MFLR(0);
+		*p++ = PPC_STW(0, 1, 112);                        // LR (same slot as the mem thunks)
+		// ---- pinned R0..R15 + CPSR -> cpu.R[] / CPSR ----
+		*p++ = PPC_LWZ(PPC_R10, 1, 80);                   // &cpu.R[0]
+		*p++ = PPC_LWZ(0, PPC_R10, 17 * 4);               // SPSR (the stmw clobbers it with r31)
+		*p++ = PPC_STMW(14, PPC_R10, 0);
+		*p++ = PPC_STW(0, PPC_R10, 17 * 4);
+		*p++ = PPC_STW(PPC_R3, 1, 92);                    // cycle accumulator
+		*p++ = PPC_OR(PPC_R3, PPC_R5, PPC_R5);            // arg1 = opcode
+		*p++ = PPC_OR(PPC_R4, PPC_R6, PPC_R6);            // arg2 = its address
+		*p++ = PPC_LIS(PPC_R12, fn >> 16);
+		*p++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
+		*p++ = PPC_MTCTR(PPC_R12);
+		*p++ = PPC_BCTRL();
+		// ---- cpu.R[] / CPSR -> pinned registers (possibly a different bank now) ----
+		*p++ = PPC_LWZ(PPC_R10, 1, 80);
+		*p++ = PPC_OR(PPC_R12, PPC_R31, PPC_R31);         // icount survives the lmw in r12
+		*p++ = PPC_LMW(14, PPC_R10, 0);                   // r14..r29 = R0..R15, r30 = CPSR, r31 = SPSR
+		*p++ = PPC_OR(PPC_R31, PPC_R12, PPC_R12);
+		*p++ = PPC_OR(PPC_R11, PPC_R3, PPC_R3);           // r11 = cycles | exit flags
+		*p++ = PPC_LWZ(PPC_R3, 1, 92);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 0, 2, 31);    // handler cycles
+		*p++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R12);
+		*p++ = PPC_LWZ(PPC_R4, PPC_R10, -4);              // cpu.next_instruction (R[-1])
+		*p++ = PPC_LWZ(0, 1, 112);
+		*p++ = PPC_MTLR(0);
+		*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 2, 30, 31);   // TO_C -> 2, CHAIN -> 1
+		*p++ = PPC_CMPWI(1, PPC_R12, 1);                  // cr1 EQ <=> CHAIN
+		*p++ = PPC_CMPWI(0, PPC_R12, 0);                  // cr0 EQ <=> continue
+		*p++ = PPC_BLR();
+	}
+}
+
+// Loads a 32-bit constant in one word when it fits a signed 16-bit li.
+static inline void emitLoadImm32(u32*& p, u8 r, u32 v)
+{
+	if ((s32)v >= -0x8000 && (s32)v < 0x8000) { *p++ = PPC_LI(r, (s32)v); return; }
+	*p++ = PPC_LIS(r, v >> 16);
+	if (v & 0xFFFF) *p++ = PPC_ORI(r, r, v & 0xFFFF);
+}
+
 void JitTraceCtx::emitInterpFallback(u32 opcode)
 {
 	ensureArena();
 	JIT_STAT_SCOPE(*this, JCS_FALLBACK, false);
 	u32*& p = emitPtr;
 	const bool arm9 = (cpu.isaLevel >= 5);
-	const u32 fn = arm9 ? (thumbMode ? (u32)&jitInterpFallbackArm9Thumb : (u32)&jitInterpFallbackArm9Arm)
-	                    : (thumbMode ? (u32)&jitInterpFallbackArm7Thumb : (u32)&jitInterpFallbackArm7Arm);
-	const u32 pc = currentPC;
+	u32* const thunk = cache.fbThunk[(arm9 ? 0 : 2) + (thumbMode ? 1 : 0)];
 
-	// ---- pinned R0..R15 + CPSR -> cpu.R[] / CPSR ----
-	*p++ = PPC_LWZ(PPC_R10, 1, 80);                   // &cpu.R[0]
-	*p++ = PPC_LWZ(0, PPC_R10, 17 * 4);               // SPSR (the stmw clobbers it with r31)
-	*p++ = PPC_STMW(14, PPC_R10, 0);
-	*p++ = PPC_STW(0, PPC_R10, 17 * 4);
-	*p++ = PPC_STW(PPC_R3, 1, 92);                    // cycle accumulator
-	*p++ = PPC_LIS(PPC_R3, opcode >> 16);             // arg1 = opcode
-	*p++ = PPC_ORI(PPC_R3, PPC_R3, opcode & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R4, pc >> 16);                 // arg2 = its address
-	*p++ = PPC_ORI(PPC_R4, PPC_R4, pc & 0xFFFF);
-	*p++ = PPC_LIS(PPC_R12, fn >> 16);
-	*p++ = PPC_ORI(PPC_R12, PPC_R12, fn & 0xFFFF);
-	*p++ = PPC_MTCTR(PPC_R12);
-	*p++ = PPC_BCTRL();
-
-	// ---- cpu.R[] / CPSR -> pinned registers (possibly a different bank now) ----
-	*p++ = PPC_LWZ(PPC_R10, 1, 80);
-	*p++ = PPC_OR(PPC_R12, PPC_R31, PPC_R31);         // icount survives the lmw in r12
-	*p++ = PPC_LMW(14, PPC_R10, 0);                   // r14..r29 = R0..R15, r30 = CPSR, r31 = SPSR
-	*p++ = PPC_OR(PPC_R31, PPC_R12, PPC_R12);
-	*p++ = PPC_OR(PPC_R11, PPC_R3, PPC_R3);           // r11 = cycles | exit flags
-	*p++ = PPC_LWZ(PPC_R3, 1, 92);
-	*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 0, 2, 31);    // handler cycles
-	*p++ = PPC_ADD(PPC_R3, PPC_R3, PPC_R12);
-	*p++ = PPC_RLWINM(PPC_R12, PPC_R11, 2, 30, 31) | 1;   // rlwinm.: TO_C -> 2, CHAIN -> 1
+	emitLoadImm32(p, PPC_R5, opcode);
+	emitLoadImm32(p, PPC_R6, currentPC);
+	{ s32 o = (s32)((u8*)thunk - (u8*)p); *p++ = PPC_BL(o); }
 	u32* cont = p++;
 
 	// ---- exit: the handler moved PC, or the dispatcher has to look ----
-	*p++ = PPC_LWZ(PPC_R4, PPC_R10, -4);              // cpu.next_instruction (R[-1])
 	emitAddCycles(cyclesAccum);
 	emitResultMetadata(instrCount + 1, 0);
-	*p++ = PPC_CMPWI(0, PPC_R12, 1);
-	u32* toC = p++;
 #if JIT_ENABLE_DYNAMIC_CHAINING
+	u32* toC = p++;
 	{	// the stub sets r29 = r4 + 4/8 (task jit-exitaddi)
 		u32* stub = thumbMode ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
 		s32 o = (s32)((u8*)stub - (u8*)p);
 		*p++ = PPC_B(o);
 	}
+	*toC = PPC_BC(4, 6, (u32)((p - toC) * 4));        // bne cr1 -> return to C
 #endif
-	*toC = PPC_BNE((u32)((p - toC) * 4));
 	{ s32 o = (s32)((u8*)cache.linkerReturnAddress - (u8*)p); *p++ = PPC_B(o); }
 
 	*cont = PPC_BEQ((u32)((p - cont) * 4));
