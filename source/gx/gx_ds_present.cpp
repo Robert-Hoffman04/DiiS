@@ -4,14 +4,33 @@
 #include <gccore.h>
 #include <malloc.h>
 #include "../perf_zones.h"   // Task pzones: mbright / readback zones (no-op otherwise)
+#include "gx_fence.h"
+#include <unistd.h>
 
 const void *g_gxDsPresentPending[2] = { NULL, NULL };
+static u16 s_presentFence[2];   // Task gpu-overlap: the copy that fills each pending slot's buffer
+
+// Task gpu-overlap: gx_fence.h.
+u16 g_gxFenceNext, g_gxFence3d, g_gxFencePresent;
+
+void gxFenceWait(u16 t)
+{
+	if (gxFenceReached(t)) return;
+	PZ_SUB_SCOPE(PZ_GX_FENCE);
+	while (!gxFenceReached(t)) {}
+}
+
+void gxFenceWaitSleep(u16 t)
+{
+	while (!gxFenceReached(t)) usleep(50);
+}
 
 static const int kW = 256, kH = 192;
 
-void gxDsPresentSet(int slot, const void *buf)
+void gxDsPresentSet(int slot, const void *buf, u16 fence)
 {
 	g_gxDsPresentPending[slot] = buf;
+	s_presentFence[slot] = fence;
 }
 
 void gxDsPresentReleaseBuffer(const void *buf, int keepSlot)
@@ -148,6 +167,7 @@ void gxDsPresentResolveSlotImpl(int slot)
 	PZ_SCOPE(PZ_2D_READBACK);
 	const u16 *src = (const u16 *)g_gxDsPresentPending[slot];
 	g_gxDsPresentPending[slot] = NULL;
+	gxFenceWait(s_presentFence[slot]);   // Task gpu-overlap: the copy may still be in flight
 	DCInvalidateRange((void *)src, kW * kH * 2);
 	u16 *dst = (u16 *)(GPU_screen + (u32)slot * 192 * 512);
 	for (int ty = 0; ty < kH / 4; ++ty) {

@@ -31,6 +31,7 @@
 #include "gx_ds_3d_render.h"   // task 13e: GX geometry pass
 #endif
 #include "gx_ds_present.h"     // Task directpresent
+#include "gx_fence.h"          // Task gpu-overlap
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
 #include <gccore.h>
@@ -646,6 +647,9 @@ static GXTexObj s_backdropTexObj[GX_DSB_MAX_BAND_REGS];
 static void *s_backdropTexData;
 
 static void *s_copyBackBuf;
+// Task gpu-overlap (gx_fence.h): fence after this engine's last GX batch (its copy); waited on
+// before the CPU next rewrites anything that batch read.
+static u16 s_fenceTok;
 static u16 *s_copyBackLinear;
 
 
@@ -778,6 +782,7 @@ void GXDS_API(RenderShutdown)()
 {
 	if (!s_initDone)
 		return;
+	gxFenceWait(s_fenceTok);   // Task gpu-overlap: the GPU may still read what is freed below
 	for (int i = 0; i < 4; ++i) {
 		free(s_bgPlane[i].texData); s_bgPlane[i].texData = NULL; s_bgPlane[i].texDataCap = 0; s_bgPlane[i].valid = false;
 		free(s_bgPlaneFx[i].texData); s_bgPlaneFx[i].texData = NULL; s_bgPlaneFx[i].texDataCap = 0; s_bgPlaneFx[i].valid = false;
@@ -3810,7 +3815,7 @@ static void gxDsA3dRenderGeomTex()
 	s_tevK = -1;
 	gxDsA3dDrawBand(s_3d, 0, 0, k3dH);
 	gxDsA3dGeomDraw();
-	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+	// Task gpu-overlap: no GX_DrawDone here; the FIFO runs the copy after the pass anyway.
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
 	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
@@ -3873,6 +3878,7 @@ bool gxDsEngineA3dReadback()
 	const u8 c5[3] = { (u8)(cc & 0x1F), (u8)((cc >> 5) & 0x1F), (u8)((cc >> 10) & 0x1F) };   // r, g, b
 	const bool cover = ca != 31;
 
+	gxFenceWait(s_fenceTok);   // Task gpu-overlap: the pass below may re-record s_dl, which the GPU may still read
 	LWP_MutexLock(vidmutex);
 	gxDsBSetup2DState();
 	if (cover) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
@@ -3933,8 +3939,11 @@ bool gxDsEngineA3dReadback()
 		DCFlushRange(s_3dScratch, cb);
 		GX_CopyTex(s_3dScratch, GX_TRUE);
 		GX_PixModeSync();
-		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }   // before the CPU reuses s_3dScratch
+		// Task gpu-overlap: was a GX_DrawDone "before the CPU reuses s_3dScratch"; the only CPU
+		// writers of s_3dScratch (gxDsA3dEnsureTex / EnsureAlphaTex) run in the compositor after
+		// its entry wait on s_fenceTok, so a fence is enough.
 	}
+	s_fenceTok = g_gxFence3d = gxFenceIssue();
 	GX_InvalidateTexAll();
 	GxRestorePresentState();
 	LWP_MutexUnlock(vidmutex);
@@ -3945,6 +3954,9 @@ bool gxDsEngineA3dReadback()
 
 static bool gxDsBRenderFrameImpl()
 {
+	// Task gpu-overlap: last frame's draws of this engine may still be reading the textures the
+	// bakes below rewrite. Normally long done (a whole emulated frame ago), so this is free.
+	gxFenceWait(s_fenceTok);
 	// Whatever happens below, this frame's band trace is finished with here;
 	// the next frame re-arms it from its own scanline 0.
 	//
@@ -4348,7 +4360,11 @@ static bool gxDsBRenderFrameImpl()
 	if (gxRenderModeIsFast())
 		gxDsA3dStampOpaqueAlpha();
 #endif
-	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+	// Task gpu-overlap: the GX_DrawDone that stood here drained the whole GPU before the copy
+	// (the old `gxwait`). The copy is FIFO-ordered after the draws, so the GPU needs no wait;
+	// the CPU only needs one before it rewrites something these draws read (next frame's bakes,
+	// 3D textures / tag buffers, s_3dScratch) or reads the copy -- the fence issued after the
+	// copy below, waited on at those points (gx_fence.h, zone gxfence).
 	// Deflicker OFF for this copy. main.cpp's InitVideo() leaves
 	// GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE,
 	// rmode->vfilter) in force for the TV present; that vertical filter
@@ -4390,6 +4406,10 @@ static bool gxDsBRenderFrameImpl()
 	GX_CopyTex(s_copyBackBuf, GX_TRUE);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
+	s_fenceTok = gxFenceIssue();
+#if GXDS_CORE == 0
+	g_gxFence3d = s_fenceTok;
+#endif
 
 	// Put back everything gxDsBSetup2DState() + the copy-src/dst setup above
 	// changed, before draw_thread's next present pass can observe it.
@@ -4412,12 +4432,14 @@ static bool gxDsBRenderFrameImpl()
 	u16 *dst = (u16 *)(GPU_screen + (u32)GXDS_SCREEN.offset * 512);
 #ifndef DSB_ABCMP
 	if (!anyMb || mbOnGpu) {
-		gxDsPresentSet(slot, s_copyBackBuf);
+		gxDsPresentSet(slot, s_copyBackBuf, s_fenceTok);
 	} else
 #endif
 	{
 	PZ_SUB_SCOPE(PZ_2D_READBACK);
 	g_gxDsPresentPending[slot] = NULL;
+	gxFenceWait(s_fenceTok);   // Task gpu-overlap: the copy must have landed
+	DCInvalidateRange(s_copyBackBuf, (u32)kDsBScreenW * kDsBScreenH * sizeof(u16));
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);
 

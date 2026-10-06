@@ -1,4 +1,5 @@
 #include "gx_ds_3d_render.h"
+#include "gx_fence.h"   // Task gpu-overlap
 #include "gx_rendermode.h"
 #include "gx_swizzle.h"
 #include "../gfx3d.h"
@@ -1455,6 +1456,9 @@ static void gxDs3dReplayDrop();
 bool gxDs3dGeomFramePrepare()
 {
 	PZ_SUB_SCOPE(PZ_GX3D_PREP);
+	// Task gpu-overlap: this runs outside vidmutex at VBlank end and rewrites / frees buffers
+	// the last GX 3D pass read (tag buffers, s_tex), which no GX_DrawDone drains any more.
+	gxFenceWait(g_gxFence3d);
 	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead (and frees its tag buffers)
 	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
@@ -2834,7 +2838,7 @@ static struct {
 } s_dlKey;
 
 // No GX calls: runs at VBlank end outside vidmutex. The GPU is done with the list and the
-// tag buffers by then (the compositor GX_DrawDone()s after the pass, before its copy), and
+// tag buffers by then (Task gpu-overlap: gxDs3dGeomFramePrepare waits on g_gxFence3d), and
 // whatever reuses the freed memory as a texture invalidates TMEM itself (s_texDirty for
 // ours, and the compositor's GX_InvalidateTexAll after every copy).
 static void gxDs3dReplayDrop()

@@ -50,6 +50,7 @@
 #include "gx/gx_gba_render.h"
 #include "gx/gx_rendermode.h"
 #include "gx/gx_ds_present.h"
+#include "gx/gx_fence.h"      // Task gpu-overlap
 #ifdef DESMUME_JIT
 // F1 runtime CPU mode (Interpreter / JIT): the startup picker's CPU line, the
 // harness "cpumode" command, and the wrestler probes' per-core overrides.
@@ -685,6 +686,9 @@ static void Draw(void) {
 	u16 *sBottom = sTop+256*192;
 	u16 *dBottom = BottomScreen;
 	LWP_MutexLock(vidmutex);
+	// Task gpu-overlap: draw_thread no longer drains the GPU under vidmutex, so its last present
+	// may still be sampling the textures rewritten below (DsDirectTex's GX_InitTexObj is CPU-only).
+	gxFenceWait(g_gxFencePresent);
 
 	{ PZ_SCOPE(PZ_DRAW_CONVERT);
 
@@ -928,19 +932,23 @@ static void *draw_thread(void*){
 		// On-screen FPS counter, top-left corner (outside the DS screen area).
 		FPSOverlay_Draw();
 
-		GXDBG_MAIN("draw_thread: calling GX_DrawDone");
-		GX_DrawDone();
-		GXDBG_MAIN("draw_thread: GX_DrawDone returned");
-
+		// Task gpu-overlap: no GX_DrawDone under vidmutex. It used to drain the compositor's
+		// queued work too, holding vidmutex (and so the emulation thread's next compositor
+		// pass) for the whole GPU backlog. The FIFO runs the copy after the quads; a fence
+		// covers the CPU-side reuse (Draw() waits on g_gxFencePresent before rewriting the
+		// present textures) and the XFB flip waits for it below, outside the lock.
 		currfb ^= 1;
 
 		GX_CopyDisp(xfb[currfb],GX_TRUE);
 		GXDBG_MAIN("draw_thread: GX_CopyDisp done");
+		const u16 presentTok = g_gxFencePresent = gxFenceIssue();
+
+		LWP_MutexUnlock(vidmutex);
+
+		gxFenceWaitSleep(presentTok);   // the XFB must be complete before VI scans it out
 		VIDEO_SetNextFramebuffer(xfb[currfb]);
 		VIDEO_Flush();
 		GXDBG_MAIN("draw_thread: VIDEO_Flush done");
-
-		LWP_MutexUnlock(vidmutex);
 
 		VIDEO_WaitVSync();
 		GXDBG_MAIN("draw_thread: VIDEO_WaitVSync done, loop end");

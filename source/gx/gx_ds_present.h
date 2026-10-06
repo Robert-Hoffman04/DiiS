@@ -28,8 +28,9 @@
         so the old per-frame opaque scan is gone.
 
     The copy buffers are only written by their engine's GX_CopyTex under vidmutex, and
-    draw_thread samples them under vidmutex followed by GX_DrawDone, so a copy can never
-    overwrite a buffer the GPU is still reading. Deviation from the pipeline doc: this
+    draw_thread samples them under vidmutex, so the GPU (in-order FIFO) can never copy over a
+    buffer before the present quads that read it. Task gpu-overlap: no GX_DrawDone follows the
+    copy any more; a CPU resolve waits for the copy's fence token instead. Deviation from the pipeline doc: this
     is per-engine (the engines still copy separately), not the shared Stage 6
     composition.
 */
@@ -42,7 +43,8 @@
 extern const void *g_gxDsPresentPending[2];
 
 // Engine side: record `buf` (256x192 tiled RGB5A3, all texels opaque) as slot's content.
-void gxDsPresentSet(int slot, const void *buf);
+// fence (gx_fence.h): the token issued after that copy; readers wait for it.
+void gxDsPresentSet(int slot, const void *buf, u16 fence);
 // Engine side, before its GX_CopyTex overwrites `buf`: resolve any slot still pointing at it,
 // except keepSlot, which the caller rewrites whole right after (dropped unconverted; lazyfix).
 void gxDsPresentReleaseBuffer(const void *buf, int keepSlot);

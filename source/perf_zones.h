@@ -53,6 +53,7 @@ enum PerfZone {
 	PZ_2D_BAKE_BD,    // backdrop bakes (both engines)
 	PZ_2D_READBACK,   // GPU_screen readback of a GX copy: lazy present resolve + eager MASTER_BRIGHT fallback
 	PZ_GX_WAIT,       // GX_DrawDone() in the compositor (GPU drain, Dolphin-timed)
+	PZ_GX_FENCE,      // Task gpu-overlap: residual deferred-fence wait (gx_fence.h) before the CPU reuses a GPU-read buffer
 	PZ_VIDLOCK,       // LWP_MutexLock(vidmutex) wait in the compositor
 	PZ_GX3D_REC,      // gxDs3dRenderFast() recording (or unrecorded) pass
 	PZ_GX3D_REPLAY,   // gxDs3dRenderFast() display-list replay

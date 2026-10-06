@@ -128,7 +128,7 @@ static const char* k_name[PZ_COUNT] = {
 	"spu", "draw",
 	"dma", "draw_convert", "draw_present",
 	"a_cpu", "b_cpu", "a_gx", "b_gx", "a_bakebg", "a_bakeobj", "b_bakebg", "b_bakeobj", "bakebd",
-	"readback", "gxwait", "vidlock", "g3rec", "g3replay", "g3acc", "g3prep", "g3tex",
+	"readback", "gxwait", "gxfence", "vidlock", "g3rec", "g3replay", "g3acc", "g3prep", "g3tex",
 	"g3gate", "a_3dscan", "a_3dtex",
 	"efb_copy", "mbright", "a_3dgeomtex", "sched", "host",
 	"j9_exec", "j9m_io", "j9m_gxfifo", "j9m_vram", "j9m_palobj", "j9m_wram", "j9m_other", "j9_fb",
