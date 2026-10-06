@@ -93,6 +93,7 @@ public:
 	} savedInfo;
 
 	//and these are used by old savestates
+	void apply_known_game_save_type();
 	void load_old_state(u32 addr_size, u8* data, u32 datasize);
 	static u32 addr_size_for_old_save_size(int bupmem_size);
 	static u32 addr_size_for_old_save_type(int bupmem_type);

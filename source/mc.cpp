@@ -307,6 +307,7 @@ void BackupDevice::reset()
 	state = DETECTING;
 	addr_size = 0;
 	loadfile();
+	apply_known_game_save_type();
 
 	//if the user has requested a manual choice for backup type, and we havent imported a raw save file, then apply it now
 	if(state == DETECTING && CommonSettings.manualBackupType != MC_TYPE_AUTODETECT)
@@ -318,6 +319,49 @@ void BackupDevice::reset()
 		data.resize(savesize); //truncate if necessary
 		addr_size = addr_size_for_old_save_type(savetype);
 		flush();
+	}
+}
+
+//Built-in save types for games the byte-count autodetect gets wrong.
+//Keyed by the first 3 chars of the ROM game code (region letter ignored).
+//Phantom Hourglass (AZE*) is 4 Mbit flash with 3-byte addresses; autodetect picks
+//addr_size 2 for it, so one address byte is consumed as data and the game reports
+//"The data in file 1 is corrupted." on the next boot.
+static const struct { char code[4]; u32 addr_size; u32 size; } kKnownSaveTypes[] = {
+	{ "AZE", 3, 512*1024 }, // The Legend of Zelda: Phantom Hourglass - FLASH 4 Mbit
+};
+
+void BackupDevice::apply_known_game_save_type()
+{
+	if(CommonSettings.manualBackupType != MC_TYPE_AUTODETECT) return; //user choice wins
+	if(MMU.CART_ROM == NULL || MMU.CART_ROM == MMU.UNUSED_RAM) return;
+	const u8* code = MMU.CART_ROM + 12;
+	for(u32 i=0;i<sizeof(kKnownSaveTypes)/sizeof(kKnownSaveTypes[0]);i++)
+	{
+		if(memcmp(code,kKnownSaveTypes[i].code,3)) continue;
+		const u32 want_addr = kKnownSaveTypes[i].addr_size;
+		const u32 want_size = kKnownSaveTypes[i].size;
+		if(state == RUNNING && addr_size == want_addr)
+			return; //existing save already has the right geometry
+		if(state == RUNNING)
+		{
+			//an existing .dsv made by the old autodetect with the wrong address size:
+			//its contents were written at garbage addresses and the game sees it as corrupt.
+			//keep a copy as <name>.dsv.bad and start from a blank save of the right type.
+			printf("Save file has addr_size %u, game %.4s needs %u; resetting it (old file kept as .bad)\n",
+				addr_size, (const char*)code, want_addr);
+			std::string bad = filename + ".bad";
+			remove(bad.c_str());
+			rename(filename.c_str(), bad.c_str());
+			data.resize(0);
+		}
+		state = RUNNING;
+		addr_size = want_addr;
+		ensure(want_size);
+		data.resize(want_size);
+		data_autodetect.resize(0);
+		if(filename.length()) flush();
+		return;
 	}
 }
 
