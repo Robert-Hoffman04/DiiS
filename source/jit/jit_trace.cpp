@@ -1630,15 +1630,23 @@ void JitTraceCtx::emitDynamicExit(u8 pcReg, u32 metaCount, u32 termCycles, bool 
 	// -- so a guarded-dispatch hit lands in the next block with r29 already
 	// correct. It is resident (the i=15 slot of the pinned register file), so
 	// no block ever reloads it from memory.
-	*p++ = PPC_ADDI(PPC_R29, pcReg, targetThumb ? 4 : 8);
-	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
 #if JIT_ENABLE_DYNAMIC_CHAINING
+	// Task jit-exitaddi: the stub sets r29 (and copies r12 -> r4 at its R12
+	// entry), so a site whose target is in r12 is a single `b`.
 	{
-		u32* stub = targetThumb ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
+		u32* stub;
+		if (pcReg == PPC_R12) {
+			stub = targetThumb ? cache.linkerStubDynamicThumbR12Address : cache.linkerStubDynamicArmR12Address;
+		} else {
+			if (pcReg != PPC_R4) *p++ = PPC_OR(PPC_R4, pcReg, pcReg);
+			stub = targetThumb ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
+		}
 		s32 o = (s32)((u8*)stub - (u8*)p);
 		*p++ = PPC_B(o);
 	}
 #else
+	*p++ = PPC_ADDI(PPC_R29, pcReg, targetThumb ? 4 : 8);
+	*p++ = PPC_OR(PPC_R4, pcReg, pcReg);
 	s32 retOff = (s32)((u8*)cache.linkerReturnAddress - (u8*)p);
 	*p++ = PPC_B(retOff);
 #endif
@@ -1724,8 +1732,7 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 	*p++ = PPC_CMPWI(0, PPC_R12, 1);
 	u32* toC = p++;
 #if JIT_ENABLE_DYNAMIC_CHAINING
-	*p++ = PPC_ADDI(PPC_R29, PPC_R4, thumbMode ? 4 : 8);
-	{
+	{	// the stub sets r29 = r4 + 4/8 (task jit-exitaddi)
 		u32* stub = thumbMode ? cache.linkerStubDynamicThumbAddress : cache.linkerStubDynamicArmAddress;
 		s32 o = (s32)((u8*)stub - (u8*)p);
 		*p++ = PPC_B(o);

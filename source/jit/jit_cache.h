@@ -184,8 +184,14 @@ class JITCache {
 		// through to linkerReturnAddress exactly like any other miss, so this is
 		// pure guarded speed-up: worst case is identical to today's unconditional
 		// return-to-C, never a wrong-mode jump. See emitDynamicExit().
+		// Entry contract (task jit-exitaddi): r4 = target PC; the stub itself
+		// sets r29 = r4 + 4 (THUMB) / + 8 (ARM) first. The ...R12 entries sit one
+		// word earlier (`mr r4,r12`) for exit sites whose target is in r12 --
+		// every BX/LDR-pc/POP{pc} site, so those sites are just one `b`.
 		u32* linkerStubDynamicThumbAddress;
 		u32* linkerStubDynamicArmAddress;
+		u32* linkerStubDynamicThumbR12Address;
+		u32* linkerStubDynamicArmR12Address;
 		u8* smcPageFlags;
 		// Shared SMC-bail tail (both caches): r3/r31/r4 already hold the bail's
 		// cycles / instruction count / resume PC and r12 the refused EA; sets

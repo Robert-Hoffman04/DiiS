@@ -83,6 +83,8 @@ JITCache::JITCache() {
 	linkerReturnAddress = nullptr;
 	linkerStubDynamicThumbAddress = nullptr;
 	linkerStubDynamicArmAddress = nullptr;
+	linkerStubDynamicThumbR12Address = nullptr;
+	linkerStubDynamicArmR12Address = nullptr;
 	smcTailAddress = nullptr;
 	yieldTailAddress = nullptr;
 	thunkProfile = nullptr;
@@ -276,9 +278,14 @@ BasicBlock* JITCache::registerBlock(u32 pc, u32 length, JITBlockFunc execute, bo
 // there is no runtime mode test here, just two fixed-expectation stub bodies.
 static u32* emitDynamicLinkerStub(u32*& emitPtr, BasicBlock* blockTable,
                                    u32 maskBegin, u32* linkerReturnAddress,
-                                   bool expectThumb)
+                                   bool expectThumb, u32*& entryR12)
 {
+	// Task jit-exitaddi: the pipeline-PC write every dynamic exit used to emit
+	// inline lives here now. entryR12 = `mr r4,r12` falling into entry.
+	entryR12 = emitPtr;
+	*emitPtr++ = PPC_OR(PPC_R4, PPC_R12, PPC_R12);
 	u32* entry = emitPtr;
+	*emitPtr++ = PPC_ADDI(PPC_R29, PPC_R4, expectThumb ? 4 : 8);
 
 	*emitPtr++ = PPC_LIS(PPC_R10, (u32)blockTable >> 16);
 	*emitPtr++ = PPC_ORI(PPC_R10, PPC_R10, (u32)blockTable & 0xFFFF);
@@ -477,9 +484,11 @@ void JITCache::flushCache() {
 		// static one (same hash calc inputs still in scope: blockTable,
 		// maskBegin, and linkerReturnAddress == missTarget above).
 		linkerStubDynamicThumbAddress =
-			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/true);
+			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/true,
+			                      linkerStubDynamicThumbR12Address);
 		linkerStubDynamicArmAddress =
-			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/false);
+			emitDynamicLinkerStub(emitPtr, blockTable, maskBegin, linkerReturnAddress, /*expectThumb=*/false,
+			                      linkerStubDynamicArmR12Address);
 
 		// Shared SMC-bail and quota-yield tails (see jit_cache.h), then the
 		// memory thunks.
