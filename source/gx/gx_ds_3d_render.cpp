@@ -870,7 +870,7 @@ static void gxDs3dPlanStore(int i, const VERT *const *cv, int nv, bool clipped, 
 
 // Which gxDs3dTransIdPlan bail (TEXSTATS `tidwhy=`): 1 too many translucent polygons, 2 carry
 // budget, carried range with 3 a depth-writing (bit 11) polygon, 4 a shadow draw, 5 an
-// alpha-31 polygon over an earlier one; 6 a run polygon over the run's alpha-31 one, 7 RGB565.
+// alpha-31 polygon over an earlier one (only with -DDSA_GXGEOM_MUTATE_R5BAIL, Task transid-r5); 6 a run polygon over the run's alpha-31 one, 7 RGB565.
 #ifdef DSA_GXGEOM_TEXSTATS
 static int s_tidWhy;
 #define GXDS3D_TIDWHY(k) do { s_tidWhy = (k); return -1; } while (0)
@@ -969,20 +969,28 @@ static int gxDs3dTransIdPlan()
 				if (runS0 >= 0) {
 					// The carried range: shapes [runS0, runStart) that meet the run's box. An
 					// alpha-31 one's a == 31 fragments neither stamp (left out of the mask
-					// draw) nor may change an EARLIER range polygon's depth test: those must
-					// not overlap it.
+					// draw, rasterize.cpp: opaque fragments leave the translucent ID alone)
+					// but write depth. The mask draw (Z LESS, no update) runs against the
+					// depth after the whole range, so an EARLIER range polygon behind such a
+					// fragment loses its stamp there. Task transid-r5: accepted in GxFast (was
+					// bail `tidwhy` 5). It only matters where a run polygon lies in front of
+					// that alpha-31 texel while the earlier one lay behind it: the run polygon
+					// is then blended where the CPU rejects it by ID.
 					r.c0 = s_shN[runS0];
 					s_tagCarryAny = true;
 					for (int k = runS0; k < runStart; ++k) {
 						if (s_sh[k].x1 < x0 || s_sh[k].x0 > x1 || s_sh[k].y1 < y0 || s_sh[k].y0 > y1) continue;
 						if (++carryCost > kCarryBudget) GXDS3D_TIDWHY(2);
 						bool block = gxDs3dCarryBlocks(gfx3d.polylist->list[s_shPoly[k]]);
+#ifdef DSA_GXGEOM_MUTATE_R5BAIL
+						// mutation: the pre-change rule (Task transid-r5), for A/B
 						if (!block && gxDs3dPolyAlpha(gfx3d.polylist->list[s_shPoly[k]]) == 31)
 							for (int j = runS0; j < k && !block; ++j) {
 								if (s_sh[j].x1 < x0 || s_sh[j].x0 > x1 || s_sh[j].y1 < y0 || s_sh[j].y0 > y1) continue;
 								if (++carryCost > kCarryBudget) GXDS3D_TIDWHY(2);
 								block = !gxDs3dTransShapesDisjoint(s_sh[j], s_sh[k]);
 							}
+#endif
 						if (block) {
 #ifdef DSA_GXGEOM_TRANSIDDBG
 							const POLY &q = gfx3d.polylist->list[s_shPoly[k]];
