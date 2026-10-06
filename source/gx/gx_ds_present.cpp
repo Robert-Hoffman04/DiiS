@@ -5,7 +5,8 @@
 #include <malloc.h>
 #include "../perf_zones.h"   // Task pzones: mbright / readback zones (no-op otherwise)
 #include "gx_fence.h"
-#include <unistd.h>
+#include <ogc/lwp.h>
+#include <ogc/machine/processor.h>   // _CPU_ISR_Disable/Restore
 
 const void *g_gxDsPresentPending[2] = { NULL, NULL };
 static u16 s_presentFence[2];   // Task gpu-overlap: the copy that fills each pending slot's buffer
@@ -20,9 +21,27 @@ void gxFenceWait(u16 t)
 	while (!gxFenceReached(t)) {}
 }
 
+// Task host-zone: interrupt-driven sleep. The usleep(50) poll this replaces woke the
+// higher-priority draw_thread ~every 50 us for the whole GPU backlog, preempting the emulation
+// thread each time (+1.2 ms/frame in zone `host` on hardware). Now the PE token interrupt
+// (draw-sync callback, fired for every GX_SetDrawSync token the GPU reaches) wakes it once.
+static lwpq_t s_fenceQueue = LWP_TQUEUE_NULL;
+static void gxFenceSyncCb(u16)
+{
+	LWP_ThreadBroadcast(s_fenceQueue);
+}
+
 void gxFenceWaitSleep(u16 t)
 {
-	while (!gxFenceReached(t)) usleep(50);
+	if (gxFenceReached(t)) return;
+	if (s_fenceQueue == LWP_TQUEUE_NULL) {
+		LWP_InitQueue(&s_fenceQueue);
+		GX_SetDrawSyncCallback(gxFenceSyncCb);
+	}
+	u32 level;
+	_CPU_ISR_Disable(level);   // same pattern as libogc's GX_WaitDrawDone: no lost wakeup
+	while (!gxFenceReached(t)) LWP_ThreadSleep(s_fenceQueue);
+	_CPU_ISR_Restore(level);
 }
 
 static const int kW = 256, kH = 192;
