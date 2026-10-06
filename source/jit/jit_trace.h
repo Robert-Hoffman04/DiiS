@@ -579,8 +579,37 @@ struct JitTraceCtx {
 	// it at the current emit position. Every condition is a short record-form
 	// test of the packed flags (1..3 words, see jit_trace.cpp) + the branch.
 	// Clobbers r11 and cr0.
+	//
+	// Condition runs (ARM only): patchCondSkip() remembers the skip it just
+	// aimed at the current position. If the very next instruction is
+	// predicated, emitted nothing before its emitCondSkip() and the previous one
+	// cannot have changed the flags (condRunOk, set by jitCompileTrace()), then
+	//   same cond:    no test at all -- the previous skip is re-aimed past this
+	//                 instruction too (returned as this instruction's slot);
+	//   inverse cond: one `b` (the previous body's way over this one) and the
+	//                 previous skip is aimed just past it, into this body.
+	// condUndoSlot records a re-aimed skip so a refused (rewound) instruction
+	// can point it back at the rewind mark.
 	u32* emitCondSkip(u8 cond);
-	void patchCondSkip(u32* slot) { *slot |= (u32)((emitPtr - slot) * 4) & 0xFFFC; }
+	void patchCondSkip(u32* slot)
+	{
+		aimSkip(slot, emitPtr);
+		condRunSlot = (slot == condLastSlot) ? slot : nullptr;
+		condRunEnd = emitPtr; condRunCond = condLastCond;
+	}
+	static void aimSkip(u32* slot, u32* target)
+	{
+		const u32 d = (u32)((target - slot) * 4);
+		if ((*slot >> 26) == 18) *slot = (*slot & ~0x03FFFFFCu) | (d & 0x03FFFFFCu);   // b
+		else                     *slot = (*slot & ~0xFFFCu) | (d & 0xFFFCu);            // bc
+	}
+	u32* condRunSlot;          // last patched skip, taken iff condRunCond fails
+	u32* condRunEnd;           // ...and where it pointed when patched
+	u8   condRunCond;
+	bool condRunOk;            // the previous instruction cannot write the flags
+	u32* condLastSlot;         // slot emitCondSkip() last returned...
+	u8   condLastCond;         // ...and the condition it skips on
+	u32* condUndoSlot;         // skip re-aimed by the current instruction (rewind fix-up)
 };
 
 #ifdef JIT_CODE_STATS

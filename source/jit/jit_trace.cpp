@@ -1737,6 +1737,12 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 	*cont = PPC_BEQ((u32)((p - cont) * 4));
 }
 
+#ifdef JIT_CODE_STATS
+// Compile-time counts per core ([0] ARM9, [1] ARM7): condition tests emitted,
+// skips extended over a same-cond successor, inverse-cond `b` reuses.
+u64 g_jitCondTests[2], g_jitCondRunSame[2], g_jitCondRunInv[2];
+#endif
+
 // Every condition is a test on the packed flags in r30 (N Z C V = PPC bits
 // 0..3) that leaves its answer in cr0, then one bc taken when it FAILS:
 //   EQ..VC  rlwinm. r11,r30,0,f,f                        eq <=> flag clear
@@ -1748,8 +1754,33 @@ void JitTraceCtx::emitInterpFallback(u32 opcode)
 u32* JitTraceCtx::emitCondSkip(u8 cond)
 {
 	JIT_STAT_SCOPE(*this, JCS_PRED, false);
-	ensureFlagsLoaded();
 	u32*& p = emitPtr;
+	u32* const run = condRunSlot;
+	condRunSlot = nullptr;
+	condLastCond = cond;
+	if (run && condRunOk && !thumbMode && p == condRunEnd && cond < 0xE) {
+		if (cond == condRunCond) {                                 // same cond: extend the skip
+			condUndoSlot = run;
+#ifdef JIT_CODE_STATS
+			g_jitCondRunSame[cpu.isaLevel >= 5 ? 0 : 1]++;
+#endif
+			return condLastSlot = run;
+		}
+		if (cond == (condRunCond ^ 1)) {                           // inverse: previous body jumps over
+			u32* slot = p;
+			*p++ = PPC_B(0);
+			aimSkip(run, p);
+			condUndoSlot = run;
+#ifdef JIT_CODE_STATS
+			g_jitCondRunInv[cpu.isaLevel >= 5 ? 0 : 1]++;
+#endif
+			return condLastSlot = slot;
+		}
+	}
+#ifdef JIT_CODE_STATS
+	g_jitCondTests[cpu.isaLevel >= 5 ? 0 : 1]++;
+#endif
+	ensureFlagsLoaded();
 	const u32 F = PPC_REG_FLAGS;
 	u32 skip;                                                      // taken when cond fails
 	switch (cond) {
@@ -1785,7 +1816,7 @@ u32* JitTraceCtx::emitCondSkip(u8 cond)
 	}
 	u32* slot = p;
 	*p++ = skip;
-	return slot;
+	return condLastSlot = slot;
 }
 
 // =========================================================================
@@ -1929,6 +1960,27 @@ static void jitFlagLiveness(const JitCpuProfile& cpu, u32 startPC, bool thumb, u
 		live = (u8)((live & ~wr[i]) | rd[i]);
 		if (liveIn) liveIn[i] = live;
 	}
+}
+
+// Condition runs (emitCondSkip()): can the following instruction reuse this
+// one's condition skip? Only for an instruction whose every path either falls
+// through to its end with the guest flags untouched or leaves the block:
+// data processing without S (not MRS/MSR, no pc destination) and single
+// LDR/STR/LDRB/STRB (no pc destination). Everything else -- S-forms, compares,
+// multiplies, block transfers, branches, coprocessor -- ends the run.
+static bool jitArmCondRunSafe(u32 op)
+{
+	if ((op >> 28) >= 0xE) return false;                          // only predicated ones open a run
+	if (((op >> 12) & 0xF) == 15) return false;                   // pc destination
+	if ((op & 0x0C000000u) == 0) {                                // data processing
+		const bool immForm = (op >> 25) & 1;
+		if (!immForm && ((op >> 4) & 1) && ((op >> 7) & 1)) return false;   // mul / misc space
+		if ((op >> 20) & 1) return false;                          // S (incl. CMP/CMN/TST/TEQ)
+		const u8 aluOp = (op >> 21) & 0xF;
+		return !(aluOp >= 8 && aluOp <= 11);                       // MRS / MSR / BX / CLZ ...
+	}
+	if ((op & 0x0E000010u) == 0x06000010u) return false;          // media / undefined space
+	return (op & 0x0C000000u) == 0x04000000u;                     // LDR / STR
 }
 
 // =========================================================================
@@ -2255,6 +2307,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		u32 statColdCatMark[JCS_N]; memcpy(statColdCatMark, ctx.statColdCat, sizeof statColdCatMark);
 #endif
 
+		ctx.condUndoSlot = nullptr;
 		u32 opcode;
 		if (thumb) {
 			opcode = (u16)cpu.fetch16(ctx.currentPC);
@@ -2267,6 +2320,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 		} else {
 			opcode = cpu.fetch32(ctx.currentPC);
 			jitArmEmitOne(ctx, opcode);
+			ctx.condRunOk = jitArmCondRunSafe(opcode);
 			if (!ctx.endBlock) {
 				ctx.instrCount++;
 				ctx.currentPC   += 4;
@@ -2293,6 +2347,9 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 				memcpy(ctx.statColdCat, statColdCatMark, sizeof statColdCatMark);
 			}
 #endif
+			if (ctx.condUndoSlot) JitTraceCtx::aimSkip(ctx.condUndoSlot, ctx.emitPtr);
+			ctx.condRunSlot = nullptr;
+			ctx.condRunOk = false;
 			ctx.bailoutCount = bailMark;
 			ctx.coldCount = coldMark;
 			ctx.endBlock = false;
@@ -2608,6 +2665,8 @@ void jitCodeStatsTick(u32 frame)
 			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR && k != JCS_PAD) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)(S.fHotCat[k] * 4 / fr));
 			fprintf(f, "\nframe=%u core=%d execcat: per-frame hot bytes x entries |", frame, c ? 7 : 9);
 			for (int k = 0; k < JCS_N; k++) if (k != JCS_STATCTR && k != JCS_PAD) fprintf(f, " %s=%llu", k_jcsName[k], (unsigned long long)(S.fExecCat[k] * 4 / fr));
+			fprintf(f, "\nframe=%u core=%d condrun: tests=%llu same=%llu inverse=%llu", frame, c ? 7 : 9,
+			        (unsigned long long)g_jitCondTests[c], (unsigned long long)g_jitCondRunSame[c], (unsigned long long)g_jitCondRunInv[c]);
 			fprintf(f, "\n");
 		}
 		S.fBlocks = S.fWords = S.fCold = S.fEntries = S.fInsnsRun = S.frames = 0;
