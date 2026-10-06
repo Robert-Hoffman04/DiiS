@@ -696,6 +696,10 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 			u8 regs[8]; u32 nn = 0;
 			for (int i = 0; i < 8; i++) if (list & (1 << i)) regs[nn++] = (u8)i;
 			ctx.emitInlineBlockLoad(regs, nn, PPC_R12, lockedMask);
+			// LDMIA Rb! with Rb in the list: the loaded value wins, no
+			// writeback (thumb_instructions.cpp OP_LDMIA; Phantom Hourglass
+			// boot hinges on `ldmia r2!, {r1, r2}`).
+			if (list & (1 << rb)) break;
 			const u8 hRb2 = ctx.writeReg(rb, /*fullOverwrite=*/true, lockedMask);
 			*emitPtr++ = PPC_OR(hRb2, PPC_R12, PPC_R12);   // R12 still = raw base
 			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(nn * 4));
@@ -729,8 +733,9 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 
 		if (!thk) ctx.emitMemEpilogue();
-		// writeback: Rb = base + 4 * count  (raw base still stashed at 96(r1))
-		{
+		// writeback: Rb = base + 4 * count  (raw base still stashed at 96(r1));
+		// skipped for a load whose list holds Rb (the loaded value wins).
+		if (!(isLoad && (list & (1 << rb)))) {
 			const u8 hRb2 = ctx.hostRegFor(rb);
 			*emitPtr++ = PPC_LWZ(hRb2, 1, 96);
 			*emitPtr++ = PPC_ADDI(hRb2, hRb2, (s32)(slot * 4));
