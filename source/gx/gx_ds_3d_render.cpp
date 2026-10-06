@@ -182,19 +182,71 @@ static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, f
 // remap (texture-mapped VRAM isn't CPU-writable), which also resolves a deferred raster
 // first (gfx3d_vramRemapBarrier), so GX and the CPU raster see the same texels.
 // ---------------------------------------------------------------------------------
-struct GxDs3dTex {
+// Task g3-dcache: the per-polygon loops of the gate, prepare and record walk the 1.7 MB
+// POLYLIST and the VERTLIST (MEM2, never resident across frames) and were load-miss bound on
+// hardware. POLY is 44 bytes and VERT 52, so each straddles up to two 32-byte lines; these
+// touch both lines with dcbt a few records ahead (Broadway keeps several misses in flight),
+// a POLY kPfPoly polygons ahead and the vertices of the one kPfVert ahead (its POLY was
+// prefetched kPfPoly - kPfVert iterations earlier). dcbt never faults and changes no data.
+static const int kPfPoly = 6, kPfVert = 3;
+// (devkitPPC's GCC emits no dcbt for the builtin prefetch on the 750, hence inline asm.)
+static inline void gxDs3dDcbt(const void *a) { __asm__ volatile("dcbt 0,%0" : : "r"(a)); }
+static inline void gxDs3dPfLine2(const void *a, int len)
+{
+	gxDs3dDcbt(a);
+	gxDs3dDcbt((const char *)a + len - 1);
+}
+static inline void gxDs3dPfPoly(const POLY *p) { gxDs3dPfLine2(p, sizeof(POLY)); }
+static inline void gxDs3dPfVerts(const POLY *p)
+{
+	const VERT *vl = gfx3d.vertlist->list;
+	const int t = p->type == 4 ? 4 : 3;
+	for (int j = 0; j < t; ++j) {
+		const u32 vi = p->vertIndexes[j];
+		if (vi < VERTLIST_SIZE) gxDs3dPfLine2(&vl[vi], sizeof(VERT));
+	}
+}
+// Prefetch for iteration i of a loop over polylist->list[0..count).
+static inline void gxDs3dPfSeq(int i, int count)
+{
+	const POLY *pl = gfx3d.polylist->list;
+	if (i + kPfPoly < count) gxDs3dPfPoly(&pl[i + kPfPoly]);
+	if (i + kPfVert < count) gxDs3dPfVerts(&pl[i + kPfVert]);
+}
+// The same for a loop over polylist->list[gfx3d.indexlist[0..count)].
+static inline void gxDs3dPfIdx(int n, int count)
+{
+	const POLY *pl = gfx3d.polylist->list;
+	if (n + 2 * kPfPoly < count) gxDs3dDcbt(&gfx3d.indexlist[n + 2 * kPfPoly]);
+	if (n + kPfPoly < count) gxDs3dPfPoly(&pl[gfx3d.indexlist[n + kPfPoly]]);
+	if (n + kPfVert < count) gxDs3dPfVerts(&pl[gfx3d.indexlist[n + kPfVert]]);
+}
+// Polygon-only (no vertex) variants, for loops that read only POLY fields.
+static inline void gxDs3dPfSeqPoly(int i, int count)
+{
+	if (i + kPfPoly < count) gxDs3dPfPoly(&gfx3d.polylist->list[i + kPfPoly]);
+}
+
+// Task g3-dcache: the fields gxDs3dTexFind / the texture-ready gate scan per textured
+// polygon live in s_texK (16 bytes, two slots per 32-byte line) instead of at the head of
+// each 64-byte GxDs3dTex, so a full scan touches a quarter of the lines.
+struct GxDs3dTexKey {
 	u32 key, pal;          // texParam with the wrap/flip/texgen bits masked, PLTT_BASE
 	u32 amode;             // translucent formats: baked alpha mode (gxDs3dTexAMode), else 0
+	u32 seq;               // g_gfx3dRenderSeq of the last prepare that used it
+};
+struct GxDs3dTex {
+	u32 amode;             // copy of s_texK[].amode (fixed for the slot's life), for the converters
 	TexCacheItem *src;     // texcache item this was converted from; NULL = stale
 	void *data;
 	u32 bytes;
 	u16 w, h;
-	u32 seq;               // g_gfx3dRenderSeq of the last prepare that used it
 	GXTexObj obj;          // wrap modes set per polygon, see gxDs3dBindTex
 };
 static const int kTexSlots = 256;
 static const u32 kTexBudget = 1536 * 1024;   // heap is tight (Task ssload-hang)
 static GxDs3dTex s_tex[kTexSlots];
+static GxDs3dTexKey s_texK[kTexSlots] __attribute__((aligned(32)));
 static int s_texCount = 0;
 static u32 s_texBytes = 0;
 static u32 s_texPrepSeq = 0xFFFFFFFF;
@@ -257,11 +309,11 @@ static void gxDs3dTexItemDeleted(TexCacheItem *item)
 
 static int gxDs3dTexFind(u32 key, u32 pal, u32 amode)
 {
-	if (s_texLastHit < s_texCount && s_tex[s_texLastHit].key == key && s_tex[s_texLastHit].pal == pal &&
-	    s_tex[s_texLastHit].amode == amode)
+	if (s_texLastHit < s_texCount && s_texK[s_texLastHit].key == key && s_texK[s_texLastHit].pal == pal &&
+	    s_texK[s_texLastHit].amode == amode)
 		return s_texLastHit;
 	for (int i = 0; i < s_texCount; ++i)
-		if (s_tex[i].key == key && s_tex[i].pal == pal && s_tex[i].amode == amode) return s_texLastHit = i;
+		if (s_texK[i].key == key && s_texK[i].pal == pal && s_texK[i].amode == amode) return s_texLastHit = i;
 	return -1;
 }
 
@@ -269,14 +321,16 @@ static void gxDs3dTexFree(int i)
 {
 	free(s_tex[i].data);
 	s_texBytes -= s_tex[i].bytes;
-	s_tex[i] = s_tex[--s_texCount];
+	--s_texCount;
+	s_tex[i] = s_tex[s_texCount];
+	s_texK[i] = s_texK[s_texCount];
 }
 
 // Frees every texture the current frame doesn't use until `need` more bytes fit.
 static bool gxDs3dTexMakeRoom(u32 need, u32 seq)
 {
 	for (int i = s_texCount - 1; i >= 0 && s_texBytes + need > kTexBudget; --i)
-		if (s_tex[i].seq != seq) gxDs3dTexFree(i);
+		if (s_texK[i].seq != seq) gxDs3dTexFree(i);
 	return s_texBytes + need <= kTexBudget && s_texCount < kTexSlots;
 }
 
@@ -329,16 +383,17 @@ bool gxDs3dPrepareTextures()
 	s_texPrepSeq = 0xFFFFFFFF;
 	const int polycount = gfx3d.polylist->count;
 	for (int i = 0; i < polycount; ++i) {
+		gxDs3dPfSeqPoly(i, polycount);
 		const POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dTexFormat(p) == 0) continue;
 		const u32 key = gxDs3dTexKey(p.texParam);
 		const u32 amode = gxDs3dTexAMode(p);
 		int k = gxDs3dTexFind(key, p.texPalette, amode);
-		if (k >= 0 && s_tex[k].seq == seq && s_tex[k].src) continue;   // done this frame
+		if (k >= 0 && s_texK[k].seq == seq && s_tex[k].src) continue;   // done this frame
 		TexCacheItem *item = TexCache_SetTexture(TexFormat_15bpp, p.texParam, p.texPalette);
 		if (!item || !item->decoded) return false;
 		item->deleteCallback = gxDs3dTexItemDeleted;
-		if (k >= 0 && s_tex[k].src == item) { s_tex[k].seq = seq; continue; }
+		if (k >= 0 && s_tex[k].src == item) { s_texK[k].seq = seq; continue; }
 		const u16 w = (u16)item->sizeX, h = (u16)item->sizeY;
 		const u32 bytes = (u32)w * h * (amode ? 4 : 2);
 		if (k >= 0 && s_tex[k].bytes != bytes) { gxDs3dTexFree(k); k = -1; }
@@ -347,12 +402,12 @@ bool gxDs3dPrepareTextures()
 			void *data = memalign(32, bytes);
 			if (!data) return false;
 			k = s_texCount++;
-			s_tex[k].key = key; s_tex[k].pal = p.texPalette; s_tex[k].amode = amode;
+			s_texK[k].key = key; s_texK[k].pal = p.texPalette; s_texK[k].amode = amode; s_tex[k].amode = amode;
 			s_tex[k].data = data; s_tex[k].bytes = bytes;
 			s_texBytes += bytes;
 		}
 		GxDs3dTex &t = s_tex[k];
-		t.w = w; t.h = h; t.src = item; t.seq = seq;
+		t.w = w; t.h = h; t.src = item; s_texK[k].seq = seq;
 		if (amode) gxDs3dTexConvertTrans(t, item);
 		else       gxDs3dTexConvert(t, item);
 		GX_InitTexObj(&t.obj, t.data, w, h, amode ? GX_TF_RGBA8 : GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
@@ -891,6 +946,7 @@ static int gxDs3dTransIdPlan()
 		POLY *pp = NULL;
 		GxDs3dTransShape *sh = NULL;
 		if (n < polycount) {
+			gxDs3dPfIdx(n, polycount);
 			const int i = gfx3d.indexlist[n];
 			POLY &p = gfx3d.polylist->list[i];
 			s_tagRun[i] = 0;
@@ -1294,6 +1350,7 @@ static int gxDs3dFrameGate(bool requireTex)
 	s_shIdAt = -1;
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
 	for (int i = 0; i < polycount; ++i) {
+		gxDs3dPfSeq(i, polycount);
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
 		// Shadow volumes (see the shadow section): GxFast, translucent-list polygons, RGB8 EFB.
 		if (gxDs3dPolyMode(p) == 3) {
@@ -1321,7 +1378,7 @@ static int gxDs3dFrameGate(bool requireTex)
 			// A3I5/A5I3 (translucent, GxFast only) are baked to RGBA8 per polygon alpha.
 			if (requireTex) {
 				const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, gxDs3dTexAMode(p));
-				if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_tex[k].seq != s_texPrepSeq)
+				if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_texK[k].seq != s_texPrepSeq)
 					return kGateTexNotReady;
 			}
 			if (!fast && !toon && !gxDs3dTexColorExact(p)) return kGateTexColor;
@@ -1431,10 +1488,11 @@ static int gxDs3dFrameTexReady()
 {
 	const int polycount = gfx3d.polylist->count;
 	for (int i = 0; i < polycount; ++i) {
+		gxDs3dPfSeqPoly(i, polycount);
 		const POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dTexFormat(p) == 0) continue;
 		const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, gxDs3dTexAMode(p));
-		if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_tex[k].seq != s_texPrepSeq)
+		if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_texK[k].seq != s_texPrepSeq)
 			return kGateTexNotReady;
 	}
 	return kGateOk;
@@ -1472,7 +1530,7 @@ bool gxDs3dGeomFramePrepare()
 	// Task gpu-overlap: this runs outside vidmutex at VBlank end and rewrites / frees buffers
 	// the last GX 3D pass read (tag buffers, s_tex), which no GX_DrawDone drains any more.
 	gxFenceWait(g_gxFence3d);
-	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead (and frees its tag buffers)
+	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead
 	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
 	GXDS3D_TP_BEGIN(tp0);
@@ -2265,17 +2323,11 @@ static bool gxDs3dShadowBuffers()
 	return true;
 }
 
-static void gxDs3dTagBuffersFree()
-{
-	if (!s_tagSaveBuf) return;
-	GX_DrawDone();   // the FIFO may still read them
-	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf); free(s_tagCarryBuf);
-	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = s_tagCarryBuf = nullptr;
-	free(s_shCntBuf); free(s_shIdBuf);
-	s_shCntBuf = s_shIdBuf = nullptr;
-	gxDs3dShadowKeepFree();
-	GX_InvalidateTexAll();
-}
+// Task g3-dcache: the tag / shadow buffers are allocated once (first frame that needs them)
+// and kept. They were freed and re-allocated every 3D frame, each time with a GX_DrawDone
+// and a DCInvalidateRange over ~192-288 KB (6-9 K dcbi) on the record path. Only the GPU
+// reads or writes them (EFB copy targets, texture sources), in FIFO order, so a new
+// recording's copies into them can't overtake the previous list's reads.
 
 // TEV stage 1 (and 2) after gxDs3dBindPoly's stage 0, per tagMode (see the section comment).
 // Mode 3 (shadow draws, untextured; `two` = test the opaque ID too, see the shadow section).
@@ -2800,6 +2852,7 @@ static void gxDs3dRenderFastDraw()
 	int sg = 0;
 	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n < polycount; ++n) {
+		gxDs3dPfIdx(n, polycount);
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
 		// rasterize.cpp draws them (see the translucent section).
 		const int i = gfx3d.indexlist[n];
@@ -2844,6 +2897,7 @@ static void gxDs3dRenderFastDraw()
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
 			for (int n = 0; n < polycount; ++n) {
+				gxDs3dPfIdx(n, polycount);
 				POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 				if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;
 				gxDs3dFastPoly(c, p, 0);
@@ -2884,13 +2938,7 @@ static struct {
 // ours, and the compositor's GX_InvalidateTexAll after every copy).
 static void gxDs3dReplayDrop()
 {
-	s_dlSize = 0;
-	if (!s_tagSaveBuf) return;
-	free(s_tagSaveBuf); free(s_tagLoBuf); free(s_tagHiBuf); free(s_tagCarryBuf);
-	s_tagSaveBuf = s_tagLoBuf = s_tagHiBuf = s_tagCarryBuf = nullptr;
-	free(s_shCntBuf); free(s_shIdBuf);
-	s_shCntBuf = s_shIdBuf = nullptr;
-	gxDs3dShadowKeepFree();
+	s_dlSize = 0;   // the tag buffers stay (see gxDs3dTagBuffers' Task g3-dcache note)
 }
 
 #ifdef DSA_GXGEOM_REPLAYSTATS
@@ -2923,7 +2971,6 @@ void gxDs3dRenderFast()
 		return;
 	}
 	s_dlSize = 0;
-	gxDs3dTagBuffersFree();   // a previous recording's (normally already dropped by Prepare)
 #ifndef DSA_GXGEOM_NOREPLAY
 	if (s_dlCap < s_dlWant) {
 		free(s_dl);
@@ -2969,7 +3016,6 @@ void gxDs3dRenderFast()
 	}
 #endif
 	gxDs3dRenderFastDraw();
-	gxDs3dTagBuffersFree();
 }
 
 // ---------------------------------------------------------------------------------
