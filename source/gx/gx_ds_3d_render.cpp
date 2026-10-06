@@ -182,50 +182,6 @@ static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, f
 // remap (texture-mapped VRAM isn't CPU-writable), which also resolves a deferred raster
 // first (gfx3d_vramRemapBarrier), so GX and the CPU raster see the same texels.
 // ---------------------------------------------------------------------------------
-// Task g3-dcache: the per-polygon loops of the gate, prepare and record walk the 1.7 MB
-// POLYLIST and the VERTLIST (MEM2, never resident across frames) and were load-miss bound on
-// hardware. POLY is 44 bytes and VERT 52, so each straddles up to two 32-byte lines; these
-// touch both lines with dcbt a few records ahead (Broadway keeps several misses in flight),
-// a POLY kPfPoly polygons ahead and the vertices of the one kPfVert ahead (its POLY was
-// prefetched kPfPoly - kPfVert iterations earlier). dcbt never faults and changes no data.
-static const int kPfPoly = 6, kPfVert = 3;
-// (devkitPPC's GCC emits no dcbt for the builtin prefetch on the 750, hence inline asm.)
-static inline void gxDs3dDcbt(const void *a) { __asm__ volatile("dcbt 0,%0" : : "r"(a)); }
-static inline void gxDs3dPfLine2(const void *a, int len)
-{
-	gxDs3dDcbt(a);
-	gxDs3dDcbt((const char *)a + len - 1);
-}
-static inline void gxDs3dPfPoly(const POLY *p) { gxDs3dPfLine2(p, sizeof(POLY)); }
-static inline void gxDs3dPfVerts(const POLY *p)
-{
-	const VERT *vl = gfx3d.vertlist->list;
-	const int t = p->type == 4 ? 4 : 3;
-	for (int j = 0; j < t; ++j) {
-		const u32 vi = p->vertIndexes[j];
-		if (vi < VERTLIST_SIZE) gxDs3dPfLine2(&vl[vi], sizeof(VERT));
-	}
-}
-// Prefetch for iteration i of a loop over polylist->list[0..count).
-static inline void gxDs3dPfSeq(int i, int count)
-{
-	const POLY *pl = gfx3d.polylist->list;
-	if (i + kPfPoly < count) gxDs3dPfPoly(&pl[i + kPfPoly]);
-	if (i + kPfVert < count) gxDs3dPfVerts(&pl[i + kPfVert]);
-}
-// The same for a loop over polylist->list[gfx3d.indexlist[0..count)].
-static inline void gxDs3dPfIdx(int n, int count)
-{
-	const POLY *pl = gfx3d.polylist->list;
-	if (n + 2 * kPfPoly < count) gxDs3dDcbt(&gfx3d.indexlist[n + 2 * kPfPoly]);
-	if (n + kPfPoly < count) gxDs3dPfPoly(&pl[gfx3d.indexlist[n + kPfPoly]]);
-	if (n + kPfVert < count) gxDs3dPfVerts(&pl[gfx3d.indexlist[n + kPfVert]]);
-}
-// Polygon-only (no vertex) variants, for loops that read only POLY fields.
-static inline void gxDs3dPfSeqPoly(int i, int count)
-{
-	if (i + kPfPoly < count) gxDs3dPfPoly(&gfx3d.polylist->list[i + kPfPoly]);
-}
 
 // Task g3-dcache: the fields gxDs3dTexFind / the texture-ready gate scan per textured
 // polygon live in s_texK (16 bytes, two slots per 32-byte line) instead of at the head of
@@ -383,7 +339,6 @@ bool gxDs3dPrepareTextures()
 	s_texPrepSeq = 0xFFFFFFFF;
 	const int polycount = gfx3d.polylist->count;
 	for (int i = 0; i < polycount; ++i) {
-		gxDs3dPfSeqPoly(i, polycount);
 		const POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dTexFormat(p) == 0) continue;
 		const u32 key = gxDs3dTexKey(p.texParam);
@@ -946,7 +901,6 @@ static int gxDs3dTransIdPlan()
 		POLY *pp = NULL;
 		GxDs3dTransShape *sh = NULL;
 		if (n < polycount) {
-			gxDs3dPfIdx(n, polycount);
 			const int i = gfx3d.indexlist[n];
 			POLY &p = gfx3d.polylist->list[i];
 			s_tagRun[i] = 0;
@@ -1350,7 +1304,6 @@ static int gxDs3dFrameGate(bool requireTex)
 	s_shIdAt = -1;
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
 	for (int i = 0; i < polycount; ++i) {
-		gxDs3dPfSeq(i, polycount);
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
 		// Shadow volumes (see the shadow section): GxFast, translucent-list polygons, RGB8 EFB.
 		if (gxDs3dPolyMode(p) == 3) {
@@ -1488,7 +1441,6 @@ static int gxDs3dFrameTexReady()
 {
 	const int polycount = gfx3d.polylist->count;
 	for (int i = 0; i < polycount; ++i) {
-		gxDs3dPfSeqPoly(i, polycount);
 		const POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dTexFormat(p) == 0) continue;
 		const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, gxDs3dTexAMode(p));
@@ -2852,7 +2804,6 @@ static void gxDs3dRenderFastDraw()
 	int sg = 0;
 	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n < polycount; ++n) {
-		gxDs3dPfIdx(n, polycount);
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
 		// rasterize.cpp draws them (see the translucent section).
 		const int i = gfx3d.indexlist[n];
@@ -2897,7 +2848,6 @@ static void gxDs3dRenderFastDraw()
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
 			for (int n = 0; n < polycount; ++n) {
-				gxDs3dPfIdx(n, polycount);
 				POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 				if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;
 				gxDs3dFastPoly(c, p, 0);
