@@ -569,6 +569,9 @@ struct tmpVertInfo {
 static const POLYMTX *s_polyMtx = NULL;
 static bool s_polyMtxDirty = true;
 static const POLYMTX s_polyMtxZero = {};
+// Task player-tris: bumped by every matrix command that can change mtxCurrent[0]/[1]
+// (not texture-mode ones); SetVertex stamps it into VERT::mtxEpoch.
+static u8 s_mtxEpoch = 0;
 
 // Task gpu-ge: allocate the output lines of the lists being built with dcbz instead of a
 // read from memory. The two POLYLIST/VERTLISTs alternate per frame and together far exceed
@@ -843,6 +846,7 @@ static void SetVertex(){
 	vert.color[0] = GFX3D_5TO6(colorRGB[0]);
 	vert.color[1] = GFX3D_5TO6(colorRGB[1]);
 	vert.color[2] = GFX3D_5TO6(colorRGB[2]);
+	vert.mtxEpoch = s_mtxEpoch;
 
 	tempVertInfo.map[tempVertInfo.count] = vertlist->count + tempVertInfo.count - continuation;
 	tempVertInfo.count++;
@@ -1903,7 +1907,7 @@ static void gfx3d_execute(u8 cmd, u32 param){
 	// Task gespeed: MTX_POP .. MTX_TRANS may change mtxCurrent[0]/[1] (see s_polyMtx).
 	// Task gelight: and, in matrix modes 1 and 2, the directional matrix (see s_normEpoch).
 	// (Task gedma: done in those commands' own cases below rather than as a range test on every command.)
-#define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode - 1 <= 1u) gfx3d_normEpochBump(); } while (0)
+#define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode != 3) ++s_mtxEpoch; if (mode - 1 <= 1u) gfx3d_normEpochBump(); } while (0)
 
 	switch (cmd)
 	{

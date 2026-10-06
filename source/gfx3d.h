@@ -236,6 +236,13 @@ struct VERT {
 		w = coords[3];
 	}
 	u8 color[3];
+	// Task player-tris: gfx3d.cpp's s_mtxEpoch when this vertex was transformed (the pad
+	// byte after color). A polygon whose vertices differ was built across a position or
+	// projection matrix command (skinned models: SM64DS's characters load a bone matrix
+	// mid-strip), so no single mvMatrix/projMatrix snapshot transforms all its objcoords;
+	// GxFast re-derives those vertices' object positions from coord[] (gxDs3dMixedObj).
+	// Not saved (like objcoord).
+	u8 mtxEpoch;
 	float fcolor[3];
 	// Task 13e (gx-next-steps-log.md#task-13e / gx-13e-design.md): the DS-space OBJECT-space
 	// position (post float16table decode, pre mtxCurrent[0] clip transform) -- SetVertex()

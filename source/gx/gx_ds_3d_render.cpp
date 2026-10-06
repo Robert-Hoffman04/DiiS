@@ -2144,6 +2144,73 @@ void gxDs3dRenderAccurate()
 // as the stamp mask (s_tagCarryBuf, 48 KB more, TEXMAP6); its draw's last TEV stage zeroes
 // the alpha where the mask is set.
 // ---------------------------------------------------------------------------------
+// Task player-tris: a polygon built across a position/projection matrix command (VERT::
+// mtxEpoch differs between its vertices: SM64DS's skinned characters load a bone matrix
+// between the vertices of a strip) has only its LAST matrix pair in mvMatrix/projMatrix,
+// so redrawing every objcoord through that snapshot puts the earlier vertices in the wrong
+// place (limbs drawn as scattered slivers). Their object positions are re-derived for the
+// snapshot from the clip coordinates the CPU computed: obj = (P*MV)^-1 * coord, divided by
+// its w. The snapshot's own vertices (the newest epoch) keep their objcoord exactly, so
+// depth against neighbouring polygons on the same matrix is
+// bit-identical to the unmixed path. Returns false (use objcoord) for an unmixed polygon.
+static const float *s_mixInvKey = NULL;
+static double s_mixInv[16];
+static bool s_mixInvOk = false;
+static bool gxDs3dMixedObj(const POLY &p, float out[4][3])
+{
+	const int n = p.type;
+	const VERT *v[4];
+	u8 eNew = 0;
+	bool mixed = false;
+	for (int j = 0; j < n; ++j) {
+		v[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+		if (j == 0) eNew = v[0]->mtxEpoch;
+		else if (v[j]->mtxEpoch != eNew) {
+			mixed = true;
+			if ((s8)(u8)(v[j]->mtxEpoch - eNew) > 0) eNew = v[j]->mtxEpoch;
+		}
+	}
+	if (!mixed) return false;
+	if (s_mixInvKey != p.mvMatrix) {
+		// Q = P * MV (column-major, vec' = Q * vec as MatrixMultVec4x4), then its inverse.
+		double a[4][8];
+		for (int r = 0; r < 4; ++r)
+			for (int c = 0; c < 4; ++c) {
+				double q = 0;
+				for (int k = 0; k < 4; ++k) q += (double)p.projMatrix[k * 4 + r] * (double)p.mvMatrix[c * 4 + k];
+				a[r][c] = q;
+				a[r][4 + c] = r == c;
+			}
+		s_mixInvOk = true;
+		for (int c = 0; c < 4 && s_mixInvOk; ++c) {
+			int piv = c;
+			for (int r = c + 1; r < 4; ++r) if (fabs(a[r][c]) > fabs(a[piv][c])) piv = r;
+			if (fabs(a[piv][c]) < 1e-12) { s_mixInvOk = false; break; }
+			if (piv != c) for (int k = 0; k < 8; ++k) { const double t = a[c][k]; a[c][k] = a[piv][k]; a[piv][k] = t; }
+			const double d = 1.0 / a[c][c];
+			for (int k = 0; k < 8; ++k) a[c][k] *= d;
+			for (int r = 0; r < 4; ++r) {
+				if (r == c) continue;
+				const double f = a[r][c];
+				if (f != 0) for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
+			}
+		}
+		for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) s_mixInv[c * 4 + r] = a[r][4 + c];
+		s_mixInvKey = p.mvMatrix;
+	}
+	if (!s_mixInvOk) return false;
+	for (int j = 0; j < n; ++j) {
+		if (v[j]->mtxEpoch == eNew) { out[j][0] = v[j]->objcoord[0]; out[j][1] = v[j]->objcoord[1]; out[j][2] = v[j]->objcoord[2]; continue; }
+		const float *cc = v[j]->coord;
+		double h[4];
+		for (int r = 0; r < 4; ++r)
+			h[r] = s_mixInv[r] * cc[0] + s_mixInv[4 + r] * cc[1] + s_mixInv[8 + r] * cc[2] + s_mixInv[12 + r] * cc[3];
+		const double iw = h[3] != 0 ? 1.0 / h[3] : 0.0;
+		out[j][0] = (float)(h[0] * iw); out[j][1] = (float)(h[1] * iw); out[j][2] = (float)(h[2] * iw);
+	}
+	return true;
+}
+
 struct GxDs3dFastCtx {
 	float lastMv[16], lastProj[16];
 	u32 lastVp;
@@ -2513,6 +2580,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	}
 	GXDS3D_TP_END(kTpSetup, tpsu);
 	GXDS3D_TP_BEGIN(tpe);
+	float mixedBuf[4][3];
+	const float (*mixedObj)[3] = (!clipped && gxDs3dMixedObj(p, mixedBuf)) ? mixedBuf : NULL;
 	for (int pass = twoPass ? 0 : 1; pass < (c.shIdPass && twoPass ? 1 : 2); ++pass) {   // ID pass: pass 0 only when there is one
 		// A tagged run's a == 31 fragments neither stamp (no tag written) nor test the ID
 		// (pass 0 without the tag stages; see gxDs3dTransIdPlan).
@@ -2550,7 +2619,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		GX_Begin(p.type == 4 ? GX_QUADS : GX_TRIANGLES, GX_VTXFMT0, p.type);
 		for (int j = 0; j < p.type; ++j) {
 			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
-			GX_Position3f32(v.objcoord[0], v.objcoord[1], v.objcoord[2]);
+			if (mixedObj) GX_Position3f32(mixedObj[j][0], mixedObj[j][1], mixedObj[j][2]);
+			else GX_Position3f32(v.objcoord[0], v.objcoord[1], v.objcoord[2]);
 			gxDs3dSendColor(v, va);
 			if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
 		}
@@ -2776,6 +2846,7 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 
 static void gxDs3dRenderFastDraw()
 {
+	s_mixInvKey = NULL;   // POLYMTX pointers are reused by later lists
 	gxDs3dWSetup();
 	gxDs3dSetupCommonState();
 	gxDs3dLoadScreenOrtho();
