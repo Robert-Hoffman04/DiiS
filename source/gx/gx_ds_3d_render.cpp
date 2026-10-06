@@ -666,6 +666,8 @@ static const char *const kGateNames[kGateCount] = {
 
 // Set by the last gxDs3dFrameGate: the frame has translucent polygons that will be drawn.
 static bool s_gateHasTrans = false;
+// Task gxfast-fog: the frame is fogged (GxFast pass) / has opaque polygons with fog off.
+static bool s_gateFog = false, s_gateFogRedraw = false;
 
 // A polygon's screen outline for the polygon-ID check and GxFast culling: rasterize.cpp's
 // divide + viewport + clamp (gxDs3dScreenXY) of the vertices it draws (gxDs3dPolyVerts) and
@@ -1266,18 +1268,28 @@ static int gxDs3dFrameGate(bool requireTex)
 	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
 	if (gfx3d.enableEdgeMarking) return kGateEdge;     // no polygon-ID infra yet (13f handoff item)
 	if (gfx3d.enableFog) {
-		// Task 13f-fog (see gx-next-steps-log.md's Task 13f-fog section): a GxFast-only
-		// fog post-process (gxDs3dApplyFogFast()) was built -- EFB-Z masking and the LUT
-		// and blend hardware are verified -- but the single-8-bit-indirect-texture
-		// Z-lookup that should make the blend weight vary per pixel does NOT vary
-		// (a3_c29: 19511/19516 fogged pixels off by up to 83/255). Not the small/bounded
-		// kind of gap GxFast is meant to accept, so fog keeps bailing to the CPU
-		// rasterizer; gxDs3dApplyFogFast() and its call site stay compiled in, unreached.
-		return kGateFog;
+		// Task gxfast-fog: GxFast draws fog as a post-pass (gxDs3dApplyFogFast: the GX depth
+		// buffer's top byte looked up in a 256-entry copy of the CPU's fogTable through an
+		// indirect stage, blended toward the fog colour on every pixel the geometry wrote).
+		// Not modelled, so these still go to the CPU rasterizer: GxAccurate (8-bit depth
+		// buckets are not the CPU's 15-bit fogIndex), alpha-only fog, a fog alpha other than
+		// 31 (alpha is left as drawn), and a fogged rear plane (the pass masks it out).
+		// Per-polygon fog-enable bits are not modelled: every drawn pixel is fogged.
+#ifdef DSA_GXGEOM_FOGANYALPHA
+		// measurement only (a3_c29 uses fog alpha 24): skip the fog-alpha check
+		if (!fast || gfx3d.enableFogAlphaOnly ||
+#else
+		if (!fast || gfx3d.enableFogAlphaOnly || ((gfx3d.fogColor >> 16) & 0x1F) != 31 ||
+#endif
+		    (gfx3d_rasterClearColor() & 0x8000)) {
+			return kGateFog;
+		}
 	}
 
 	bool anyTrans = false, anyShadow = false;
 	s_gateHasTrans = false;
+	s_gateFog = gfx3d.enableFog && CommonSettings.GFX3D_Fog;
+	s_gateFogRedraw = false;
 	s_shGroupCount = 0;
 	s_shIdAt = -1;
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
@@ -1288,6 +1300,7 @@ static int gxDs3dFrameGate(bool requireTex)
 			if (!fast || !p.isTranslucent() || (rmode && rmode->aa)) return kGateShadow;
 			anyShadow = true;
 		}
+		if (s_gateFog && !(p.polyAttr & 0x8000) && !p.isTranslucent() && gxDs3dPolyMode(p) != 3) s_gateFogRedraw = true;
 		if (p.isTranslucent()) {
 			// GxFast only (see the translucent section): GX's 8-bit blend is +-1 LSB.
 			if (!fast) return kGateTranslucent;
@@ -1769,7 +1782,8 @@ static inline float gxDs3dWDepthInv(float invw) { return 1.0f - s_wK * invw; }
 // Seeds the EFB's Z with the DS CLEAR_DEPTH value (the CPU rasterizer's
 // clearFragment.depth), independent of whatever GX_SetCopyClear or the 2D pass left
 // there. Needs gxDs3dLoadScreenOrtho() bound; colour untouched.
-static void gxDs3dClearDepth()
+// The screen-ortho position z that lands on the CLEAR_DEPTH value in GX's depth buffer.
+static float gxDs3dClearZ()
 {
 	float z = -(float)(gfx3d_rasterClearDepth() & 0xFFFFFF) / 16777215.0f;
 	if (gfx3d.wbuffer) {
@@ -1781,6 +1795,12 @@ static void gxDs3dClearDepth()
 #endif
 		z = -(d < 0.0f ? 0.0f : d);
 	}
+	return z;
+}
+
+static void gxDs3dClearDepth()
+{
+	const float z = gxDs3dClearZ();
 	GX_SetColorUpdate(GX_FALSE);
 	GX_SetAlphaUpdate(GX_FALSE);
 	GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
@@ -2811,6 +2831,27 @@ static void gxDs3dRenderFastDraw()
 	}
 	if (c.tagMode > 0) GX_SetNumTevStages(1);
 	s_shRec = false;
+	if (s_gateFog) {
+		// Task gxfast-fog: fog post-pass over everything drawn (part of the recorded list,
+		// so replayed frames get it too). The CPU fogs only pixels whose polygon has
+		// POLYGON_ATTR bit 15 set; opaque polygons without it are drawn again over the
+		// fogged result with GX_EQUAL depth (same transform, so the same depth: like the
+		// shadow ID pass), which puts their unfogged colour back wherever they are the
+		// visible surface. (Translucent ones without it stay fogged: GxFast gap.)
+		gxDs3dApplyFogFast();
+		if (s_gateFogRedraw) {
+			gxDs3dSetupCommonState();
+			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
+			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
+			for (int n = 0; n < polycount; ++n) {
+				POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
+				if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;
+				gxDs3dFastPoly(c, p, 0);
+			}
+			GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+			if (c.tagMode > 0) GX_SetNumTevStages(1);
+		}
+	}
 	gxDs3dRestoreState();
 }
 
@@ -2987,10 +3028,10 @@ static GXTexObj s_fogLutTex;
 static void *s_fogLutTexData = nullptr;
 static bool s_fogLutValid = false;
 // Cache key: only rebuild the (somewhat expensive, 32768-entry) table when something it
-// depends on actually changed -- FOG_TABLE's 32 density bytes, fogOffset, fogShift, or
-// fogColor (color doesn't affect the table, but is cheap to fold into the same key so a
-// single memcmp covers "does the LUT texture need re-uploading" completely).
-static u8 s_fogKey[32 + 4 + 4 + 4];
+// depends on actually changed -- FOG_TABLE's 32 density bytes, fogOffset or fogShift.
+static u8 s_fogKey[32 + 4 + 4];        // the density table inputs (s_fogTable)
+static float s_fogLutWK = -1.0f;      // the depth mapping the LUT was built for
+static bool s_fogLutWbuf = false;
 
 static void gxDs3dFogEnsureLut()
 {
@@ -2998,14 +3039,28 @@ static void gxDs3dFogEnsureLut()
 	memcpy(key, MMU.MMU_MEM[ARMCPU_ARM9][0x40] + 0x360, 32);
 	memcpy(key + 32, &gfx3d.fogOffset, 4);
 	memcpy(key + 36, &gfx3d.fogShift, 4);
-	memcpy(key + 40, &gfx3d.fogColor, 4);
-
-	if (s_fogLutValid && memcmp(key, s_fogKey, sizeof(key)) == 0)
+	const bool wbuf = gfx3d.wbuffer != 0;
+	const bool tableOk = s_fogLutValid && memcmp(key, s_fogKey, sizeof(key)) == 0;
+	// The LUT maps a GX depth byte to a DS depth, so in W mode it also depends on s_wK
+	// (gxDs3dWSetup, per frame); Z mode's mapping is fixed.
+	if (tableOk && wbuf == s_fogLutWbuf && (!wbuf || s_wK == s_fogLutWK))
 		return;
 
-	gxDs3dFogBuildTable();
+	if (!tableOk) gxDs3dFogBuildTable();
+	// Texel k = the GX depth bucket D in [k/256, (k+1)/256) (the Z8 copy's top byte),
+	// sampled at its centre and turned into the CPU's fogIndex = depth >> 9:
+	//   Z mode: GX D = DS z (gxDs3dFastXformBuild), CPU depth = floor(z*0x7FFF) << 9.
+	//   W mode: GX D = 1 - K/w (gxDs3dWDepthInv), CPU depth = floor(4096*w).
 	for (int k = 0; k < 256; ++k) {
-		u32 idx = (u32)k * 128 + 64;
+		const float d = ((float)k + 0.5f) / 256.0f;
+		u32 idx;
+		if (wbuf) {
+			const float w = s_wK / (1.0f - d);
+			const float depth = 4096.0f * w;
+			idx = depth >= 16777215.0f ? 32767u : ((u32)depth >> 9);
+		} else {
+			idx = (u32)(d * 32767.0f);
+		}
 		if (idx > 32767) idx = 32767;
 		u32 fog = s_fogTable[idx];
 		if (fog == 127) fog = 128;
@@ -3028,6 +3083,8 @@ static void gxDs3dFogEnsureLut()
 		GX_InitTexObjFilterMode(&s_fogLutTex, GX_NEAR, GX_NEAR);
 	}
 	memcpy(s_fogKey, key, sizeof(key));
+	s_fogLutWbuf = wbuf;
+	s_fogLutWK = s_wK;
 	s_fogLutValid = true;
 }
 
@@ -3059,6 +3116,7 @@ static void gxDs3dFogCopyZ(u16 w, u16 h)
 
 void gxDs3dApplyFogFast()
 {
+	if (!CommonSettings.GFX3D_Fog) return;   // as rasterize.cpp
 	gxDs3dFogEnsureLut();
 	gxDs3dFogCopyZ(kScreenW, kScreenH);
 
@@ -3071,6 +3129,7 @@ void gxDs3dApplyFogFast()
 	// fog draw was a silent, invisible no-op -- verified via a PEEK probe showing the
 	// unfogged raster colour unchanged after this function ran.
 	gxDs3dLoadScreenOrtho();
+	GX_SetViewport(0, 0, (f32)kScreenW, (f32)kScreenH, 0, 1);   // the polygons' own viewports are still bound
 
 	// Mask: only pixels the geometry pass actually wrote get fogged. gxDs3dClearDepth()
 	// seeded every pixel in this region to the same reference Z before the geometry draw;
@@ -3078,7 +3137,8 @@ void gxDs3dApplyFogFast()
 	// (the geometry pass's own GX_LESS test guarantees this), so comparing the incoming
 	// quad's Z (fed the same reference value) GX_GREATER against the buffer catches
 	// exactly "something nearer was drawn here" without needing a polygon-ID buffer.
-	const float clearZ = -(float)(gfx3d_rasterClearDepth() & 0xFFFFFF) / 16777215.0f;
+	// (gxDs3dClearZ: the same value in W mode too, where it is K-relative.)
+	const float clearZ = gxDs3dClearZ();
 
 	GX_LoadTexObj(&s_fogZTex, GX_TEXMAP0);
 	GX_LoadTexObj(&s_fogLutTex, GX_TEXMAP1);
@@ -3090,20 +3150,24 @@ void gxDs3dApplyFogFast()
 	GX_SetNumIndStages(1);
 	GX_SetIndTexOrder(GX_INDTEXSTAGE0, GX_TEXCOORD0, GX_TEXMAP0);
 	GX_SetIndTexCoordScale(GX_INDTEXSTAGE0, GX_ITS_1, GX_ITS_1);
-	// ds = 0.5 * (Z8-128) * 2^-7 : maps Z8 in [0,255] to a LUT texcoord offset spanning
-	// almost exactly [0,1) around the base (0.5,0) coordinate fed via TEXCOORD1 below --
-	// see gx-next-steps-log.md's Task 13f-fog section for the derivation.
+	// Task gxfast-fog: the indirect offset is in TEXELS of the stage's texture (GX adds it to
+	// the s/t coordinate in its fixed-point texel form, u*width with 7 fraction bits), not in
+	// normalized texcoords: offset = M * c * 2^exp texels. The 13f-fog version used
+	// M = 0.5, exp = -7 with the signed bias, i.e. (Z8-128)/256 of ONE texel -- less than a
+	// texel across the whole depth range, which is why the lookup never varied per pixel.
+	// Here M = 0.5, exp = +1, no bias: offset = Z8 texels exactly, added to TEXCOORD1's base
+	// (texel 0's centre), so texel k of the 256-wide LUT = depth byte k.
 	f32 indMtx[2][3] = { { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
-	GX_SetIndTexMatrix(GX_ITM_0, indMtx, -7);
+	GX_SetIndTexMatrix(GX_ITM_0, indMtx, 1);
 
 	GX_SetNumChans(0);
 	GX_SetNumTevStages(1);
 	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD1, GX_TEXMAP1, GX_COLORNULL);
 #ifdef DSA_GXGEOM_MUTATE_FOGNOINDIRECT
-	GX_SetTevIndirect(GX_TEVSTAGE0, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_S, GX_ITM_OFF,
+	GX_SetTevIndirect(GX_TEVSTAGE0, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_NONE, GX_ITM_OFF,
 	                   GX_ITW_OFF, GX_ITW_OFF, GX_FALSE, GX_FALSE, GX_ITBA_OFF);
 #else
-	GX_SetTevIndirect(GX_TEVSTAGE0, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_S, GX_ITM_0,
+	GX_SetTevIndirect(GX_TEVSTAGE0, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_NONE, GX_ITM_0,
 	                   GX_ITW_OFF, GX_ITW_OFF, GX_FALSE, GX_FALSE, GX_ITBA_OFF);
 #endif
 
@@ -3132,7 +3196,9 @@ void gxDs3dApplyFogFast()
 #endif
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	GX_SetColorUpdate(GX_TRUE);
-	GX_SetAlphaUpdate(GX_TRUE);
+	// The CPU also blends alpha toward the fog alpha; the gate requires fog alpha 31, which
+	// leaves opaque pixels at 31 as here (translucent ones keep their own alpha: GxFast gap).
+	GX_SetAlphaUpdate(GX_FALSE);
 	GX_SetCullMode(GX_CULL_NONE);
 	GX_SetDither(GX_FALSE);
 
@@ -3144,16 +3210,19 @@ void gxDs3dApplyFogFast()
 	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
 	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 
+	const f32 lu = 0.5f / 256.0f, lv = 0.5f / (f32)kFogLutH;   // LUT texel 0's centre
 	GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
 		GX_Position3f32(0, 0, clearZ);
-		GX_TexCoord2f32(0.0f, 0.0f); GX_TexCoord2f32(0.5f, 0.0f);
+		GX_TexCoord2f32(0.0f, 0.0f); GX_TexCoord2f32(lu, lv);
 		GX_Position3f32((f32)kScreenW, 0, clearZ);
-		GX_TexCoord2f32(1.0f, 0.0f); GX_TexCoord2f32(0.5f, 0.0f);
+		GX_TexCoord2f32(1.0f, 0.0f); GX_TexCoord2f32(lu, lv);
 		GX_Position3f32((f32)kScreenW, (f32)kScreenH, clearZ);
-		GX_TexCoord2f32(1.0f, 1.0f); GX_TexCoord2f32(0.5f, 0.0f);
+		GX_TexCoord2f32(1.0f, 1.0f); GX_TexCoord2f32(lu, lv);
 		GX_Position3f32(0, (f32)kScreenH, clearZ);
-		GX_TexCoord2f32(0.0f, 1.0f); GX_TexCoord2f32(0.5f, 0.0f);
+		GX_TexCoord2f32(0.0f, 1.0f); GX_TexCoord2f32(lu, lv);
 	GX_End();
+	GX_SetAlphaUpdate(GX_TRUE);
+	GX_SetTevDirect(GX_TEVSTAGE0);
 
 	// Restore what this draw doesn't own the caller relying on (mirrors
 	// gxDs3dSetupCommonState's own contract): the next thing to run in

@@ -140,19 +140,15 @@ void gxDs3dRenderAccurate();
 // frames (Task replay, see the .cpp; -DDSA_GXGEOM_NOREPLAY draws directly every time).
 void gxDs3dRenderFast();
 
-// ADDED (Task 13f-fog, see gx-next-steps-log.md): fog post-process, GxFast only. Draws a
-// full-screen quad immediately after gxDs3dRenderFast()'s geometry, EFB-Z-masked (GX_GREATER
-// against the same clear-Z gxDs3dClearDepth() seeded, so only pixels the geometry pass
-// actually touched this frame are affected -- 2D content showing through a hole must never
-// get fogged, and this is how that's enforced without a polygon-ID buffer) and GX-hardware
-// alpha-blended toward gfx3d.fogColor, with the blend weight sampled from a 256-entry fog LUT
-// texture (downsampled from the CPU's own 32768-entry fogTable[] -- see gxDs3dFogBuildTable's
-// comment in the .cpp) via a single 8-bit indirect-texture lookup keyed on the GX Z-buffer's
-// own top byte. Caller must have just called gxDs3dRenderFast() (not Accurate -- see
-// gxDs3dGeomFrameSupported()'s fog gate, which requires GxFast mode and every in-scope
-// polygon's POLYGON_ATTR fog-enable bit set before this is reachable at all) with the same
-// viewport/scissor still bound. Leaves blend mode, Z mode and the vertex format dirty --
-// same "caller restores before the next 2D draw" contract as the two render functions above.
+// Fog post-process, GxFast only (Task 13f-fog, made live by Task gxfast-fog; see
+// gx-next-steps-log.md). Called by gxDs3dRenderFast()'s own draw (so it is in the replayed
+// display list) after the geometry: a full-screen quad, EFB-Z-masked (GX_GREATER against the
+// CLEAR_DEPTH value gxDs3dClearDepth() seeded, so only pixels the geometry wrote are fogged;
+// 2D content showing through a hole never is) and GX-hardware alpha-blended toward
+// gfx3d.fogColor. The blend weight is the GX depth buffer's top byte (EFB Z8 copy) looked up
+// through one indirect stage in a 256-entry LUT built from the CPU's own fogTable[] for the
+// frame's depth mapping (Z or W buffer). gxDs3dGeomFrameSupported()'s fog gate decides which
+// fog setups reach it. Leaves blend mode, Z mode and the vertex format dirty.
 void gxDs3dApplyFogFast();
 
 // Task P1-6a-flicker (implemented in Engine A, gx_ds_engine_impl.inc): resolves a deferred
