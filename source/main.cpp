@@ -1516,15 +1516,22 @@ static void frameLimiterTick()
 	if (nextDue == 0) nextDue = now;
 
 	const u64 frameTicks = (u64)(secs_to_ticks(1) / 59.8261);
+	// Max lateness (in frame periods) we try to make up; beyond it, resync.
+	const u64 kMaxDebtFrames = 4;
 	nextDue += frameTicks;
 
 	if ((s64)(nextDue - now) > 0) {
 		usleep((u32)ticks_to_microsecs(nextDue - now));
-	} else {
-		// Fell behind real time (a slow scene, a hitch, turbo just released) --
+	} else if ((s64)(now - nextDue) > (s64)(kMaxDebtFrames * frameTicks)) {
+		// Fell far behind real time (a hitch, a load, turbo just released) --
 		// resync rather than bursting frames back-to-back to "catch up".
 		nextDue = now;
 	}
+	// else: behind by less than kMaxDebtFrames periods -- keep the debt. Games
+	// like SM64DS alternate heavy/light frames (3D record vs replay); forgiving
+	// each heavy frame's overrun made the following light frame sleep to its
+	// own deadline even though the average frame was slower than real time.
+	// Carrying the debt means we only sleep when genuinely ahead on average.
 }
 #endif // !DESMUME_HARNESS && !DESMUME_BENCH
 
