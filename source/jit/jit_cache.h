@@ -46,8 +46,9 @@
 
 // Arena sizes. Both arenas are static .bss arrays in MEM1 (jitInitSlot(),
 // jit_trace.cpp); -DJIT_ARENA_HEAP memaligns them instead, which lands them in
-// MEM2. MEM1 is what bounds the size: the dol's .bss + heap leave ~0.9 MB of
-// MEM1 free with 4 MB + 1 MB here, so neither can grow without moving
+// MEM2. MEM1 is what bounds the size: with the ARM9 block table and SMC tables
+// also in MEM1 .bss (Task jit-tables-mem1) ~460 KB of MEM1 is left after ROM
+// load, so neither can grow without moving
 // something else out of MEM1 (and DS main RAM cannot go to MEM2 by lowering
 // SYS_SetArena2Hi: that crashed on real hardware at ROM select).
 // History: the heap arenas were 2 MB ARM7 / 12 MB ARM9 (3 and 6 MB ARM9 had

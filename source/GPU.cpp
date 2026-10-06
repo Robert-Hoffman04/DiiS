@@ -30,6 +30,10 @@
 #include "GPU.h"
 #include "perf_zones.h"
 #include "gx/gx_ds_present.h"
+#ifdef HW_RVL
+#include <gccore.h>   // SYS_GetArena2Lo/SetArena2Lo (fade tables in MEM2)
+#include <malloc.h>
+#endif
 
 // Diagnostic log for the DISPCAPCNT display-capture path + per-engine
 // DisplayMode, used to confirm/deny whether a game's dual-3D-screen trick
@@ -176,8 +180,40 @@ static const CACHE_ALIGN u8 win_empty[256] = {
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-static CACHE_ALIGN u16 fadeInColors[17][0x8000];
-CACHE_ALIGN u16 fadeOutColors[17][0x8000];
+// Brightness (BLDY) lookup tables, 2 x 1.06 MB. They are only read by the
+// CPU compositor's brightness-up/down paths, so they live in MEM2: on the Wii
+// GPU_InitFadeColors() carves them off the bottom of arena2 (SYS_SetArena2Lo)
+// the first time it runs, which is in NDS_Init() before newlib's sbrk has
+// switched to MEM2 (libogc's sbrk reads Arena2Lo when it switches). That frees
+// the MEM1 the JIT's ARM9 block table + SMC tables now use (jitInitSlot()).
+// Never raises Arena2Hi (main RAM via SYS_SetArena2Hi crashed on hardware).
+typedef u16 FadeTable[0x8000];
+#ifdef HW_RVL
+static FadeTable* fadeInColors;
+FadeTable* fadeOutColors;
+static void GPU_AllocFadeTables()
+{
+	if (fadeInColors) return;
+	const u32 bytes = 2 * 17 * sizeof(FadeTable);
+	u32 level;
+	level = IRQ_Disable();
+	u32 lo = ((u32)SYS_GetArena2Lo() + 31) & ~31u;
+	if (lo + bytes <= (u32)SYS_GetArena2Hi()) {
+		SYS_SetArena2Lo((void*)(lo + bytes));
+		fadeInColors  = (FadeTable*)lo;
+		fadeOutColors = (FadeTable*)(lo + 17 * sizeof(FadeTable));
+	}
+	IRQ_Restore(level);
+	if (!fadeInColors) {   // arena2 exhausted (cannot happen at boot): heap
+		fadeInColors  = (FadeTable*)memalign(32, bytes);
+		fadeOutColors = fadeInColors + 17;
+	}
+}
+#else
+static CACHE_ALIGN FadeTable fadeInColors[17];
+CACHE_ALIGN FadeTable fadeOutColors[17];
+static void GPU_AllocFadeTables() {}
+#endif
 
 //this should be public, because it gets used somewhere else
 CACHE_ALIGN u8 gpuBlendTable555[17][17][32][32];
@@ -209,6 +245,7 @@ static void GPU_InitFadeColors()
 
 	*/
 
+	GPU_AllocFadeTables();
 	for(int i = 0; i <= 16; i++)
 	{
 		float idiv16 = ((float)i) / 16;

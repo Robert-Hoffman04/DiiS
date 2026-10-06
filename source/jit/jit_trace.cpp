@@ -228,9 +228,16 @@ static void jitFreeSlot(int i)
 	free(s_arena[i]);
 #endif
 	s_arena[i]        = nullptr;
-	free(s_blockTable[i]);   s_blockTable[i]   = nullptr;
-	free(s_smcRegistry[i]);  s_smcRegistry[i]  = nullptr;
-	free(s_smcPageFlags[i]); s_smcPageFlags[i] = nullptr;
+#ifdef JIT_TABLES_HEAP
+	free(s_blockTable[i]);
+	free(s_smcRegistry[i]);
+	free(s_smcPageFlags[i]);
+#else
+	if (i == JIT_ARM7) free(s_blockTable[i]);   // only the ARM7 block table is heap (MEM2)
+#endif
+	s_blockTable[i]   = nullptr;
+	s_smcRegistry[i]  = nullptr;
+	s_smcPageFlags[i] = nullptr;
 }
 
 void jitShutdown()
@@ -270,9 +277,26 @@ static bool jitInitSlot(int i, size_t arenaBytes, JITCache& cache, JitCpuProfile
 	static u32 s_bssArena7[(JIT_ARENA_SIZE      + s_jitCanaryPad) / 4] __attribute__((aligned(32)));
 	s_arena[i] = (i == JIT_ARM9) ? s_bssArena9 : s_bssArena7;
 #endif
+#ifdef JIT_TABLES_HEAP
 	s_blockTable[i]   = (BasicBlock*) memalign(16, blockTableBytes   + s_jitCanaryPad);
 	s_smcRegistry[i]  = (BasicBlock**)memalign(32, smcRegistryBytes  + s_jitCanaryPad);
 	s_smcPageFlags[i] = (u8*)         memalign(32, smcFlagsBytes     + s_jitCanaryPad);
+#else
+	// Task jit-tables-mem1: the ARM9 block table (2 MB, probed on every ARM9
+	// dispatch) and both cores' SMC registries (256 KB) + page flags (64 KB)
+	// are static .bss arrays too, i.e. MEM1. That MEM1 came from moving the
+	// 2 x 1.06 MB fade tables to MEM2 (GPU.cpp) plus the arena1 tail the heap
+	// never used. The ARM7 block table (2 MB) does not fit as well (MEM1 would
+	// be left with < 256 KB) and stays a lazy memalign, i.e. MEM2.
+	// -DJIT_TABLES_HEAP restores the old all-memalign path.
+	static BasicBlock  s_bssBlockTable9[(BLOCK_TABLE_SLOTS * sizeof(BasicBlock) + s_jitCanaryPad) / sizeof(BasicBlock)] __attribute__((aligned(32)));
+	static BasicBlock* s_bssSmcRegistry[2][(SMC_MAP_SIZE * sizeof(BasicBlock*) + s_jitCanaryPad) / sizeof(BasicBlock*)] __attribute__((aligned(32)));
+	static u8          s_bssSmcPageFlags[2][SMC_MAP_SIZE + s_jitCanaryPad] __attribute__((aligned(32)));
+	s_blockTable[i]   = (i == JIT_ARM9) ? s_bssBlockTable9
+	                  : (BasicBlock*)memalign(16, blockTableBytes + s_jitCanaryPad);
+	s_smcRegistry[i]  = s_bssSmcRegistry[i];
+	s_smcPageFlags[i] = s_bssSmcPageFlags[i];
+#endif
 
 	if (!s_arena[i] || !s_blockTable[i] || !s_smcRegistry[i] || !s_smcPageFlags[i])
 		return false;
