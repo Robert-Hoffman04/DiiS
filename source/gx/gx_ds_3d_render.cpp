@@ -40,6 +40,15 @@ static const int kScreenW = 256;
 static const int kScreenH = 192;
 // GX samples pixel centres, the DS rasterizer pixel corners (see gxDs3dRenderAccurate).
 static const float kGxDs3dSampleOffset = 0.5f;
+// GxFast (Task gxfast-toon): the offset goes into the projection, not the viewport
+// (gxDs3dFastPoly). A viewport at y + 0.5 lost the 3D layer's first row on every GxFast
+// frame (SM64DS and PH: the clear colour showed through): Dolphin clips/scissors to the
+// viewport rectangle at whole pixels, so [0.5, 192.5] kept rows 1..191. With an integer
+// viewport and the shift in clip space, the clip edge is the screen edge again. (The
+// clipper's row-0 top edge, vertices snapped to y = +-w, then runs exactly through row 0's
+// pixel centres; Dolphin covers them. 0.5 - 1/16 to sidestep that tie measured worse on PH
+// f900, +814 px on sloped edges, so it is not done; unverified on hardware.)
+// Mutation -DDSA_GXGEOM_MUTATE_VPOFFSET: the old viewport offset.
 
 static inline u8 gxDs3d6To8Tex(u8 v6) { return (u8)((v6 << 2) | (v6 >> 4)); }
 
@@ -407,10 +416,27 @@ static bool gxDs3dTexColorExact(const POLY &p)
 // (vertices, spans, clipped vertices) is replaced by the entry, so the existing modulate
 // TEV does the rest. GxAccurate asks for one identical r (no reliance on the rounding at
 // a r >> 1 boundary) and, textured, for an entry the texcolor rule allows (0/63 channels).
-// Per-fragment lookup (Gouraud r across an index boundary, which would need the table as
-// an indirect-indexed texture) and textured highlight (the 6-bit saturating add is not
-// the 8-bit TEV add of the expansions) bail ("toon"), both modes.
+// GxAccurate bails ("toon") on a per-fragment lookup (Gouraud r across an index boundary)
+// and on textured highlight (the 6-bit saturating add is not the 8-bit TEV add of the
+// expansions).
+//
+// GxFast (Task gxfast-toon) draws every mode-2 polygon through the table as a texture
+// instead: a 32x4 RGBA8 LUT (s_toonLutTex, TEXMAP7) of the entries' 8-bit expansions,
+// nearest-sampled at s = (r + 0.5) / 64 sent as a second texcoord (GX_VA_TEX1). GX's
+// perspective-correct texcoord interpolation then gives floor(s * 32) = floor((r + 0.5) / 2)
+// = rasterize.cpp's materialColor.r >> 1 per fragment (r perspective-interpolated, +0.5,
+// floor). One TEV stage after the others (gxDs3dToonTev): colour = CPREV * LUT, with the
+// vertex colour sent white, so it is texel * entry (textured) or the entry (untextured),
+// the same TEV multiply as the flat-index path; textured highlight sends (r, r, r) and
+// adds the entry instead (8-bit clamp, not the 6-bit one: <= 1 6-bit step off). Exact for
+// one index per polygon; at an index boundary it can only move by the interpolation's
+// rounding. Mutation -DDSA_GXGEOM_MUTATE_TOONBAIL puts back the flat-index-only GxFast.
 static struct { bool on; u8 rgb[3]; } s_toon;
+#ifdef DSA_GXGEOM_MUTATE_TOONBAIL
+static const bool kToonLut = false;
+#else
+static const bool kToonLut = true;
+#endif
 
 static inline void gxDs3dToonEntry(int idx, u8 *rgb)
 {
@@ -423,6 +449,7 @@ static inline void gxDs3dToonEntry(int idx, u8 *rgb)
 // The gate half: whether a mode-2 polygon is drawable (see above).
 static bool gxDs3dToonOk(const POLY &p, bool fast)
 {
+	if (fast && kToonLut) return true;   // the LUT path takes every mode-2 polygon
 	const u8 r0 = gfx3d.vertlist->list[p.vertIndexes[0]].color[0];
 	for (int j = 1; j < p.type; ++j) {
 		const u8 r = gfx3d.vertlist->list[p.vertIndexes[j]].color[0];
@@ -439,10 +466,66 @@ static bool gxDs3dToonOk(const POLY &p, bool fast)
 }
 
 // The draw half: called per polygon before any colour is sent for it.
-static inline void gxDs3dToonBegin(const POLY &p)
+static inline void gxDs3dToonBegin(const POLY &p, bool lut = false)
 {
-	s_toon.on = gxDs3dPolyMode(p) == 2;
+	s_toon.on = !lut && gxDs3dPolyMode(p) == 2;
 	if (s_toon.on) gxDs3dToonEntry(gfx3d.vertlist->list[p.vertIndexes[0]].color[0] >> 1, s_toon.rgb);
+}
+
+// GxFast's toon LUT (see above): rewritten only when the latched table changes, at the start
+// of a recording (gxDs3dRenderFastDraw), after gxDs3dGeomFramePrepare's fence wait.
+static void *s_toonLutBuf = nullptr;
+static GXTexObj s_toonLutTex;
+static u16 s_toonLutKey[32];
+static bool s_toonLutValid = false;
+
+static bool gxDs3dToonLutEnsure()
+{
+	if (!s_toonLutBuf) {
+		s_toonLutBuf = memalign(32, 32 * 4 * 4);
+		if (!s_toonLutBuf) return false;
+		GX_InitTexObj(&s_toonLutTex, s_toonLutBuf, 32, 4, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_toonLutTex, GX_NEAR, GX_NEAR);
+		s_toonLutValid = false;
+	}
+	u16 key[32];
+	for (int i = 0; i < 32; ++i) key[i] = gfx3d_rasterToon(i);
+	if (s_toonLutValid && !memcmp(key, s_toonLutKey, sizeof(key))) return true;
+	memcpy(s_toonLutKey, key, sizeof(key));
+	// RGBA8 tiles: 4x4 texels per 64-byte block (32 bytes of AR pairs, then 32 of GB);
+	// the 8 blocks cover x = 4b..4b+3, all four rows the same entry.
+	u8 *d = (u8 *)s_toonLutBuf;
+	for (int i = 0; i < 32; ++i) {
+		u8 rgb[3];
+		gxDs3dToonEntry(i, rgb);
+		u8 *b = d + (i >> 2) * 64;
+		for (int y = 0; y < 4; ++y) {
+			const int t = (y * 4 + (i & 3)) * 2;
+			b[t] = 255; b[t + 1] = gxDs3d6To8Tex(rgb[0]);
+			b[32 + t] = gxDs3d6To8Tex(rgb[1]); b[32 + t + 1] = gxDs3d6To8Tex(rgb[2]);
+		}
+	}
+	DCFlushRange(s_toonLutBuf, 32 * 4 * 4);
+	s_texDirty = true;
+	s_toonLutValid = true;
+	return true;
+}
+
+// The LUT stage as TEV stage `stage`, its texcoord (GX_VA_TEX1) as texgen `texgens`.
+// hl: textured highlight, CPREV + entry; else CPREV * entry.
+static void gxDs3dToonTev(int stage, int texgens, bool hl)
+{
+	const u8 tc = (u8)(GX_TEXCOORD0 + texgens), st = (u8)(GX_TEVSTAGE0 + stage);
+	GX_SetNumTexGens(texgens + 1);
+	GX_SetTexCoordGen(tc, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+	GX_SetNumTevStages(stage + 1);
+	GX_SetTevDirect(st);
+	GX_SetTevOrder(st, tc, GX_TEXMAP7, GX_COLORNULL);
+	if (hl) GX_SetTevColorIn(st, GX_CC_TEXC, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+	else    GX_SetTevColorIn(st, GX_CC_ZERO, GX_CC_TEXC, GX_CC_CPREV, GX_CC_ZERO);
+	GX_SetTevColorOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(st, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+	GX_SetTevAlphaOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 }
 
 // ---------------------------------------------------------------------------------
@@ -678,6 +761,8 @@ static const char *const kGateNames[kGateCount] = {
 static bool s_gateHasTrans = false;
 // Task gxfast-fog: the frame is fogged (GxFast pass) / has opaque polygons with fog off.
 static bool s_gateFog = false, s_gateFogRedraw = false;
+// Task gxfast-toon: the frame has mode-2 polygons (GxFast draws them through the toon LUT).
+static bool s_gateToon = false;
 
 // A polygon's screen outline for the polygon-ID check and GxFast culling: rasterize.cpp's
 // divide + viewport + clamp (gxDs3dScreenXY) of the vertices it draws (gxDs3dPolyVerts) and
@@ -1367,6 +1452,7 @@ static int gxDs3dFrameGate(bool requireTex)
 	s_gateHasTrans = false;
 	s_gateFog = gfx3d.enableFog && CommonSettings.GFX3D_Fog;
 	s_gateFogRedraw = false;
+	s_gateToon = false;
 	s_shGroupCount = 0;
 	s_shIdAt = -1;
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
@@ -1396,6 +1482,7 @@ static int gxDs3dFrameGate(bool requireTex)
 		const bool toon = gxDs3dPolyMode(p) == 2;
 		if (gxDs3dPolyMode(p) == 1) return kGatePolyMode;
 		if (toon && !gxDs3dToonOk(p, fast)) return kGateToon;
+		s_gateToon |= toon;
 		if (gxDs3dTexFormat(p) != 0) {
 			// Every format goes through texcache's decoder (see the textured section);
 			// A3I5/A5I3 (translucent, GxFast only) are baked to RGBA8 per polygon alpha.
@@ -1569,6 +1656,7 @@ bool gxDs3dGeomFramePrepare()
 	++s_gate[g];
 	if (g == kGateTransId) ++s_tidWhyN[s_tidWhy & 7];
 	static u32 s_shWhyN[16];
+	static u32 s_toonN[6];
 	if (g == kGateShadow) ++s_shWhyN[s_shWhy & 15];
 #ifdef DSA_GXGEOM_SHADOWDBG
 	if (g == kGateShadow) harness_profile_emitf("shbail why=%d", s_shWhy);
@@ -1592,6 +1680,17 @@ bool gxDs3dGeomFramePrepare()
 		for (int i = 0; i < gfx3d.polylist->count; ++i) {
 			const POLY &p = gfx3d.polylist->list[i];
 			++s_fmt[gxDs3dTexFormat(p)];
+			if (gxDs3dPolyMode(p) == 2) {
+				// toon= untextured flat/per-fragment index, textured flat/per-fragment, highlight mode, max index span
+				int lo = 63, hi = 0;
+				for (int j = 0; j < p.type; ++j) {
+					const int r = gfx3d.vertlist->list[p.vertIndexes[j]].color[0] >> 1;
+					lo = r < lo ? r : lo; hi = r > hi ? r : hi;
+				}
+				++s_toonN[(gxDs3dTexFormat(p) != 0) * 2 + (hi != lo)];
+				s_toonN[4] += gfx3d.shading == GFX3D::HIGHLIGHT;
+				if ((u32)(hi - lo) > s_toonN[5]) s_toonN[5] = (u32)(hi - lo);
+			}
 			bool out = false;
 			for (int j = 0; j < p.type; ++j) out |= gxDs3dVertOutside(gfx3d.vertlist->list[p.vertIndexes[j]]);
 			s_clipPolys += out;
@@ -1632,7 +1731,7 @@ bool gxDs3dGeomFramePrepare()
 		int n = 0;
 		for (int k = 0; k < kGateCount; ++k)
 			if (s_gate[k]) n += snprintf(buf + n, sizeof(buf) - n, " %s=%u", kGateNames[k], (unsigned)s_gate[k]);
-		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u tagruns=%u tagmax=%u tagarea=%u carryruns=%u tidwhy=%u,%u,%u,%u,%u,%u,%u shwhy=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u gates:%s",
+		harness_profile_emitf("gxds3dstats frames=%u fmt=%u,%u,%u,%u,%u,%u,%u,%u texbytes=%u clippolys=%u transidclash=%u transpolys_ok=%u tagruns=%u tagmax=%u tagarea=%u carryruns=%u tidwhy=%u,%u,%u,%u,%u,%u,%u shwhy=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u toon=%u,%u,%u,%u,%u,%u gates:%s",
 		                      (unsigned)s_frames, (unsigned)s_fmt[0], (unsigned)s_fmt[1], (unsigned)s_fmt[2],
 		                      (unsigned)s_fmt[3], (unsigned)s_fmt[4], (unsigned)s_fmt[5], (unsigned)s_fmt[6],
 		                      (unsigned)s_fmt[7], (unsigned)s_texBytes, (unsigned)s_clipPolys, (unsigned)s_tidClash, (unsigned)s_tidPolys,
@@ -1640,7 +1739,8 @@ bool gxDs3dGeomFramePrepare()
 		                      (unsigned)s_tidWhyN[1], (unsigned)s_tidWhyN[2], (unsigned)s_tidWhyN[3], (unsigned)s_tidWhyN[4],
 		                      (unsigned)s_tidWhyN[5], (unsigned)s_tidWhyN[6], (unsigned)s_tidWhyN[7],
 		                      (unsigned)s_shWhyN[1], (unsigned)s_shWhyN[2], (unsigned)s_shWhyN[3], (unsigned)s_shWhyN[4], (unsigned)s_shWhyN[5],
-		                      (unsigned)s_shWhyN[6], (unsigned)s_shWhyN[7], (unsigned)s_shWhyN[8], (unsigned)s_shWhyN[9], (unsigned)s_shWhyN[10], (unsigned)s_shWhyN[11], (unsigned)s_shWhyN[12], buf);
+		                      (unsigned)s_shWhyN[6], (unsigned)s_shWhyN[7], (unsigned)s_shWhyN[8], (unsigned)s_shWhyN[9], (unsigned)s_shWhyN[10], (unsigned)s_shWhyN[11], (unsigned)s_shWhyN[12],
+		                      (unsigned)s_toonN[0], (unsigned)s_toonN[1], (unsigned)s_toonN[2], (unsigned)s_toonN[3], (unsigned)s_toonN[4], (unsigned)s_toonN[5], buf);
 	}
 #endif
 	s_prepSeq = g_gfx3dRenderSeq;
@@ -1691,6 +1791,7 @@ static void gxDs3dSetupCommonState()
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);   // GxFast toon LUT coordinate
 
 	// Textured polygons: a texel with alpha 0 makes the CPU's modulated fragment alpha 0,
 	// which rasterize.cpp drops before the depth write. Alpha compare > 0 with the Z test
@@ -1717,18 +1818,20 @@ static void gxDs3dRestoreState()
 // interpolation do it from plain (s, t). Both scale texel units to [0,1] in TEXMTX0.
 struct GxDs3dTexState {
 	bool textured;
+	bool toonLut;   // GxFast toon LUT coordinate (GX_VA_TEX1) in the vertex format
 	u32 texParam, texPal, amode;
 };
 
-static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, bool first)
+static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, bool first, bool toonLut = false)
 {
 	const bool textured = gxDs3dTexFormat(p) != 0;
-	if (first || textured != st.textured) {
+	if (first || textured != st.textured || toonLut != st.toonLut) {
 		GX_ClearVtxDesc();
 		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
 		if (textured && accurate) GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
 		GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
 		if (textured && !accurate) GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+		if (toonLut) GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
 		if (textured) {
 			GX_SetNumTexGens(1);
 			if (accurate) GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX0);
@@ -1741,6 +1844,7 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 			GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 		}
 		st.textured = textured;
+		st.toonLut = toonLut;
 		st.texParam = 0xFFFFFFFF;
 	}
 	const u32 amode = gxDs3dTexAMode(p);
@@ -1786,6 +1890,14 @@ static inline void gxDs3dSendColor(const VERT &v, u8 alpha = 255)
 	const u8 *c = s_toon.on ? s_toon.rgb : v.color;   // gxDs3dToonBegin
 	GX_Color4u8(gxDs3d6To8(c[0]), gxDs3d6To8(c[1]), gxDs3d6To8(c[2]), alpha);
 #endif
+}
+
+// A GxFast toon-LUT vertex's colour (see the toon section): white (the LUT stage multiplies),
+// or for textured highlight the grey of its red, which stage 0 modulates the texel by.
+static inline void gxDs3dToonColor(float r6, bool hl, u8 alpha)
+{
+	const u8 g = hl ? gxDs3dF6To8(r6) : 255;
+	GX_Color4u8(g, g, g, alpha);
 }
 
 static void gxDs3dLoadScreenOrtho()
@@ -2303,6 +2415,8 @@ struct GxDs3dFastCtx {
 	bool shTest;           // this polygon is a shadow draw: stencil (and opaque-ID) test
 	bool shId;             // the opaque-ID texture is built (gxDs3dShadowIdPass): shadow draws test it
 	bool shIdPass;         // drawing that texture: translucent polygons give their alpha-31 fragments only
+	bool toonLut;          // the toon LUT is loaded (gxDs3dToonLutEnsure): mode-2 polygons use it
+	int toonKey;           // LUT stage installed after the tag stages: 0 none, 1 multiply, 2 highlight add
 };
 
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
@@ -2531,7 +2645,8 @@ static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
 static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
 	if (gxDs3dPolyInvisible(p) && !c.shCount) return;   // counted all the same (the stencil comes before shading)
-	gxDs3dToonBegin(p);
+	const bool toonLut = c.toonLut && gxDs3dPolyMode(p) == 2;
+	gxDs3dToonBegin(p, toonLut);
 	const bool trans = p.isTranslucent() && !c.shCount;
 	const VERT *cv[MAX_CLIPPED_VERTS];
 	bool clipped;
@@ -2600,18 +2715,34 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		}
 	}
 
+	bool vpNew = false;
 	if (!c.haveLast || p.viewport != c.lastVp) {
 		c.vp.decode(p.viewport);
+#ifdef DSA_GXGEOM_MUTATE_VPOFFSET
 		GX_SetViewport((f32)c.vp.x + kGxDs3dSampleOffset,
 		               (f32)(kScreenH - c.vp.y - c.vp.height) + kGxDs3dSampleOffset,
 		               (f32)c.vp.width, (f32)c.vp.height, 0, 1);
+#else
+		GX_SetViewport((f32)c.vp.x, (f32)(kScreenH - c.vp.y - c.vp.height), (f32)c.vp.width, (f32)c.vp.height, 0, 1);
+		vpNew = true;   // the projection carries the sample offset in this viewport's NDC units
+#endif
 		c.lastVp = p.viewport;
 	}
-	if (!c.haveLast || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix)) {
+	if (!c.haveLast || vpNew || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix)) {
 		GxDs3dFastXform x;
 		if (!gxDs3dFastXformBuild(p, x, c.wbuf, s_wK))
 			return;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
 		GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
+#ifndef DSA_GXGEOM_MUTATE_VPOFFSET
+		{
+			// Screen +0.5 px right and down (GX y down, NDC y up), as
+			// clip-space x += dx*w, y -= dy*w (perspective w = -z_in, orthographic w = 1).
+			const float dx = 2.0f * kGxDs3dSampleOffset / (float)c.vp.width;
+			const float dy = 2.0f * kGxDs3dSampleOffset / (float)c.vp.height;
+			if (x.projType == GX_ORTHOGRAPHIC) { x.proj[0][3] += dx; x.proj[1][3] -= dy; }
+			else                               { x.proj[0][2] -= dx; x.proj[1][2] += dy; }
+		}
+#endif
 		GX_LoadProjectionMtx(x.proj, x.projType);
 		c.ortho = x.projType == GX_ORTHOGRAPHIC;
 		memcpy(c.pos, x.pos, sizeof(c.pos));
@@ -2628,14 +2759,25 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	}
 
 	const bool textured = gxDs3dTexFormat(p) != 0;
-	const bool rebound = c.first || textured != c.st.textured;
-	gxDs3dBindPoly(p, false, c.st, c.first);
+	const bool rebound = c.first || textured != c.st.textured || toonLut != c.st.toonLut;
+	gxDs3dBindPoly(p, false, c.st, c.first, toonLut);
 	c.first = false;
 	const int mode = c.shTest ? (tagWrite ? 4 : 3) : tag == 0 ? 0 : (tagWrite ? 1 : 2);
-	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured)) {
+	// Toon LUT stage (see the toon section) after the colour-passing stages: plain draws and
+	// tag tests; a tag write's colour is its tag, so none there.
+	const bool toonHl = toonLut && textured && gfx3d.shading == GFX3D::HIGHLIGHT;
+	const int toonKey = (toonLut && (mode == 0 || mode == 2)) ? 1 + toonHl : 0;
+	const int toonStage = mode == 0 ? 1 : (c.tagTwo ? 3 : 2) + (c.tagCarry ? 1 : 0);
+	const int toonGens = (textured ? 1 : 0) + (mode == 2);
+	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured) || (c.toonKey && !toonKey)) {
 		gxDs3dTagTev(mode, textured, mode >= 3 ? c.shId : c.tagTwo, mode == 2 && c.tagCarry);
 		c.tagMode = mode;
 		c.tagTextured = textured;
+		c.toonKey = 0;
+	}
+	if (toonKey && toonKey != c.toonKey) {
+		gxDs3dToonTev(toonStage, toonGens, toonKey == 2);
+		c.toonKey = toonKey;
 	}
 	if (mode >= 3) {
 		const GXColor k2 = { 0, 0, 0, 0 };
@@ -2663,7 +2805,12 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		// A tagged run's a == 31 fragments neither stamp (no tag written) nor test the ID
 		// (pass 0 without the tag stages; see gxDs3dTransIdPlan).
 		if (tagWrite && !c.shIdPass && pass == 0) continue;
-		if (mode == 2 && twoPass) GX_SetNumTevStages(pass == 0 ? 1 : (c.tagTwo ? 3 : 2) + (c.tagCarry ? 1 : 0));
+		if (mode == 2 && twoPass && toonKey) {
+			// pass 0 has no tag stages: the LUT stage moves to stage 1 (over the first tag
+			// stage), and pass 1 puts the tag stages back.
+			if (pass == 1) gxDs3dTagTev(mode, textured, c.tagTwo, c.tagCarry);
+			gxDs3dToonTev(pass == 0 ? 1 : toonStage, toonGens, toonKey == 2);
+		} else if (mode == 2 && twoPass) GX_SetNumTevStages(pass == 0 ? 1 : (c.tagTwo ? 3 : 2) + (c.tagCarry ? 1 : 0));
 		if (trans && c.shIdPass) {
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
@@ -2686,9 +2833,11 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 				gxDs3dSendColor(v, va);
 #else
 				if (s_toon.on) gxDs3dSendColor(v, va);
+				else if (toonLut) gxDs3dToonColor(v.fcolor[0], toonHl, va);
 				else GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
 #endif
 				if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+				if (toonLut) GX_TexCoord2f32((v.fcolor[0] + 0.5f) * (1.0f / 64.0f), 0.5f);
 			}
 			GX_End();
 			continue;
@@ -2698,8 +2847,13 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
 			if (mixedObj) GX_Position3f32(mixedObj[j][0], mixedObj[j][1], mixedObj[j][2]);
 			else GX_Position3f32(v.objcoord[0], v.objcoord[1], v.objcoord[2]);
+#ifndef DSA_GXGEOM_PROBE
+			if (toonLut) gxDs3dToonColor((float)v.color[0], toonHl, va);
+			else
+#endif
 			gxDs3dSendColor(v, va);
 			if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+			if (toonLut) GX_TexCoord2f32((float)(v.color[0] + 0.5f) * (1.0f / 64.0f), 0.5f);
 		}
 		GX_End();
 	}
@@ -2940,12 +3094,16 @@ static void gxDs3dRenderFastDraw()
 {
 	s_mixInvKey = NULL;   // POLYMTX pointers are reused by later lists
 	gxDs3dWSetup();
+	// Before the common state: a rewritten LUT sets s_texDirty (heap failure: flat toon).
+	const bool toonLut = kToonLut && s_gateToon && gxDs3dToonLutEnsure();
 	gxDs3dSetupCommonState();
 	gxDs3dLoadScreenOrtho();
 	gxDs3dClearDepth();
+	if (toonLut) GX_LoadTexObj(&s_toonLutTex, GX_TEXMAP7);
 
 	GxDs3dFastCtx c;
 	memset(&c, 0, sizeof(c));
+	c.toonLut = toonLut;
 	c.first = true;
 	c.curMtx = -1;
 	c.tagMode = -1;
