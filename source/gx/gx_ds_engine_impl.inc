@@ -90,6 +90,7 @@ static u32 s_abExact, s_abAlpha, s_abBad, s_abFirstBad;
 static int s_abMn, s_abMp;
 static u16 s_abCpu[256 * 192];
 #endif
+static u32 s_dsbCapGx;   // Task gxfast-capture: frames whose capture ran on the GX composite (Engine A)
 static char s_dsbNote[192];   // free-form detail for the last bail (blendunder: the layer/target sets)
 static u32 s_dsb3dOk = 0, s_dsb3dEnabled = 0;   // engaged frames drawing the 3D layer / frames with BG0_3D+BG0 enabled (any outcome)
 static bool s_dsbFr3d, s_dsb3dSeen;
@@ -914,6 +915,28 @@ static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r, int line, bool *af
 	}
 }
 
+#if GXDS_CORE == 0
+// Task gxfast-capture: a capture of Source A's screen (capSrc 0, srcA 0: the composited
+// BG + OBJ + 3D line before MASTER_BRIGHT; Phantom Hourglass's dual-screen 3D, every frame)
+// stays on the GX compositor in GxFast. Its lines are deferred like any other; when the frame
+// is handled the capture unit runs at frame end for the discarded lines on the GX composite
+// (gxDsACaptureDiscarded), else the flushed CPU lines capture as before. Not exact (the
+// composite is GxFast's, and the bank is written at line 191 instead of line by line, so a
+// CPU read of the LCDC bank mid-frame sees the old image), so GxAccurate still bails.
+// Other sources (3D only, VRAM, FIFO, A+B blends) still bail: PH uses only this one.
+static inline bool gxDsACaptureOnGx(GPU *gpu)
+{
+#ifdef DSA_GXGEOM_MUTATE_CAPBAIL
+	(void)gpu;
+	return false;   // mutation: the old bail on every armed capture
+#else
+	return gxRenderModeIsFast() && gpu->dispCapCnt.capSrc == 0 && gpu->dispCapCnt.srcA == 0;
+#endif
+}
+static bool s_capReady;    // this frame's copy (pre-MASTER_BRIGHT) is readable for the capture
+static bool s_capTiled;    // ... still in s_copyBackBuf's RGB5A3 blocks (else s_copyBackLinear)
+#endif
+
 // Everything this file can't reproduce natively. Checked per scanline (not
 // once per frame) precisely because a game can turn any of these on
 // mid-frame -- a frame-end-only check would silently render the first half
@@ -941,10 +964,12 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 	// renders and reads this engine's own composited lines; a bank it writes may be
 	// the very bank a BG/OBJ of this or the other engine reads (the classic dual-3D
 	// trick). Baking from frame-final VRAM would not reproduce a line-interleaved
-	// read/write, and the capture source (Engine A's composite) has to be the CPU's.
+	// read/write, and the capture source (Engine A's composite) has to be the CPU's
+	// for an exact result.
 	// Armed = the register's enable bit (set by the game, latched into `enabled` at line
-	// 0 and cleared after line 191) -- either form bails.
-	if (gpu->dispCapCnt.enabled || (gpu->dispCapCnt.val & 0x80000000u)) { DSB_WHY("capture"); return true; }
+	// 0 and cleared after line 191) -- either form bails, except in GxFast for a
+	// Source-A-screen capture (gxDsACaptureOnGx).
+	if ((gpu->dispCapCnt.enabled || (gpu->dispCapCnt.val & 0x80000000u)) && !gxDsACaptureOnGx(gpu)) { DSB_WHY("capture"); return true; }
 	// DISPCNT's 64KB character / screen base blocks (Engine A only) move BG_tile_ram /
 	// BG_map_ram; those are baked once from the frame-final value, like ExBGxPalette.
 	{
@@ -4014,7 +4039,7 @@ static bool gxDsBRenderFrameImpl()
 					char h[192]; int hn = 0;
 					for (int i = 0; i < 24 && s_dsbWhyHist[i].why && hn < 150; ++i)
 						hn += snprintf(h + hn, sizeof(h) - hn, "%s=%u ", s_dsbWhyHist[i].why, (unsigned)s_dsbWhyHist[i].n);
-					harness_profile_emitf(GXDS_TAG "w n=%u %s", (unsigned)(s_dsbOk + s_dsbBail), h);
+					harness_profile_emitf(GXDS_TAG "w n=%u capgx=%u %s", (unsigned)(s_dsbOk + s_dsbBail), (unsigned)s_dsbCapGx, h);
 				}
 #ifdef DSB_ABCMP
 				harness_profile_emitf(GXDS_TAG "ab n=%u exact=%u alpha=%u bad=%u firstbad=%u mn=%d mp=%d", (unsigned)(s_dsbOk + s_dsbBail),
@@ -4073,6 +4098,13 @@ static bool gxDsBRenderFrameImpl()
 #endif
 	if (!GXDS_SCREEN.gpu)
 		return false;
+#if GXDS_CORE == 0
+	// Task gxfast-capture: the trace let an armed capture through (gxDsACaptureOnGx); re-checked
+	// here against a render-mode switch since.
+	s_capReady = false;
+	const bool capArmed = GXDS_SCREEN.gpu->dispCapCnt.enabled || (GXDS_SCREEN.gpu->dispCapCnt.val & 0x80000000u);
+	if (capArmed && !gxDsACaptureOnGx(GXDS_SCREEN.gpu)) { DSB_WHY("capture"); return false; }
+#endif
 	if (!GXDS_API(RenderInit)())
 		return false;
 	if (vidmutex == LWP_MUTEX_NULL)
@@ -4381,8 +4413,14 @@ static bool gxDsBRenderFrameImpl()
 	for (int y = 0; y < kDsBScreenH; ++y)
 		if (s_mbMode[y] != 0 && s_mbFac[y] != 0) { anyMb = true; break; }
 	bool mbOnGpu = false;
+#if GXDS_CORE == 0
+	const bool mbKeepPre = capArmed;   // the capture reads the composite before MASTER_BRIGHT: CPU fade below
+#else
+	const bool mbKeepPre = false;
+#endif
+	(void)mbKeepPre;
 #ifndef DSB_ABCMP
-	if (anyMb) {
+	if (anyMb && !mbKeepPre) {
 		mbOnGpu = gxDsPresentMasterBright(s_mbMode, s_mbFac);
 		s_tevK = -2;   // stage0 wiring left non-standard -- force a resync next use
 	}
@@ -4425,6 +4463,7 @@ static bool gxDsBRenderFrameImpl()
 	// in-process A/B. The copy is always opaque: the EFB is RGB8_Z24 / RGB565_Z16 here
 	// (no alpha, so the copy's alpha is 255), which made the old per-frame scan redundant.
 	u16 *dst = (u16 *)(GPU_screen + (u32)GXDS_SCREEN.offset * 512);
+	bool linearDone = false;   // s_copyBackLinear holds this frame's copy
 #ifndef DSB_ABCMP
 	if (!anyMb || mbOnGpu) {
 		gxDsPresentSet(slot, s_copyBackBuf, s_fenceTok);
@@ -4437,6 +4476,7 @@ static bool gxDsBRenderFrameImpl()
 	DCInvalidateRange(s_copyBackBuf, (u32)kDsBScreenW * kDsBScreenH * sizeof(u16));
 	GXBlockShape blk = gxBlockShape(GXTEXFMT_RGB5A3);
 	gxUnswizzle16bpp((const u16 *)s_copyBackBuf, s_copyBackLinear, blk.texelsWide, blk.texelsTall, kDsBScreenW, kDsBScreenH);
+	linearDone = true;
 
 #ifdef DSB_ABCMP
 	memcpy(s_abCpu, dst, sizeof(s_abCpu));
@@ -4501,6 +4541,21 @@ static bool gxDsBRenderFrameImpl()
 		}
 	}
 #endif
+#if GXDS_CORE == 0
+	// Task gxfast-capture: the capture source is this copy (the present path above only hands it
+	// on, so it is waited for here); the capture itself runs once the CPU lines are known to be
+	// discarded, reading the 4x4 blocks directly (or the readback's linear image).
+	if (capArmed) {
+		if (!linearDone) {
+			PZ_SUB_SCOPE(PZ_2D_READBACK);
+			gxFenceWait(s_fenceTok);
+			DCInvalidateRange(s_copyBackBuf, (u32)kDsBScreenW * kDsBScreenH * sizeof(u16));
+		}
+		s_capTiled = !linearDone;
+		s_capReady = true;
+	}
+#endif
+	(void)linearDone;
 	// Success path only (see BandResetter's comment): every write recorded
 	// this frame has now been consumed by a bake, so the trace can start
 	// clean. Writes landing after this point -- i.e. during lines 192-262's
@@ -4534,6 +4589,46 @@ static bool gxDsBRenderFrameImpl()
 	return true;
 }
 
+#if GXDS_CORE == 0
+// Task gxfast-capture: the capture unit for the lines the GX frame replaces (the pending
+// range, about to be discarded), fed with the GX composite. Lines rendered on the CPU before a
+// barrier already captured themselves. GPU_DispCaptureLine does the line-0 latch and the
+// line-191 clear of DISPCAPCNT bit 31, and tags the written VRAM (gxDsMarkVram) like the CPU.
+static inline u16 gxDsACapTexel(u16 v)
+{
+	// The copy is opaque (RGB8/RGB565 EFB): 1 R5 G5 B5 -> 1 B5 G5 R5, stored little-endian as the
+	// capture writes it (bit 15 set); the alpha form is defensive only.
+	const u16 c = (v & 0x8000) ? (u16)(0x8000 | ((v >> 10) & 0x1F) | (v & 0x03E0) | ((v & 0x1F) << 10)) : (u16)(0x8000 | gxDsBRgb5a3ToNds(v));
+	return (u16)LOCAL_TO_LE_16(c);
+}
+static void gxDsACaptureDiscarded()
+{
+	if (!s_capReady) return;
+	s_capReady = false;
+	PZ_SUB_SCOPE(PZ_2D_READBACK);
+	u16 line[256];
+	s_lzFlushing = true;   // the pending lines are being replaced, never flushed (no own-engine barrier can hit an LCDC bank anyway)
+	for (int l = s_lzRendered; l < s_lzSeen; ++l) {
+		if (s_capTiled) {
+			// RGB5A3 4x4 blocks, 64 per block row: line l is row (l & 3) of block row l >> 2.
+			const u16 *src = (const u16 *)s_copyBackBuf + (u32)(l >> 2) * (kDsBScreenW * 4) + (u32)(l & 3) * 4;
+			for (int x = 0; x < kDsBScreenW; x += 4, src += 16) {
+				line[x] = gxDsACapTexel(src[0]); line[x + 1] = gxDsACapTexel(src[1]);
+				line[x + 2] = gxDsACapTexel(src[2]); line[x + 3] = gxDsACapTexel(src[3]);
+			}
+		} else {
+			const u16 *src = s_copyBackLinear + (u32)l * kDsBScreenW;
+			for (int x = 0; x < kDsBScreenW; ++x) line[x] = gxDsACapTexel(src[x]);
+		}
+		GPU_DispCaptureLine((u16)l, (const u8 *)line);
+	}
+	s_lzFlushing = false;
+#ifdef DSB_STATS
+	++s_dsbCapGx;
+#endif
+}
+#endif
+
 bool GXDS_API(RenderFrame)()
 {
 #if GXDS_LAZY_COMPILED
@@ -4545,6 +4640,9 @@ bool GXDS_API(RenderFrame)()
 	gxDsLzFlush(2);
 #endif
 	const bool handled = gxDsBRenderFrameImpl();
+#if GXDS_CORE == 0
+	if (handled) gxDsACaptureDiscarded();
+#endif
 	if (handled) gxDsLzDiscard(); else gxDsLzFlush(2);
 #ifdef DSLZ_STATS
 	++s_lzStFrames;

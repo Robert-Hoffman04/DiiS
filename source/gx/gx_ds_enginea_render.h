@@ -12,7 +12,9 @@
     Queue item 13j: Engine A's CPU lines are deferred exactly like Engine B's (see the
     "Task 13j" bullet in gx_ds_engineb_render.h). Engine-A-specific parts: a capture armed at
     a line's hook (or the DISPCAPCNT enable bit set) is an out-of-scope state, so the line
-    renders eagerly and the capture unit runs on real composited lines; a DISPCAPCNT /
+    renders eagerly and the capture unit runs on real composited lines (GxFast keeps a
+    Source-A-screen capture on GX and captures from the GX copy at frame end: Task
+    gxfast-capture, gxDsACaptureOnGx); a DISPCAPCNT /
     DISPCNT / MASTER_BRIGHT / BLDCNT ... write is a register barrier; the 3D layer input
     (gfx3d_convertedScreen) only changes at VBlank end, so it needs no barrier.
 */

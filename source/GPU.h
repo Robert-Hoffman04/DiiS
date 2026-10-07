@@ -844,6 +844,12 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip = false) ;
 // is the state those lines would have used (deferral is only legal across a stretch with no
 // register/VRAM/palette/OAM write, see gx_ds_engine_impl.inc).
 void GPU_DiscardDeferredLines(NDS_Screen * screen, int first, int last);
+// Task gxfast-capture: the display-capture unit's work for Engine A line `l` (latch at line 0,
+// the capture write, the end-of-capture clear at line 191), as GPU_RenderLine would do it,
+// with `srcA` as the Source A screen line: 256 pixels before MASTER_BRIGHT, already in the
+// form the capture stores (guest little-endian X-B5-G5-R5, bit 15 set). Used for lines whose
+// CPU pass the GX compositor discarded.
+void GPU_DispCaptureLine(u16 l, const u8 *srcA);
 #ifdef GPU_DISPCAP_DEBUG_LOG
 // Dumps the last ~1024 frames' worth of DISPCAPCNT/offset ring-buffer history
 // to sd:/dispring.log. Cheap to keep recording every frame (RAM only, no

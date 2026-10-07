@@ -2313,7 +2313,10 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	}
 }
 
-template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
+// srcALine: Source A "screen" line to capture instead of gpu->tempScanline, for a line the GX
+// compositor drew (GPU_DispCaptureLine): already in the captured form (guest little-endian,
+// bit 15 set, before MASTER_BRIGHT). NULL = the CPU line.
+template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l, u8 *srcALine = NULL)
 {
 	//this macro takes advantage of the fact that there are only two possible values for capx
 	//
@@ -2408,8 +2411,13 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 								{
 									//INFO("Capture screen (BG + OBJ + 3D)\n");
 
-									u8 *src = (u8*)(gpu->tempScanline);
-									CAPCOPY(src,cap_dst,true,HostReadWord);
+									if (srcALine)
+										memcpy(cap_dst, srcALine, gpu->dispCapCnt.capx == DISPCAPCNT::_128 ? 256 : 512);
+									else
+									{
+										u8 *src = (u8*)(gpu->tempScanline);
+										CAPCOPY(src,cap_dst,true,HostReadWord);
+									}
 								}
 							break;
 							case 1:			// Capture 3D
@@ -2451,6 +2459,12 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l)
 						{
 							// Capture screen (BG + OBJ + 3D)
 							srcA = (u16*)(gpu->tempScanline);
+							if (srcALine)
+							{
+								static u16 nativeLine[256];   // back to this loop's native order
+								for (int i = 0; i < 256; i++) nativeLine[i] = T1ReadWord(srcALine, i << 1);
+								srcA = nativeLine;
+							}
 						}
 						else
 						{
@@ -2868,6 +2882,11 @@ void GPU_RenderLine(NDS_Screen * screen, u16 l, bool skip)
 	}
 
 	GPU_RenderLine_MasterBrightness(screen, l);
+}
+
+void GPU_DispCaptureLine(u16 l, const u8 *srcA)
+{
+	GPU_RenderLine_DispCapture<false>(l, (u8 *)srcA);
 }
 
 void GPU_DiscardDeferredLines(NDS_Screen * screen, int first, int last)
