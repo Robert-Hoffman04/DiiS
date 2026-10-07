@@ -1336,7 +1336,14 @@ static int gxDs3dFrameGate(bool requireTex)
 	if (gfx3d.wbuffer && !fast) return kGateWbuffer;
 	if (gfx3d.enableClearImage) return kGateClearImage;  // rear-plane per-pixel clear depth (Stage 2) not modelled
 	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
-	if (gfx3d.enableEdgeMarking) return kGateEdge;     // no polygon-ID infra yet (13f handoff item)
+	// Edge marking: no polygon-ID pass yet (13f handoff item), so GxAccurate bails. GxFast
+	// inaccurate path (Task gxfast-edge): draw the frame without the outlines until that
+	// pass exists (Phantom Hourglass turns edge marking on in every scene).
+#ifdef DSA_GXGEOM_MUTATE_EDGEBAIL
+	if (gfx3d.enableEdgeMarking) return kGateEdge;     // mutation: the pre-change bail, for A/B
+#else
+	if (gfx3d.enableEdgeMarking && !fast) return kGateEdge;
+#endif
 	if (gfx3d.enableFog) {
 		// Task gxfast-fog: GxFast draws fog as a post-pass (gxDs3dApplyFogFast: the GX depth
 		// buffer's top byte looked up in a 256-entry copy of the CPU's fogTable through an
