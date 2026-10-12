@@ -30,6 +30,17 @@
 //              ext 256x16 with ext palette OFF
 //  10  mode 0: text BG + affine OBJ with an OBJ-window/semitransparent mix ->
 //              must bail (Mode != 0 affine sprite)
+//  11  mode 5: BG3 = ext DIRECT colour bitmap 256x256, wrap OFF, rotated/scaled but
+//              sampled only inside the bitmap (the borderless rows-only bake), matrix +
+//              reference point rewritten at line 96 (two bands)
+//  12  mode 0: text BG0 + bitmap OBJs (Mode 3), 2D 256x256 bitmap mapping, alpha 15,
+//              flips, one alpha 0 (not drawn), one running past the bitmap's right edge,
+//              a 4bpp sprite among them; BLDCNT alpha with all 2nd targets and no 1st
+//              target (Phantom Hourglass's sub screen)
+//  13  as 12 with the 1D bitmap mapping
+//  14  as 12 with the 2D 128x512 bitmap mapping
+//  15  as 12 plus an alpha-7 bitmap OBJ -> must bail (objbmpalpha)
+//  16  as 12 with OBJ a BLDCNT 1st target -> must bail (objbmpblend)
 
 #include <nds.h>
 #include <stdio.h>
@@ -94,6 +105,23 @@ static void hblank5(void)
 	// Rewrite at the end of line 95 so lines 96.. use the new matrix/origin.
 	if (REG_VCOUNT == 95) setMatrix2(0x0120, 0x0040, -0x0040, 0x0120, 0x1000, 0x3000);
 	else if (REG_VCOUNT == 262 || REG_VCOUNT == 261) setMatrix2(0x0100, 0x0000, 0x0000, 0x0100, 0, 0);
+}
+#endif
+#if AT_CASE == 11
+static void hblank11(void)
+{
+	if (REG_VCOUNT == 95) setMatrix3(0x0100, 0x0000, 0x0000, 0x0100, 3 * 256, 60 * 256);
+	else if (REG_VCOUNT == 262 || REG_VCOUNT == 261) setMatrix3(0x00C0, 0x0020, -0x0020, 0x00C0, 20 * 256, 40 * 256);
+}
+#endif
+#if AT_CASE >= 12 && AT_CASE <= 16
+// Writes one sub OAM entry straight to hardware OAM (no libnds sprite shadow in these cases).
+static void bmpObj(int i, int x, int y, int shape, int size, int hflip, int vflip, int prio, int alpha, int tile, int mode)
+{
+	u16 *o = (u16 *)0x07000400 + i * 4;
+	o[0] = (u16)((y & 0xFF) | (mode << 10) | (shape << 14));
+	o[1] = (u16)((x & 0x1FF) | (hflip << 12) | (vflip << 13) | (size << 14));
+	o[2] = (u16)((tile & 0x3FF) | (prio << 10) | (alpha << 12));
 }
 #endif
 #if AT_CASE == 6
@@ -258,6 +286,51 @@ int main(void)
 	REG_BG0CNT_SUB = BG_32x32 | BG_COLOR_256 | BG_MAP_BASE(16) | BG_TILE_BASE(0) | BG_PRIORITY(1);
 	REG_BG3CNT_SUB = BG_RS_32x32 | BG_WRAP_ON | BG_MAP_BASE(8) | BG_TILE_BASE(0) | BG_PRIORITY(2);
 	setMatrix3(0x0100, 0x0000, 0x0000, 0x0100, 0x0800, 0x0400);
+
+#elif AT_CASE == 11
+	// BG3 direct colour bitmap 256x256 at ScreenBase 0 (the whole 128KB bank): bit15 = opaque
+	{ u16 *bm = (u16 *)SUBVRAM;
+	  for (int y = 0; y < 256; y++) for (int x = 0; x < 256; x++)
+	      bm[y * 256 + x] = (u16)(((x ^ y) & 24) ? (0x8000 | RGB15((x * 3) & 31, y & 31, (x + 2 * y) & 31)) : RGB15(31, 0, 0)); }
+	videoSetModeSub(MODE_5_2D | DISPLAY_BG3_ACTIVE);
+	REG_BG3CNT_SUB = BG_RS_32x32 | BG_MAP_BASE(0) | BG_TILE_BASE(1) | BG_COLOR_256 | BG_PRIORITY(0);   // direct, wrap off
+	setMatrix3(0x00C0, 0x0020, -0x0020, 0x00C0, 20 * 256, 40 * 256);   // texels x 43..235, y 8..183: all inside
+	irqSet(IRQ_HBLANK, hblank11); irqEnable(IRQ_HBLANK);
+
+#elif AT_CASE >= 12 && AT_CASE <= 16
+	// sub OBJ VRAM (bank D, 128KB): a 256x256 direct-colour bitmap (also read as 128x512 / 1D blocks)
+	{ u16 *bm = (u16 *)SUBOBJ;
+	  for (int i = 0; i < 0x10000; i++) {
+	      int x = i & 255, y = i >> 8;
+	      bm[i] = (u16)((((x >> 2) ^ (y >> 3)) & 3) ? (0x8000 | RGB15(x & 31, (y * 3) & 31, ((x >> 3) + y) & 31)) : RGB15(0, 31, 0)); } }
+	fillTiles4(SUBVRAM + 0x0000, 64);
+	{ u16 *m0 = (u16 *)(SUBVRAM + 0x4000);
+	  for (int i = 0; i < 32 * 32; i++) m0[i] = (u16)((i % 60) | (((i >> 2) & 15) << 12)); }
+	// bit 5: 2D bitmap 256 wide, bit 6: 1D bitmap mapping (sub sprBMPBoundary = 128 bytes)
+	u32 bmpMap = (AT_CASE == 13) ? (1u << 6) : (AT_CASE == 14) ? 0 : (1u << 5);
+	videoSetModeSub(MODE_0_2D | DISPLAY_BG0_ACTIVE | DISPLAY_SPR_ACTIVE | bmpMap);
+	REG_BG0CNT_SUB = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(8) | BG_TILE_BASE(0) | BG_PRIORITY(1);
+	REG_BLDCNT_SUB = (AT_CASE == 16 ? 0x3F50 : 0x3F40);   // alpha, 2nd targets all, 1st target none (16: OBJ)
+	REG_BLDALPHA_SUB = (8 << 0) | (8 << 8);
+	for (int i = 0; i < 128; i++) { u16 *o = (u16 *)0x07000400 + i * 4; o[0] = 0x0200; o[1] = 0; o[2] = 0; }
+	// TileIndex per mapping for a block at bitmap pixel (bx, by) / 1D byte offset:
+#if AT_CASE == 13
+#define BT(bx, by, n) (n)                                    /* 1D: n * 128 bytes */
+#elif AT_CASE == 14
+#define BT(bx, by, n) ((((by) / 8) << 4) | ((bx) / 8))       /* 2D 128x512 */
+#else
+#define BT(bx, by, n) ((((by) / 8) << 5) | ((bx) / 8))       /* 2D 256x256 */
+#endif
+	bmpObj(0, 0, 0, 0, 3, 0, 0, 0, 15, BT(0, 0, 0), 3);          // 64x64
+	bmpObj(1, 100, 20, 1, 2, 1, 0, 0, 15, BT(64, 0, 64), 3);     // 32x16 hflip
+	bmpObj(2, 60, 50, 0, 1, 0, 0, 0, 0, BT(16, 16, 80), 3);      // 16x16 alpha 0: never drawn
+	bmpObj(3, 230, 150, 1, 3, 0, 1, 1, 15, BT(96, 96, 96), 3);   // 64x32 vflip, off the right edge
+	bmpObj(4, 40, 40, 0, 2, 0, 0, 0, 0, 0, 0);                   // 4bpp 32x32 (reads the bitmap bytes as tiles)
+	bmpObj(5, 150, 80, 0, 2, 1, 1, 1, 15, BT(200, 40, 160), 3);  // 32x32 h+v flip; 2D-256: runs past x 255
+#if AT_CASE == 15
+	bmpObj(6, 180, 120, 0, 2, 0, 0, 0, 7, BT(8, 8, 200), 3);     // alpha 7 -> bail
+#endif
+#undef BT
 #endif
 
 	printf("");   // keep stdio linked; no console on the sub screen (all BG VRAM is test data)
