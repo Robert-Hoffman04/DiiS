@@ -1474,9 +1474,14 @@ static int gxDs3dFrameGate(bool requireTex)
 			if (!gfx3d.enableAlphaBlending) return kGateTransBlend;
 			anyTrans = true;
 		}
-		// POLYGON_ATTR bit 14: depth test EQUAL (rasterize.cpp's decalMode). Not modelled
-		// (GX_EQUAL on GX's own depth would not match the CPU's quantized equality).
-		if (p.polyAttr & (1 << 14)) return kGateDepthEqual;
+		// POLYGON_ATTR bit 14: depth test EQUAL (rasterize.cpp's decalMode). GX_EQUAL on GX's
+		// own depth is not the CPU's quantized equality, so GxAccurate bails; GxFast draws it
+		// with GX_EQUAL (see the depth-equal note at gxDs3dFastPoly), except shadow-mode ones.
+#ifdef DSA_GXGEOM_MUTATE_DEQBAIL
+		if (p.polyAttr & (1 << 14)) return kGateDepthEqual;   // mutation: the pre-change bail, for A/B
+#else
+		if ((p.polyAttr & (1 << 14)) && (!fast || gxDs3dPolyMode(p) == 3)) return kGateDepthEqual;
+#endif
 		// modulate, toon/highlight (as a flat colour, gxDs3dToonOk) and shadow (above) only:
 		// decal needs its own TEV
 		const bool toon = gxDs3dPolyMode(p) == 2;
@@ -2417,6 +2422,7 @@ struct GxDs3dFastCtx {
 	bool shIdPass;         // drawing that texture: translucent polygons give their alpha-31 fragments only
 	bool toonLut;          // the toon LUT is loaded (gxDs3dToonLutEnsure): mode-2 polygons use it
 	int toonKey;           // LUT stage installed after the tag stages: 0 none, 1 multiply, 2 highlight add
+	bool zEqBase;          // every polygon draws with GX_EQUAL / no Z write (the fog redraw), not LESS / write
 };
 
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
@@ -2641,10 +2647,26 @@ static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
 	GX_LoadTexMtxImm(T, GX_TEXMTX1, GX_MTX3x4);
 }
 
+// Depth-equal polygons (POLYGON_ATTR bit 14, GxFast only; Task gxfast-depthequal). The CPU
+// passes a fragment iff its quantized depth equals the buffer's (15-bit z, or floor(4096*w)
+// in W mode). GxFast draws them with GX_EQUAL on GX's 24-bit depth, without a depth write
+// (the CPU's would store the value already there). Measured in Dolphin (a3_c58/c59): a decal
+// re-drawn with its base's exact vertices and transform gets bit-identical GX depth, so it
+// passes everywhere, as on the CPU; a decal tessellated differently from its base, or off its plane,
+// fails almost everywhere on both (the CPU's vertices are 4.12 fixed point, so a different
+// tessellation of the same plane lands in another depth bucket on most pixels); the CPU's
+// scattered passing pixels there are not reproduced (bounded by the decal's own area).
+// A one-sided window (LEQUAL with the depth pulled nearer) was measured too and is worse:
+// it also draws such decals in full, plus any part in front of or overhanging the base.
+// Phantom Hourglass draws 1-4 A5I3 depth-equal quads per frame in its ship scenes; on the
+// CPU none of their fragments passes (all lie behind the buffer).
 // tag: 0 plain draw; > 0 test this tag (the run's real draw); < 0 write tag -tag (pass 2).
 static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
 	if (gxDs3dPolyInvisible(p) && !c.shCount) return;   // counted all the same (the stencil comes before shading)
+	// Depth-equal (see above; never a shadow polygon, gxDs3dFrameGate). The opaque-ID pass
+	// and the fog redraw already draw everything GX_EQUAL without a depth write.
+	const bool deq = (p.polyAttr & (1 << 14)) && !c.shIdPass && !c.zEqBase;
 	const bool toonLut = c.toonLut && gxDs3dPolyMode(p) == 2;
 	gxDs3dToonBegin(p, toonLut);
 	const bool trans = p.isTranslucent() && !c.shCount;
@@ -2801,6 +2823,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	GXDS3D_TP_BEGIN(tpe);
 	float mixedBuf[4][3];
 	const float (*mixedObj)[3] = (!clipped && gxDs3dMixedObj(p, mixedBuf)) ? mixedBuf : NULL;
+	if (deq && !trans) GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);   // (translucent: per pass below)
 	for (int pass = twoPass ? 0 : 1; pass < (c.shIdPass && twoPass ? 1 : 2); ++pass) {   // ID pass: pass 0 only when there is one
 		// A tagged run's a == 31 fragments neither stamp (no tag written) nor test the ID
 		// (pass 0 without the tag stages; see gxDs3dTransIdPlan).
@@ -2817,7 +2840,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		} else if (trans) {
 			// pass 0: the a == 31 fragments of a non-depth-writing polygon (opaque
 			// writes, with depth); pass 1: everything else it draws.
-			GX_SetZMode(GX_TRUE, GX_LESS, (!tagWrite && (pass == 0 || zw)) ? GX_TRUE : GX_FALSE);
+			if (deq) GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
+			else     GX_SetZMode(GX_TRUE, GX_LESS, (!tagWrite && (pass == 0 || zw)) ? GX_TRUE : GX_FALSE);
 			if (pass == 0)    GX_SetAlphaCompare(GX_EQUAL, 255, GX_AOP_AND, GX_ALWAYS, 0);
 			else if (twoPass) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_LESS, 255);
 			else              GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
@@ -2857,6 +2881,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		}
 		GX_End();
 	}
+	if (deq && !trans) GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
 	GXDS3D_TP_END(kTpEmit, tpe);
 }
 
@@ -3168,6 +3193,7 @@ static void gxDs3dRenderFastDraw()
 			gxDs3dSetupCommonState();
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
+			c.zEqBase = true;
 			for (int n = 0; n < polycount; ++n) {
 				POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 				if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;

@@ -118,6 +118,15 @@
 //      an A5I3 texture set (ignored by shadow shading), then a translucent quad inside the volume.
 //  55  bail control: masks of two boxes, then the draws of both in ONE run with overlapping
 //      outlines -> GxFast BAILs `shadow`.
+//  58  depth-equal decals (POLYGON_ATTR bit 14, Task gxfast-depthequal), W-buffer: an opaque
+//      base plane (two triangles), an opaque occluder in front of part of it, then decals
+//      tessellated differently from the base: an opaque flat quad on the plane, two opaque quads
+//      0.03 off it (one nearer, one farther: rejected everywhere), all three past the base's top
+//      edge, an A5I3 alpha-31 quad partly behind the occluder, and an alpha-16 quad overhanging
+//      the base's right edge (the CPU rejects the overhangs). A second base quad redrawn with
+//      its exact vertices as an opaque decal, then an A5I3 alpha-31 one (multi-pass texturing).
+//      Cover, blending on, manual sort, isolated like 30. GxAccurate bails, GxFast engaged.
+//  59  case 58 in Z-buffer mode.
 
 #include <nds.h>
 #include <stdio.h>
@@ -161,6 +170,17 @@
 #if A3_CASE == 36
 #undef A3_SAMEID
 #define A3_SAMEID 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+#define A3_DECAL 0
+#if A3_CASE == 58 || A3_CASE == 59
+#undef A3_DECAL
+#define A3_DECAL 1
+#if A3_CASE == 58
+#undef A3_WBUF
+#define A3_WBUF GL_WBUFFERING
+#endif
 #undef A3_CASE
 #define A3_CASE 34
 #endif
@@ -649,8 +669,79 @@ static void carryScene(void)
 }
 #endif
 
+#if A3_DECAL
+// Cases 58/59 (see the header). The base plane z = 0.25x - 0.2y + 0.1; off: offset along z.
+#define T_DEQ (1u << 14)   // POLYGON_ATTR: depth test EQUAL
+static float dPlane(float x, float y) { return 0.25f * x - 0.2f * y + 0.1f; }
+static void dQuad(u32 tex, float x0, float y0, float x1, float y1, float off, int r, int g, int b)
+{
+	GFX_TEX_FORMAT = tex;
+	GFX_PAL_FORMAT = 0;
+	glBegin(GL_QUADS);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(x0, y1, dPlane(x0, y1) + off);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(0),  inttot16(16)); glVertex3f(x0, y0, dPlane(x0, y0) + off);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(16), inttot16(16)); glVertex3f(x1, y0, dPlane(x1, y0) + off);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(16), inttot16(0));  glVertex3f(x1, y1, dPlane(x1, y1) + off);
+	glEnd();
+}
+
+static void qQuad(u32 tex, int r, int g, int b)
+{
+	GFX_TEX_FORMAT = tex;
+	GFX_PAL_FORMAT = 0;
+	glBegin(GL_QUADS);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(1.0f, -0.1f, 0.3f);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(0),  inttot16(16)); glVertex3f(1.0f, -0.6f, 0.2f);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(16), inttot16(16)); glVertex3f(1.4f, -0.6f, 0.4f);
+		glColor3b(r, g, b); glTexCoord2t16(inttot16(16), inttot16(0));  glVertex3f(1.4f, -0.1f, 0.5f);
+	glEnd();
+}
+
+static void decalScene(void)
+{
+	GFX_TEX_FORMAT = 0;
+	// base, as two triangles along the other diagonal from the decals' quads
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_TRIANGLES);
+		glColor3b(90, 140, 200); glVertex3f(-1.3f,  0.8f, dPlane(-1.3f,  0.8f));
+		glColor3b(90, 140, 200); glVertex3f( 0.9f,  0.8f, dPlane( 0.9f,  0.8f));
+		glColor3b(90, 140, 200); glVertex3f(-1.3f, -0.9f, dPlane(-1.3f, -0.9f));
+		glColor3b(90, 140, 200); glVertex3f( 0.9f,  0.8f, dPlane( 0.9f,  0.8f));
+		glColor3b(90, 140, 200); glVertex3f( 0.9f, -0.9f, dPlane( 0.9f, -0.9f));
+		glColor3b(90, 140, 200); glVertex3f(-1.3f, -0.9f, dPlane(-1.3f, -0.9f));
+	glEnd();
+	// occluder, in front of the base
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(3));
+	dQuad(0, -0.2f, -0.9f, 0.3f, 0.0f, 0.5f, 200, 190, 70);
+	// a second base off to the right, then two decals with its exact vertices (a multi-pass
+	// redraw): an opaque one, and an A5I3 alpha-31 one over that
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(4));
+	qQuad(0, 140, 140, 140);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13) | T_DEQ);
+	qQuad(0, 240, 150, 40);
+	// opaque decals reaching past the base's top edge (the DS sorts opaque polygons by their
+	// top, so they come after the base): on the plane; 0.03 nearer; 0.03 farther
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(12) | T_DEQ);
+	dQuad(0, -1.2f, 0.45f, -0.75f, 1.0f, 0.0f, 230, 60, 60);
+	dQuad(0, -0.65f, 0.45f, -0.4f, 0.95f, 0.03f, 60, 230, 60);
+	dQuad(0, -0.3f, 0.45f, -0.05f, 0.95f, -0.03f, 60, 230, 60);
+	// translucent decals: A5I3 alpha 31 partly behind the occluder; alpha 16 over the right edge
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(10) | T_DEQ);
+	dQuad(texA5I3, -0.4f, -0.6f, 0.6f, 0.1f, 0.0f, 255, 255, 255);
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(11) | T_DEQ);
+	dQuad(0, 0.5f, 0.3f, 1.3f, 0.7f, 0.0f, 250, 250, 60);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(14) | T_DEQ);
+	qQuad(texA5I3, 255, 255, 255);
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+}
+#endif
+
 static void transScene(void)
 {
+#if A3_DECAL
+	decalScene();
+	return;
+#endif
 	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
 #if A3_TAGRUN
 	tagScene();
