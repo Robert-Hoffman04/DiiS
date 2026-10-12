@@ -677,6 +677,8 @@ void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val);
 u8  FASTCALL _MMU_ARM7_read08(u32 adr);
 u16 FASTCALL _MMU_ARM7_read16(u32 adr);
 u32 FASTCALL _MMU_ARM7_read32(u32 adr);
+bool MMU_ARM7_irqRead32(u32 adr, u32* out);   // Task ph-arm7 JIT slow-path shortcut
+bool MMU_ARM7_irqWrite32(u32 adr, u32 val);
 
 // roadmap #20 (GBA compat), §12.3 step 4: the GBA memory-map backend --
 // a parallel function set to _MMU_ARM7_* above (per §7.1's precedent of

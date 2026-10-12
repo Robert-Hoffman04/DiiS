@@ -20,7 +20,17 @@
 
 #include "../MMU.h"
 #include "../armcpu.h"
+#include "../MMU_timing.h"
 #include "../perf_zones.h"
+#include "jit_arm7_prof.h"
+#ifdef DESMUME_ARM7PROF
+#include <ogc/lwp_watchdog.h>
+#define A7P_T0 const u64 _a7t0 = gettime();
+#define A7P_MEM(a,s,w) a7pMem((a),(s),(w),(u32)(gettime()-_a7t0))
+#else
+#define A7P_T0
+#define A7P_MEM(a,s,w)
+#endif
 
 // --- compile-time guest fetch (trace scanning / literal folding) ------------
 static u32 arm7_fetch16(u32 addr) { return _MMU_read16<ARMCPU_ARM7, MMU_AT_CODE>(addr & ~1u); }
@@ -30,21 +40,34 @@ static u32 arm7_fetch32(u32 addr) { return _MMU_read32<ARMCPU_ARM7, MMU_AT_CODE>
 static u32 arm7_slowRead(u32 addr, u32 size)
 {
 	PZ_SCOPE(PZ_JIT7_MEM);
+	A7P_T0
+	u32 v;
+#if !defined(JIT_DIFFERENTIAL_TESTING) && !defined(JIT_NO_ARM7_IRQ_SHORTCUT)
+	// Task ph-arm7: IME / IE / IF skip the generic decode (as the ARM9 does).
+	if (size == 4 && (addr >> 12) == 0x04000 && MMU_ARM7_irqRead32(addr, &v)) { A7P_MEM(addr, size, false); return v; }
+#endif
 	switch (size) {
-		case 1:  return _MMU_read08<ARMCPU_ARM7>(addr);
-		case 2:  return _MMU_read16<ARMCPU_ARM7>(addr);
-		default: return _MMU_read32<ARMCPU_ARM7>(addr);
+		case 1:  v = _MMU_read08<ARMCPU_ARM7>(addr); break;
+		case 2:  v = _MMU_read16<ARMCPU_ARM7>(addr); break;
+		default: v = _MMU_read32<ARMCPU_ARM7>(addr); break;
 	}
+	A7P_MEM(addr, size, false);
+	return v;
 }
 
 static void arm7_slowWrite(u32 addr, u32 val, u32 size)
 {
 	PZ_SCOPE(PZ_JIT7_MEM);
+	A7P_T0
+#if !defined(JIT_DIFFERENTIAL_TESTING) && !defined(JIT_NO_ARM7_IRQ_SHORTCUT)
+	if (size == 4 && (addr >> 12) == 0x04000 && MMU_ARM7_irqWrite32(addr, val)) { A7P_MEM(addr, size, true); return; }
+#endif
 	switch (size) {
 		case 1:  _MMU_write08<ARMCPU_ARM7>(addr, (u8)val);  break;
 		case 2:  _MMU_write16<ARMCPU_ARM7>(addr, (u16)val); break;
 		default: _MMU_write32<ARMCPU_ARM7>(addr, val);      break;
 	}
+	A7P_MEM(addr, size, true);
 }
 
 static void arm7_smcInvalidate(u32 addr) { jitCacheArm7.invalidateSMCTarget(addr); }
@@ -195,6 +218,15 @@ static u8 arm7_cyclesForArm(u32 op)
 	return 1;
 }
 
+// Task ph-arm7: OP_LDR / OP_LDRB's own return for a literal-pool EA. DS
+// timing (not isGBA) is a pure function of the address in this build
+// (ACCOUNT_FOR_NON_SEQUENTIAL_ACCESS off).
+static u32 arm7_litLoadCycles(u32 ea, u32 size)
+{
+	return size == 1 ? MMU_aluMemAccessCycles<ARMCPU_ARM7, 8,  MMU_AD_READ>(3, ea)
+	                 : MMU_aluMemAccessCycles<ARMCPU_ARM7, 32, MMU_AD_READ>(3, ea);
+}
+
 // P14 cached page descriptors -- see jitBuildArm7Profile(). Static storage: the
 // table outlives the profile and is captured once (the ARM7 RAM window mapping
 // is fixed for the life of an NDS_Init in this build).
@@ -220,6 +252,7 @@ JitCpuProfile* jitBuildArm7Profile()
 	s_arm7Profile.canEnterArm    = arm7_canEnterArm;
 	s_arm7Profile.cyclesForThumb = arm7_cyclesForThumb;
 	s_arm7Profile.cyclesForArm   = arm7_cyclesForArm;
+	s_arm7Profile.litLoadCycles  = arm7_litLoadCycles;
 
 	// P13: main-RAM backing store for the inline Tier-1 fast path. Allocated by
 	// MMU_Init() (NDS_Init runs it before jitInit) and never reallocated -- a
@@ -240,6 +273,14 @@ JitCpuProfile* jitBuildArm7Profile()
 	s_arm7Profile.pageDescBase = (u32)(uintptr_t)s_arm7Pages;
 	s_arm7Profile.pageDescLo   = ARM7_PAGE_DESC_LO;
 	s_arm7Profile.pageDescHi   = ARM7_PAGE_DESC_HI;
+
+	// Task ph-arm7: ARM7 private WRAM for the inline store thunk path
+	// (jitEmitMemThunks). Same lifetime as MAIN_MEM (a member of MMU).
+	s_arm7Profile.arm7EramBase = (u32)(uintptr_t)MMU.ARM7_ERAM;
+#if defined(JIT_DIFFERENTIAL_TESTING)
+	// Those inline stores bypass the _MMU_write* journal choke points.
+	s_arm7Profile.journalNote = jitDiffJournalNote;
+#endif
 
 	s_arm7Profile.isaLevel    = 4;                          // ARMv4T
 	// DS ARM7 executes from main RAM (0x02xxxxxx) and WRAM / shared WRAM

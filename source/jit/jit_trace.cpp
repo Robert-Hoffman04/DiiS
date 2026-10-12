@@ -997,6 +997,38 @@ void jitEmitMemThunks(JITCache& c, u32*& p)
 				emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R10, flags);
 				*p++ = PPC_BNELR();
 			}
+#if !defined(JIT_NO_ARM7_WRAM_STORE)
+			// Task ph-arm7: an aligned store into ARM7 private WRAM
+			// (0x03800000..0x03FFFFFF, 64 KB mirrored) is written straight to
+			// MMU.ARM7_ERAM. That is exactly what slowWrite ->
+			// _MMU_ARM7_write* -> T1Write*(MMU_MEM[1][0x38..0x3F],
+			// adr & 0xFFFF) does (the ARM7 page table for those pages is
+			// static), minus its jitInvalidateSMC(): an ARM7 page with ARM7
+			// code on it is tested here (STSLOW) or was refused above (ST),
+			// and the ARM9 cannot see this memory. Unaligned EAs, every
+			// other region, and STSLOW onto a code page keep the C call.
+			if (cpu.arm7EramBase) {
+				u32* toSlow[3]; int nSlow = 0;
+				*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 9, 23, 31);       // EA >> 23
+				*p++ = PPC_CMPLI(0, PPC_R9, 0x07);
+				toSlow[nSlow++] = p++;                                // BNE: not 0x038..0x03F
+				if (size > 1) {
+					*p++ = PPC_ANDI_(PPC_R9, PPC_R12, size - 1);
+					toSlow[nSlow++] = p++;                            // BNE: unaligned
+				}
+				if (k == JTH_STSLOW_U32) {                            // block store: per-word SMC test
+					emitSmcPageTest(p, PPC_R12, PPC_R9, PPC_R10, flags);
+					toSlow[nSlow++] = p++;                            // BNE: code on the page
+				}
+				journal(size);
+				jitImm32(p, PPC_R10, cpu.arm7EramBase);
+				*p++ = PPC_RLWINM(PPC_R9, PPC_R12, 0, 16, 31);       // EA & 0xFFFF
+				emitStoreOp(p, PPC_R11, PPC_R10, PPC_R9, size);
+				if (k != JTH_STSLOW_U32) *p++ = PPC_CMPW(0, PPC_R12, PPC_R12);
+				*p++ = PPC_BLR();
+				for (int i = 0; i < nSlow; i++) *toSlow[i] = PPC_BNE((u32)((p - toSlow[i]) * 4));
+			}
+#endif
 			callPrologue();
 			*p++ = PPC_OR(PPC_R3, PPC_R12, PPC_R12);
 			*p++ = PPC_OR(PPC_R4, PPC_R11, PPC_R11);

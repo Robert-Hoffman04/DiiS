@@ -4207,6 +4207,72 @@ void FASTCALL _MMU_ARM7_write16(u32 adr, u16 val)
 #endif
 }
 //================================================= MMU ARM7 write 32
+// Task ph-arm7: the ARM7 IME / IE / IF 32-bit write bodies, shared by
+// _MMU_ARM7_write32() and the JIT slow-path shortcut MMU_ARM7_irqWrite32().
+static FORCEINLINE void arm7WriteIME32(u32 val)
+{
+	NDS_Reschedule();
+	u32 old_val = MMU.reg_IME[ARMCPU_ARM7];
+	u32 new_val = val & 1;
+	MMU.reg_IME[ARMCPU_ARM7] = new_val;
+	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM7][0x40], 0x208, val);
+#ifndef NEW_IRQ
+	if ( new_val && old_val != new_val)
+	{
+		// raise an interrupt request to the CPU if needed
+		if ( MMU.reg_IE[ARMCPU_ARM7] & MMU.reg_IF[ARMCPU_ARM7])
+		{
+			NDS_ARM7.waitIRQ = FALSE;
+		}
+	}
+#endif
+}
+
+static FORCEINLINE void arm7WriteIE32(u32 val)
+{
+	NDS_Reschedule();
+	MMU.reg_IE[ARMCPU_ARM7] = val;
+#ifndef NEW_IRQ
+	if ( MMU.reg_IME[ARMCPU_ARM7])
+	{
+		/* raise an interrupt request to the CPU if needed */
+		if ( MMU.reg_IE[ARMCPU_ARM7] & MMU.reg_IF[ARMCPU_ARM7])
+		{
+			NDS_ARM7.waitIRQ = FALSE;
+		}
+	}
+#endif
+}
+
+static FORCEINLINE void arm7WriteIF32(u32 val)
+{
+	NDS_Reschedule();
+	MMU.reg_IF[ARMCPU_ARM7] &= (~val);
+}
+
+// JIT slow-path shortcut (jit_arm7_profile.cpp): 32-bit ARM7 accesses to IME /
+// IE / IF -- the game's ARM7 IRQ dispatcher makes several per IRQ -- handled
+// exactly as _MMU_read32/_MMU_write32<ARMCPU_ARM7>() would (none of the three
+// is a DMA register, so _MMU_ARM7_*32's is_dma() test never matches them).
+bool MMU_ARM7_irqRead32(u32 adr, u32* out)
+{
+	switch (adr) {
+		case REG_IME: *out = MMU.reg_IME[ARMCPU_ARM7]; return true;
+		case REG_IE:  *out = MMU.reg_IE[ARMCPU_ARM7];  return true;
+		case REG_IF:  *out = MMU.reg_IF[ARMCPU_ARM7];  return true;
+		default:      return false;
+	}
+}
+
+bool MMU_ARM7_irqWrite32(u32 adr, u32 val)
+{
+	if (adr == REG_IME)     arm7WriteIME32(val);
+	else if (adr == REG_IE) arm7WriteIE32(val);
+	else if (adr == REG_IF) arm7WriteIF32(val);
+	else return false;
+	return true;
+}
+
 void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 {
 	mmu_log_debug_ARM7(adr, "(write32) 0x%08X", val);
@@ -4247,45 +4313,9 @@ void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 				rtcWrite((u16)val);
 				break;
 
-			case REG_IME : 
-			{
-				NDS_Reschedule();
-				u32 old_val = MMU.reg_IME[ARMCPU_ARM7];
-				u32 new_val = val & 1;
-				MMU.reg_IME[ARMCPU_ARM7] = new_val;
-				T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM7][0x40], 0x208, val);
-#ifndef NEW_IRQ
-				if ( new_val && old_val != new_val) 
-				{
-					// raise an interrupt request to the CPU if needed
-					if ( MMU.reg_IE[ARMCPU_ARM7] & MMU.reg_IF[ARMCPU_ARM7]) 
-					{
-						NDS_ARM7.waitIRQ = FALSE;
-					}
-				}
-#endif
-				return;
-			}
-				
-			case REG_IE :
-				NDS_Reschedule();
-				MMU.reg_IE[ARMCPU_ARM7] = val;
-#ifndef NEW_IRQ
-				if ( MMU.reg_IME[ARMCPU_ARM7])
-				{
-					/* raise an interrupt request to the CPU if needed */
-					if ( MMU.reg_IE[ARMCPU_ARM7] & MMU.reg_IF[ARMCPU_ARM7]) 
-					{
-						NDS_ARM7.waitIRQ = FALSE;
-					}
-				}
-#endif
-				return;
-			
-			case REG_IF :
-				NDS_Reschedule();
-				MMU.reg_IF[ARMCPU_ARM7] &= (~val); 
-				return;
+			case REG_IME : arm7WriteIME32(val); return;
+			case REG_IE :  arm7WriteIE32(val);  return;
+			case REG_IF :  arm7WriteIF32(val);  return;
 
             case REG_TM0CNTL:
             case REG_TM1CNTL:

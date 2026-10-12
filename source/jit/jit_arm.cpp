@@ -847,7 +847,7 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 
 	// ---- pc-relative literal: [pc, #imm], I=0 P=1 W=0 -> EA is constant ----
 	if (rn == 15) {
-		if (I || W || !P || predicated) { ctx.endBlock = true; return; }
+		if (I || W || !P) { ctx.endBlock = true; return; }
 		const u32 ea = ctx.currentPC + 8 + (u32)immOff;
 		ctx.ensureArena();
 
@@ -864,11 +864,34 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 		const bool inDtcm = ((dtcmR & 0x3FFFu) == 0) && ((ea & ~0x3FFFu) == dtcmR);
 		const bool litMain = ctx.cpu.mainMemBase != 0 && (ea & 0x0F000000u) == 0x02000000u;
 		const bool litItcm = ctx.cpu.arm9ItcmBase != 0 && ea < 0x02000000u;
-		if (L && rd != 15 && !inDtcm && (litMain || litItcm)) {
+		// Task ph-arm7: ARM7 private WRAM (0x038xxxxx-0x03Fxxxxx, 64 KB mirrored,
+		// static ARM7 page table) -- the ARM7 sound/IRQ code's literal pools.
+		// Aligned EAs only: _MMU_ARM7_read* reads this region at adr & 0xFFFF
+		// without clearing the low bits, so an unaligned one keeps the C call.
+#if !defined(JIT_NO_ARM7_WRAM_LIT)
+		const bool litEram = ctx.cpu.arm7EramBase != 0 && (ea >> 23) == 0x07u && (ea & (size - 1)) == 0;
+#else
+		const bool litEram = false;
+#endif
+		const bool litFold = L && rd != 15 && !inDtcm && (litMain || litItcm || litEram);
+		// Task ph-arm7: a predicated literal load (the ARM7 IRQ code's
+		// LDREQ/LDRNE rX,[pc,#imm]) folds too when the profile gives its exact
+		// interpreter cost: 1 when the condition fails (counted statically), the
+		// OP_LDR/OP_LDRB return when it passes (the rest added to r3 inside the
+		// guarded body). Without it, the interpreter fallback as before.
+#if !defined(JIT_NO_ARM7_PRED_LIT)
+		const bool predFold = predicated && litFold && ctx.cpu.litLoadCycles != nullptr;
+#else
+		const bool predFold = false;
+#endif
+		if (predicated && !predFold) { ctx.endBlock = true; return; }
+		if (litFold) {
 			const u32 m = (size == 4) ? 0x3FFFFCu : (size == 2) ? 0x3FFFFEu : 0x3FFFFFu;
 			u32 lockedMask = 0;
-			const u8 hRd = ctx.writeReg(rd, /*fullOverwrite=*/true, lockedMask);
+			const u8 hRd = ctx.writeReg(rd, /*fullOverwrite=*/!predicated, lockedMask);
+			u32* guard = predicated ? ctx.emitCondSkip(cond) : nullptr;
 			emitLoadImm32(p, PPC_R12, litMain ? ctx.cpu.mainMemBase + (ea & m)
+			                        : litEram ? ctx.cpu.arm7EramBase + (ea & 0xFFFFu)
 			                                  : ctx.cpu.arm9ItcmBase + (ea & m & 0x7FFFu));
 			if (size == 4) {
 				*p++ = PPC_LWBRX(hRd, 0, PPC_R12);
@@ -878,6 +901,14 @@ void emitSingleDataTransfer(JitTraceCtx& ctx, u32 op, u8 cond)
 				*p++ = PPC_LHBRX(hRd, 0, PPC_R12);
 			} else {
 				*p++ = PPC_LBZX(hRd, 0, PPC_R12);
+			}
+			if (guard) {
+				const u32 taken = ctx.cpu.litLoadCycles(ea, size);
+				if (taken != 1) *p++ = PPC_ADDI(PPC_R3, PPC_R3, (s32)taken - 1);
+				ctx.patchCondSkip(guard);
+				// jitCompileTrace() adds cyclesForArm(op) after this returns;
+				// leave a net 1 (the cond-false cost) in the static sum.
+				ctx.cyclesAccum += 1u - (u32)ctx.cpu.cyclesForArm(op);
 			}
 			return;
 		}

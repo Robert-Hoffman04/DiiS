@@ -31,6 +31,10 @@
 #include "../thumb_instructions.h"
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
+#include "jit_arm7_prof.h"
+#ifdef DESMUME_ARM7PROF
+#include <ogc/lwp_watchdog.h>
+#endif
 #include "../harness/harness.h"
 #include <string.h>
 #include <stdio.h>
@@ -295,6 +299,9 @@ template<int PROCNUM, bool THUMB>
 static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
 {
 	PZ_SCOPE(PROCNUM == ARMCPU_ARM9 ? PZ_JIT9_FB : PZ_JIT7_FB);
+#ifdef DESMUME_ARM7PROF
+	const u64 _a7t0 = gettime();
+#endif
 	armcpu_t& cpu = (PROCNUM == ARMCPU_ARM9) ? NDS_ARM9 : NDS_ARM7;
 	JITCache& jc  = (PROCNUM == ARMCPU_ARM9) ? jitCacheArm9 : jitCacheArm7;
 	const u32 step = THUMB ? 2u : 4u;
@@ -331,6 +338,9 @@ static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
 		ret |= JIT_FALLBACK_EXIT_CHAIN;
 
 	JCC_FALLBACK(PROCNUM == ARMCPU_ARM9 ? 1 : 0, ret);
+#ifdef DESMUME_ARM7PROF
+	if (PROCNUM == ARMCPU_ARM7) a7pFb(pc, opcode, THUMB, (u32)(gettime() - _a7t0));
+#endif
 	return ret;
 }
 
@@ -493,9 +503,15 @@ u32 jitRunArm7(s32 budget)
 	JITResult r;
 	jitResultInit(r);
 	JCC_EXEC_BEGIN();
+#ifdef DESMUME_ARM7PROF
+	const u64 _a7t0 = gettime();
+#endif
 	{ PZ_SCOPE(PZ_JIT7_EXEC); ExecuteJITTrace(b->execute, &r, &st, start); }
 	JCC_EXEC_END(0);
 	r.cycles -= start;
+#ifdef DESMUME_ARM7PROF
+	a7pRun(pc | (thumb ? 1u : 0u), r.cycles, r.instructions, (u32)(gettime() - _a7t0), r.nextPC);
+#endif
 	g_jitAttempts++;
 
 	if (r.smcHit)

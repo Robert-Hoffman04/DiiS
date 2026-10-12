@@ -72,6 +72,11 @@ struct JitCpuProfile {
 	// not VBA's GBA wait-state model (see the plan, risk "audio pitch drift").
 	u8   (*cyclesForThumb)(u16 opcode);
 	u8   (*cyclesForArm)(u32 opcode);
+	// Task ph-arm7: exact interpreter cost of an immediate-offset LDR / LDRB
+	// (OP_LDR / OP_LDRB: MMU_aluMemAccessCycles(3, ea)) at a compile-time EA.
+	// Set on the DS ARM7 only (its timing depends on the address alone); null
+	// elsewhere, which keeps predicated literal loads on the interpreter.
+	u32  (*litLoadCycles)(u32 ea, u32 size);
 
 	s32  isaLevel;     // 4 = ARMv4T (ARM7), 5 = ARMv5TE (ARM9)
 	u32  smcBankMask;  // bit b set => guest bank (addr>>24)==b can hold JIT code
@@ -119,6 +124,10 @@ struct JitCpuProfile {
 	// interpreter's ITCM decode has no CP15 dependency, so this pointer is
 	// the only thing baked. 0 on the ARM7.
 	u32  arm9ItcmBase;
+	// Task ph-arm7: host address of MMU.ARM7_ERAM (64 KB, mirrored over
+	// 0x03800000-0x03FFFFFF), written inline by the ARM7 store thunks. 0 on the
+	// ARM9 and on the GBA ARM7 profile (which never uses the thunks).
+	u32  arm7EramBase;
 };
 
 // One cached page descriptor (see JitCpuProfile::pageDescBase). LAYOUT IS ABI:
