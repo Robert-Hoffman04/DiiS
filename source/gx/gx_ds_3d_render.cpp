@@ -11,7 +11,7 @@
 #include <malloc.h>
 #include <math.h>
 #include <string.h>
-#if defined(DSA_GXGEOM_DEBUGWHY) || defined(DSA_GXGEOM_TEXSTATS) || defined(DSA_GXGEOM_TAGPROF)
+#if defined(DSA_GXGEOM_DEBUGWHY) || defined(DSA_GXGEOM_TEXSTATS) || defined(DSA_GXGEOM_TAGPROF) || defined(DSA_GXGEOM_POLYSTATS) || defined(DSA_GXGEOM_VISCHECK)
 #include "../harness/harness.h"
 #include "../harness/harness_profile.h"
 #endif
@@ -28,6 +28,22 @@ static u32 s_tpRec, s_tpHit, s_tpShapes, s_tpPlanPolys, s_tpPlanClip, s_tpDPolys
 #else
 #define GXDS3D_TP_BEGIN(v) do {} while (0)
 #define GXDS3D_TP_END(k, v) do {} while (0)
+#endif
+
+// Task 3d-percost (measurement only): per recorded 3D pass, what gxDs3dFastPoly did (polygon
+// verdicts, GX state changes, emitted vertices, display-list bytes) and, from gfx3d.cpp, the
+// geometry engine's command mix for the same 3D frames. "gxds3dps" lines every 32 recordings.
+#ifdef DSA_GXGEOM_POLYSTATS
+enum { kPsCalls, kPsMain, kPsInvis, kPsCull, kPsClipDrawn, kPsDrawn, kPsQuad, kPsTrans, kPsSlot, kPsMtx, kPsVp,
+       kPsDesc, kPsTex, kPsTev, kPsToonTev, kPsToonLut, kPsMixed, kPsVerts, kPsBegins, kPsTagged, kPsList, kPsVList,
+       kPsDl, kPsMtxCmp, kPsPasses, kPsClipAway, kPsAnyOut, kPsCount };
+static u32 s_ps[kPsCount], s_psRec;
+#define GXDS3D_PS(k) (++s_ps[k])
+#define GXDS3D_PSN(k, n) (s_ps[k] += (u32)(n))
+extern u32 g_gePs[8];   // gfx3d.cpp: cmds, vertices, normals, normal computes, matrix cmds, mtx mult cmds, begins, polys
+#else
+#define GXDS3D_PS(k) do {} while (0)
+#define GXDS3D_PSN(k, n) do {} while (0)
 #endif
 
 extern MMU_struct MMU;
@@ -764,6 +780,26 @@ static bool s_gateFog = false, s_gateFogRedraw = false;
 // Task gxfast-toon: the frame has mode-2 polygons (GxFast draws them through the toon LUT).
 static bool s_gateToon = false;
 
+// Task 3d-percost: what the GxFast gate found per polylist index, so gxDs3dFastPoly and the record
+// loops skip a polygon that draws nothing without loading its POLY or VERT lines again (on Phantom
+// Hourglass ~85% of the list is clipped away entirely, and the fog redraw visits every opaque
+// polygon a second time). The verdict is a pure function of the polygon and its vertices (the
+// same in every pass): kVisCull = clipped away (gxDs3dClipTrivialReject) or culled by its facing
+// (gxDs3dFacingVisible on the unclipped outline), kVisDraw = unclipped and drawn, 0 = unknown
+// (clipped but not trivially rejected, or polygon alpha 0: those keep the full path). kVisSpecial:
+// translucent or shadow (the main loop never skips those); kVisFogRedraw: the fog redraw draws it
+// (opaque, POLYGON_ATTR bit 15 clear, not a shadow). Valid for the list the gate passed on
+// (s_visKey); -DDSA_GXGEOM_NOVISCACHE: not built (every pass recomputes, as before).
+enum { kVisCull = 1, kVisDraw = 2, kVisSpecial = 4, kVisFogRedraw = 8 };
+#ifdef DSA_GXGEOM_VISCHECK
+// check build: every cached answer recomputed the old way; "gxds3dchk" every 64 gates
+static u32 s_chkGates, s_chkPolys, s_chkCode, s_chkCodeBad, s_chkVis, s_chkVisBad;
+#endif
+#ifndef DSA_GXGEOM_NOVISCACHE
+static u8 s_polyVis[POLYLIST_SIZE];
+static struct { const void *list; int count; u32 seq; bool valid; } s_visKey;
+#endif
+
 // A polygon's screen outline for the polygon-ID check and GxFast culling: rasterize.cpp's
 // divide + viewport + clamp (gxDs3dScreenXY) of the vertices it draws (gxDs3dPolyVerts) and
 // 28.4 truncation (as gxDs3dDrawSpansAccurate), in 1/16 px units. False if it draws nothing:
@@ -1449,6 +1485,9 @@ static int gxDs3dFrameGate(bool requireTex)
 	}
 
 	bool anyTrans = false, anyShadow = false;
+#ifndef DSA_GXGEOM_NOVISCACHE
+	s_visKey.valid = false;
+#endif
 	s_gateHasTrans = false;
 	s_gateFog = gfx3d.enableFog && CommonSettings.GFX3D_Fog;
 	s_gateFogRedraw = false;
@@ -1518,14 +1557,63 @@ static int gxDs3dFrameGate(bool requireTex)
 		// GxFast doesn't (SM64DS clips ~1500 polygons a frame, and the gate runs on every frame):
 		// gxDs3dRenderFast skips such a polygon, where the CPU would divide by zero.
 		bool clipped = false;
+		const VERT *gv[4];
+#if !defined(DSA_GXGEOM_NOCLIPCODES) && !defined(DSA_GXGEOM_NOVISCACHE)
+		// Task 3d-percost: the geometry engine's outcodes (POLY::clipOr) answer the vertex tests
+		// below without loading the vertices: clipped = some vertex outside (gxDs3dVertOutside),
+		// w <= 0 at an unclipped vertex, and gxDs3dClipTrivialReject (all vertices outside the
+		// first plane any of them is outside of, in the clipper's plane order = bit order).
+		if (fast && (p.clipOr & 0x80)) {
+			const u32 o = p.clipOr & 0x3F;
+			u8 vis = (gxDs3dPolyMode(p) == 3 || p.isTranslucent()) ? kVisSpecial : ((p.polyAttr & 0x8000) ? 0 : kVisFogRedraw);
+			if (!o) {
+				if (p.clipOr & 0x40) return kGateW;
+				if (gxDs3dPolyAlpha(p) != 0) {
+					for (int j = 0; j < p.type; ++j) gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+					vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
+				}
+			}
+#ifndef DSA_GXGEOM_NOTRIVREJECT
+			else if (gxDs3dPolyAlpha(p) != 0 && ((p.clipAnd >> __builtin_ctz(o)) & 1)) vis |= kVisCull;
+#endif
+			s_polyVis[i] = vis;
+			clipped = o != 0;
+#ifdef DSA_GXGEOM_VISCHECK
+			{
+				const VERT *cv2[4];
+				bool cl2 = false, w2 = false;
+				for (int j = 0; j < p.type; ++j) { cv2[j] = &gfx3d.vertlist->list[p.vertIndexes[j]]; cl2 |= gxDs3dVertOutside(*cv2[j]); w2 |= cv2[j]->coord[3] <= 0.0f; }
+				const bool rj2 = cl2 && gxDs3dClipTrivialReject(cv2, p.type);
+				const bool rj = o && ((p.clipAnd >> __builtin_ctz(o)) & 1);
+				++s_chkCode;
+				if (cl2 != clipped || (!cl2 && w2 != ((p.clipOr & 0x40) != 0)) || rj2 != rj) ++s_chkCodeBad;
+			}
+#endif
+		} else
+#endif
+		{
 		for (int j = 0; j < p.type; ++j) {
-			const VERT &v = gfx3d.vertlist->list[p.vertIndexes[j]];
-			clipped |= gxDs3dVertOutside(v);
+			gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+			clipped |= gxDs3dVertOutside(*gv[j]);
 		}
 		if (!clipped) {
 			for (int j = 0; j < p.type; ++j)
-				if (gfx3d.vertlist->list[p.vertIndexes[j]].coord[3] <= 0.0f) return kGateW;
-		} else if (!fast) {
+				if (gv[j]->coord[3] <= 0.0f) return kGateW;
+		}
+#ifndef DSA_GXGEOM_NOVISCACHE
+		if (fast) {
+			u8 vis = (gxDs3dPolyMode(p) == 3 || p.isTranslucent()) ? kVisSpecial : ((p.polyAttr & 0x8000) ? 0 : kVisFogRedraw);
+			if (gxDs3dPolyAlpha(p) != 0) {   // gxDs3dPolyInvisible
+				if (!clipped) vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
+#ifndef DSA_GXGEOM_NOTRIVREJECT
+				else if (gxDs3dClipTrivialReject(gv, p.type)) vis |= kVisCull;
+#endif
+			}
+			s_polyVis[i] = vis;
+		}
+#endif
+		}
+		if (clipped && !fast) {
 			const VERT *cv[MAX_CLIPPED_VERTS];
 			const int n = gxDs3dPolyVerts(p, cv, clipped);
 			for (int j = 0; j < n; ++j)
@@ -1564,6 +1652,17 @@ static int gxDs3dFrameGate(bool requireTex)
 #endif
 		return kGateTransId;
 	}
+#ifndef DSA_GXGEOM_NOVISCACHE
+	if (fast) {
+		s_visKey.list = gfx3d.polylist; s_visKey.count = polycount; s_visKey.seq = g_gfx3dRenderSeq; s_visKey.valid = true;
+	}
+#ifdef DSA_GXGEOM_VISCHECK
+	s_chkPolys += (u32)polycount;
+	if ((++s_chkGates & 63) == 0)
+		harness_profile_emitf("gxds3dchk gates=%u polys=%u code=%u codebad=%u vis=%u visbad=%u", (unsigned)s_chkGates, (unsigned)s_chkPolys,
+		                      (unsigned)s_chkCode, (unsigned)s_chkCodeBad, (unsigned)s_chkVis, (unsigned)s_chkVisBad);
+#endif
+#endif
 
 	return kGateOk;
 }
@@ -1831,6 +1930,7 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 {
 	const bool textured = gxDs3dTexFormat(p) != 0;
 	if (first || textured != st.textured || toonLut != st.toonLut) {
+		GXDS3D_PS(kPsDesc);
 		GX_ClearVtxDesc();
 		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
 		if (textured && accurate) GX_SetVtxDesc(GX_VA_NRM, GX_DIRECT);
@@ -1854,6 +1954,7 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 	}
 	const u32 amode = gxDs3dTexAMode(p);
 	if (!textured || (p.texParam == st.texParam && p.texPalette == st.texPal && amode == st.amode)) return;
+	GXDS3D_PS(kPsTex);
 	const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, amode);
 	if (k < 0) return;   // unreachable: gxDs3dFrameGate checked every textured poly
 	GxDs3dTex &t = s_tex[k];
@@ -2423,6 +2524,8 @@ struct GxDs3dFastCtx {
 	bool toonLut;          // the toon LUT is loaded (gxDs3dToonLutEnsure): mode-2 polygons use it
 	int toonKey;           // LUT stage installed after the tag stages: 0 none, 1 multiply, 2 highlight add
 	bool zEqBase;          // every polygon draws with GX_EQUAL / no Z write (the fog redraw), not LESS / write
+	const u8 *vis;         // Task 3d-percost: s_polyVis when valid for this list, else NULL
+	const float *lastMvP, *lastProjP;   // Task 3d-percost: the POLYMTX entries lastMv/lastProj hold
 };
 
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
@@ -2663,12 +2766,12 @@ static void gxDs3dTagTexMtx(const GxDs3dFastCtx &c, bool clipped)
 // tag: 0 plain draw; > 0 test this tag (the run's real draw); < 0 write tag -tag (pass 2).
 static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
-	if (gxDs3dPolyInvisible(p) && !c.shCount) return;   // counted all the same (the stencil comes before shading)
+	GXDS3D_PS(kPsCalls);
+	if (gxDs3dPolyInvisible(p) && !c.shCount) { GXDS3D_PS(kPsInvis); return; }   // counted all the same (the stencil comes before shading)
 	// Depth-equal (see above; never a shadow polygon, gxDs3dFrameGate). The opaque-ID pass
 	// and the fog redraw already draw everything GX_EQUAL without a depth write.
 	const bool deq = (p.polyAttr & (1 << 14)) && !c.shIdPass && !c.zEqBase;
 	const bool toonLut = c.toonLut && gxDs3dPolyMode(p) == 2;
-	gxDs3dToonBegin(p, toonLut);
 	const bool trans = p.isTranslucent() && !c.shCount;
 	const VERT *cv[MAX_CLIPPED_VERTS];
 	bool clipped;
@@ -2679,17 +2782,52 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 #else
 	const int slot = trans ? s_planSlot[&p - gfx3d.polylist->list] : 0;   // the plan's result (gxDs3dPlanStore)
 #endif
+	const int vis = c.vis ? (c.vis[&p - gfx3d.polylist->list] & (kVisCull | kVisDraw)) : 0;   // the gate's verdict
 	if (slot) {
 		const GxDs3dPlanPoly &e = s_planPoly[slot - 1];
-		if (e.state == kPlanCulled) return;
+		GXDS3D_PS(kPsSlot);
+		if (e.state == kPlanCulled) { GXDS3D_PS(kPsCull); return; }
 		clipped = e.state == kPlanPooled;
 		nv = clipped ? e.n : p.type;
 		for (int j = 0; j < nv; ++j)
 			cv[j] = clipped ? &s_planVerts[e.vert + j] : &gfx3d.vertlist->list[p.vertIndexes[j]];
+	} else if (vis == kVisCull) {
+#ifdef DSA_GXGEOM_VISCHECK
+		{
+			const VERT *cv2[MAX_CLIPPED_VERTS];
+			bool cl2;
+			const int nv2 = gxDs3dPolyVerts(p, cv2, cl2);
+			bool bad = false;
+			if (cl2) for (int j = 0; j < nv2; ++j) bad |= cv2[j]->coord[3] <= 0.0f;
+			GxDs3dTransShape sh2;
+			++s_chkVis;
+			if (!bad && gxDs3dTransShapeBuild(p, cv2, nv2, sh2)) ++s_chkVisBad;
+		}
+#endif
+		// what the facing / clip-away return below does, without the vertex loads
+		if (s_shRec && !c.shIdPass) s_shBoxState[&p - gfx3d.polylist->list] = kShBoxNone;
+		GXDS3D_PS(kPsCull);
+		return;
+	} else if (vis == kVisDraw) {
+#ifdef DSA_GXGEOM_VISCHECK
+		{
+			const VERT *cv2[MAX_CLIPPED_VERTS];
+			bool cl2;
+			const int nv2 = gxDs3dPolyVerts(p, cv2, cl2);
+			GxDs3dTransShape sh2;
+			++s_chkVis;
+			if (cl2 || !gxDs3dTransShapeBuild(p, cv2, nv2, sh2)) ++s_chkVisBad;
+		}
+#endif
+		nv = p.type;
+		clipped = false;
+		for (int j = 0; j < nv; ++j) cv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
 	} else {
 		nv = gxDs3dPolyVerts(p, cv, clipped);
 	}
 	GXDS3D_TP_END(kTpDVerts, tpv);
+	if (clipped) GXDS3D_PS(kPsAnyOut);
+	if (nv < 3) GXDS3D_PS(kPsClipAway);
 #ifdef DSA_GXGEOM_TAGPROF
 	++s_tpDPolys; s_tpDClip += clipped;
 	if (clipped && nv < 3) ++s_tpDGone;
@@ -2697,7 +2835,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	if (clipped) {   // degenerate (through the eye), see gxDs3dFrameGate
 		bool bad = false;
 		for (int j = 0; j < nv; ++j) bad |= cv[j]->coord[3] <= 0.0f;
-		if (bad) return;
+		if (bad) { GXDS3D_PS(kPsCull); return; }
 	}
 	// Back/front-face culling (POLYGON_ATTR bits 6-7) on the CPU's own (clipped) screen
 	// outline; false also when clipped away. Already known for a polygon the plan cached.
@@ -2710,20 +2848,22 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			const int i = (int)(&p - gfx3d.polylist->list);
 			s_shBoxState[i] = shOk ? kShBoxDraws : kShBoxNone;
 			if (shOk) { s_shPolyBox[i][0] = shape.x0; s_shPolyBox[i][1] = shape.y0; s_shPolyBox[i][2] = shape.x1; s_shPolyBox[i][3] = shape.y1; }
-			if (!shOk) return;
-		} else {
+			if (!shOk) { GXDS3D_PS(kPsCull); return; }
+		} else if (vis != kVisDraw) {
 			// Only the verdict is used (the outline matters for the shadow boxes alone).
 			const bool shOk = gxDs3dFacingVisible(p, cv, nv);
 			GXDS3D_TP_END(kTpDShape, tps);
-			if (!shOk) return;
+			if (!shOk) { GXDS3D_PS(kPsCull); return; }
 		}
 	}
+	gxDs3dToonBegin(p, toonLut);   // (after the culling: it loads vertex 0)
 	GXDS3D_TP_BEGIN(tpsu);
 	const bool tagWrite = tag < 0;
 	u8 va = 255;
 	bool zw = true, twoPass = false;
 	if (trans) {
-		if (!gxDs3dTransDraws(p)) return;
+		if (!gxDs3dTransDraws(p)) { GXDS3D_PS(kPsCull); return; }
+		GXDS3D_PS(kPsTrans);
 		const bool texTrans = gxDs3dTexFmtTrans(gxDs3dTexFormat(p));
 		if (!texTrans) va = gxDs3dGxAlpha(gxDs3dPolyAlpha(p));
 		zw = (p.polyAttr >> 11) & 1;
@@ -2739,6 +2879,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 
 	bool vpNew = false;
 	if (!c.haveLast || p.viewport != c.lastVp) {
+		GXDS3D_PS(kPsVp);
 		c.vp.decode(p.viewport);
 #ifdef DSA_GXGEOM_MUTATE_VPOFFSET
 		GX_SetViewport((f32)c.vp.x + kGxDs3dSampleOffset,
@@ -2750,8 +2891,17 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 #endif
 		c.lastVp = p.viewport;
 	}
-	if (!c.haveLast || vpNew || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix)) {
+	GXDS3D_PS(kPsMtxCmp);
+	// Task 3d-percost: the same POLYMTX entry (most consecutive polygons) holds the same values,
+	// so the two 16-float compares run only when the pointers differ. -DDSA_GXGEOM_NOMTXPTR: off.
+#ifndef DSA_GXGEOM_NOMTXPTR
+	const bool samePtr = c.haveLast && !vpNew && p.mvMatrix == c.lastMvP && p.projMatrix == c.lastProjP;
+#else
+	const bool samePtr = false;
+#endif
+	if (!samePtr && (!c.haveLast || vpNew || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix))) {
 		GxDs3dFastXform x;
+		GXDS3D_PS(kPsMtx);
 		if (!gxDs3dFastXformBuild(p, x, c.wbuf, s_wK))
 			return;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
 		GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
@@ -2774,6 +2924,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		c.haveLast = true;
 		c.curMtx = -1;
 	}
+	c.lastMvP = p.mvMatrix; c.lastProjP = p.projMatrix;   // lastMv / lastProj hold their values now
 	// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section).
 	if (c.curMtx != (int)clipped) {
 		GX_SetCurrentMtx(clipped ? GX_PNMTX1 : GX_PNMTX0);
@@ -2793,11 +2944,13 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	const int toonGens = (textured ? 1 : 0) + (mode == 2);
 	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured) || (c.toonKey && !toonKey)) {
 		gxDs3dTagTev(mode, textured, mode >= 3 ? c.shId : c.tagTwo, mode == 2 && c.tagCarry);
+		GXDS3D_PS(kPsTev);
 		c.tagMode = mode;
 		c.tagTextured = textured;
 		c.toonKey = 0;
 	}
 	if (toonKey && toonKey != c.toonKey) {
+		GXDS3D_PS(kPsToonTev);
 		gxDs3dToonTev(toonStage, toonGens, toonKey == 2);
 		c.toonKey = toonKey;
 	}
@@ -2823,6 +2976,12 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	GXDS3D_TP_BEGIN(tpe);
 	float mixedBuf[4][3];
 	const float (*mixedObj)[3] = (!clipped && gxDs3dMixedObj(p, mixedBuf)) ? mixedBuf : NULL;
+	GXDS3D_PS(kPsDrawn);
+	if (clipped) GXDS3D_PS(kPsClipDrawn);
+	if (p.type == 4) GXDS3D_PS(kPsQuad);
+	if (mixedObj) GXDS3D_PS(kPsMixed);
+	if (toonLut) GXDS3D_PS(kPsToonLut);
+	if (tag) GXDS3D_PS(kPsTagged);
 	if (deq && !trans) GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);   // (translucent: per pass below)
 	for (int pass = twoPass ? 0 : 1; pass < (c.shIdPass && twoPass ? 1 : 2); ++pass) {   // ID pass: pass 0 only when there is one
 		// A tagged run's a == 31 fragments neither stamp (no tag written) nor test the ID
@@ -2846,6 +3005,8 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			else if (twoPass) GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_LESS, 255);
 			else              GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
 		}
+		GXDS3D_PS(kPsBegins);
+		GXDS3D_PSN(kPsVerts, clipped ? nv : p.type);
 		if (clipped) {
 			GX_Begin(GX_TRIANGLEFAN, GX_VTXFMT0, nv);
 			for (int j = 0; j < nv; ++j) {
@@ -3138,6 +3299,10 @@ static void gxDs3dRenderFastDraw()
 		guMtxIdentity(id);
 		GX_LoadPosMtxImm(id, GX_PNMTX1);
 	}
+#ifndef DSA_GXGEOM_NOVISCACHE
+	if (s_visKey.valid && s_visKey.list == gfx3d.polylist && s_visKey.count == gfx3d.polylist->count && s_visKey.seq == g_gfx3dRenderSeq)
+		c.vis = s_polyVis;
+#endif
 	int curRun = 0;
 	bool tags = s_tagRunCount > 0 && gxDs3dTagBuffers() && (!s_tagCarryAny || gxDs3dTagCarryBuffer());
 #ifdef DSA_GXGEOM_MUTATE_TAGOFF
@@ -3153,6 +3318,14 @@ static void gxDs3dRenderFastDraw()
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
 		// rasterize.cpp draws them (see the translucent section).
 		const int i = gfx3d.indexlist[n];
+		GXDS3D_PS(kPsMain);
+		if (c.vis && (c.vis[i] & (kVisCull | kVisSpecial)) == kVisCull) {
+			// an opaque polygon that draws nothing: gxDs3dFastPoly's cull return, without the POLY load
+			if (sh && n == s_shIdAt) gxDs3dShadowIdPass(c);
+			if (s_shRec) s_shBoxState[i] = kShBoxNone;
+			GXDS3D_PS(kPsCalls); GXDS3D_PS(kPsCull);
+			continue;
+		}
 		POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dPolyMode(p) == 3) {   // only in a frame the shadow plan passed
 			if (sh && n == s_shIdAt) gxDs3dShadowIdPass(c);
@@ -3195,7 +3368,14 @@ static void gxDs3dRenderFastDraw()
 			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
 			c.zEqBase = true;
 			for (int n = 0; n < polycount; ++n) {
-				POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
+				const int i = gfx3d.indexlist[n];
+				if (c.vis) {
+					if (!(c.vis[i] & kVisFogRedraw)) continue;
+					if (c.vis[i] & kVisCull) { GXDS3D_PS(kPsCalls); GXDS3D_PS(kPsCull); continue; }   // draws nothing
+					gxDs3dFastPoly(c, gfx3d.polylist->list[i], 0);
+					continue;
+				}
+				POLY &p = gfx3d.polylist->list[i];
 				if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;
 				gxDs3dFastPoly(c, p, 0);
 			}
@@ -3282,6 +3462,19 @@ void gxDs3dRenderFast()
 		gxDs3dRenderFastDraw();
 		GXDS3D_TP_END(kTpDraw, tpd);
 		const u32 n = GX_EndDispList();
+#ifdef DSA_GXGEOM_POLYSTATS
+		s_ps[kPsDl] += n; s_ps[kPsList] += (u32)count; s_ps[kPsVList] += (u32)gfx3d.vertlist->count;
+		if ((++s_psRec & 31) == 0) {
+			const float d = 1.0f / (float)s_psRec;
+			harness_profile_emitf("gxds3dps rec=%u per rec: list=%.0f vlist=%.0f main=%.0f calls=%.0f invis=%.0f cull=%.0f drawn=%.0f clipdrawn=%.0f quad=%.0f trans=%.0f slot=%.0f tagged=%.0f mixed=%.0f toonlut=%.0f mtxcmp=%.0f mtx=%.0f vp=%.0f desc=%.0f tex=%.0f tev=%.0f toontev=%.0f anyout=%.0f clipaway=%.0f begins=%.0f verts=%.0f dlbytes=%.0f ge: cmds=%.0f vtx=%.0f nrm=%.0f nrmcomp=%.0f mtxcmd=%.0f mtxmul=%.0f begin=%.0f polys=%.0f",
+			                      (unsigned)s_psRec, d * s_ps[kPsList], d * s_ps[kPsVList], d * s_ps[kPsMain], d * s_ps[kPsCalls], d * s_ps[kPsInvis],
+			                      d * s_ps[kPsCull], d * s_ps[kPsDrawn], d * s_ps[kPsClipDrawn], d * s_ps[kPsQuad], d * s_ps[kPsTrans], d * s_ps[kPsSlot],
+			                      d * s_ps[kPsTagged], d * s_ps[kPsMixed], d * s_ps[kPsToonLut], d * s_ps[kPsMtxCmp], d * s_ps[kPsMtx], d * s_ps[kPsVp],
+			                      d * s_ps[kPsDesc], d * s_ps[kPsTex], d * s_ps[kPsTev], d * s_ps[kPsToonTev], d * s_ps[kPsAnyOut], d * s_ps[kPsClipAway], d * s_ps[kPsBegins], d * s_ps[kPsVerts],
+			                      d * s_ps[kPsDl], d * g_gePs[0], d * g_gePs[1], d * g_gePs[2], d * g_gePs[3], d * g_gePs[4], d * g_gePs[5], d * g_gePs[6], d * g_gePs[7]);
+			memset(s_ps, 0, sizeof(s_ps)); memset(g_gePs, 0, sizeof(g_gePs)); s_psRec = 0;
+		}
+#endif
 		if (n) {
 			s_dlSize = n;
 			s_dlKey.seq = g_gfx3dRenderSeq; s_dlKey.list = gfx3d.polylist; s_dlKey.count = count;

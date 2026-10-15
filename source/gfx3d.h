@@ -134,7 +134,15 @@ void gfx3d_reset();
 #define OSREAD(x) is->fread((char*)&(x),sizeof((x)));
 
 struct POLY {
-	int type; //tri or quad
+	// Task 3d-percost: type was an int (only 3 or 4); its upper bytes now hold clipOr/clipAnd, so
+	// POLY stays 44 bytes. The savestate still writes type as an int (save/load below).
+	u8 type; //tri or quad
+	// Task 3d-percost: the outcodes of the polygon's vertices as SetVertex computed them from the
+	// clip-space floats it stored (gfx3d.cpp GE_VTXCODE): bits 0-5 x<-w, x>w, y<-w, y>w, z<-w, z>w,
+	// bit 6 w<=0. clipOr = 0x80 | OR of the vertices' codes, clipAnd = their AND. clipOr == 0:
+	// not known (savestate load, -DDSA_GXGEOM_NOCLIPCODES): consumers read the vertices instead.
+	u8 clipOr, clipAnd;
+	u8 clipPad;
 	u16 vertIndexes[4]; //up to four verts can be referenced by this poly
 	u32 polyAttr, texParam, texPalette; //the hardware rendering params
 	u32 viewport;
@@ -172,6 +180,7 @@ struct POLY {
 
 	void save(EMUFILE* os)
 	{
+		int type = this->type;   // (an int in the savestate)
 		OSWRITE(type);
 		OSWRITE(vertIndexes[0]); OSWRITE(vertIndexes[1]); OSWRITE(vertIndexes[2]); OSWRITE(vertIndexes[3]);
 		OSWRITE(polyAttr); OSWRITE(texParam); OSWRITE(texPalette);
@@ -182,7 +191,10 @@ struct POLY {
 
 	void load(EMUFILE* is)
 	{
+		int type;
 		OSREAD(type);
+		this->type = (u8)type;
+		clipOr = clipAnd = 0;
 		OSREAD(vertIndexes[0]); OSREAD(vertIndexes[1]); OSREAD(vertIndexes[2]); OSREAD(vertIndexes[3]);
 		OSREAD(polyAttr); OSREAD(texParam); OSREAD(texPalette);
 		OSREAD(viewport);

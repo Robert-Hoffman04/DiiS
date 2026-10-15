@@ -561,6 +561,38 @@ struct tmpVertInfo {
 	//indicates that the first poly in a list has been completed
 	BOOL first;
 } tempVertInfo;
+// Task 3d-percost: the outcode (POLY::clipOr) of the vertex in each tempVertInfo.map slot; follows
+// map's rotations. Not in the savestate: invalid after a load until the next BEGIN/END resets
+// the slots (the polygons built meanwhile get clipOr = 0, "not known").
+#ifndef DSA_GXGEOM_NOCLIPCODES
+static u8 s_vtxCode[4];
+static bool s_vtxCodeOk = true;
+// A vertex's outcode: bits 0-5 x<-w, x>w, y<-w, y>w, z<-w, z>w, bit 6 w<=0 (unordered: 0, as the
+// C comparisons). PPC: the seven fcmpu land in distinct volatile CR fields and are read with two
+// mfcr (GCC's version of the C expression below takes one mfcr per comparison).
+static inline u32 ge_outcode(float x, float y, float z, float w)
+{
+#if defined(__PPC__) && !defined(DSA_GXGEOM_CLIPCODE_C)
+	const float nw = -w, zero = 0.0f;
+	u32 a, b;
+	// CR bit k (IBM numbering, bit 0 = MSB) = (mfcr >> (31 - k)) & 1; field n holds LT GT EQ UN at 4n..4n+3.
+	asm("fcmpu 0,%2,%5\n\t"    // cr0.lt (bit 0):  x < -w
+	    "fcmpu 1,%2,%6\n\t"    // cr1.gt (bit 5):  x > w
+	    "fcmpu 5,%3,%5\n\t"    // cr5.lt (bit 20): y < -w
+	    "fcmpu 6,%3,%6\n\t"    // cr6.gt (bit 25): y > w
+	    "fcmpu 7,%4,%5\n\t"    // cr7.lt (bit 28): z < -w
+	    "mfcr %0\n\t"
+	    "fcmpu 0,%4,%6\n\t"    // cr0.gt (bit 1):  z > w
+	    "fcmpu 1,%6,%7\n\t"    // cr1.lt | cr1.eq (bits 4, 6): w <= 0
+	    "mfcr %1"
+	    : "=&r"(a), "=r"(b) : "f"(x), "f"(y), "f"(z), "f"(nw), "f"(w), "f"(zero) : "cr0", "cr1", "cr5", "cr6", "cr7");
+	return ((a >> 31) & 1) | ((a >> 25) & 2) | ((a >> 9) & 4) | ((a >> 3) & 8) | ((a << 1) & 16) |
+	       ((b >> 25) & 32) | (((b >> 21) | (b >> 19)) & 64);
+#else
+	return (u32)((x < -w) | ((x > w) << 1) | ((y < -w) << 2) | ((y > w) << 3) | ((z < -w) << 4) | ((z > w) << 5) | ((w <= 0.0f) << 6));
+#endif
+}
+#endif
 
 
 // Task gespeed: the POLYMTX the next polygon points at, and whether a matrix command ran
@@ -718,6 +750,9 @@ void gfx3d_reset(){
 	memset(gxPIPE.param, 0, sizeof(gxPIPE.param));
 	memset(colorRGB, 0, sizeof(colorRGB));
 	memset(&tempVertInfo, 0, sizeof(tempVertInfo));
+#ifndef DSA_GXGEOM_NOCLIPCODES
+	s_vtxCodeOk = true;
+#endif
 
 	MatrixInit (mtxCurrent[0]);
 	MatrixInit (mtxCurrent[1]);
@@ -771,8 +806,26 @@ void gfx3d_reset(){
 // Task gpu-ge: fresh output lines for the polygon about to be written (before SUBMITVERTEX).
 #define GE_POLYFRESH() GE_ZEROFRESH_TO(s_pHw, polylist->list + polylist->count + 1, s_pLim)
 #define SUBMITVERTEX(ii, nn) polylist->list[polylist->count].vertIndexes[ii] = tempVertInfo.map[nn];
+// Task 3d-percost: POLY::clipOr / clipAnd of the polygon being completed (map slots 0..n-1).
+#ifndef DSA_GXGEOM_NOCLIPCODES
+#define GE_POLYCODE(n) do { POLY &pc_ = polylist->list[polylist->count]; \
+	u32 o_ = s_vtxCode[0] | s_vtxCode[1] | s_vtxCode[2], a_ = s_vtxCode[0] & s_vtxCode[1] & s_vtxCode[2]; \
+	if ((n) == 4) { o_ |= s_vtxCode[3]; a_ &= s_vtxCode[3]; } \
+	pc_.clipOr = s_vtxCodeOk ? (u8)(o_ | 0x80) : 0; pc_.clipAnd = (u8)a_; } while (0)
+#define GE_VTXCODE_MOVE(d, s) (s_vtxCode[d] = s_vtxCode[s])
+#else
+#define GE_POLYCODE(n) do {} while (0)
+#define GE_VTXCODE_MOVE(d, s) do {} while (0)
+#endif
 //Submit a vertex to the GE
+#ifdef DSA_GXGEOM_POLYSTATS
+u32 g_gePs[8];   // Task 3d-percost (measurement): see gx_ds_3d_render.cpp's gxds3dps line
+#define GE_PS(k) (++g_gePs[k])
+#else
+#define GE_PS(k) do {} while (0)
+#endif
 static void SetVertex(){
+	GE_PS(1);
 	// Task gedma: a local (it was the file-scope global of the same name, stored to and
 	// reloaded three times per vertex, and read by nothing outside this function).
 	int polygonListCompleted;
@@ -847,6 +900,12 @@ static void SetVertex(){
 	vert.color[1] = GFX3D_5TO6(colorRGB[1]);
 	vert.color[2] = GFX3D_5TO6(colorRGB[2]);
 	vert.mtxEpoch = s_mtxEpoch;
+#ifndef DSA_GXGEOM_NOCLIPCODES
+	{
+		// the comparisons gxDs3dVertOutside / gxDs3dClipTrivialReject / the gate's w test make on these floats
+		s_vtxCode[tempVertInfo.count] = (u8)ge_outcode(coordTransformed[0], coordTransformed[1], coordTransformed[2], coordTransformed[3]);
+	}
+#endif
 
 	tempVertInfo.map[tempVertInfo.count] = vertlist->count + tempVertInfo.count - continuation;
 	tempVertInfo.count++;
@@ -864,6 +923,7 @@ static void SetVertex(){
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
+				GE_POLYCODE(3);
 				vertlist->count+=3;
 				polylist->list[polylist->count].type = 3;
 				tempVertInfo.count = 0;
@@ -877,6 +937,7 @@ static void SetVertex(){
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
 				SUBMITVERTEX(3,3);
+				GE_POLYCODE(4);
 				vertlist->count+=4;
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.count = 0;
@@ -889,12 +950,14 @@ static void SetVertex(){
 				SUBMITVERTEX(0,0);
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
+				GE_POLYCODE(3);
 				polylist->list[polylist->count].type = 3;
 
 				if(triStripToggle)
 					tempVertInfo.map[1] = vertlist->count+2-continuation;
 				else
 					tempVertInfo.map[0] = vertlist->count+2-continuation;
+				GE_VTXCODE_MOVE(triStripToggle ? 1 : 0, 2);
 				
 				if(tempVertInfo.first)
 					vertlist->count+=3;
@@ -914,9 +977,12 @@ static void SetVertex(){
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,3);
 				SUBMITVERTEX(3,2);
+				GE_POLYCODE(4);
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.map[0] = vertlist->count+2-continuation;
 				tempVertInfo.map[1] = vertlist->count+3-continuation;
+				GE_VTXCODE_MOVE(0, 2);
+				GE_VTXCODE_MOVE(1, 3);
 				if(tempVertInfo.first)
 					vertlist->count+=4;
 				else vertlist->count+=2;
@@ -928,6 +994,7 @@ static void SetVertex(){
 		}
 
 		if(polygonListCompleted == 1){
+			GE_PS(7);
 			POLY &poly = polylist->list[polylist->count];
 
 			if (s_polyMtxDirty) {
@@ -1467,6 +1534,7 @@ static GE_NOINLINE void gfx3d_glNormal(u32 v){
 		colorRGB[2] = e.rgb[2];
 		return;
 	}
+	GE_PS(3);
 	gfx3d_glNormalCompute(v);
 	e.key = v;
 	e.epoch = s_normEpoch;
@@ -1643,6 +1711,9 @@ static GE_NOINLINE void gfx3d_glBegin(u32 v){
 	triStripToggle = 0;
 	tempVertInfo.count = 0;
 	tempVertInfo.first = true;
+#ifndef DSA_GXGEOM_NOCLIPCODES
+	s_vtxCodeOk = true;   // every slot is rewritten before a polygon uses it
+#endif
 	polyAttr = polyAttrPending;
 	gfx3d_glPolygonAttrib_cache();
 	GFX_DELAY(1);
@@ -1651,6 +1722,9 @@ static GE_NOINLINE void gfx3d_glBegin(u32 v){
 static GE_NOINLINE void gfx3d_glEnd(){
 	inBegin = FALSE;
 	tempVertInfo.count = 0;
+#ifndef DSA_GXGEOM_NOCLIPCODES
+	s_vtxCodeOk = true;
+#endif
 	GFX_DELAY(1);
 }
 
@@ -1907,6 +1981,13 @@ static void gfx3d_execute(u8 cmd, u32 param){
 	// Task gespeed: MTX_POP .. MTX_TRANS may change mtxCurrent[0]/[1] (see s_polyMtx).
 	// Task gelight: and, in matrix modes 1 and 2, the directional matrix (see s_normEpoch).
 	// (Task gedma: done in those commands' own cases below rather than as a range test on every command.)
+#ifdef DSA_GXGEOM_POLYSTATS
+	++g_gePs[0];
+	if (cmd == 0x21) ++g_gePs[2];
+	if (cmd >= 0x10 && cmd <= 0x1C) ++g_gePs[4];
+	if (cmd >= 0x18 && cmd <= 0x1C) ++g_gePs[5];
+	if (cmd == 0x40) ++g_gePs[6];
+#endif
 #define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode != 3) ++s_mtxEpoch; if (mode - 1 <= 1u) gfx3d_normEpochBump(); } while (0)
 
 	switch (cmd)
@@ -2084,6 +2165,7 @@ void gfx3d_execute3D(){
 				u16coord[0] = (u16)param;
 				u16coord[1] = (u16)(param >> 16);
 				u16coord[2] = (u16)param2;
+				GE_PS(0);
 				SetVertex();
 				i--;
 				continue;
@@ -2724,6 +2806,9 @@ void gfx3d_savestate(EMUFILE* os){
 
 bool gfx3d_loadstate(EMUFILE* is, int size){
 	gfx3d_normEpochBump();
+#ifndef DSA_GXGEOM_NOCLIPCODES
+	s_vtxCodeOk = false;   // tempVertInfo.map comes from the state, s_vtxCode does not
+#endif
 	int version;
 	if(read32le(&version,is) != 1) return false;
 	if(size==8) version = 0;
