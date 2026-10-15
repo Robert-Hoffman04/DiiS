@@ -42,11 +42,31 @@
 // Pending tiled-RGB5A3 copy buffer per GPU_screen slot, NULL when GPU_screen is current.
 extern const void *g_gxDsPresentPending[2];
 
+// Task ph-swapflicker: the copy buffer draw_thread binds for each physical screen (set by
+// Draw() under vidmutex, NULL for the converted TopTex/BottomTex). Draw() runs at the end of
+// NDS_exec (VBlank end); the engines copy at VBlank start (line 192), so for the whole VBlank
+// draw_thread keeps presenting with the previous Draw()'s bindings. With one copy buffer per
+// engine that copy refilled a bound buffer with the NEW frame, which after a POWCNT1 DISPSWAP
+// flip belongs to the other screen: Phantom Hourglass (swaps every frame, 3D on alternate
+// screens) showed both screens swapped on every present that fell in the VBlank, i.e. both
+// screens flickered. Now each engine has two copy buffers and copies into the one that is not
+// bound. If it cannot (no memory for the second buffer, or both bound), the copy sets
+// g_gxDsPresentHold and draw_thread re-shows its last XFB instead of presenting until Draw()
+// rebinds and clears it. -DDSP_MUTATE_SWAPFLICKER: one buffer, hold never acted on (the old
+// behaviour).
+extern const void *g_gxDsPresentBound[2];
+extern bool g_gxDsPresentHold;
+#ifdef DSP_SWAPLOG
+// Instrumentation: g_gxDsPresentHoldWrong = a bound buffer was refilled for the other screen.
+extern bool g_gxDsPresentHoldWrong;
+#endif
+
 // Engine side: record `buf` (256x192 tiled RGB5A3, all texels opaque) as slot's content.
 // fence (gx_fence.h): the token issued after that copy; readers wait for it.
 void gxDsPresentSet(int slot, const void *buf, u16 fence);
 // Engine side, before its GX_CopyTex overwrites `buf`: resolve any slot still pointing at it,
 // except keepSlot, which the caller rewrites whole right after (dropped unconverted; lazyfix).
+// Called before EVERY copy into an engine's present buffer (also sets g_gxDsPresentHold).
 void gxDsPresentReleaseBuffer(const void *buf, int keepSlot);
 
 void gxDsPresentResolveSlotImpl(int slot);

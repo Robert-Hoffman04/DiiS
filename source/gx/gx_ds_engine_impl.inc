@@ -654,6 +654,10 @@ static GXTexObj s_backdropTexObj[GX_DSB_MAX_BAND_REGS];
 static void *s_backdropTexData;
 
 static void *s_copyBackBuf;
+// Task ph-swapflicker: s_copyBackBuf is one of two buffers. Each copy goes into the one
+// draw_thread does not bind (g_gxDsPresentBound), so the screen it shows keeps last frame's
+// content until Draw() rebinds; [1] NULL (no memory): one buffer, gx_ds_present.h's hold.
+static void *s_copyBackBufs[2];
 // Task gpu-overlap (gx_fence.h): fence after this engine's last GX batch (its copy); waited on
 // before the CPU next rewrites anything that batch read.
 static u16 s_fenceTok;
@@ -776,8 +780,11 @@ bool GXDS_API(RenderInit)()
 	gxDsBInitFadeTables();
 
 	u32 copySz = GX_GetTexBufferSize(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE, 0);
-	s_copyBackBuf = memalign(32, copySz);
+	s_copyBackBuf = s_copyBackBufs[0] = memalign(32, copySz);
 	if (!s_copyBackBuf) return false;
+#ifndef DSP_MUTATE_SWAPFLICKER
+	s_copyBackBufs[1] = memalign(32, copySz);
+#endif
 	s_copyBackLinear = (u16 *)malloc((u32)kDsBScreenW * kDsBScreenH * sizeof(u16));
 	if (!s_copyBackLinear) return false;
 
@@ -805,7 +812,7 @@ void GXDS_API(RenderShutdown)()
 	free(s_bgBakeScratch); s_bgBakeScratch = NULL; s_bgBakeScratchCap = 0;
 	free(s_objBakeScratch); s_objBakeScratch = NULL;
 	free(s_backdropTexData); s_backdropTexData = NULL;
-	free(s_copyBackBuf); s_copyBackBuf = NULL;
+	free(s_copyBackBufs[0]); free(s_copyBackBufs[1]); s_copyBackBufs[0] = s_copyBackBufs[1] = s_copyBackBuf = NULL;
 	free(s_copyBackLinear); s_copyBackLinear = NULL;
 #if GXDS_CORE == 0
 	free(s_3d.texData); s_3d.texData = NULL; s_3d.texDataCap = 0; s_3d.valid = false;
@@ -4677,6 +4684,12 @@ static bool gxDsBRenderFrameImpl()
 	// copy or eager readback), so last frame's copy there is dropped unconverted.
 	PZ_SUB_SCOPE(PZ_EFB_COPY);   // to the end of the function; the readbacks below re-zone themselves
 	const int slot = GXDS_SCREEN.offset ? 1 : 0;
+	// Task ph-swapflicker: not into the buffer draw_thread still shows (on either screen).
+	if ((s_copyBackBuf == g_gxDsPresentBound[0] || s_copyBackBuf == g_gxDsPresentBound[1]) && s_copyBackBufs[1]) {
+		void *other = (s_copyBackBuf == s_copyBackBufs[0]) ? s_copyBackBufs[1] : s_copyBackBufs[0];
+		if (other != g_gxDsPresentBound[0] && other != g_gxDsPresentBound[1])
+			s_copyBackBuf = other;
+	}
 	gxDsPresentReleaseBuffer(s_copyBackBuf, slot);
 	// clear=GX_TRUE (task 12): wipe the 256x192 EFB corner just drawn into so it
 	// does not ghost under draw_thread's present (visible in the live window).

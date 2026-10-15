@@ -178,6 +178,13 @@ static bool GbaUseDirectTopTex = false;
 // DsDirectTex[screen] (pointing at the copy buffer) instead of TopTex/BottomTex.
 static GXTexObj DsDirectTex[2];
 static bool DsUseDirectTex[2] = { false, false };
+#ifdef DSP_SWAPLOG
+// Task ph-swapflicker instrumentation, per Draw(): draw_thread passes that presented, that
+// found the hold set (a bound buffer refilled since Draw(); `wrong`: for the other screen),
+// and that were held (skipped) because of it.
+static u32 s_swPresents, s_swStale, s_swWrong, s_swHeld;
+#include "harness/harness_profile.h"
+#endif
 
 // TODO: Make this fancier
 static u16 CursorData[16] __attribute__((aligned(32))) = {
@@ -716,7 +723,18 @@ static void Draw(void) {
 		DsUseDirectTex[s] = !gameInfo.isGBA && g_gxDsPresentPending[s] != NULL;
 		if (DsUseDirectTex[s])
 			GX_InitTexObj(&DsDirectTex[s], (void *)g_gxDsPresentPending[s], 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		g_gxDsPresentBound[s] = DsUseDirectTex[s] ? g_gxDsPresentPending[s] : NULL;   // Task ph-swapflicker
 	}
+#ifdef DSP_SWAPLOG
+	static u32 s_swDraws = 0;
+	harness_profile_emitf("swlog f=%u off=%d,%d bound=%03x,%03x presents=%u stale=%u wrong=%u held=%u",
+		++s_swDraws, (int)MainScreen.offset, (int)SubScreen.offset,
+		(unsigned)((u32)g_gxDsPresentBound[0] & 0xFFF), (unsigned)((u32)g_gxDsPresentBound[1] & 0xFFF),
+		s_swPresents, s_swStale, s_swWrong, s_swHeld);
+	s_swPresents = s_swStale = s_swWrong = s_swHeld = 0;
+	g_gxDsPresentHoldWrong = false;
+#endif
+	g_gxDsPresentHold = false;   // every bound buffer holds this frame's content again
 
 	if (!GbaUseDirectTopTex && !DsUseDirectTex[0]) {
 		u16 *dTop = TopScreen;
@@ -855,6 +873,28 @@ static void *draw_thread(void*){
 		GXDBG_MAIN("draw_thread: waiting for vidmutex");
 		LWP_MutexLock(vidmutex);
 		GXDBG_MAIN("draw_thread: vidmutex acquired");
+
+		// Task ph-swapflicker (gx_ds_present.h): an engine has refilled a bound copy buffer with
+		// the next frame (maybe the other screen's content) and Draw() has not rebound yet.
+		// Keep showing the last XFB, which was made from the old content.
+#ifdef DSP_SWAPLOG
+		if (g_gxDsPresentHold) {
+			s_swStale += 1; if (g_gxDsPresentHoldWrong) s_swWrong += 1;
+		}
+#endif
+#ifndef DSP_MUTATE_SWAPFLICKER
+		if (g_gxDsPresentHold) {
+#ifdef DSP_SWAPLOG
+			s_swHeld += 1;
+#endif
+			LWP_MutexUnlock(vidmutex);
+			VIDEO_WaitVSync();
+			continue;
+		}
+#endif
+#ifdef DSP_SWAPLOG
+		s_swPresents += 1;
+#endif
 
 		// Transform for scaling and rotate
 

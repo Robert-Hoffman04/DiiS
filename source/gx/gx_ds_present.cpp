@@ -10,6 +10,11 @@
 
 const void *g_gxDsPresentPending[2] = { NULL, NULL };
 static u16 s_presentFence[2];   // Task gpu-overlap: the copy that fills each pending slot's buffer
+const void *g_gxDsPresentBound[2] = { NULL, NULL };   // Task ph-swapflicker (header)
+bool g_gxDsPresentHold = false;
+#ifdef DSP_SWAPLOG
+bool g_gxDsPresentHoldWrong = false;
+#endif
 
 // Task gpu-overlap: gx_fence.h.
 u16 g_gxFenceNext, g_gxFence3d, g_gxFencePresent;
@@ -56,11 +61,19 @@ void gxDsPresentReleaseBuffer(const void *buf, int keepSlot)
 {
 	// Task lazyfix: keepSlot is about to be overwritten whole by the copy being released for,
 	// so its stale contents are dropped, not converted (they were already presented).
-	for (int s = 0; s < 2; ++s)
+	for (int s = 0; s < 2; ++s) {
+		// Task ph-swapflicker: the copy after this call refills a buffer draw_thread still binds.
+		if (g_gxDsPresentBound[s] == buf) {
+			g_gxDsPresentHold = true;
+#ifdef DSP_SWAPLOG
+			if (s != keepSlot) g_gxDsPresentHoldWrong = true;
+#endif
+		}
 		if (g_gxDsPresentPending[s] == buf) {
 			if (s == keepSlot) g_gxDsPresentPending[s] = NULL;
 			else gxDsPresentResolveSlotImpl(s);
 		}
+	}
 }
 
 void gxDsPresentDropAll()
