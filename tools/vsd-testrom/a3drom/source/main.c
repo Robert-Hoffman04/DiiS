@@ -127,6 +127,14 @@
 //      its exact vertices as an opaque decal, then an A5I3 alpha-31 one (multi-pass texturing).
 //      Cover, blending on, manual sort, isolated like 30. GxAccurate bails, GxFast engaged.
 //  59  case 58 in Z-buffer mode.
+//  60  alpha-31 polygons inside tagged runs (Task tidwhy-a31): case 34's setup. Run of ID 21: a
+//      far triangle, an A5I3 alpha-31 quad nearer (half its texels a == 31), a triangle behind
+//      that quad and one in front of it, both over the first (GxFast: two segments). ID 25: the
+//      same with a bit-11 alpha-31 quad, then a second alpha-31 quad and a triangle behind it
+//      (three segments). ID 23 / 24 / 23: the second ID-23 run carried, starting with an
+//      alpha-31 quad over the first, then a triangle over both (carry + segment).
+//  61  case 60's ID-21 run cut after its alpha-31 quad (a two-pass polygon in a tagged run;
+//      -DDSA_GXGEOM_MUTATE_TWOPASSTEV drops its 0 < a < 31 texels).
 
 #include <nds.h>
 #include <stdio.h>
@@ -164,6 +172,18 @@
 #if A3_CASE == 56
 #undef A3_CARRY
 #define A3_CARRY 1
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+// 60: alpha-31 polygons overlapped inside tagged runs (Task tidwhy-a31).
+#define A3_A31RUN 0
+#if A3_CASE == 60 || A3_CASE == 61
+#undef A3_A31RUN
+#if A3_CASE == 61
+#define A3_A31RUN 2
+#else
+#define A3_A31RUN 1
+#endif
 #undef A3_CASE
 #define A3_CASE 34
 #endif
@@ -546,6 +566,7 @@ static void clipScene(void)
 static const u32 texA3I5 = TEXP(0x0000, 1, 1, 1) | (1u << 16) | (1u << 17);   // 16x16, repeat
 static const u32 texA5I3 = TEXP(0x0400, 1, 1, 6);                              // 16x16, clamp
 static const u32 texDir  = TEXP(0x0800, 1, 1, 7);                              // 16x16 direct, alpha-bit holes
+static const u32 texA5I3h = TEXP(0x0C00, 1, 1, 6);                             // 16x16 A5I3, half its texels a == 31
 
 static void texSetup34(void)
 {
@@ -558,6 +579,10 @@ static void texSetup34(void)
 	for (int i = 0; i < 256; i++) c[0x0400 + i] = (u8)((hashb(i, 73) & 7) | ((hashb(i, 74) & 31) << 3));   // A5I3
 	for (int i = 0; i < 256; i++)
 		((u16 *)(c + 0x0800))[i] = (u16)((hashb(i, 75) | (hashb(i, 76) << 8)) & 0x7FFF) | ((hashb(i, 77) & 3) ? 0x8000 : 0);
+#if A3_A31RUN
+	for (int i = 0; i < 256; i++)   // 2x2-texel checker of a == 31 / a in 4..27
+		c[0x0C00 + i] = (u8)((hashb(i, 78) & 7) | ((((i >> 1) ^ (i >> 5)) & 1) ? 31 << 3 : (4 + hashb(i, 79) % 24) << 3));
+#endif
 	vramSetBankC(VRAM_C_TEXTURE_SLOT0);
 	vramSetBankE(VRAM_E_TEX_PALETTE);
 }
@@ -574,7 +599,7 @@ static void tQuad(u32 tex, float x0, float y0, float x1, float y1, float zl, flo
 	glEnd();
 }
 
-#if A3_TAGRUN || A3_CARRY
+#if A3_TAGRUN || A3_CARRY || A3_A31RUN
 static void tagTri(float x0, float y0, float x1, float y1, float x2, float y2, float z, int r, int g, int b)
 {
 	glBegin(GL_TRIANGLES);
@@ -669,6 +694,62 @@ static void carryScene(void)
 }
 #endif
 
+#if A3_A31RUN
+static void a31Scene(void)
+{
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glBegin(GL_QUADS);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f,  0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-1.4f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f, -0.9f, 0.0f);
+		glColor3b(200, 190, 70); glVertex3f(-0.6f,  0.9f, 0.0f);
+	glEnd();
+	// left, ID 21: R (far), P (alpha-31 A5I3, nearer), T1 behind P (fails at P's a == 31
+	// texels, rejected where R stamped), T2 in front of all (drawn only over P's a == 31 texels
+	// that nothing stamped, and where nothing else drew)
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.3f, 0.8f, -1.3f, -0.5f, -0.4f, 0.1f, 0.1f, 250, 40, 40);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(21));
+	tQuad(texA5I3h, -1.0f, -0.6f, -0.1f, 0.6f, 0.2f, 0.2f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+#if A3_A31RUN == 2   // case 61
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+	return;
+#endif
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.2f, -0.8f, -0.3f, -0.7f, -0.6f, 0.9f, 0.15f, 40, 250, 120);
+	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(21));
+	tagTri(-1.35f, 0.3f, 0.0f, 0.5f, -0.5f, -0.9f, 0.35f, 60, 60, 250);
+	// right top, ID 25: U, V (alpha-31 A5I3, bit 11), W behind V; then X (alpha-31 A5I3)
+	// over W, and Y behind X
+	glPolyFmt(POLY_ALPHA(13) | POLY_CULL_NONE | POLY_ID(25));
+	tagTri(0.1f, 0.9f, 0.2f, 0.1f, 1.1f, 0.5f, 0.1f, 250, 40, 160);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(25) | T_ZW);
+	tQuad(texA5I3h, 0.3f, 0.2f, 0.9f, 0.85f, 0.2f, 0.25f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(19) | POLY_CULL_NONE | POLY_ID(25));
+	tagTri(0.15f, 0.4f, 1.3f, 0.95f, 0.8f, 0.05f, 0.15f, 40, 160, 250);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(25));
+	tQuad(texA5I3h, 0.7f, 0.3f, 1.35f, 0.75f, 0.3f, 0.3f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(15) | POLY_CULL_NONE | POLY_ID(25));
+	tagTri(0.6f, 0.9f, 1.45f, 0.6f, 1.0f, 0.15f, 0.25f, 250, 250, 40);
+	// right bottom: ID 23 A, ID 24 B, then ID 23 again (carried from A): C (alpha-31 A5I3)
+	// over A, D in front of both
+	glPolyFmt(POLY_ALPHA(14) | POLY_CULL_NONE | POLY_ID(23));
+	tagTri(0.1f, -0.1f, 0.2f, -0.9f, 1.0f, -0.5f, 0.1f, 250, 120, 40);
+	glPolyFmt(POLY_ALPHA(17) | POLY_CULL_NONE | POLY_ID(24));
+	tagTri(0.9f, -0.05f, 1.45f, -0.3f, 1.2f, -0.95f, 0.2f, 120, 250, 250);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(23));
+	tQuad(texA5I3h, 0.35f, -0.85f, 1.2f, -0.2f, 0.2f, 0.25f, 16, 16);
+	GFX_TEX_FORMAT = 0;
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(23));
+	tagTri(0.05f, -0.4f, 1.4f, -0.15f, 0.8f, -0.98f, 0.4f, 160, 250, 40);
+	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);
+}
+#endif
+
 #if A3_DECAL
 // Cases 58/59 (see the header). The base plane z = 0.25x - 0.2y + 0.1; off: offset along z.
 #define T_DEQ (1u << 14)   // POLYGON_ATTR: depth test EQUAL
@@ -749,6 +830,10 @@ static void transScene(void)
 #endif
 #if A3_CARRY
 	carryScene();
+	return;
+#endif
+#if A3_A31RUN
+	a31Scene();
 	return;
 #endif
 	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
