@@ -331,6 +331,11 @@ static GxDsA3dTex s_3d, s_3dFx;
 // target (memalign'd, never CPU-written after init); only texObj/texData are used.
 static GxDsA3dTex s_3dGx;
 static bool s_3dTexMode;   // this frame draws s_3dGx in BG0's slot
+// Task a3dgeomtex: what s_3dGx.texData holds, so a repeat frame of the same 3D frame skips the
+// pass and its copy (gxDsA3dRenderGeomTex). gen: the replayed recording (gxDs3dFastReplayGen);
+// bake: s_3dBakeGen of the s_3d background drawn under it.
+static struct { bool valid, holes; u32 gen, bake; } s_3dGxKey;
+static u32 s_3dBakeGen;     // bumped by every gxDsA3dEnsureTex bake (any variant)
 static u16 *s_3dLinear;            // 256*192: bit15 = present, low 15 = R6G6B6TORGB15 colour
 static u16 *s_3dScratch;
 static u8  s_3dLineTrans[192];     // line has a texel with alpha 1..30
@@ -818,7 +823,7 @@ void GXDS_API(RenderShutdown)()
 	free(s_3d.texData); s_3d.texData = NULL; s_3d.texDataCap = 0; s_3d.valid = false;
 	free(s_3dFx.texData); s_3dFx.texData = NULL; s_3dFx.texDataCap = 0; s_3dFx.valid = false;
 	free(s_3dLinear); s_3dLinear = NULL; free(s_3dScratch); s_3dScratch = NULL; s_3dScanValid = false;
-	free(s_3dGx.texData); s_3dGx.texData = NULL; s_3dGx.valid = false;
+	free(s_3dGx.texData); s_3dGx.texData = NULL; s_3dGx.valid = false; s_3dGxKey.valid = false;
 #endif
 	s_bankMapCopyValid = false;
 	s_initDone = false;
@@ -2756,6 +2761,7 @@ static void gxDsA3dEnsureTex(GxDsA3dTex &t, int fadeMode, int fadeLvl)
 	t.seq = s_3dScanSeq;
 	t.cfgFx = fx;
 	t.valid = true;
+	++s_3dBakeGen;
 }
 
 // One band [y0,y1) of the 3D layer, horizontally scrolled by `hofs` (0..511): pixel k
@@ -4060,6 +4066,36 @@ static void gxDsA3dGeomDraw()
 	s_tevK = -2;
 }
 
+#ifndef DSA_GXTEX_DIRECTCOPY
+static inline void gxDsA3dDcbi(const void *p) { __asm__ volatile("dcbi 0,%0" : : "r"(p) : "memory"); }
+static inline void gxDsA3dDcbt(const void *p) { __asm__ volatile("dcbt 0,%0" : : "r"(p)); }
+static inline void gxDsA3dDcbf(const void *p) { __asm__ volatile("dcbf 0,%0" : : "r"(p) : "memory"); }
+
+// Task a3dgeomtex: the GX copy's move into the texture (gxDsA3dRenderGeomTex), what
+// DCInvalidateRange(src) + memcpy + DCFlushRange(dst) did, one 32-byte line at a time: the
+// source line is invalidated (and prefetched kAhead lines early, so the misses overlap the
+// copy), the destination claimed with dcbz instead of read for ownership, and pushed out with
+// dcbf as soon as it is written. `cb` is a multiple of 32, both buffers 32-byte aligned.
+static void gxDsA3dMoveCopy(void *dst, const void *src, u32 cb)
+{
+	enum { kAhead = 4 };
+	const u8 *s = (const u8 *)src, *const end = s + cb;
+	u8 *d = (u8 *)dst;
+	for (int i = 0; i < kAhead && s + i * 32 < end; ++i) { gxDsA3dDcbi(s + i * 32); gxDsA3dDcbt(s + i * 32); }
+	for (; s < end; s += 32, d += 32) {
+		const u8 *pf = s + kAhead * 32;
+		if (pf < end) { gxDsA3dDcbi(pf); gxDsA3dDcbt(pf); }
+		const u32 *si = (const u32 *)s;
+		const u32 a0 = si[0], a1 = si[1], a2 = si[2], a3 = si[3], a4 = si[4], a5 = si[5], a6 = si[6], a7 = si[7];
+		gxDsBDcbz(d);
+		u32 *di = (u32 *)d;
+		di[0] = a0; di[1] = a1; di[2] = a2; di[3] = a3; di[4] = a4; di[5] = a5; di[6] = a6; di[7] = a7;
+		gxDsA3dDcbf(d);
+	}
+	__asm__ volatile("sync" : : : "memory");
+}
+#endif
+
 // Under vidmutex, before the bands. See gxDsA3dEnsureGeomTex's comment.
 static void gxDsA3dRenderGeomTex()
 {
@@ -4068,6 +4104,15 @@ static void gxDsA3dRenderGeomTex()
 #ifdef DSA_GXTEX_MUTATE_RGB8
 	holes = false;   // mutation: hole texels come out opaque, must fail a hole fixture
 #endif
+	// Task a3dgeomtex: a repeat frame of the same 3D frame (GxFast replays the recorded list, so
+	// the same GX stream) over the same s_3d background and pixel format writes exactly the
+	// texels s_3dGx.texData already holds (nothing else writes it): skip the pass, the copy
+	// and its GX_DrawDone. The EFB corner it would have drawn is repainted by the bands anyway.
+	u32 gen = 0;
+	if (s_3dGxKey.valid && gxRenderModeIsFast() && gxDs3dFastReplayGen(&gen) && gen == s_3dGxKey.gen
+	    && s_3dGxKey.bake == s_3dBakeGen && s_3d.valid && s_3dGxKey.holes == holes)
+		return;
+	s_3dGxKey.valid = false;
 	if (holes) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
@@ -4095,15 +4140,18 @@ static void gxDsA3dRenderGeomTex()
 #else
 	{
 		const u32 cb = (u32)k3dW * k3dH * sizeof(u16);
-		DCFlushRange(s_3dScratch, cb);   // no dirty bake line may be written back over the copy
+		// No dirty bake line may be written back over the copy; its contents are dead (s_3d is
+		// baked), so they are dropped rather than written back.
+		DCInvalidateRange(s_3dScratch, cb);
 		GX_CopyTex(s_3dScratch, GX_FALSE);   // the bands' backdrop quads repaint every pixel
 		GX_PixModeSync();
 		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
-		DCInvalidateRange(s_3dScratch, cb);
-		memcpy(s_3dGx.texData, s_3dScratch, cb);
-		DCFlushRange(s_3dGx.texData, cb);
+		gxDsA3dMoveCopy(s_3dGx.texData, s_3dScratch, cb);
 	}
 #endif
+	// The repeat-frame key (above): only a replayable GxFast pass has one.
+	s_3dGxKey.valid = gxRenderModeIsFast() && gxDs3dFastReplayGen(&s_3dGxKey.gen) && s_3d.valid;
+	s_3dGxKey.bake = s_3dBakeGen; s_3dGxKey.holes = holes;
 	if (holes) GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
 	GX_InvalidateTexAll();
 }

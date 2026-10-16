@@ -139,6 +139,9 @@ void gxDs3dRenderAccurate();
 // Recorded into a display list once per g_gfx3dRenderSeq and replayed on the repeat
 // frames (Task replay, see the .cpp; -DDSA_GXGEOM_NOREPLAY draws directly every time).
 void gxDs3dRenderFast();
+// Task a3dgeomtex: true when gxDs3dRenderFast() would replay its recorded list now; *gen then
+// identifies that recording (equal gens: the same GX stream, so the same EFB result).
+bool gxDs3dFastReplayGen(u32 *gen);
 
 // Fog post-process, GxFast only (Task 13f-fog, made live by Task gxfast-fog; see
 // gx-next-steps-log.md). Called by gxDs3dRenderFast()'s own draw (so it is in the replayed

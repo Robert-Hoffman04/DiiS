@@ -3445,6 +3445,17 @@ static struct {
 	const void *list;
 	int count;
 } s_dlKey;
+static u32 s_dlGen;   // bumped per successful recording (gxDs3dFastReplayGen)
+
+// Task a3dgeomtex: would gxDs3dRenderFast() replay its recorded list now? If so, *gen names
+// that recording: two passes with the same gen issue the same GX stream (see above).
+bool gxDs3dFastReplayGen(u32 *gen)
+{
+	if (!(s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == gfx3d.polylist->count))
+		return false;
+	*gen = s_dlGen;
+	return true;
+}
 
 // No GX calls: runs at VBlank end outside vidmutex. The GPU is done with the list and the
 // tag buffers by then (Task gpu-overlap: gxDs3dGeomFramePrepare waits on g_gxFence3d), and
@@ -3514,7 +3525,7 @@ void gxDs3dRenderFast()
 #endif
 		if (n) {
 			s_dlSize = n;
-			s_dlKey.seq = g_gfx3dRenderSeq; s_dlKey.list = gfx3d.polylist; s_dlKey.count = count;
+			s_dlKey.seq = g_gfx3dRenderSeq; s_dlKey.list = gfx3d.polylist; s_dlKey.count = count; ++s_dlGen;
 			GXDS3D_TP_BEGIN(tp0);
 			GX_CallDispList(s_dl, s_dlSize);
 #ifdef DSA_GXGEOM_TAGPROF
