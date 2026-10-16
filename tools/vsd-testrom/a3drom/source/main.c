@@ -169,6 +169,8 @@
 //      modelview and an identity projection (non-affine modelview bottom row; depth still affine in w). 91: 90 with
 //      depth += x/32 (depth not affine in w). 92: 90 in W-buffer mode. 93: case 28 plus an opaque and a translucent
 //      triangle with a vertex exactly at the eye (clip (0, 0, 0, 0), not clipped).
+//  94-95  3D brighten/darken while the 3D layer is drawn as a texture (Task a3dtex-slow; BG3 in front). 94: holes,
+//      darken BG0 EVY 6, no 2nd targets. 95: cover, darken BG0 and BG3 EVY 11.
 
 #include <nds.h>
 #include <stdio.h>
@@ -1536,6 +1538,13 @@ int main(void)
 	fog = 1;
 #elif A3_CASE == 13
 	M_MBRIGHT = (2u << 14) | 8;
+#elif A3_CASE == 94
+	// Task a3dtex-slow: holes, darken BG0 (EVY 6), no 2nd targets, BG3 in front (3D drawn as a texture)
+	M_BLDCNT = (3 << 6) | L_BG0; M_BLDY = 6;
+#elif A3_CASE == 95
+	// Task a3dtex-slow: cover, darken BG0 and BG3 (same key, EVY 11), BG3 in front
+	cover = 1;
+	M_BLDCNT = (3 << 6) | L_BG0 | L_BG3; M_BLDY = 11;
 #elif A3_CASE == 14
 	;
 #elif A3_CASE == 15

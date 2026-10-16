@@ -335,6 +335,10 @@ static bool s_3dTexMode;   // this frame draws s_3dGx in BG0's slot
 // pass and its copy (gxDsA3dRenderGeomTex). gen: the replayed recording (gxDs3dFastReplayGen);
 // bake: s_3dBakeGen of the s_3d background drawn under it.
 static struct { bool valid, holes; u32 gen, bake; } s_3dGxKey;
+// Task a3dtex-slow: s_3dGx with the BLDCNT brighten/darken of the bands' fade3d runs applied
+// (gxDsA3dEnsureGeomTexFx). seq = s_3dGxSerial of the s_3dGx texels it was made from.
+static GxDsA3dTex s_3dGxFx;
+static u32 s_3dGxSerial;    // bumped whenever gxDsA3dRenderGeomTex rewrites s_3dGx.texData
 static u32 s_3dBakeGen;     // bumped by every gxDsA3dEnsureTex bake (any variant)
 static u16 *s_3dLinear;            // 256*192: bit15 = present, low 15 = R6G6B6TORGB15 colour
 static u16 *s_3dScratch;
@@ -429,7 +433,7 @@ void GXDS_API(InvalidateAll)()
 	s_forceRebakeAll = true;
 	gxDsLzReset();   // task 13j: a reset / savestate load abandons whatever the frame in flight had pending
 #if GXDS_CORE == 0
-	s_3dScanValid = false; s_3d.valid = false; s_3dFx.valid = false;   // task 13: reset / savestate load rewrite gfx3d_convertedScreen
+	s_3dScanValid = false; s_3d.valid = false; s_3dFx.valid = false; s_3dGxFx.valid = false;   // task 13: reset / savestate load rewrite gfx3d_convertedScreen
 #endif
 }
 
@@ -827,6 +831,7 @@ void GXDS_API(RenderShutdown)()
 	free(s_3dFx.texData); s_3dFx.texData = NULL; s_3dFx.texDataCap = 0; s_3dFx.valid = false;
 	free(s_3dLinear); s_3dLinear = NULL; free(s_3dScratch); s_3dScratch = NULL; s_3dScanValid = false;
 	free(s_3dGx.texData); s_3dGx.texData = NULL; s_3dGx.valid = false; s_3dGxKey.valid = false;
+	free(s_3dGxFx.texData); s_3dGxFx.texData = NULL; s_3dGxFx.texDataCap = 0; s_3dGxFx.valid = false;
 #endif
 	s_bankMapCopyValid = false;
 	s_initDone = false;
@@ -3473,7 +3478,8 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 #endif
 					continue;
 				}
-				const GxDsA3dTex &t3 = s_3dTexMode ? s_3dGx : ((p.fade3dCfg >> ru.cfg) & 1) ? s_3dFx : s_3d;
+				const bool fx3 = (p.fade3dCfg >> ru.cfg) & 1;
+				const GxDsA3dTex &t3 = s_3dTexMode ? (fx3 ? s_3dGxFx : s_3dGx) : fx3 ? s_3dFx : s_3d;
 				if (!t3.valid) continue;
 				gxDsBTevReplace();
 				GX_SetScissor(ru.x0, sl.y0, ru.x1 - ru.x0, sl.y1 - sl.y0);
@@ -4051,8 +4057,9 @@ static bool gxDsA3dOverlaySafe(int bandCount)
 // layer's: GX polygons only add opaque coverage (translucent ones exist here only with clear
 // alpha 31, i.e. no hole anywhere; the rest are gxDs3dGeomFrameNeedsAlpha frames, which never
 // take this path), so a line the scan calls covered stays covered. What the texture
-// can't carry is the CPU-side fade bake (s_3dFx) and the 13d two-pass draw (s_3dAlphaTex from
-// the scan), so the caller drops back to s_3d if the plan wants either, or a translucent line.
+// can't carry is the 13d two-pass draw (s_3dAlphaTex from the scan), so the caller drops back
+// to s_3d if the plan wants it, or a translucent line. The fade bake (s_3dFx) is applied to the
+// copied texels instead in GxFast (s_3dGxFx, Task a3dtex-slow).
 // Coverage: the EFB here is RGB8 (or RGB565) with no alpha, which is fine when s_3d has no
 // alpha-0 texel (copied alpha is 255); with holes the pass runs in GX_PF_RGBA6_Z24 so the hole
 // texels keep alpha 0 through the copy. RGBA6 truncates colour to 6 bits, which keeps the top
@@ -4157,8 +4164,8 @@ static void gxDsA3dRenderGeomTex()
 	// the EFB's 8-bit colour instead of the RGB5A3 quantization (measured: a3_c42 GxAccurate,
 	// 1097 px of BG3-over-3D blend off by 1 step against the identical CPU-baked texture). Real
 	// hardware reads the quantized RAM, but everything here is verified in Dolphin, so the copy
-	// lands in s_3dScratch (free again once s_3d is baked; fade and 13d, its other users,
-	// never run in texture mode) and the CPU moves it into the texture: exact in both, at the
+	// lands in s_3dScratch (free again once s_3d is baked; the s_3dFx bake and 13d, its other
+	// users, never run in texture mode) and the CPU moves it into the texture: exact in both, at the
 	// cost of a GX_DrawDone and a 96 KB copy. -DDSA_GXTEX_DIRECTCOPY copies straight into the
 	// texture instead (right on hardware, not in Dolphin).
 #ifdef DSA_GXTEX_DIRECTCOPY
@@ -4179,9 +4186,62 @@ static void gxDsA3dRenderGeomTex()
 	// The repeat-frame key (above): only a replayable GxFast pass has one.
 	s_3dGxKey.valid = gxRenderModeIsFast() && gxDs3dFastReplayGen(&s_3dGxKey.gen) && s_3d.valid;
 	s_3dGxKey.bake = s_3dBakeGen; s_3dGxKey.holes = holes;
+	++s_3dGxSerial;
 	if (holes) GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
 	GX_InvalidateTexAll();
 }
+
+#if !defined(DSA_GXTEX_DIRECTCOPY) && !defined(DSA_GXTEX_MUTATE_NOFADE)
+// Task a3dtex-slow: the brightened/darkened s_3dGx for fade3d runs (GxFast). Under vidmutex,
+// after gxDsA3dRenderGeomTex. The old way dropped such frames out of texture mode onto the
+// CPU 3D layer: the deferred raster resolved by the readback, a full re-scan and two bakes
+// (s_3d, s_3dFx), ~9 ms per frame on hardware during SM64DS's darkened dialog screens.
+// Per texel this is what s_3dFx would hold for the same layer: s_3dFx is the fade of the 5-bit
+// s_3d texel (gxDsBOpaqueTexel), and an opaque s_3dGx texel is the 5-bit colour the s_3d path
+// would show at that pixel (gxDsA3dEnsureGeomTex), so the same per-channel table on it gives
+// the same result. Non-opaque texels (holes, alpha 0) stay as they are; s_3dFx bakes them
+// transparent too. s_3dGx.texData was written by the CPU (gxDsA3dMoveCopy), so its cached
+// view is the copy; the DIRECTCOPY build (GPU-written, not synced) keeps the old fallback.
+static void gxDsA3dEnsureGeomTexFx(int fadeMode, int fadeLvl)
+{
+	const u16 fx = (u16)((fadeMode << 8) | fadeLvl);
+	if (s_3dGxFx.valid && s_3dGxFx.seq == s_3dGxSerial && s_3dGxFx.cfgFx == fx)
+		return;
+	const u32 bytes = (u32)k3dW * k3dTexH * sizeof(u16);
+	if (!s_3dGxFx.texData) {
+		s_3dGxFx.texData = memalign(32, bytes);
+		if (!s_3dGxFx.texData) return;
+		memset(s_3dGxFx.texData, 0, bytes);   // rows 192.. stay transparent padding (never written)
+		DCFlushRange(s_3dGxFx.texData, bytes);
+		GX_InitTexObj(&s_3dGxFx.texObj, s_3dGxFx.texData, k3dW, k3dTexH, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_3dGxFx.texObj, GX_NEAR, GX_NEAR);
+	}
+	s_3dGxFx.valid = false;
+	// The opaque RGB5A3 sub-format is 1:R5:G5:B5, three independent 5-bit channels like the
+	// NDS colour the fade tables were built for (gxDsBFadeColor), so one table serves all three.
+	const u8 *t = (fadeMode == 2) ? s_fadeUp[fadeLvl] : s_fadeDown[fadeLvl];
+	const u32 *src = (const u32 *)s_3dGx.texData;
+	u8 *d = (u8 *)s_3dGxFx.texData;
+	const u32 cb = (u32)k3dW * k3dH * sizeof(u16);   // rows 0..191; 16 texels per 32-byte line, two per word
+	for (u32 off = 0; off < cb; off += 32, d += 32, src += 8) {
+		gxDsBDcbz(d);
+		u32 *dw = (u32 *)d;
+		for (int i = 0; i < 8; ++i) {
+			const u32 w = src[i];
+			u32 hi = w >> 16, lo = w & 0xFFFF;
+			if (hi & 0x8000) hi = 0x8000u | ((u32)t[(hi >> 10) & 31] << 10) | ((u32)t[(hi >> 5) & 31] << 5) | t[hi & 31];
+			if (lo & 0x8000) lo = 0x8000u | ((u32)t[(lo >> 10) & 31] << 10) | ((u32)t[(lo >> 5) & 31] << 5) | t[lo & 31];
+			dw[i] = (hi << 16) | lo;
+		}
+		gxDsA3dDcbf(d);
+	}
+	__asm__ volatile("sync" : : : "memory");
+	s_3dGxFx.seq = s_3dGxSerial;
+	s_3dGxFx.cfgFx = fx;
+	s_3dGxFx.valid = true;
+	GX_InvalidateTexAll();
+}
+#endif
 
 // Task P1-6a-flicker: set while the compositor holds vidmutex (not recursive), so a raster
 // resolved from inside that section never tries to take it again (it gets the CPU raster).
@@ -4603,7 +4663,13 @@ static bool gxDsBRenderFrameImpl()
 				return false;
 			const GxDsBBandPlan &pl = s_bandPlan[b];
 #if GXDS_CORE == 0
-			if (pl.fade3d || pl.mask3dCfg) texModeOk = false;
+			if (pl.mask3dCfg) texModeOk = false;
+#if defined(DSA_GXTEX_DIRECTCOPY) || defined(DSA_GXTEX_MUTATE_NOFADE)
+			if (pl.fade3d) texModeOk = false;   // mutation / DIRECTCOPY: the old CPU 3D layer fallback
+#else
+			// Task a3dtex-slow: s_3dGxFx carries the fade (GxFast); GxAccurate keeps s_3dFx.
+			if (pl.fade3d && !gxRenderModeIsFast()) texModeOk = false;
+#endif
 #endif
 			if (pl.fadeBg || pl.fadeObj || pl.fade3d) {
 				if (fadeMode && (fadeMode != pl.mode || fadeLvl != pl.evy)) { DSB_WHY("fadekeys"); return false; }
@@ -4670,7 +4736,7 @@ static bool gxDsBRenderFrameImpl()
 	if (any3dBand) {
 		PZ_SUB_SCOPE(PZ_2DA_3DTEX);
 		gxDsA3dEnsureTex(s_3d, 0, 0);
-		if (fade3dAny) gxDsA3dEnsureTex(s_3dFx, fadeMode, fadeLvl);
+		if (fade3dAny && !s_3dTexMode) gxDsA3dEnsureTex(s_3dFx, fadeMode, fadeLvl);   // texture mode: s_3dGxFx below
 	}
 #endif
 
@@ -4726,6 +4792,9 @@ static bool gxDsBRenderFrameImpl()
 #endif
 #if GXDS_CORE == 0
 	if (s_3dTexMode) { PZ_SUB_SCOPE(PZ_2DA_3DGEOMTEX); gxDsA3dRenderGeomTex(); }   // the pass first, as BG0's texture (s_3dGx)
+#if !defined(DSA_GXTEX_DIRECTCOPY) && !defined(DSA_GXTEX_MUTATE_NOFADE)
+	if (s_3dTexMode && fade3dAny) { PZ_SUB_SCOPE(PZ_2DA_3DTEX); gxDsA3dEnsureGeomTexFx(fadeMode, fadeLvl); }
+#endif
 #endif
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
