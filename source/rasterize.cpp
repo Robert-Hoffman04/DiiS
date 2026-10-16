@@ -1209,12 +1209,14 @@ static void SoftRastRender()
 				//this is tested by harry potter and the order of the phoenix.
 				//TODO (optimization) dont do this if we are mapped to blank memory (such as in sonic chronicles)
 				//(or use a special zero fill in the bulk clearing above)
-				u16 col = clearImage[adr];
+				// VRAM is little-endian guest memory (Task clearimage: the native load swapped
+				// the bytes on this big-endian host)
+				u16 col = LE_TO_LOCAL_16(clearImage[adr]);
 				dstColor->color = RGB15TO6665(col,31*(col>>15));
 				
 				//this is tested quite well in the sonic chronicles main map mode
 				//where depth values are used for trees etc you can walk behind
-				u32 depth = clearDepth[adr];
+				u32 depth = LE_TO_LOCAL_16(clearDepth[adr]);
 				dst->fogged = BIT15(depth);
 				//TODO - might consider a lookup table for this
 				dst->depth = gfx3d_extendDepth_15_to_24(depth&0x7FFF);

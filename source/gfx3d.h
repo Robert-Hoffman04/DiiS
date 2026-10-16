@@ -470,6 +470,10 @@ u32 gfx3d_rasterClearDepth();
 // A VRAMCNT write is about to change what texture/palette VRAM the raster would read:
 // resolves a deferred raster of a textured frame first.
 void gfx3d_vramRemapBarrier();
+// Task clearimage: texture VRAM changes only through a VRAMCNT remap (texture-mapped banks
+// are not CPU-writable, captures need LCDC) or a savestate load/reset; this counter moves on
+// each, so content snapshot from texture VRAM (the GX rear-plane clear image) can key on it.
+u32 gfx3d_texVramGen();
 void gfx3d_Control(u32 v);
 void gfx3d_execute3D();
 void gfx3d_sendCommandToFIFO(u32 val);

@@ -346,6 +346,9 @@ static bool s_3dScanValid;
 // is read as a uniform clear-colour texel line instead of gfx3d_convertedScreen.
 static bool s_3dClearOnly;
 static u8 s_3dClearLine[256 * 4];
+// Task clearimage: a clear-only scan of a frame with a rear-plane clear image reads its texels
+// (gxDs3dClearImage: 256x192, bit 15 = alpha 31) instead of the uniform line; NULL otherwise.
+static const u16 *s_3dClearCi;
 static const int k3dW = 256, k3dH = 192;
 // The texture is 256 x 256 (rows 192.. transparent padding), NOT 256 x 192: Dolphin's GX_NEAR sampling of a
 // non-power-of-two texture through interpolated UVs picks a neighbouring texel on scattered pixels (measured on
@@ -2681,15 +2684,22 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 // keeps the linear copy, the line maps and every texture keyed on s_3dScanSeq across 3D
 // frames. SM64DS GxFast otherwise re-scanned and re-baked the same uniform layer on every
 // recording frame (~3.4 ms).
+// Task clearimage: with a rear-plane clear image (GxFast) the clear-only layer is that image
+// (rasterize.cpp's screenColor before any polygon), keyed on its generation the same way.
 static bool gxDsA3dScan(bool clearOnly = false)
 {
-	static u32 s_3dClearGen, s_3dClearCc;
+	static u32 s_3dClearGen, s_3dClearCc, s_3dClearCiGen;
 	u32 key = (g_gfx3dRenderSeq << 1);
+	u32 ciGen = 0;
+	const u16 *ci = clearOnly ? gxDs3dClearImage(&ciGen) : NULL;
 	if (clearOnly) {
 		const u32 cc = gfx3d_rasterClearColor() & 0x1F7FFF;   // the bits the clear line reads
-		if (!(s_3dScanValid && s_3dClearOnly && s_3dClearCc == cc)) { ++s_3dClearGen; s_3dClearCc = cc; }
+		if (!(s_3dScanValid && s_3dClearOnly && s_3dClearCc == cc && s_3dClearCiGen == ciGen)) {
+			++s_3dClearGen; s_3dClearCc = cc; s_3dClearCiGen = ciGen;
+		}
 		key = (s_3dClearGen << 1) | 1u;
 	}
+	s_3dClearCi = ci;
 	if (s_3dScanValid && s_3dScanSeq == key)
 		return true;
 	if (!s_3dLinear) {
@@ -2710,6 +2720,17 @@ static bool gxDsA3dScan(bool clearOnly = false)
 	u16 *o = s_3dLinear;
 	for (int y = 0; y < k3dH; ++y) {
 		u8 trans = 0, hole = 0;
+		if (ci) {
+			// RGB15TO6665(col, 31 * (col >> 15)) scanned as below: alpha 0 or 31, the 15 bits as they are
+			const u16 *r = ci + (size_t)y * k3dW;
+			for (int x = 0; x < k3dW; ++x, ++o) {
+				const u16 v = r[x];
+				if (!(v & 0x8000)) { *o = 0; hole = 1; } else *o = v;
+			}
+			s_3dLineTrans[y] = 0;
+			s_3dLineHole[y] = hole;
+			continue;
+		}
 		const u8 *c = clearOnly ? s_3dClearLine : gfx3d_convertedScreen + (size_t)y * k3dW * 4;
 		for (int x = 0; x < k3dW; ++x, c += 4, ++o) {
 			const u8 a = c[0];
@@ -2800,6 +2821,11 @@ static void gxDsA3dEnsureAlphaTex()
 	if (!s_3dScratch) return;
 	u8 *lin = (u8 *)s_3dScratch;   // reuse the scratch buffer's storage, byte-sized here
 	for (int y = 0; y < k3dH; ++y) {
+		if (s_3dClearCi) {
+			// clear image texels are alpha 31 or 0: (31 + 1) * 255 / 32 = 255
+			for (int x = 0; x < k3dW; ++x) lin[y * k3dW + x] = (s_3dClearCi[y * k3dW + x] & 0x8000) ? 255 : 0;
+			continue;
+		}
 		// Same source gxDsA3dScan() read (its key is s_3dScanSeq): the real raster or the clear line.
 		const u8 *c = s_3dClearOnly ? s_3dClearLine : gfx3d_convertedScreen + (size_t)y * k3dW * 4;
 		for (int x = 0; x < k3dW; ++x, c += 4)
@@ -4173,6 +4199,10 @@ static bool s_inVidLock;
 // alpha-0 background, so the copy's opaque bit is the coverage and uncovered pixels get the
 // exact clear fragment. Not exact (the GX pass's own GxFast error), so GxFast only; nothing
 // else ever defers the raster.
+// Task clearimage: with a rear-plane clear image the uncovered pixels are its per-pixel
+// fragments (gxDs3dClearImage), so the pass always runs over the alpha-0 background, except
+// with translucent polygons (every texel opaque then, gxDs3dFrameGate), which blend over the
+// image drawn as the background (gxDs3dClearImageTex).
 bool gxDsEngineA3dReadback()
 {
 #ifdef GXDS_FORCE_CPU
@@ -4186,7 +4216,10 @@ bool gxDsEngineA3dReadback()
 	const u32 cc = gfx3d_rasterClearColor();
 	const u8 ca = (u8)((cc >> 16) & 0x1F);
 	const u8 c5[3] = { (u8)(cc & 0x1F), (u8)((cc >> 5) & 0x1F), (u8)((cc >> 10) & 0x1F) };   // r, g, b
-	const bool cover = ca != 31;
+	const u16 *ci = gxDs3dClearImage(NULL);
+	GXTexObj *ciTex = ci && gxDs3dGeomFrameHasTranslucent() ? gxDs3dClearImageTex() : NULL;
+	if (ci && gxDs3dGeomFrameHasTranslucent() && !ciTex) return false;
+	const bool cover = ci ? !ciTex : ca != 31;
 
 	gxFenceWait(s_fenceTok);   // Task gpu-overlap: the pass below may re-record s_dl, which the GPU may still read
 	LWP_MutexLock(vidmutex);
@@ -4204,7 +4237,13 @@ bool gxDsEngineA3dReadback()
 	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
 	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
-	{
+	if (ciTex) {
+		gxDsBSetup2DState();   // textured, GX_REPLACE
+		GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+		s_tevK = -1;
+		GX_InvalidateTexAll();   // gxDs3dClearImageTex may have rewritten it
+		gxDsBDrawQuad(ciTex, 0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0.0f, 0.0f, 1.0f, (f32)k3dH / (f32)k3dTexH);
+	} else {
 		const u8 r = (u8)((c5[0] << 3) | (c5[0] >> 2)), g = (u8)((c5[1] << 3) | (c5[1] >> 2)),
 		         b = (u8)((c5[2] << 3) | (c5[2] >> 2)), a = cover ? 0 : 255;
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
@@ -4236,7 +4275,19 @@ bool gxDsEngineA3dReadback()
 					u8 *o = gfx3d_convertedScreen + ((size_t)y * k3dW + bx) * 4;
 					for (int x = 0; x < 4; ++x, ++t, o += 4) {
 						const u16 v = *t;
-						if (!(v & 0x8000)) { memcpy(o, cf, 4); continue; }
+						if (!(v & 0x8000)) {
+							if (ci) {
+								// the clear image's own fragment, RGB15TO6665(col, 31 * (col >> 15))
+								const u16 c = ci[y * k3dW + bx + x];
+								o[0] = (c & 0x8000) ? 31 : 0;
+								o[1] = (u8)GFX3D_5TO6((c >> 10) & 0x1F);
+								o[2] = (u8)GFX3D_5TO6((c >> 5) & 0x1F);
+								o[3] = (u8)GFX3D_5TO6(c & 0x1F);
+							} else {
+								memcpy(o, cf, 4);
+							}
+							continue;
+						}
 						o[0] = 31;
 						o[1] = (u8)GFX3D_5TO6(v & 0x1F);
 						o[2] = (u8)GFX3D_5TO6((v >> 5) & 0x1F);

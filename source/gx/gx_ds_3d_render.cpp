@@ -1517,6 +1517,110 @@ static bool gxDs3dCarryShadowKeep()
 	return true;
 }
 
+// ---------------------------------------------------------------------------------
+// Rear-plane clear image (DISP3DCNT bit 14, gx-remaining-work.md item 11; Task clearimage).
+// GxFast only.
+//
+// rasterize.cpp's SoftRastRender replaces the uniform clear fragment's colour, depth and fog
+// flag per pixel: colour = texture slot 2's RGB15 at ((y + yofs) & 255) * 256 + ((x + xofs) & 255)
+// (CLRIMAGE_OFFSET's two bytes), alpha 31 where its bit 15 is set, else 0; depth =
+// gfx3d_extendDepth_15_to_24 of slot 3's low 15 bits at the same address, its bit 15 the fog
+// flag. The polygon ID stays CLEAR_COLOR's. Snapshot at VBlank end (gxDs3dGeomFramePrepare),
+// where the eager raster reads it, into s_ciColor (the scrolled texels, Engine A's clear-only
+// 3D layer and the readback; gxDs3dClearImage) and a Z24X8 texture of the depths, which
+// gxDs3dClearDepth() draws with GX_ZT_REPLACE so the EFB starts from the CPU's exact 24-bit
+// rear-plane depths. Texture VRAM changes only through a remap or a state load
+// (gfx3d_texVramGen), so the snapshot is rebuilt only when that generation, a slot's bank or
+// the offset moved: a static clear image costs nothing per frame.
+// Not exact: GX's polygon depth against a per-pixel rear plane is the 24-bit compare of
+// polygon/polygon intersections (a3_c28), now along every geometry/clear-image crossing, so
+// GxAccurate bails (`clearimage`). GxFast bails too on W-buffer frames (the K-relative depth
+// mapping, gxDs3dClearZ, would be per texel), on fog (the fog pass masks against one clear
+// depth, and the fog flag is per pixel), and translucent polygons need every texel opaque
+// (`transclear`, the per-pixel form of the clear-alpha-31 rule).
+// ---------------------------------------------------------------------------------
+static u16 *s_ciColor;                 // 256 x 192 scrolled slot-2 texels (rasterize.cpp's clearImage[adr])
+static u8 *s_ciZData;                  // 256 x 192 Z24X8 = RGBA8 tiles, R/G/B = depth bits 23-16 / 15-8 / 7-0
+static GXTexObj s_ciZTex;
+static u16 *s_ciTexData;               // 256 x 256 RGB5A3 of s_ciColor, built on demand (gxDs3dClearImageTex)
+static GXTexObj s_ciTexObj;
+static u32 s_ciTexGen;
+static struct { u32 vramGen; const u8 *c, *d; u16 ofs; bool valid; } s_ciKey;
+static u32 s_ciGen = 1;                // bumped by every rebuild; Engine A keys its clear-only layer on it
+static u32 s_ciSeq = 0xFFFFFFFF;       // the g_gfx3dRenderSeq the snapshot is this frame's for
+static bool s_ciOpaque;                // no alpha-0 texel
+
+static void gxDs3dClearImageSnap()
+{
+	s_ciSeq = 0xFFFFFFFF;
+	u8 *const cs = MMU.texInfo.textureSlotAddr[2], *const ds = MMU.texInfo.textureSlotAddr[3];
+	const u16 ofs = T1ReadWord(MMU.ARM9_REG, 0x356);   // CLRIMAGE_OFFSET
+	const u32 vg = gfx3d_texVramGen();
+	if (!(s_ciKey.valid && s_ciKey.vramGen == vg && s_ciKey.c == cs && s_ciKey.d == ds && s_ciKey.ofs == ofs)) {
+		s_ciKey.valid = false;
+		if (!s_ciColor) s_ciColor = (u16 *)memalign(32, kScreenW * kScreenH * sizeof(u16));
+		if (!s_ciZData) s_ciZData = (u8 *)memalign(32, kScreenW * kScreenH * 4);
+		if (!s_ciColor || !s_ciZData) return;
+		const int xo = ofs & 0xFF, yo = (ofs >> 8) & 0xFF;
+		bool opaque = true;
+		for (int y = 0; y < kScreenH; ++y) {
+			const u32 row = (u32)((y + yo) & 255) << 9;   // bytes
+			u16 *co = s_ciColor + y * kScreenW;
+			u8 *zt = s_ciZData + ((y >> 2) * (kScreenW >> 2) << 6) + ((y & 3) << 3);
+			for (int x = 0; x < kScreenW; ++x) {
+				const u32 a = row + ((u32)((x + xo) & 255) << 1);
+				const u16 c = T1ReadWord(cs, a);
+				co[x] = c;
+				opaque &= (c >> 15) != 0;
+				const u32 z = gfx3d_extendDepth_15_to_24(T1ReadWord(ds, a) & 0x7FFF);
+				u8 *t = zt + ((x >> 2) << 6) + ((x & 3) << 1);
+				t[0] = 0xFF; t[1] = (u8)(z >> 16); t[32] = (u8)(z >> 8); t[33] = (u8)z;
+			}
+		}
+		DCFlushRange(s_ciZData, kScreenW * kScreenH * 4);
+		// RGBA8 is Z24X8's texel layout (GX_TF_Z24X8 = 0x16: the ZTF flag on format 6).
+		GX_InitTexObj(&s_ciZTex, s_ciZData, kScreenW, kScreenH, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_ciZTex, GX_NEAR, GX_NEAR);
+		s_texDirty = true;
+		s_ciOpaque = opaque;
+		++s_ciGen;
+		s_ciKey.vramGen = vg; s_ciKey.c = cs; s_ciKey.d = ds; s_ciKey.ofs = ofs; s_ciKey.valid = true;
+	}
+	s_ciSeq = g_gfx3dRenderSeq;
+}
+
+static inline bool gxDs3dClearImageLive() { return gfx3d.enableClearImage && s_ciSeq == g_gfx3dRenderSeq; }
+
+const u16 *gxDs3dClearImage(u32 *gen)
+{
+	if (!gxDs3dClearImageLive()) return NULL;
+	if (gen) *gen = s_ciGen;
+	return s_ciColor;
+}
+
+GXTexObj *gxDs3dClearImageTex()
+{
+	if (!gxDs3dClearImageLive()) return NULL;
+	if (s_ciTexData && s_ciTexGen == s_ciGen) return &s_ciTexObj;
+	const u32 bytes = (u32)kScreenW * 256 * sizeof(u16);
+	if (!s_ciTexData) {
+		s_ciTexData = (u16 *)memalign(32, bytes);
+		if (!s_ciTexData) return NULL;
+		memset(s_ciTexData, 0, bytes);   // rows 192.. transparent, never sampled
+	}
+	for (int y = 0; y < kScreenH; ++y)
+		for (int x = 0; x < kScreenW; ++x) {
+			const u16 c = s_ciColor[y * kScreenW + x];
+			const u16 o = (c & 0x8000) ? (u16)(0x8000 | ((c & 0x1F) << 10) | (c & 0x3E0) | ((c >> 10) & 0x1F)) : 0;
+			s_ciTexData[(((y >> 2) * (kScreenW >> 2) + (x >> 2)) << 4) + ((y & 3) << 2) + (x & 3)] = o;
+		}
+	DCFlushRange(s_ciTexData, bytes);
+	GX_InitTexObj(&s_ciTexObj, s_ciTexData, kScreenW, 256, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_ciTexObj, GX_NEAR, GX_NEAR);
+	s_ciTexGen = s_ciGen;   // no GX call here: the caller invalidates TMEM under vidmutex
+	return &s_ciTexObj;
+}
+
 // requireTex: textured polygons need a texture prepared for this frame (false only
 // for the VBlank-end call that decides whether to prepare them).
 static int gxDs3dFrameGate(bool requireTex)
@@ -1530,7 +1634,13 @@ static int gxDs3dFrameGate(bool requireTex)
 	// (see s_wK). GX's 24-bit D = 1 - K/w buckets w differently from the CPU's
 	// floor(4096*w), so near-ties can resolve differently: not exact, GxAccurate bails.
 	if (gfx3d.wbuffer && !fast) return kGateWbuffer;
-	if (gfx3d.enableClearImage) return kGateClearImage;  // rear-plane per-pixel clear depth (Stage 2) not modelled
+	// Rear-plane clear image (see its section): GxFast, Z-buffer, no fog, snapshot taken.
+#ifdef DSA_GXGEOM_MUTATE_CLEARIMAGE
+	if (gfx3d.enableClearImage) return kGateClearImage;   // mutation: the pre-change bail, for A/B
+#else
+	if (gfx3d.enableClearImage && (!fast || gfx3d.wbuffer || gfx3d.enableFog || !gxDs3dClearImageLive()))
+		return kGateClearImage;
+#endif
 	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
 	// Edge marking: no polygon-ID pass yet (13f handoff item), so GxAccurate bails. GxFast
 	// inaccurate path (Task gxfast-edge): draw the frame without the outlines until that
@@ -1584,7 +1694,8 @@ static int gxDs3dFrameGate(bool requireTex)
 		if (p.isTranslucent()) {
 			// GxFast only (see the translucent section): GX's 8-bit blend is +-1 LSB.
 			if (!fast) return kGateTranslucent;
-			if (((gfx3d_rasterClearColor() >> 16) & 0x1F) != 31) return kGateTransClear;
+			if (gfx3d.enableClearImage ? !s_ciOpaque : ((gfx3d_rasterClearColor() >> 16) & 0x1F) != 31)
+				return kGateTransClear;
 			if (!gfx3d.enableAlphaBlending) return kGateTransBlend;
 			anyTrans = true;
 		}
@@ -1821,6 +1932,10 @@ bool gxDs3dGeomFramePrepare()
 	gxDs3dReplayDrop();   // a new seq: the recorded pass is dead
 	s_suppCache.valid = false;
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
+	// the rear-plane clear image, read from VRAM now like the textures (its section)
+	s_ciSeq = 0xFFFFFFFF;
+	if (gfx3d.enableClearImage && gxRenderModeIsFast() && !gfx3d.wbuffer && !gfx3d.enableFog)
+		gxDs3dClearImageSnap();
 	GXDS3D_TP_BEGIN(tp0);
 	const int g = gxDs3dFrameGate(false);
 	GXDS3D_TP_END(kTpPrep, tp0);
@@ -2179,8 +2294,52 @@ static float gxDs3dClearZ()
 	return z;
 }
 
+// Task clearimage: the rear-plane clear image's per-pixel depths (s_ciZTex) instead; see its
+// section. GX_ZT_REPLACE takes the depth from the last TEV stage's texel (the Z compare is
+// already after texturing, gxDs3dSetupCommonState); the texel alpha 255 passes its alpha compare.
+static void gxDs3dClearDepthImage()
+{
+	GX_SetColorUpdate(GX_FALSE);
+	GX_SetAlphaUpdate(GX_FALSE);
+	GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetNumTexGens(1);
+	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+	GX_LoadTexObj(&s_ciZTex, GX_TEXMAP5);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP5, GX_COLORNULL);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_REPLACE);
+#ifndef DSA_GXGEOM_MUTATE_CIZFLAT
+	GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
+#endif
+	// mutation (-DDSA_GXGEOM_MUTATE_CIZFLAT): no Z texture, the quad's own flat mid-range z instead
+	static const float xy[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+	for (int j = 0; j < 4; ++j) {
+		GX_Position3f32(xy[j][0] * kScreenW, xy[j][1] * kScreenH, -0.5f);
+		GX_TexCoord2f32(xy[j][0], xy[j][1]);
+	}
+	GX_End();
+	GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+	GX_SetNumTexGens(0);
+	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+	GX_SetColorUpdate(GX_TRUE);
+	GX_SetAlphaUpdate(GX_TRUE);
+#ifdef DSA_GXGEOM_MUTATE_NOZ
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+#else
+	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+#endif
+}
+
 static void gxDs3dClearDepth()
 {
+	if (gfx3d.enableClearImage && gxDs3dClearImageLive()) { gxDs3dClearDepthImage(); return; }
 	const float z = gxDs3dClearZ();
 	GX_SetColorUpdate(GX_FALSE);
 	GX_SetAlphaUpdate(GX_FALSE);

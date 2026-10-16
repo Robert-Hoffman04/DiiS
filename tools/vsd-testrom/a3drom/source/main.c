@@ -135,6 +135,12 @@
 //      alpha-31 quad over the first, then a triangle over both (carry + segment).
 //  61  case 60's ID-21 run cut after its alpha-31 quad (a two-pass polygon in a tagged run;
 //      -DDSA_GXGEOM_MUTATE_TWOPASSTEV drops its 0 < a < 31 texels).
+//  62  rear-plane clear image (DISP3DCNT bit 14, Task clearimage) under case 28's four triangles:
+//      colour from bank A as texture slot 2 (a gradient with alpha-0 blocks: holes), depth from bank
+//      B as slot 3 (a ramp across the triangles' depth range, blocks at depth 0 that hide every
+//      polygon and at 0x7FFF that hide none, the fog bit on odd columns: fog is off). GxFast engaged.
+//  63  case 62 with CLRIMAGE_OFFSET x 83 / y 45 (the image wraps at 256 in both axes).
+//  64  case 34 (translucent polygons, blending) over an all-opaque clear image, scrolled x 200 / y 7.
 
 #include <nds.h>
 #include <stdio.h>
@@ -205,6 +211,24 @@
 #define A3_CASE 34
 #endif
 #define A3_CLIPGOURAUD 0
+// 62-64: rear-plane clear image (see the header). A3_CLRIMG: 1 plain, 2 scrolled, 3 opaque + scrolled.
+#define A3_CLRIMG 0
+#if A3_CASE >= 62 && A3_CASE <= 64
+#undef A3_CLRIMG
+#if A3_CASE == 62
+#define A3_CLRIMG 1
+#elif A3_CASE == 63
+#define A3_CLRIMG 2
+#else
+#define A3_CLRIMG 3
+#endif
+#undef A3_CASE
+#if A3_CLRIMG == 3
+#define A3_CASE 34
+#else
+#define A3_CASE 28
+#endif
+#endif
 // 47-50: toon/highlight (see the header). A3_TOONIDX: the two textured quads' toon indexes
 // (-1: no textured quads). A3_HILITE: DISP3DCNT highlight mode.
 #define A3_TOONIDX 31, 0
@@ -1158,6 +1182,36 @@ static void draw3D(void)
 	glFlush(GL_TRANS_MANUALSORT | (A3_ZBUF ? 0 : GL_WBUFFERING));
 }
 
+#if A3_CLRIMG
+// Bank A = clear colour image (texture slot 2), bank B = clear depth image (slot 3). Only cases
+// with BG1-3 and sprites off use it (their tiles/OBJ data lived in A/B).
+static void clearImageSetup(void)
+{
+	vramSetBankA(VRAM_A_LCD);
+	vramSetBankB(VRAM_B_LCD);
+	u16 *col = (u16 *)0x06800000, *dep = (u16 *)0x06820000;
+	for (int y = 0; y < 256; y++)
+		for (int x = 0; x < 256; x++) {
+			u16 c = RGB15((x >> 3) & 31, (y >> 3) & 31, (((x ^ y) >> 4) & 31) | 4);
+			if (A3_CLRIMG == 3 || (((x >> 5) + (y >> 5)) & 3) != 0) c |= 0x8000;   // else a hole
+			u32 d = 30900 + x * 4 + y * 2;
+			if (((x >> 4) & 7) == 3 && ((y >> 4) & 3) == 1) d = 0;
+			if (((x >> 4) & 7) == 6 && ((y >> 4) & 1) == 0) d = 0x7FFF;
+			if (d > 0x7FFF) d = 0x7FFF;
+			col[y * 256 + x] = c;
+			dep[y * 256 + x] = (u16)(d | ((x & 1) << 15));
+		}
+	vramSetBankA(VRAM_A_TEXTURE_SLOT2);
+	vramSetBankB(VRAM_B_TEXTURE_SLOT3);
+#if A3_CLRIMG == 2
+	GFX_CLRIMAGE_OFFSET = (45 << 8) | 83;
+#elif A3_CLRIMG == 3
+	GFX_CLRIMAGE_OFFSET = (7 << 8) | 200;
+#endif
+	glEnable(GL_CLEAR_BMP);
+}
+#endif
+
 static int f;
 #if A3_CASE == 4
 static void hb(void) { if (REG_VCOUNT == 95) M_BG0HOFS = 100; else if (REG_VCOUNT == 261 || REG_VCOUNT == 262) M_BG0HOFS = 0; }
@@ -1324,6 +1378,9 @@ int main(void)
 	glClearPolyID(63);
 	glClearDepth(0x7FFF);
 	glViewport(0, 0, 255, 191);
+#if A3_CLRIMG
+	clearImageSetup();
+#endif
 
 #if A3_CASE == 16
 	lcdMainOnBottom();

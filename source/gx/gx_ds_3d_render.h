@@ -123,6 +123,17 @@ bool gxDs3dGeomFramePrepare();
 // clear colour, never the CPU raster (which already has them blended in): see gxDsA3dScan.
 bool gxDs3dGeomFrameHasTranslucent();
 
+// Task clearimage (the .cpp's clear-image section): when this frame's gate took a rear-plane
+// clear image (DISP3DCNT bit 14, GxFast), its 256x192 texels as the CPU raster reads them
+// (CLRIMAGE_OFFSET applied; bit 15 = alpha 31, else 0) and a generation that changes with
+// them (*gen, never 0); NULL otherwise. Valid until the next VBlank end.
+const u16 *gxDs3dClearImage(u32 *gen);
+// The same as a 256x256 RGB5A3 texture (rows 192.. transparent), built on first use per
+// generation (CPU only: the caller invalidates TMEM before drawing it); NULL without a
+// clear image or on heap failure.
+struct _gx_texobj;
+struct _gx_texobj *gxDs3dClearImageTex();
+
 // Draws every opaque polygon in gfx3d.polylist (up to the translucent boundary) into
 // whatever EFB region GX_SetViewport/GX_SetScissor currently target, GxAccurate style
 // (CPU-transformed screen-space positions, byte-exact anchor). Caller owns all other

@@ -72,6 +72,7 @@ static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
 static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
 static bool s_rasterGx = false;          // gfx3d_convertedScreen is this frame's GX readback (gfx3d_ensureRendered)
 static bool s_rasterLatchValid = false;  // see gfx3d_rasterLatch; false until the first VBlank end after a reset/load
+static u32 s_texVramGen = 1;             // gfx3d_texVramGen (gfx3d.h)
 static bool s_flushFromVBlank = false;
 #ifdef DSA_RASTERSKIP_STATS
 // Why a deferred raster got resolved (index): 7 GetLineData 8 VRAM remap 9 non-VBlank flush;
@@ -787,6 +788,7 @@ void gfx3d_reset(){
 	s_rasterDeferred = false;
 	s_rasterGx = false;
 	s_rasterLatchValid = false;
+	++s_texVramGen;
 
 	gfx3d.clearDepth = gfx3d_extendDepth_15_to_24(0x7FFF);
 	
@@ -2381,8 +2383,9 @@ u32 g_gfx3dRenderSeq = 0;
 // the raster is DEFERRED, not skipped, and it runs the first time anything needs
 // gfx3d_convertedScreen (gfx3d_ensureRendered). Only GxFast frames the GX geometry pass
 // could draw are deferred (gxDs3dGeomFramePrepare(): opaque, no fog / edge marking /
-// clear image). Such a raster reads no MMU registers, and its only VRAM input
-// (textures, palettes) can change only through a VRAMCNT remap, which resolves it first
+// clear image -- since Task clearimage a GxFast clear image too). Such a raster reads no MMU
+// registers but CLRIMAGE_OFFSET (latched below), and its only VRAM input
+// (textures, palettes, the clear image) can change only through a VRAMCNT remap, which resolves it first
 // (gfx3d_vramRemapBarrier). Every other input
 // it reads is either latched at flush (control bits, lists, indexlist) or is one of
 // the plain register writes snapshot at VBlank end (gfx3d_rasterLatch), which the
@@ -2398,7 +2401,8 @@ static u32 s_rsDeferred, s_rsDropped, s_rsResolved;
 #endif
 
 // The raster inputs that are plain register writes, not latched by the flush:
-// CLEAR_COLOR, CLEAR_DEPTH, FOG_COLOR, FOG_OFFSET, ALPHA_TEST_REF, TOON_TABLE. The eager
+// CLEAR_COLOR, CLEAR_DEPTH, FOG_COLOR, FOG_OFFSET, ALPHA_TEST_REF, TOON_TABLE and (Task
+// clearimage) CLRIMAGE_OFFSET, which rasterize.cpp reads from MMU.ARM9_REG. The eager
 // raster reads them at VBlank end, so that is where they are snapshot. A deferred raster
 // swaps the snapshot in, so a write during display (SM64DS writes FOG_COLOR every frame)
 // no longer has to resolve it and only affects the next frame, as it does on the eager
@@ -2408,6 +2412,7 @@ static u32 s_rsDeferred, s_rsDropped, s_rsResolved;
 static struct {
 	u32 clearColor, clearDepth, fogColor, fogOffset;
 	u16 toon[32];
+	u16 clrImageOfs;
 	u8 alphaTestRef;
 } s_rasterLatch;
 
@@ -2418,6 +2423,7 @@ static void gfx3d_rasterLatch(){
 	s_rasterLatch.fogOffset = gfx3d.fogOffset;
 	memcpy(s_rasterLatch.toon, gfx3d.u16ToonTable, sizeof(s_rasterLatch.toon));
 	s_rasterLatch.alphaTestRef = gfx3d.alphaTestRef;
+	s_rasterLatch.clrImageOfs = T1ReadWord(MMU.ARM9_REG, 0x356);
 	s_rasterLatchValid = true;
 }
 
@@ -2428,6 +2434,9 @@ static void gfx3d_rasterLatchSwap(){
 	std::swap(s_rasterLatch.fogOffset, gfx3d.fogOffset);
 	for (int i = 0; i < 32; ++i) std::swap(s_rasterLatch.toon[i], gfx3d.u16ToonTable[i]);
 	std::swap(s_rasterLatch.alphaTestRef, gfx3d.alphaTestRef);
+	const u16 ofs = T1ReadWord(MMU.ARM9_REG, 0x356);
+	T1WriteWord(MMU.ARM9_REG, 0x356, s_rasterLatch.clrImageOfs);
+	s_rasterLatch.clrImageOfs = ofs;
 }
 
 u32 gfx3d_rasterClearColor(){ return s_rasterLatchValid ? s_rasterLatch.clearColor : gfx3d.clearColor; }
@@ -2470,6 +2479,11 @@ bool gfx3d_renderedByGx(){
 // textured raster reading what the eager one at VBlank end would have read.
 void gfx3d_vramRemapBarrier(){
 	RS_WHY(8); gfx3d_ensureRendered();
+	++s_texVramGen;
+}
+
+u32 gfx3d_texVramGen(){
+	return s_texVramGen;
 }
 
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush){
@@ -2806,6 +2820,7 @@ void gfx3d_savestate(EMUFILE* os){
 
 bool gfx3d_loadstate(EMUFILE* is, int size){
 	gfx3d_normEpochBump();
+	++s_texVramGen;   // the state brings its own VRAM
 #ifndef DSA_GXGEOM_NOCLIPCODES
 	s_vtxCodeOk = false;   // tempVertInfo.map comes from the state, s_vtxCode does not
 #endif
