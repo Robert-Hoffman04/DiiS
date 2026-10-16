@@ -1013,8 +1013,10 @@ static bool s_tagCarrySh = false;        // a carried range has shadow draws (gx
 // Task shadow-gate: runs made only of overlapping shadow draws (no carried range) are not
 // tagged; the shadow groups mark the pixels a draw shades in the carried counter instead
 // (gxDs3dShadowPrepass), so a later group's draw there is rejected like the CPU's
-// translucent-ID rule rejects it. s_shMarkRuns counts them, [s_shMarkN0, s_shMarkN1] the last.
-static int s_shMarkRuns = 0, s_shMarkN0 = 0, s_shMarkN1 = -1;
+// translucent-ID rule rejects it. s_shMarkRuns counts them, [s_shMarkN0[k], s_shMarkN1[k]] the
+// first kShMarkMax (indexlist ranges, in order; Task shadow-cases: was the last one only).
+static const int kShMarkMax = 16;
+static int s_shMarkRuns = 0, s_shMarkN0[kShMarkMax], s_shMarkN1[kShMarkMax];
 
 // Task tagcost: what the plan found per translucent polygon it visited, so the pass's draws
 // of it (the tag pass's and the real one) skip the clipper and gxDs3dTransShapeBuild. For
@@ -1138,7 +1140,8 @@ static int gxDs3dTransIdPlan()
 			// close the current run [runStart, nt)
 #ifndef DSA_GXGEOM_MUTATE_SHMARKOFF
 			if (runTag && runS0 < 0 && runAllSh) {   // shadow draws only: the counter marks them (Task shadow-gate)
-				++s_shMarkRuns; s_shMarkN0 = s_shN[runStart]; s_shMarkN1 = s_shN[nt - 1];
+				if (s_shMarkRuns < kShMarkMax) { s_shMarkN0[s_shMarkRuns] = s_shN[runStart]; s_shMarkN1[s_shMarkRuns] = s_shN[nt - 1]; }
+				++s_shMarkRuns;
 				runTag = false;
 			}
 #endif
@@ -1328,27 +1331,46 @@ static int gxDs3dTransIdPlan()
 // (neither is replayed); a draw of alpha 31 itself. Not guarded: a fragment whose depth
 // equals CLEAR_DEPTH exactly where nothing wrote would pass EQUAL and take its ID there (the
 // CPU and the LESS draw leave the clear ID).
-// Gate (`shadow`): GxAccurate (translucent polygons are GxFast only), a mode-3 polygon in
-// the opaque list (alpha 31 or 0 untextured: y-sorted among the opaque ones, and drawn
-// while the depth buffer is still being built), an RGB565 EFB (rmode->aa), > 255 masks on
-// one grid cell, a draw in a tagged translucent-ID run (overlapping same-ID draws), a group inside a tagged
-// run (its tag buffer is reused), the alpha-31 cases. Task shadow-gate: overlapping draws of
+// Gate (`shadow`): GxAccurate (translucent polygons are GxFast only), an RGB565 EFB
+// (rmode->aa), > 255 masks on one grid cell, a draw in a tagged translucent-ID run
+// (overlapping same-ID draws), the alpha-31 cases. Task shadow-gate: overlapping draws of
 // one ID (a translucent-ID run of shadow draws alone) are not a tagged run any more: each
 // group adds 128 to the carried counter where its draws shade, so later groups' draws are
 // rejected there (gxDs3dShadowPrepass); a same-ID polygon after such draws starts a carried
-// run of its own. Bails (`shwhy` 12) if the frame has more than one such run or a draw
-// outside it, since the marks stay in the counter.
+// run of its own. The marks stay in the counter, so (Task shadow-cases) a group marks only
+// the draws of its marked run, and the plan bails (`shwhy` 12) if a later group's draw outside
+// that run meets a marked draw's outline (1 px margin), or one group holds two marked runs.
+// Task shadow-cases, also: (1) opaque-list mode-3 polygons (alpha 31, or alpha 0 untextured)
+// are y-sorted among the opaque ones; a group is drawn at its own indexlist position anyway,
+// and any polygon between a group's masks and draws ends it (opaque ones too: their depth
+// writes), so the counter sees the depth buffer the CPU's does. An opaque draw of alpha 31 is
+// an opaque write (colour, depth, its ID; the alpha-0 one only counts): drawn as an opaque
+// polygon through the mode-3 stages, so a rejected fragment fails the alpha compare before
+// its depth write. The ID pass (now possibly in the opaque list) replays it like any opaque
+// polygon and leaves masks out; an opaque polygon after the pass and before the last draw
+// meeting the draws' box bails (7), except a draw of the last group. A drawing one without
+// bit 15 in a frame with the fog redraw (which leaves mode 3 out) bails `shwhy` 8. Fixtures
+// a3_c77-c79. (2) depth-equal (bit 14) masks and draws: GX_EQUAL in the count, the stencil
+// pass and the draw (GxFast's depth-equal inexactness, see gxDs3dFastPoly), a3_c80. (3) a
+// group inside a tagged run's span (was `shwhy` 1: the prepass overwrote the run's tags in
+// s_tagLoBuf) keeps s in s_shSBuf; nothing it draws reaches the screen, a3_c81.
 // ---------------------------------------------------------------------------------
 #if defined(DSA_GXGEOM_SHADOWDBG) || defined(DSA_GXGEOM_TEXSTATS)
-// TEXSTATS `shwhy=`: 1-7 gxDs3dShadowPlan, 8 mode-3 polygon in the opaque list, 9 GxAccurate, 10 RGB565 EFB, 11 draw in a tagged run (4: draw alpha 31), 12 draw outside the one marked run
+// TEXSTATS `shwhy=`: 1-7 gxDs3dShadowPlan (1 only with -DDSA_GXGEOM_MUTATE_SHRUNBAIL), 8 opaque-list draw without fog bit in a
+// fog-redraw frame (any opaque-list mode-3 polygon with -DDSA_GXGEOM_MUTATE_SHOPAQUE), 9 GxAccurate, 10 RGB565 EFB, 11 draw in a
+// tagged run (4: draw alpha 31), 12 a draw meeting an earlier group's marks outside their run (-DDSA_GXGEOM_MUTATE_SHMARK12: the old rule)
 static int s_shWhy;   // which gxDs3dShadowPlan bail (1-based, in source order)
 #define GXDS3D_SHWHY(k) (s_shWhy = (k))
 #else
 #define GXDS3D_SHWHY(k) do {} while (0)
 #endif
-struct GxDs3dShGroup { int m0, m1, d0, d1; bool keep, mark; };   // mark: Task shadow-gate   // indexlist ranges; keep: later groups need its counter
+// indexlist ranges; keep: later groups need its counter; mark (Task shadow-gate): it marks the
+// draws of marked run markRun (-1 none); runHead: the tagged run (head segment) last seen before
+// it; ownS (Task shadow-cases): that run goes on past it, so s goes to s_shSBuf, not s_tagLoBuf.
+struct GxDs3dShGroup { int m0, m1, d0, d1, runHead, markRun; bool keep, mark, ownS; };
 static GxDs3dShGroup s_shGroups[kMaxTrans];
 static int s_shGroupCount = 0;
+static bool s_shOwnS = false;             // some group has ownS
 static int s_shIdAt = -1;                 // indexlist position of the opaque-ID pass, -1 none
 static float s_shBox[4];                  // union of the draws' outlines, 1/16 px (x0, y0, x1, y1)
 
@@ -1421,24 +1443,51 @@ static inline int gxDs3dTagRunHead(int r)
 static bool gxDs3dShadowPlan()
 {
 	static GxDs3dTransShape s_dsh[kMaxTrans];
+	struct DrawBox { int n, g; float b[4]; };   // an on-screen draw's outline box (shwhy 12 check)
+	static DrawBox s_db[kMaxTrans];
+	int ndb = 0;
 	s_shGroupCount = 0;
 	s_shIdAt = -1;
+	s_shOwnS = false;
 	s_shBox[0] = s_shBox[1] = 1e30f; s_shBox[2] = s_shBox[3] = -1e30f;
+#ifdef DSA_GXGEOM_MUTATE_SHMARK12
+	if (s_shMarkRuns > 1) { GXDS3D_SHWHY(12); return false; }   // mutation: the pre-change rule, for A/B
+#endif
+	if (s_shMarkRuns > kShMarkMax) { GXDS3D_SHWHY(12); return false; }
 	u64 opIds = 1ull << ((gfx3d_rasterClearColor() >> 24) & 0x3F);   // IDs an opaque write has left so far
-	int masks = 0, nd = 0, lastRun = 0, shRun = 0, lastDraw = -1;
+	// Task shadow-cases: opaque-list draws of alpha 31 write their ID where they shade; a later
+	// draw of that ID needs the ID pass only where its outline overlaps one of an earlier group
+	// (y-sorting scatters one volume's faces over several groups; a group's own draws are disjoint)
+	static const int kOpDrawMax = 256;
+	static GxDs3dTransShape s_od[kOpDrawMax];
+	int nod = 0, odGrp = 0;   // entries [odGrp, nod) are the open group's
+	int masks = 0, nd = 0, lastRun = 0, shRun = 0, lastDraw = -1, mk = 0;
 	GxDs3dShGroup *g = NULL;              // the open group
 	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n < polycount; ++n) {
 		const int i = gfx3d.indexlist[n];
 		POLY &p = gfx3d.polylist->list[i];
-		if (!p.isTranslucent()) { opIds |= 1ull << gxDs3dPolyId(p); continue; }   // the opaque ones come first
+		const bool trans = p.isTranslucent();
 		if (gxDs3dPolyMode(p) != 3) {
-			g = NULL;
+			g = NULL;   // (opaque ones too: their depth writes come between the masks and the draws)
+			odGrp = nod;
+			if (!trans) { opIds |= 1ull << gxDs3dPolyId(p); continue; }   // the opaque ones come first
 			if (gxDs3dShadowA31(p)) opIds |= 1ull << gxDs3dPolyId(p);
-			// a tagged run going on past a group: the prepass reuses the run's tag buffer (its
-			// chained segments too: the next one's mask reads it, Task tidwhy-a31)
+			// a tagged run going on past a group: the prepass would reuse the run's tag buffer
+			// (its chained segments too: the next one's mask reads it, Task tidwhy-a31), so
+			// those groups keep s in a buffer of their own (Task shadow-cases; nothing a group
+			// in a run's span draws reaches the screen: a shadow draw that shades there would
+			// have closed the run, or been in it, shwhy 11)
 			if (s_tagRun[i]) {
-				if (shRun && gxDs3dTagRunHead(s_tagRun[i]) == gxDs3dTagRunHead(shRun)) { GXDS3D_SHWHY(1); return false; }
+				const int head = gxDs3dTagRunHead(s_tagRun[i]);
+				if (shRun && head == gxDs3dTagRunHead(shRun)) {
+#ifdef DSA_GXGEOM_MUTATE_SHRUNBAIL
+					GXDS3D_SHWHY(1); return false;   // mutation: the pre-change bail, for A/B
+#endif
+					for (int k = 0; k < s_shGroupCount; ++k)
+						if (s_shGroups[k].runHead == head) s_shGroups[k].ownS = true;
+					s_shOwnS = true;
+				}
 				lastRun = s_tagRun[i];
 			}
 			continue;
@@ -1452,15 +1501,19 @@ static bool gxDs3dShadowPlan()
 			if (g && g->d1 > g->d0) g = NULL;   // masks after draws start the next group
 			if (!g) {
 				if (s_shGroupCount == kMaxTrans) { GXDS3D_SHWHY(3); return false; }
+				odGrp = nod;
 				g = &s_shGroups[s_shGroupCount++];
 				g->m0 = g->m1 = g->d0 = g->d1 = n;
 				shRun = lastRun;
+				g->runHead = shRun ? gxDs3dTagRunHead(shRun) : 0;
+				g->ownS = false;
+				g->markRun = -1;
 			}
 			g->m1 = g->d0 = g->d1 = n + 1;
 			continue;
 		}
 		#ifdef DSA_GXGEOM_SHADOWDBG
-		if (s_tagRun[i]) {
+		if (trans && s_tagRun[i]) {
 			const GxDs3dTagRun &r = s_tagRuns[s_tagRun[i]];
 			char sb[1200]; int sn = 0;
 			for (int q = (r.c0 >= 0 ? r.c0 : r.n0); q <= r.n1 && sn < 1100; ++q) {
@@ -1471,7 +1524,8 @@ static bool gxDs3dShadowPlan()
 			harness_profile_emitf("shdbg11 n=%d run=%d..%d c0=%d cnt=%d%s", n, r.n0, r.n1, r.c0, r.count, sb);
 		}
 #endif
-		if (gxDs3dPolyAlpha(p) == 31 || s_tagRun[i]) { GXDS3D_SHWHY(s_tagRun[i] ? 11 : 4); return false; }
+		// (an opaque-list draw of alpha 31 is an opaque write: Task shadow-cases, see the section)
+		if (trans && (gxDs3dPolyAlpha(p) == 31 || s_tagRun[i])) { GXDS3D_SHWHY(s_tagRun[i] ? 11 : 4); return false; }
 		if (g && g->d1 == g->d0) nd = 0;        // the group's first draw
 		const VERT *cv[MAX_CLIPPED_VERTS];
 		bool clipped;
@@ -1486,50 +1540,104 @@ static bool gxDs3dShadowPlan()
 			s_dsh[0] = sh;
 			g = NULL;
 		}
-		// Task shadow-gate: with a marked run, every draw must be in it (one run: the marks
-		// are never taken out of the counter again)
-		// (a draw that shades nothing -- culled, clipped away, off screen -- may lie outside)
-		if (s_shMarkRuns && (s_shMarkRuns > 1 || ((n < s_shMarkN0 || n > s_shMarkN1) && shOk &&
-		                                         sh.x1 > 0 && sh.x0 < 16.0f * kScreenW && sh.y1 > 0 && sh.y0 < 16.0f * kScreenH))) {
-#ifdef DSA_GXGEOM_SHADOWDBG
-			harness_profile_emitf("shdbg12 n=%d runs=%d mark=%d..%d", n, s_shMarkRuns, s_shMarkN0, s_shMarkN1);
+		const bool onScreen = shOk && sh.x1 > 0 && sh.x0 < 16.0f * kScreenW && sh.y1 > 0 && sh.y0 < 16.0f * kScreenH;
+#ifdef DSA_GXGEOM_MUTATE_SHMARK12
+		// mutation: the pre-change rule (with a marked run, every on-screen draw must be in it)
+		if (s_shMarkRuns && onScreen && (n < s_shMarkN0[0] || n > s_shMarkN1[0])) { GXDS3D_SHWHY(12); return false; }
 #endif
-			GXDS3D_SHWHY(12); return false;
-		}
 		if (!g) {
 			if (s_shGroupCount == kMaxTrans) { GXDS3D_SHWHY(6); return false; }
+			odGrp = nod;
 			g = &s_shGroups[s_shGroupCount++];
 			g->m0 = g->m1 = g->d0 = g->d1 = n;
 			shRun = lastRun;
+			g->runHead = shRun ? gxDs3dTagRunHead(shRun) : 0;
+			g->ownS = false;
+			g->markRun = -1;
 			nd = 0;
 		}
 		g->d1 = n + 1;
+		// Task shadow-gate: the marked run (gxDs3dTransIdPlan) this draw is in, if any; its group
+		// marks the run's draws (Task shadow-cases: one marked run per group)
+		while (mk < s_shMarkRuns && n > s_shMarkN1[mk]) ++mk;
+		if (mk < s_shMarkRuns && n >= s_shMarkN0[mk] && onScreen) {
+			if (g->markRun >= 0 && g->markRun != mk) {
+#ifdef DSA_GXGEOM_SHADOWDBG
+				harness_profile_emitf("shdbg12 n=%d runs=%d group of two", n, s_shMarkRuns);
+#endif
+				GXDS3D_SHWHY(12); return false;
+			}
+			g->markRun = mk;
+		}
 		// the first draw an opaque write of its own ID came before: the ID pass goes ahead of its group
-		if (s_shIdAt < 0 && ((opIds >> gxDs3dPolyId(p)) & 1)) s_shIdAt = g->m0;
+		bool needId = (opIds >> gxDs3dPolyId(p)) & 1;
+		for (int k = 0; !needId && k < odGrp; ++k)
+			needId = s_od[k].id == gxDs3dPolyId(p) && shOk && !gxDs3dTransShapesDisjoint(s_od[k], sh);
+		if (s_shIdAt < 0 && needId) s_shIdAt = g->m0;
 		lastDraw = n;
+		// an opaque-list draw of alpha 31 writes its ID where it shades (alpha 0: nothing)
+		if (!trans && gxDs3dPolyAlpha(p) != 0 && shOk) {
+			if (nod == kOpDrawMax) { GXDS3D_SHWHY(6); return false; }
+			s_od[nod++] = sh;   // (sh.id = its polygon ID)
+		}
 		if (!shOk) continue;
 		++nd;
 		s_shBox[0] = fminf(s_shBox[0], sh.x0); s_shBox[1] = fminf(s_shBox[1], sh.y0);
 		s_shBox[2] = fmaxf(s_shBox[2], sh.x1); s_shBox[3] = fmaxf(s_shBox[3], sh.y1);
+		if (onScreen && s_shMarkRuns) {
+			DrawBox &d = s_db[ndb++];
+			d.n = n; d.g = (int)(g - s_shGroups);
+			d.b[0] = sh.x0 - 16.0f; d.b[1] = sh.y0 - 16.0f; d.b[2] = sh.x1 + 16.0f; d.b[3] = sh.y1 + 16.0f;
+		}
 	}
 	if (masks > 255 && !gxDs3dShadowMaskDepthOk()) { GXDS3D_SHWHY(2); return false; }
 	// The ID pass replays the depth writers before it: opaque polygons and alpha-31 fragments.
 	// Any other depth write where the draws are (bit 11) would leave a pixel no replayed
 	// fragment matches; an alpha-31 fragment after it, before a draw, would change an ID it
-	// has already taken.
-	if (s_shIdAt >= 0)
+	// has already taken; so would an opaque polygon (Task shadow-cases: the pass can be in the
+	// opaque list), except a draw of the last group (its draws are interior-disjoint).
+	if (s_shIdAt >= 0) {
+		int lastD0 = 0;
+		for (int k = s_shGroupCount - 1; k >= 0; --k)
+			if (s_shGroups[k].d1 > s_shGroups[k].d0) { lastD0 = s_shGroups[k].d0; break; }
 		for (int n = 0; n < lastDraw; ++n) {
 			POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
-			if (!p.isTranslucent()) continue;
 			const bool before = n < s_shIdAt;
-			if (before ? !((p.polyAttr >> 11) & 1) || !gxDs3dTransDraws(p) : !gxDs3dShadowA31(p)) continue;
+			if (!p.isTranslucent()) {
+				if (before || gxDs3dShadowMask(p) || gxDs3dPolyAlpha(p) == 0 || (gxDs3dShadowDraw(p) && n >= lastD0)) continue;
+			} else if (before ? !((p.polyAttr >> 11) & 1) || !gxDs3dTransDraws(p) : !gxDs3dShadowA31(p)) continue;
 			float b[4];
 			gxDs3dShadowPolyBox(p, b);
 			if (gxDs3dShadowBoxMeet(b, s_shBox)) { GXDS3D_SHWHY(before ? 5 : 7); return false; }
 		}
+	}
 	for (int k = 0; k < s_shGroupCount; ++k) {
-		s_shGroups[k].keep = k + 1 < s_shGroupCount;
-		s_shGroups[k].mark = s_shGroups[k].keep && s_shMarkRuns > 0;
+		GxDs3dShGroup &gk = s_shGroups[k];
+		gk.keep = k + 1 < s_shGroupCount;
+		gk.mark = gk.keep && gk.markRun >= 0;
+#ifdef DSA_GXGEOM_MUTATE_SHMARK12
+		gk.mark = gk.keep && s_shMarkRuns > 0;   // every group marks (the one run's span)
+		if (gk.mark) gk.markRun = 0;
+#endif
+	}
+	// Task shadow-cases (was: bail with more than one marked run, or an on-screen draw outside
+	// it): the marks stay in the counter, so a draw of a later group that is not in the marked
+	// run must not meet the outline (1 px margin) of a marked draw of an earlier group.
+	for (int a = 0; a < ndb; ++a) {
+		const GxDs3dShGroup &ga = s_shGroups[s_db[a].g];
+		if (!ga.mark) continue;
+		const int run = ga.markRun;
+		if (s_db[a].n < s_shMarkN0[run] || s_db[a].n > s_shMarkN1[run]) continue;   // not marked
+		for (int b = a + 1; b < ndb; ++b) {
+			if (s_db[b].g <= s_db[a].g) continue;
+			if (s_db[b].n >= s_shMarkN0[run] && s_db[b].n <= s_shMarkN1[run]) continue;   // its own run: the marks are meant for it
+			if (gxDs3dShadowBoxMeet(s_db[a].b, s_db[b].b)) {
+#ifdef DSA_GXGEOM_SHADOWDBG
+				harness_profile_emitf("shdbg12 n=%d meets marked n=%d run=%d", s_db[b].n, s_db[a].n, run);
+#endif
+				GXDS3D_SHWHY(12); return false;
+			}
+		}
 	}
 	return true;
 }
@@ -1861,10 +1969,18 @@ static int gxDs3dFrameGate(bool requireTex)
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
-		// Shadow volumes (see the shadow section): GxFast, translucent-list polygons, RGB8 EFB.
+		// Shadow volumes (see the shadow section): GxFast, RGB8 EFB. Task shadow-cases: opaque-list
+		// ones too, except a drawing one without POLYGON_ATTR bit 15 in a frame whose fog
+		// redraw puts the unfogged colour back (that redraw leaves mode 3 out).
+		// -DDSA_GXGEOM_MUTATE_SHOPAQUE: any opaque-list one bails (shwhy 8), as before.
 		if (gxDs3dPolyMode(p) == 3) {
-			if (!fast || !p.isTranslucent() || (rmode && rmode->aa)) {
-				GXDS3D_SHWHY(!fast ? 9 : !p.isTranslucent() ? 8 : 10);
+#ifdef DSA_GXGEOM_MUTATE_SHOPAQUE
+			const bool opBail = !p.isTranslucent();
+#else
+			const bool opBail = !p.isTranslucent() && s_gateFogPass && !(p.polyAttr & 0x8000) && gxDs3dShadowDraw(p);
+#endif
+			if (!fast || opBail || (rmode && rmode->aa)) {
+				GXDS3D_SHWHY(!fast ? 9 : opBail ? 8 : 10);
 				return kGateShadow;
 			}
 			anyShadow = true;
@@ -1880,11 +1996,14 @@ static int gxDs3dFrameGate(bool requireTex)
 		}
 		// POLYGON_ATTR bit 14: depth test EQUAL (rasterize.cpp's decalMode). GX_EQUAL on GX's
 		// own depth is not the CPU's quantized equality, so GxAccurate bails; GxFast draws it
-		// with GX_EQUAL (see the depth-equal note at gxDs3dFastPoly), except shadow-mode ones.
+		// with GX_EQUAL (see the depth-equal note at gxDs3dFastPoly), shadow-mode ones too (Task
+		// shadow-cases: masks count and draws test/draw with GX_EQUAL; -DDSA_GXGEOM_MUTATE_SHDEQ: bail).
 #ifdef DSA_GXGEOM_MUTATE_DEQBAIL
 		if (p.polyAttr & (1 << 14)) return kGateDepthEqual;   // mutation: the pre-change bail, for A/B
-#else
+#elif defined(DSA_GXGEOM_MUTATE_SHDEQ)
 		if ((p.polyAttr & (1 << 14)) && (!fast || gxDs3dPolyMode(p) == 3)) return kGateDepthEqual;
+#else
+		if ((p.polyAttr & (1 << 14)) && !fast) return kGateDepthEqual;
 #endif
 		// modulate, toon/highlight (as a flat colour, gxDs3dToonOk), shadow (above) and, GxFast
 		// only, decal (its TEV lerp + 31/32 scale is not the CPU's integer table, see the decal
@@ -2013,6 +2132,12 @@ static int gxDs3dFrameGate(bool requireTex)
 		GXDS3D_TP_END(kTpPlan, tp0);
 		if (nt < 0) return kGateTransId;
 		s_gateHasTrans = nt > 0;
+	}
+	if (!anyTrans) {
+		// no plan ran: nothing of an earlier frame's runs may reach the shadow plan or the draw
+		s_tagRunCount = 0;
+		s_tagCarryAny = s_tagCarrySh = false;
+		s_shMarkRuns = 0;
 	}
 	if (anyShadow && !gxDs3dShadowPlan()) return kGateShadow;
 	s_shKeepCount = 0;
@@ -3066,11 +3191,23 @@ static bool gxDs3dShadowKeepBuffers(int n)
 	return true;
 }
 
+// Task shadow-cases: s of a group inside a tagged run's span (GxDs3dShGroup::ownS), I8,
+// allocated the first time a frame needs it.
+static void *s_shSBuf = nullptr;
+static GXTexObj s_shSTex;
+
 static bool gxDs3dShadowBuffers()
 {
 	if (!gxDs3dTagBuffers()) return false;
-	if (s_shCntBuf) return true;
 	const u32 ib = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0);
+	if (s_shOwnS && !s_shSBuf) {
+		s_shSBuf = memalign(32, ib);
+		if (!s_shSBuf) return false;
+		DCInvalidateRange(s_shSBuf, ib);
+		GX_InitTexObj(&s_shSTex, s_shSBuf, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_shSTex, GX_NEAR, GX_NEAR);
+	}
+	if (s_shCntBuf) return true;
 	s_shCntBuf = memalign(32, ib);
 	s_shIdBuf = memalign(32, ib);
 	if (!s_shCntBuf || !s_shIdBuf) {
@@ -3213,8 +3350,9 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 {
 	GXDS3D_PS(kPsCalls);
 	if (gxDs3dPolyInvisible(p) && !c.shCount) { GXDS3D_PS(kPsInvis); return; }   // counted all the same (the stencil comes before shading)
-	// Depth-equal (see above; never a shadow polygon, gxDs3dFrameGate). The opaque-ID pass
-	// and the fog redraw already draw everything GX_EQUAL without a depth write.
+	// Depth-equal (see above; a shadow polygon too, Task shadow-cases: its prepass count is
+	// GX_EQUAL as well). The opaque-ID pass and the fog redraw already draw everything
+	// GX_EQUAL without a depth write.
 	const bool deq = (p.polyAttr & (1 << 14)) && !c.shIdPass && !c.zEqBase;
 	const bool toonLut = c.toonLut && gxDs3dPolyMode(p) == 2;
 	const bool decal = gxDs3dDecalTex(p);
@@ -3501,7 +3639,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		}
 		GX_End();
 	}
-	if (deq && !trans) GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+	if (deq && !trans) GX_SetZMode(GX_TRUE, GX_LESS, c.shCount ? GX_FALSE : GX_TRUE);   // (the shadow prepass's own)
 	GXDS3D_TP_END(kTpEmit, tpe);
 }
 
@@ -3702,7 +3840,7 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 	for (int n = s_shIdAt - 1; n >= 0; --n) {
 		POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 		const bool trans = p.isTranslucent();
-		if (trans && !gxDs3dShadowA31(p)) continue;
+		if ((trans && !gxDs3dShadowA31(p)) || gxDs3dShadowMask(p)) continue;   // (opaque-list masks: Task shadow-cases)
 		// The main pass's outline of it (1/16 px, truncated: 2 px margin), else the clip-space test.
 		const int st = s_shRec ? s_shBoxState[&p - gfx3d.polylist->list] : kShBoxUnknown;
 		if (st == kShBoxNone) continue;   // culled / clipped away: draws nothing here either
@@ -3720,6 +3858,7 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
 	GX_LoadTexObj(&s_shIdTex, GX_TEXMAP5);
 	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);   // (an opaque-list polygon next, Task shadow-cases)
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
 #ifndef DSA_GXGEOM_MUTATE_SHNOID
 	c.shId = true;   // (mutation: no opaque-ID test, must fail a3_c53)
@@ -3749,8 +3888,10 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 	if (0)   // mutation: masks never count, must fail a3_c51
 #endif
 	for (int n = g.m0; n < g.m1; ++n) gxDs3dFastPoly(c, gfx3d.polylist->list[gfx3d.indexlist[n]], -1);
+	// s: the run's tag buffer, unless a tagged run goes on past this group (ownS)
+	GXTexObj *const sTex = g.ownS ? &s_shSTex : &s_tagLoTex;
 	if (g.d1 > g.d0) {
-		gxDs3dTagCopy(s_tagLoBuf, GX_CTF_R8);
+		gxDs3dTagCopy(g.ownS ? s_shSBuf : s_tagLoBuf, GX_CTF_R8);
 		if (s_shKeepCount && s_shKeep[gi] >= 0) gxDs3dTagCopy(s_shKeepBuf[(int)s_shKeep[gi]], GX_CTF_R8);   // a carried range reads it
 		GX_SetBlendMode(GX_BM_SUBTRACT, GX_BL_ONE, GX_BL_ONE, GX_LO_CLEAR);
 		for (int n = g.d0; n < g.d1; ++n) gxDs3dFastPoly(c, gfx3d.polylist->list[gfx3d.indexlist[n]], -1);
@@ -3761,10 +3902,12 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 		// (the CPU: translucent-ID rule). Inexact only past 127 later masks on such a pixel.
 		GX_PixModeSync();
 		GX_InvalidateTexAll();
-		GX_LoadTexObj(&s_tagLoTex, GX_TEXMAP4);
+		GX_LoadTexObj(sTex, GX_TEXMAP4);
 		GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, GX_LO_CLEAR);
 		c.shTest = true;
-		for (int n = g.d0; n < g.d1; ++n) {
+		// only the marked run's draws (Task shadow-cases; the span's others shade nothing)
+		const int r0 = s_shMarkN0[g.markRun], r1 = s_shMarkN1[g.markRun];
+		for (int n = g.d0 > r0 ? g.d0 : r0; n < g.d1 && n <= r1; ++n) {
 			POLY &q = gfx3d.polylist->list[gfx3d.indexlist[n]];
 			if (gxDs3dTransDraws(q)) gxDs3dFastPoly(c, q, -128);
 		}
@@ -3778,7 +3921,10 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
-	GX_LoadTexObj(&s_tagLoTex, GX_TEXMAP4);
+	GX_LoadTexObj(sTex, GX_TEXMAP4);
+	// an opaque-list draw sets neither (Task shadow-cases; translucent ones set their own)
+	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
 }
 

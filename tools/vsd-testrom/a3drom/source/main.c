@@ -153,6 +153,14 @@
 //      (untextured ones = material colour; A3I5 alpha 31 no depth write: all texels opaque; A5I3 alpha 20; direct
 //      alpha 16) and Gouraud colours on the textured quads. 75: 74 with only the textured quads decal (decal /
 //      modulate switching). 76: case 46 (tagged same-ID runs, the A5I3 quad's alpha-0 texels now draw and stamp) all decal.
+//  77-83  shadow edge cases (Task shadow-cases; GxFast), case 51's scene. 77: masks and draws opaque (alpha 31, y-sorted
+//      among the opaque polygons; the draws write colour, depth and ID 5). 78: opaque masks (alpha 31), translucent draws
+//      (alpha 15). 79: invisible opaque masks (alpha 0), opaque draws with the block's ID 3 (rejected on it: the opaque-ID
+//      pass in the opaque list). 80: depth-equal (bit 14): box masks, then a floor replica (the floor's own vertices) as
+//      an EQUAL draw (ID 5); then a floor-replica EQUAL mask and an EQUAL red draw over it (rejected wherever the mask
+//      counted). 81: masks + an off-screen draw inside a tagged ID-21 run (two overlapping triangles), the box's draws
+//      after the run (was `shwhy` 1). 82: two marked runs (overlapping same-ID draws of two volumes each, IDs 5 and 6) on
+//      disjoint parts of the screen (was `shwhy` 12). 83: 82 with the second pair over the first -> GxFast BAIL shadow.
 
 #include <nds.h>
 #include <stdio.h>
@@ -303,9 +311,23 @@
 #define A3_HILITE 0
 // 51-55: shadow volumes (see the header). A3_SHADOW: the variant (1-5).
 #define A3_SHADOW 0
-#if A3_CASE >= 51 && A3_CASE <= 55
+#if (A3_CASE >= 51 && A3_CASE <= 55) || (A3_CASE >= 77 && A3_CASE <= 83)
 #undef A3_SHADOW
-#if A3_CASE == 51
+#if A3_CASE == 77
+#define A3_SHADOW 6
+#elif A3_CASE == 78
+#define A3_SHADOW 7
+#elif A3_CASE == 79
+#define A3_SHADOW 8
+#elif A3_CASE == 80
+#define A3_SHADOW 9
+#elif A3_CASE == 81
+#define A3_SHADOW 10
+#elif A3_CASE == 82
+#define A3_SHADOW 11
+#elif A3_CASE == 83
+#define A3_SHADOW 12
+#elif A3_CASE == 51
 #define A3_SHADOW 1
 #elif A3_CASE == 52
 #define A3_SHADOW 2
@@ -1103,6 +1125,72 @@ static void shadowScene(void)
 		glColor3b(240, 120, 40); glVertex3f( 0.2f, -0.6f, 0.0f);
 		glColor3b(240, 120, 40); glVertex3f( 0.2f,  0.1f, 0.0f);
 	glEnd();
+#elif A3_SHADOW == 6 || A3_SHADOW == 7 || A3_SHADOW == 8
+	// opaque-list masks / draws (alpha 31 or 0: POLY::isTranslucent false)
+	SH_MASK(A3_SHADOW == 8 ? 0 : 31); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_DRAW(A3_SHADOW == 7 ? 15 : 31, A3_SHADOW == 8 ? 3 : 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
+	// a second volume over the block's right side and the floor (y-sorted elsewhere)
+	SH_MASK(A3_SHADOW == 8 ? 0 : 31); box(0.3f, -0.9f, -0.6f, 0.9f, 0.3f, -0.1f, 0, 0, 0);
+	SH_DRAW(A3_SHADOW == 7 ? 15 : 31, A3_SHADOW == 8 ? 3 : 6); box(0.3f, -0.9f, -0.6f, 0.9f, 0.3f, -0.1f, 60, 10, 10);
+#elif A3_SHADOW == 9
+#define T_DEQ (1u << 14)
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	// the floor again, exact vertices, as an EQUAL draw: shades the floor inside the volume
+	glPolyFmt(POLY_ALPHA(15) | POLY_CULL_NONE | POLY_ID(5) | POLY_SHADOW | T_DEQ);
+	glBegin(GL_QUADS);
+		glColor3b(20, 20, 40); glVertex3f(-1.6f, -0.5f, 1.2f);
+		glColor3b(20, 20, 40); glVertex3f( 1.6f, -0.5f, 1.2f);
+		glColor3b(20, 20, 40); glVertex3f( 1.6f, -0.5f, -1.2f);
+		glColor3b(20, 20, 40); glVertex3f(-1.6f, -0.5f, -1.2f);
+	glEnd();
+	// a floor-replica EQUAL mask, then a red EQUAL draw: rejected wherever the mask counted
+	glPolyFmt(POLY_ALPHA(15) | POLY_CULL_NONE | POLY_ID(0) | POLY_SHADOW | T_DEQ);
+	glBegin(GL_QUADS);
+		glColor3b(0, 0, 0); glVertex3f(-1.6f, -0.5f, 1.2f);
+		glColor3b(0, 0, 0); glVertex3f( 1.6f, -0.5f, 1.2f);
+		glColor3b(0, 0, 0); glVertex3f( 1.6f, -0.5f, -1.2f);
+		glColor3b(0, 0, 0); glVertex3f(-1.6f, -0.5f, -1.2f);
+	glEnd();
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(6) | POLY_SHADOW | T_DEQ);
+	glBegin(GL_QUADS);
+		glColor3b(250, 20, 20); glVertex3f(-1.6f, -0.5f, 1.2f);
+		glColor3b(250, 20, 20); glVertex3f( 1.6f, -0.5f, 1.2f);
+		glColor3b(250, 20, 20); glVertex3f( 1.6f, -0.5f, -1.2f);
+		glColor3b(250, 20, 20); glVertex3f(-1.6f, -0.5f, -1.2f);
+	glEnd();
+#elif A3_SHADOW == 10
+	// tagged ID-21 run: triangle A, the volume's masks + an off-screen draw, triangle B over A
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	glBegin(GL_TRIANGLES);
+		glColor3b(250, 200, 40); glVertex3f(-1.2f, 0.6f, 0.3f);
+		glColor3b(250, 200, 40); glVertex3f( 0.4f, 0.6f, 0.3f);
+		glColor3b(250, 200, 40); glVertex3f(-0.4f, -0.4f, 0.3f);
+	glEnd();
+	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
+	SH_DRAW(15, 5); box(-9.5f, -0.9f, -0.3f, -8.7f, 0.2f, 0.3f, 20, 20, 40);
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	glBegin(GL_TRIANGLES);
+		glColor3b(40, 200, 250); glVertex3f(-0.9f, 0.8f, 0.2f);
+		glColor3b(40, 200, 250); glVertex3f( 0.7f, 0.2f, 0.2f);
+		glColor3b(40, 200, 250); glVertex3f(-0.6f, -0.6f, 0.2f);
+	glEnd();
+	SH_DRAW(15, 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
+#elif A3_SHADOW == 11 || A3_SHADOW == 12
+	// two marked runs: overlapping ID-5 draws of two volumes (left), then ID-6 ones (right, or
+	// over the left pair for 83)
+	SH_MASK(15); box(-1.3f, -0.9f, -0.3f, -0.7f, 0.2f, 0.3f, 0, 0, 0);
+	SH_MASK(15); box(-1.0f, -0.9f, -0.5f, -0.4f, 0.3f, 0.1f, 0, 0, 0);
+	SH_DRAW(15, 5); box(-1.3f, -0.9f, -0.3f, -0.7f, 0.2f, 0.3f, 20, 20, 40);
+	SH_DRAW(15, 5); box(-1.0f, -0.9f, -0.5f, -0.4f, 0.3f, 0.1f, 20, 20, 40);
+#if A3_SHADOW == 11
+#define SH_DX 1.9f
+#else
+#define SH_DX 0.2f
+#endif
+	SH_MASK(15); box(-1.3f + SH_DX, -0.9f, -0.3f, -0.7f + SH_DX, 0.2f, 0.3f, 0, 0, 0);
+	SH_MASK(15); box(-1.0f + SH_DX, -0.9f, -0.5f, -0.4f + SH_DX, 0.3f, 0.1f, 0, 0, 0);
+	SH_DRAW(12, 6); box(-1.3f + SH_DX, -0.9f, -0.3f, -0.7f + SH_DX, 0.2f, 0.3f, 80, 10, 10);
+	SH_DRAW(12, 6); box(-1.0f + SH_DX, -0.9f, -0.5f, -0.4f + SH_DX, 0.3f, 0.1f, 80, 10, 10);
 #else
 	SH_MASK(15); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 0, 0, 0);
 	SH_DRAW(15, 5); box(-0.5f, -0.9f, -0.3f, 0.3f, 0.2f, 0.3f, 20, 20, 40);
