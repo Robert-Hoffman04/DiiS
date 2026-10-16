@@ -123,9 +123,16 @@ bool gxDs3dGeomFramePrepare();
 // clear colour, never the CPU raster (which already has them blended in): see gxDsA3dScan.
 bool gxDs3dGeomFrameHasTranslucent();
 // Task fog-edge: true iff the last accepted frame's fog pass writes per-pixel alpha (fog
-// alpha != 31). Such a frame is drawn in an RGBA6 EFB and read back (gxDsEngineA3dReadback),
-// never as the overlay or the geometry texture, which carry coverage only.
+// alpha != 31), or (Task trans-blendclear) gxDs3dGeomFrameTransAlpha. Such a frame is drawn
+// in an RGBA6 EFB and read back (gxDsEngineA3dReadback), never as the overlay or the
+// geometry texture, which carry coverage only.
 bool gxDs3dGeomFrameNeedsAlpha();
+// Task trans-blendclear: true iff the last accepted frame's translucent polygons leave 3D alpha
+// < 31 (a clear of alpha < 31, or blending off). Also gxDs3dGeomFrameNeedsAlpha, but the EFB
+// alpha is a6 = 2 (a + 1) for 0 < a < 31 (gxDs3dGxAlpha's 8 (a + 1) truncated), 63 for 31, 0
+// for 0, instead of the fog pass's 2 a + 1; the background is the clear fragment's own
+// encoding (gxDsEngineA3dReadback).
+bool gxDs3dGeomFrameTransAlpha();
 // Task fog-edge: the uniform rear plane's fragment as the CPU raster leaves it, in
 // gfx3d_convertedScreen's byte order (a, b, g, r; 6-bit colour): the clear colour, or, when
 // the last accepted frame fogs a rear plane of alpha < 31, that colour fogged on the CPU

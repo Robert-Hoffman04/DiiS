@@ -161,6 +161,10 @@
 //      counted). 81: masks + an off-screen draw inside a tagged ID-21 run (two overlapping triangles), the box's draws
 //      after the run (was `shwhy` 1). 82: two marked runs (overlapping same-ID draws of two volumes each, IDs 5 and 6) on
 //      disjoint parts of the screen (was `shwhy` 12). 83: 82 with the second pair over the first -> GxFast BAIL shadow.
+//  84-89  translucent polygons whose 3D alpha stays < 31 (Task trans-blendclear; GxFast), BLDCNT 2nd target = backdrop
+//      so that alpha shows. 84: case 34 over a clear of alpha 0 (magenta: first fragments are written, not blended).
+//      85: case 34 over a clear of alpha 12. 86: case 34 with blending off (DISP3DCNT bit 3). 87: 86 over a clear of
+//      alpha 0. 88: case 46 (tagged same-ID runs) over a clear of alpha 0. 89: case 64 with the image's holes.
 
 #include <nds.h>
 #include <stdio.h>
@@ -189,6 +193,32 @@
 #define A3_CASE 46
 #else
 #undef A3_CASE
+#define A3_CASE 34
+#endif
+#endif
+// 84-89: translucent polygons whose 3D alpha stays < 31 (see the header). A3_TRANSBC: case - 83.
+#define A3_TRANSBC 0
+#if A3_CASE >= 84 && A3_CASE <= 89
+#undef A3_TRANSBC
+#if A3_CASE == 84
+#define A3_TRANSBC 1
+#elif A3_CASE == 85
+#define A3_TRANSBC 2
+#elif A3_CASE == 86
+#define A3_TRANSBC 3
+#elif A3_CASE == 87
+#define A3_TRANSBC 4
+#elif A3_CASE == 88
+#define A3_TRANSBC 5
+#else
+#define A3_TRANSBC 6
+#endif
+#undef A3_CASE
+#if A3_TRANSBC == 5
+#define A3_CASE 46
+#elif A3_TRANSBC == 6
+#define A3_CASE 64
+#else
 #define A3_CASE 34
 #endif
 #endif
@@ -1357,7 +1387,7 @@ static void clearImageSetup(void)
 	for (int y = 0; y < 256; y++)
 		for (int x = 0; x < 256; x++) {
 			u16 c = RGB15((x >> 3) & 31, (y >> 3) & 31, (((x ^ y) >> 4) & 31) | 4);
-			if (A3_CLRIMG == 3 || (((x >> 5) + (y >> 5)) & 3) != 0) c |= 0x8000;   // else a hole
+			if ((A3_CLRIMG == 3 && A3_TRANSBC != 6) || (((x >> 5) + (y >> 5)) & 3) != 0) c |= 0x8000;   // else a hole
 			u32 d = 30900 + x * 4 + y * 2;
 			if (((x >> 4) & 7) == 3 && ((y >> 4) & 3) == 1) d = 0;
 			if (((x >> 4) & 7) == 6 && ((y >> 4) & 1) == 0) d = 0x7FFF;
@@ -1544,6 +1574,14 @@ int main(void)
 	cover = 1;
 #endif
 	if (cover) glClearColor(6, 10, 18, 31); else glClearColor(0, 0, 0, 0);
+#if A3_TRANSBC
+	// Task trans-blendclear: the 3D alpha blends with the backdrop (2nd target); an alpha-0 clear
+	// is magenta, so a fragment blended over it instead of written shows.
+	if (A3_TRANSBC == 1 || A3_TRANSBC == 4 || A3_TRANSBC == 5) glClearColor(31, 0, 31, 0);
+	if (A3_TRANSBC == 2) glClearColor(6, 10, 18, 12);
+	if (A3_TRANSBC == 3 || A3_TRANSBC == 4) glDisable(GL_BLEND);
+	M_BLDCNT = (L_BD << 8);
+#endif
 	glClearPolyID(63);
 #if A3_FOGEDGE
 	// Task fog-edge (cases 65-72): fog colour (2, 6, 24), alpha per case; shift 0 / offset 0 as case 29.

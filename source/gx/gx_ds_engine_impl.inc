@@ -4048,8 +4048,9 @@ static bool gxDsA3dOverlaySafe(int bandCount)
 // GxAccurate / a resolved frame), copy that out as s_3dGx and draw it in BG0's slot like s_3d.
 // Per pixel it is exactly the overlay's BG0 result, so the band plan's rules for s_3d carry
 // over, with the scan's per-line flags (s_3dLineTrans/Hole, from the same s_3d source) as the
-// layer's: GX polygons only add opaque coverage (translucent ones exist only with clear alpha
-// 31, i.e. no hole anywhere), so a line the scan calls covered stays covered. What the texture
+// layer's: GX polygons only add opaque coverage (translucent ones exist here only with clear
+// alpha 31, i.e. no hole anywhere; the rest are gxDs3dGeomFrameNeedsAlpha frames, which never
+// take this path), so a line the scan calls covered stays covered. What the texture
 // can't carry is the CPU-side fade bake (s_3dFx) and the 13d two-pass draw (s_3dAlphaTex from
 // the scan), so the caller drops back to s_3d if the plan wants either, or a translucent line.
 // Coverage: the EFB here is RGB8 (or RGB565) with no alpha, which is fine when s_3d has no
@@ -4219,10 +4220,15 @@ bool gxDsEngineA3dReadback()
 	const u16 *ci = gxDs3dClearImage(NULL);
 	GXTexObj *ciTex = ci && gxDs3dGeomFrameHasTranslucent() ? gxDs3dClearImageTex() : NULL;
 	if (ci && gxDs3dGeomFrameHasTranslucent() && !ciTex) return false;
-	const bool cover = ci ? !ciTex : ca != 31;
+	// Task trans-blendclear: translucent polygons that leave alpha < 31 (gxDs3dGeomFrameTransAlpha)
+	// blend over the clear colour of its own alpha, or over alpha 0 (clear alpha 0, the image's
+	// holes: cover mode, which the pass pre-fills, gxDs3dTransPrefill).
+	const bool tAlpha = gxDs3dGeomFrameTransAlpha();
+	const bool cover = ci ? !ciTex || tAlpha : tAlpha ? ca == 0 : ca != 31;
 	// Task fog-edge: a frame whose fog pass writes alpha (gxDs3dGeomFrameNeedsAlpha) runs in
 	// RGBA6 and is copied as RGBA8 (s_3dRbAlpha): colour = the EFB's 6 bits, alpha = a6 >> 1
 	// (the pass writes 2 a' + 1, opaque polygons 63); in cover mode a6 == 0 is uncovered.
+	// tAlpha frames: a6 = 2 (a + 1) for 0 < a < 31 (see gxDs3dGeomFrameTransAlpha).
 	const bool alphaRb = gxDs3dGeomFrameNeedsAlpha();
 	static u8 *s_3dRbAlpha;
 	const u32 cb32 = (u32)k3dW * k3dH * 4;
@@ -4254,8 +4260,11 @@ bool gxDsEngineA3dReadback()
 		GX_InvalidateTexAll();   // gxDs3dClearImageTex may have rewritten it
 		gxDsBDrawQuad(ciTex, 0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0.0f, 0.0f, 1.0f, (f32)k3dH / (f32)k3dTexH);
 	} else {
-		const u8 r = (u8)((c5[0] << 3) | (c5[0] >> 2)), g = (u8)((c5[1] << 3) | (c5[1] >> 2)),
-		         b = (u8)((c5[2] << 3) | (c5[2] >> 2)), a = cover ? 0 : 255;
+		// tAlpha: the clear fragment's 6-bit colour and alpha exactly as the RGBA6 EFB keeps them
+		const u8 r = tAlpha ? (u8)(GFX3D_5TO6(c5[0]) << 2) : (u8)((c5[0] << 3) | (c5[0] >> 2)),
+		         g = tAlpha ? (u8)(GFX3D_5TO6(c5[1]) << 2) : (u8)((c5[1] << 3) | (c5[1] >> 2)),
+		         b = tAlpha ? (u8)(GFX3D_5TO6(c5[2]) << 2) : (u8)((c5[2] << 3) | (c5[2] >> 2)),
+		         a = cover ? 0 : (tAlpha && ca != 31) ? (u8)(8 * (ca + 1)) : 255;
 		GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
 			GX_Position2f32(0, 0);                                   GX_Color4u8(r, g, b, a);
 			GX_Position2f32((f32)kDsBScreenW, 0);                    GX_Color4u8(r, g, b, a);
@@ -4294,7 +4303,7 @@ bool gxDsEngineA3dReadback()
 						}
 						continue;
 					}
-					o[0] = a6 >> 1;
+					o[0] = !tAlpha ? a6 >> 1 : a6 == 63 ? 31 : a6 >= 2 ? (a6 >> 1) - 1 : 0;
 					o[1] = t[32 + 2 * j + 1] >> 2;
 					o[2] = t[32 + 2 * j] >> 2;
 					o[3] = t[2 * j + 1] >> 2;
