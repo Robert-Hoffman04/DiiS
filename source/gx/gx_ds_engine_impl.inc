@@ -237,6 +237,12 @@ static GxDsBBandRegs s_lastBandRegs;
 static u8 s_frameExtBgPal = 0;
 static u8 s_frameExtObjPal = 0;   // task 11: same, for DISPCNT.ExOBJPalette_Enable
 static bool s_frameExtBgPalKnown = false;
+// Task 2d-bails-1: BGxCNT of each BG as first seen enabled this frame (bit n of s_frameBgCntKnown),
+// minus the priority (band-tracked) and mosaic (own check) bits: the planes are baked from the
+// frame-final value, so a mid-frame change of anything else (char / screen base, size, colour
+// mode, wrap / ext-palette slot) cannot be replayed.
+static u16 s_frameBgCnt[4];
+static u8 s_frameBgCntKnown = 0;
 // Task 13: screen offset / (Engine A) DISPCNT base blocks as seen on line 0 of this frame.
 static u16 s_frameOffset = 0;
 static bool s_frameOffsetKnown = false;
@@ -280,11 +286,43 @@ static int s_lzRendered = 0;      // lines [0, s_lzRendered) are CPU-rendered (e
 static int s_lzSeen = 0;          // lines [0, s_lzSeen) have passed the hook; pending = [s_lzRendered, s_lzSeen)
 static bool s_lzFlushing = false; // re-entrancy guard (a flushed line's capture write hits the barrier again)
 static bool s_lzDataHit = false;  // a data write (VRAM/palette/OAM) hit this engine's read set during the frame
-extern u32 g_gxDsLazyPend;        // gx_ds_engineb_render.cpp: bit `core` = this engine has pending lines
+// Task 2d-bails-1: a write to BGxCNT (IO 0x08-0x0F) or to the colour-effect registers (BLDCNT /
+// BLDALPHA / BLDY, 0x50-0x57) does NOT flush. SM64DS's stage sub screen rewrites BLDCNT+BLDALPHA
+// and BG2CNT once per game frame around line 55-65, which used to render ~60 deferred lines on the
+// CPU every frame (b_cpu ~1 ms/frame on HW) although GX handles the frame (the band tracker
+// replays the change). Instead the state the pending lines were deferred with is SAVED -- the raw
+// register bytes and every GPU field the writes derive from them (GPU_setBGProp / GPU_setBLDCNT /
+// setBLDALPHA / GPU_setBLDY_EVY), copied, not re-derived, so DeSmuME's write quirks (8-bit writes)
+// cannot skew it -- with the line it stops applying at. A later flush renders each pending line
+// with the state of its own segment and then puts the current state back, so the result is the
+// eager one. Exact: those fields are only read by the line pass (DISPCNT, which the derivation
+// also reads, and every other write still flush before they land), and GPU_DiscardDeferredLines
+// only reads the frame-final state. Bounded: kLzMaxRegSegs writes per frame, then the old flush.
+struct GxDsLzRegSeg {
+	int line;                          // this state applied to pending lines < line
+	u8 ioCnt[8];                       // IO 0x08-0x0F (BG0CNT..BG3CNT)
+	u8 ioBld[8];                       // IO 0x50-0x57 (BLDCNT, BLDALPHA, BLDY, unused)
+	// GPU_setBGProp's outputs
+	u8 prioBGs[NB_PRIORITIES][NB_BG], prioNb[NB_PRIORITIES];
+	u32 bmpLarge[4], bmp[4], tile[4], map[4];
+	u8 extPalSlot[4];
+	u32 size[4][2];
+	BGType types[4];
+	u8 bgPrio[4];
+	// the colour-effect setters' outputs
+	u16 bldcnt;
+	u8 eva, evb, evy;
+	int fnBck, fn3d, fnSpr;
+	GPU::TBlendTable *table;
+};
+enum { kLzMaxRegSegs = 4 };
+static GxDsLzRegSeg s_lzSeg[kLzMaxRegSegs];
+static int s_lzSegN = 0;
+extern u32 g_gxDsLazyPend;       // gx_ds_engineb_render.cpp: bit `core` = this engine has pending lines
 extern u32 g_gxDsLazyOn;          // bit `core` = this engine is inside a lazy frame (data-write bail window)
 #ifdef DSLZ_STATS
 static u32 s_lzStFrames, s_lzStDeferredLines, s_lzStFlushRegLines, s_lzStFlushDataLines, s_lzStFlushBailLines,
-           s_lzStFlushOosLines, s_lzStDiscardFrames, s_lzStEagerLines, s_lzStBarrierIo, s_lzStBarrierData, s_lzStDataBail;
+           s_lzStFlushOosLines, s_lzStDiscardFrames, s_lzStEagerLines, s_lzStBarrierIo, s_lzStBarrierData, s_lzStDataBail, s_lzStRegSeg;
 #endif
 
 // vram_arm9_map (MMU.h) page ranges that back Engine B's BG and OBJ
@@ -1041,6 +1079,17 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 		if (!enabled) continue;
 		const _BGxCNT &cnt = gpu->dispx_st->dispx_BGxCNT[bg].bits;
 		if (cnt.Mosaic_Enable) { DSB_WHY("mosaic"); return true; }
+#ifndef DSB_MUTATE_BGCNTCHANGE   // mutation: the pre-task silent frame-final bake (lz_c25/c26 must then differ)
+		if (!(GXDS_CORE == 0 && bg == 0 && d.BG0_3D)) {   // BG0 as the 3D layer bakes no plane
+			const u16 v = (u16)(T1ReadWord((u8 *)&gpu->dispx_st->dispx_BGxCNT[bg].val, 0) & 0xFFBC);
+			if ((s_frameBgCntKnown >> bg) & 1) {
+				if (v != s_frameBgCnt[bg]) { DSB_WHY("bgcntchange"); return true; }
+			} else {
+				s_frameBgCnt[bg] = v;
+				s_frameBgCntKnown |= (u8)(1u << bg);
+			}
+		}
+#endif
 		// Task 8: text plus every affine flavour is in scope. Anything else
 		// (BGType_Invalid -- e.g. BG0/1 enabled in BG_Mode 6/7 -- or the
 		// unresolved BGType_AffineExt placeholder) has no reference behaviour
@@ -1104,6 +1153,7 @@ static void gxDsBScanlineTrace(int line)
 		s_affPred[0].valid = s_affPred[1].valid = false;
 		s_frameExtBgPalKnown = false;
 		s_frameOffsetKnown = false;
+		s_frameBgCntKnown = 0;
 #if GXDS_CORE == 0
 		s_frameBaseBlocksKnown = false;
 #endif
@@ -1186,6 +1236,56 @@ static inline bool gxDsLzAllowed()
 #endif
 }
 
+// Task 2d-bails-1: save / restore the segment state of this engine (see GxDsLzRegSeg).
+static void gxDsLzSegSave(GxDsLzRegSeg *sg, int line)
+{
+	const GPU *gpu = GXDS_SCREEN.gpu;
+	const u8 *io = MMU.ARM9_REG + GXDS_CORE * 0x1000;
+	sg->line = line;
+	memcpy(sg->ioCnt, io + 0x08, sizeof(sg->ioCnt));
+	memcpy(sg->ioBld, io + 0x50, sizeof(sg->ioBld));
+	for (int p = 0; p < NB_PRIORITIES; ++p) {
+		memcpy(sg->prioBGs[p], gpu->itemsForPriority[p].BGs, NB_BG);
+		sg->prioNb[p] = gpu->itemsForPriority[p].nbBGs;
+	}
+	memcpy(sg->bmpLarge, gpu->BG_bmp_large_ram, sizeof(sg->bmpLarge));
+	memcpy(sg->bmp, gpu->BG_bmp_ram, sizeof(sg->bmp));
+	memcpy(sg->tile, gpu->BG_tile_ram, sizeof(sg->tile));
+	memcpy(sg->map, gpu->BG_map_ram, sizeof(sg->map));
+	memcpy(sg->extPalSlot, gpu->BGExtPalSlot, sizeof(sg->extPalSlot));
+	memcpy(sg->size, gpu->BGSize, sizeof(sg->size));
+	memcpy(sg->types, gpu->BGTypes, sizeof(sg->types));
+	memcpy(sg->bgPrio, gpu->bgPrio, sizeof(sg->bgPrio));
+	sg->bldcnt = gpu->BLDCNT;
+	sg->eva = gpu->BLDALPHA_EVA; sg->evb = gpu->BLDALPHA_EVB; sg->evy = gpu->BLDY_EVY;
+	sg->fnBck = gpu->setFinalColorBck_funcNum; sg->fn3d = gpu->setFinalColor3d_funcNum; sg->fnSpr = gpu->setFinalColorSpr_funcNum;
+	sg->table = gpu->blendTable;
+}
+
+static void gxDsLzSegApply(const GxDsLzRegSeg *sg)
+{
+	GPU *gpu = GXDS_SCREEN.gpu;
+	u8 *io = MMU.ARM9_REG + GXDS_CORE * 0x1000;
+	memcpy(io + 0x08, sg->ioCnt, sizeof(sg->ioCnt));
+	memcpy(io + 0x50, sg->ioBld, sizeof(sg->ioBld));
+	for (int p = 0; p < NB_PRIORITIES; ++p) {
+		memcpy(gpu->itemsForPriority[p].BGs, sg->prioBGs[p], NB_BG);
+		gpu->itemsForPriority[p].nbBGs = sg->prioNb[p];
+	}
+	memcpy(gpu->BG_bmp_large_ram, sg->bmpLarge, sizeof(sg->bmpLarge));
+	memcpy(gpu->BG_bmp_ram, sg->bmp, sizeof(sg->bmp));
+	memcpy(gpu->BG_tile_ram, sg->tile, sizeof(sg->tile));
+	memcpy(gpu->BG_map_ram, sg->map, sizeof(sg->map));
+	memcpy(gpu->BGExtPalSlot, sg->extPalSlot, sizeof(sg->extPalSlot));
+	memcpy(gpu->BGSize, sg->size, sizeof(sg->size));
+	memcpy(gpu->BGTypes, sg->types, sizeof(sg->types));
+	memcpy(gpu->bgPrio, sg->bgPrio, sizeof(sg->bgPrio));
+	gpu->BLDCNT = sg->bldcnt;
+	gpu->BLDALPHA_EVA = sg->eva; gpu->BLDALPHA_EVB = sg->evb; gpu->BLDY_EVY = sg->evy;
+	gpu->setFinalColorBck_funcNum = sg->fnBck; gpu->setFinalColor3d_funcNum = sg->fn3d; gpu->setFinalColorSpr_funcNum = sg->fnSpr;
+	gpu->blendTable = sg->table;
+}
+
 // Renders every pending line on the CPU, in order (exactly the GPU_RenderLine call the eager path
 // would have made at that line's hblank, with the state constant since then: see the header
 // comment on s_lzOn). `why`: 0 register write, 1 data write, 2 frame-end bail, 3 out-of-scope line.
@@ -1203,9 +1303,29 @@ static void gxDsLzFlush(int why)
 		else if (why == 2) s_lzStFlushBailLines += n; else s_lzStFlushOosLines += n;
 #endif
 		(void)why; (void)n;
-		while (s_lzRendered < s_lzSeen) {
-			GPU_RenderLine(&GXDS_SCREEN, (u16)s_lzRendered, false);
-			++s_lzRendered;
+		if (s_lzSegN == 0) {
+			while (s_lzRendered < s_lzSeen) {
+				GPU_RenderLine(&GXDS_SCREEN, (u16)s_lzRendered, false);
+				++s_lzRendered;
+			}
+		} else {
+			// Task 2d-bails-1: per-segment register state (see GxDsLzRegSeg).
+			GxDsLzRegSeg now;
+			gxDsLzSegSave(&now, s_lzSeen);
+			int si = 0, applied = -1;
+			while (s_lzRendered < s_lzSeen) {
+				while (si < s_lzSegN && s_lzRendered >= s_lzSeg[si].line) ++si;
+				if (si != applied) {
+#ifndef DSB_MUTATE_LZSEG   // mutation: render every pending line with the current (frame-later) state
+					gxDsLzSegApply(si < s_lzSegN ? &s_lzSeg[si] : &now);
+#endif
+					applied = si;
+				}
+				GPU_RenderLine(&GXDS_SCREEN, (u16)s_lzRendered, false);
+				++s_lzRendered;
+			}
+			gxDsLzSegApply(&now);
+			s_lzSegN = 0;
 		}
 	}
 	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
@@ -1231,6 +1351,28 @@ void GXDS_API(LazyBarrier)(int data)
 #endif
 }
 
+// Task 2d-bails-1: a BGxCNT / colour-effect register write (IO 0x08-0x0F / 0x50-0x57 of this
+// engine, called before it lands). Returns true when it was absorbed as a new pending-line segment
+// (no flush needed); false = the caller takes the ordinary register barrier.
+bool GXDS_API(LazySegWrite)()
+{
+#if GXDS_LAZY_COMPILED && !defined(DSLZ_MUTATE_NOBARRIER)
+	if (s_lzFlushing || s_lzSeen <= s_lzRendered)
+		return false;                                  // nothing pending: the barrier is a no-op anyway
+	if (s_lzSegN > 0 && s_lzSeg[s_lzSegN - 1].line == s_lzSeen)
+		return true;                                   // another write before the next line: the saved state already precedes it
+	if (s_lzSegN >= kLzMaxRegSegs)
+		return false;
+	gxDsLzSegSave(&s_lzSeg[s_lzSegN++], s_lzSeen);
+#ifdef DSLZ_STATS
+	++s_lzStRegSeg;
+#endif
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool GXDS_API(LazyPending)()
 {
 	return s_lzSeen > s_lzRendered;
@@ -1238,7 +1380,7 @@ bool GXDS_API(LazyPending)()
 
 static void gxDsLzReset()
 {
-	s_lzOn = false; s_lzRendered = 0; s_lzSeen = 0; s_lzFlushing = false; s_lzDataHit = false;
+	s_lzOn = false; s_lzRendered = 0; s_lzSeen = 0; s_lzFlushing = false; s_lzDataHit = false; s_lzSegN = 0;
 	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
 	g_gxDsLazyOn &= ~(1u << GXDS_CORE);
 }
@@ -3982,7 +4124,14 @@ static void gxDsBEnsureBgPlane(int bg, GxDsBBgPlaneCache &pc, int fadeMode, int 
 				const u64 t0 = gettime();
 #endif
 				PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_BG : PZ_2DB_BAKE_BG);
+				// Task 2d-bails-1: the brighten/darken variant's TLUT holds FADED colours
+				// (gxDsBOpaqueTexel applies s_bakeFade*): rebuilt without the fade it showed the
+				// plain colours after a palette write until the next full bake (lz_c25 / c26).
+#ifndef DSB_MUTATE_TLUTFADE
+				s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+#endif
 				gxDsBRebuildBgTlut(pc, gxDsBBgSlotFor(bg));
+				s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 #ifdef DSB_STATS
 				s_dsbTlutOnlyTicks += gettime() - t0;
 				++s_dsbTlutOnlyBg;
@@ -4058,7 +4207,11 @@ static void gxDsBEnsureObjTex(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot, int 
 				const u64 t0 = gettime();
 #endif
 				PZ_SUB_SCOPE(GXDS_CORE == 0 ? PZ_2DA_BAKE_OBJ : PZ_2DB_BAKE_OBJ);
+#ifndef DSB_MUTATE_TLUTFADE   // Task 2d-bails-1: the fade variant's TLUT is faded, as in gxDsBEnsureBgPlane
+				s_bakeFadeMode = fadeMode; s_bakeFadeLvl = fadeLvl;
+#endif
 				gxDsBRebuildObjTlut(slot, gxDsBObjSlotFor());
+				s_bakeFadeMode = 0; s_bakeFadeLvl = 0;
 #ifdef DSB_STATS
 				s_dsbTlutOnlyTicks += gettime() - t0;
 				++s_dsbTlutOnlyObj;
@@ -4622,6 +4775,17 @@ static bool gxDsBRenderFrameImpl()
 #endif
 	if (!GXDS_SCREEN.gpu)
 		return false;
+#ifndef DSB_MUTATE_BGCNTCHANGE
+	// Task 2d-bails-1: the per-line `bgcntchange` check only sees enabled lines, so a BG disabled
+	// for the rest of the frame can have its BGxCNT changed unseen; the planes bake the
+	// frame-final value (lz_c27).
+	for (int bg = 0; bg < 4; ++bg)
+		if (((s_frameBgCntKnown >> bg) & 1) &&
+		    (u16)(T1ReadWord((u8 *)&GXDS_SCREEN.gpu->dispx_st->dispx_BGxCNT[bg].val, 0) & 0xFFBC) != s_frameBgCnt[bg]) {
+			DSB_WHY("bgcntchange");
+			return false;
+		}
+#endif
 #if GXDS_CORE == 0
 	// Task gxfast-capture: the trace let an armed capture through (gxDsACaptureOnGx); re-checked
 	// here against a render-mode switch since.
@@ -5201,10 +5365,10 @@ bool GXDS_API(RenderFrame)()
 	++s_lzStFrames;
 	if ((s_lzStFrames % 30) == 0) {
 #ifdef HARNESS_PROFILE_SINK
-		harness_profile_emitf(GXDS_TAG "lz n=%u defer=%u eager=%u disc=%u flushreg=%u flushdata=%u flushbail=%u flushoos=%u barrio=%u barrdata=%u databail=%u",
+		harness_profile_emitf(GXDS_TAG "lz n=%u defer=%u eager=%u disc=%u flushreg=%u flushdata=%u flushbail=%u flushoos=%u barrio=%u barrdata=%u databail=%u regseg=%u",
 		                      (unsigned)s_lzStFrames, (unsigned)s_lzStDeferredLines, (unsigned)s_lzStEagerLines, (unsigned)s_lzStDiscardFrames,
 		                      (unsigned)s_lzStFlushRegLines, (unsigned)s_lzStFlushDataLines, (unsigned)s_lzStFlushBailLines, (unsigned)s_lzStFlushOosLines,
-		                      (unsigned)s_lzStBarrierIo, (unsigned)s_lzStBarrierData, (unsigned)s_lzStDataBail);
+		                      (unsigned)s_lzStBarrierIo, (unsigned)s_lzStBarrierData, (unsigned)s_lzStDataBail, (unsigned)s_lzStRegSeg);
 #endif
 	}
 #endif

@@ -42,6 +42,18 @@
 //      left by the previous line's last layer); even frames = plain, BLDCNT with OBJ as 1st target (GX handles).
 //      The CPU pass of an odd frame's line 0 therefore depends on the last layer of the previous (GX-handled) frame:
 //      the deferred-line 'discard' path must replay that leftover (GPU_DiscardDeferredLines).
+//  25  B: BG1CNT (map base + priority) and BLDCNT/BLDY (brighten BG1) rewritten at line 57 EVERY frame, reset in vblank
+//      (the SM64DS stage sub-screen pattern; task 2d-bails-1 "register segments": no flush). Per frame (f % 5):
+//      0 nothing else (BG1's map base changes too: GX bails 'bgcntchange', the rest of the frame is eager);
+//      1 BG1CNT priority only + a second set at line 120 (BG0CNT priority, BLDY: 2 segments, GX handles, exact);
+//      2-4 map base change as in 0, and:
+//      2 + sub BG palette write at line 130 (data barrier: segments replayed, GX bails midframewrite);
+//      3 + BG1 mosaic at line 140 (BG1CNT is a segment, the MOSAIC write flushes them, rest eager);
+//      4 BLDY rewritten at 6 lines (more segments than the cap -> the plain flush; fade keys differ -> bail)
+//  26  A: the same as 25 on Engine A
+//  27  B: on even frames BG1 is disabled at line 80 and its BG1CNT map base changed in the same hblank (BG1 never
+//      enabled again that frame; restored in vblank): the per-line 'bgcntchange' check never sees the new value on an
+//      enabled line, the frame-end check must still bail (planes are baked from the frame-final BGxCNT).
 
 #include <nds.h>
 #include <stdio.h>
@@ -78,6 +90,9 @@
 #define B_WINOUT  R16(0x0400104A)
 #define B_MOSAIC  R16(0x0400104C)
 #define B_BG1CNT  R16(0x0400100A)
+#define B_BG0CNT  R16(0x04001008)
+#define B_BLDCNT  R16(0x04001050)
+#define B_BLDY    R16(0x04001054)
 #define R_POWCNT1 R16(0x04000304)
 #define R_VRAMCNT_A (*(volatile u8 *)0x04000240)
 
@@ -244,6 +259,38 @@ static void hb(void)
 #elif LZ_CASE == 21
 	if ((ff & 3) == 0) { if (L == 39) { A_BLDCNT = (2 << 6) | L_BG1; A_BLDY = 8; } else if (L == 89) A_BLDCNT = 0; }
 	if ((ff & 3) == 2) { if (L == 89) { A_BLDCNT = (1 << 6) | L_BG3 | ((L_BG1 | L_BD) << 8); A_BLDALPHA = 9 | (7 << 8); } else if (L == 149) A_BLDCNT = 0; }
+#elif LZ_CASE == 25 || LZ_CASE == 26
+	{
+#if LZ_CASE == 25
+		volatile u16 *cnt0 = &B_BG0CNT, *cnt1 = &B_BG1CNT, *bld = &B_BLDCNT, *bldy = &B_BLDY, *mos = &B_MOSAIC;
+		volatile u16 *pal = BG_PALETTE_SUB;
+		const u16 map1 = BG_MAP_BASE(24), map1b = BG_MAP_BASE(25), map0 = BG_MAP_BASE(24);   // map1b = BG1's own
+#else
+		volatile u16 *cnt0 = &A_BG0CNT, *cnt1 = &A_BG1CNT, *bld = &A_BLDCNT, *bldy = &A_BLDY, *mos = &A_MOSAIC;
+		volatile u16 *pal = BG_PALETTE;
+		const u16 map1 = BG_MAP_BASE(25), map1b = BG_MAP_BASE(24), map0 = BG_MAP_BASE(27);   // map1b = BG1's own
+#endif
+		const int v = ff % 5;
+		if (L == 56) {
+#ifndef LZ_NOCNT
+			*cnt1 = BG_32x32 | BG_COLOR_16 | (v == 1 ? map1b : map1) | BG_TILE_BASE(1) | BG_PRIORITY(0);
+#endif
+			if (v == 1) R32((u32)bld) = (2 << 6) | L_BG1;   // 32-bit BLDCNT+BLDALPHA, like SM64DS
+			else *bld = (2 << 6) | L_BG1;
+			*bldy = 8;
+		}
+		if (v == 1 && L == 119) { *cnt0 = BG_32x32 | BG_COLOR_16 | map0 | BG_TILE_BASE(0) | BG_PRIORITY(3); *bldy = 8; }
+#ifndef LZ_NOPAL
+		if (v == 2 && L == 129) { for (int i = 1; i < 16; i++) pal[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+#endif
+		if (v == 3 && L == 139) { *cnt1 = BG_32x32 | BG_COLOR_16 | map1b | BG_TILE_BASE(1) | BG_PRIORITY(0) | BG_MOSAIC_ON; *mos = 0x0033; }
+		if (v == 4 && (L == 19 || L == 39 || L == 59 || L == 79 || L == 99 || L == 119)) *bldy = (u16)(L / 10);
+	}
+#elif LZ_CASE == 27
+	if ((ff & 1) == 0 && L == 79) {
+		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(24) | BG_TILE_BASE(1) | BG_PRIORITY(2);
+		B_DISPCNT &= ~(1u << 9);
+	}
 #elif LZ_CASE == 22
 	if ((ff % 3) == 0) { if (L == 49) A_BG0HOFS = 33; else if (L == 149) A_BG0HOFS = 0; if (L == 59) B_BG0VOFS = 17; else if (L == 159) B_BG0VOFS = 0; }
 #endif
@@ -287,6 +334,22 @@ int main(void)
 #endif
 #if LZ_CASE == 16
 		B_BG0VOFS = 0;
+#endif
+#if LZ_CASE == 25
+		B_BG0CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(24) | BG_TILE_BASE(0) | BG_PRIORITY(1);
+		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);
+		B_BLDCNT = 0; B_BLDY = 0; B_MOSAIC = 0;
+		if ((f % 5) == 3) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 3 + 5) & 31, (i * 9 + 14) & 31, (i * 5 + 2) & 31); }
+#endif
+#if LZ_CASE == 27
+		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);
+		B_DISPCNT |= (1u << 9);
+#endif
+#if LZ_CASE == 26
+		A_BG0CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(27) | BG_TILE_BASE(0) | BG_PRIORITY(1);
+		A_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(24) | BG_TILE_BASE(1) | BG_PRIORITY(3);
+		A_BLDCNT = 0; A_BLDY = 0; A_MOSAIC = 0;
+		if ((f % 5) == 3) { for (int i = 1; i < 16; i++) BG_PALETTE[i] = RGB15((i * 5 + 9) & 31, (i * 11 + 4) & 31, (i * 7 + 17) & 31); }
 #endif
 #if LZ_CASE == 11
 		if ((f & 3) == 1) A_MBRIGHT = (1u << 14) | 16;

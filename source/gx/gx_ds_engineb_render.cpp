@@ -66,6 +66,12 @@ void gxDsLazyIoWriteSlow(u32 adr)
 		// (0x60-0x63) are not compositor state.
 		const u32 off = adr & 0x7Fu;
 		if (off < 4 || (off >= 8 && off < 0x60) || (off >= 0x64 && off < 0x70)) {
+			// Task 2d-bails-1: BGxCNT (0x08-0x0F) and BLDCNT / BLDALPHA / BLDY (0x50-0x57) become a
+			// pending-line segment instead of a flush where possible (writes are size-aligned, so
+			// they stay inside their 8-byte range).
+			if (((off >= 0x08 && off < 0x10) || (off >= 0x50 && off < 0x58)) &&
+			    ((adr & 0x1000u) ? gxDsEngineBLazySegWrite() : gxDsEngineALazySegWrite()))
+				return;
 			if (adr & 0x1000u) gxDsEngineBLazyBarrier(0); else gxDsEngineALazyBarrier(0);
 		}
 		return;

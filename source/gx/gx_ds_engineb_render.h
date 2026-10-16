@@ -578,6 +578,9 @@ void gxDsLazyIoWriteSlow(u32 adr);
 void gxDsLazyVramRemapped();   // MMU_VRAMmapControl: a bank was (re)mapped, recompute which LCDC pages each engine sees
 void gxDsEngineALazyBarrier(int data);
 void gxDsEngineBLazyBarrier(int data);
+// Task 2d-bails-1: BGxCNT / colour-effect register write; true = absorbed as a pending-line segment (no flush).
+bool gxDsEngineALazySegWrite();
+bool gxDsEngineBLazySegWrite();
 bool gxDsEngineALazyPending();
 bool gxDsEngineBLazyPending();
 void gxDsLazyFlushAll();
