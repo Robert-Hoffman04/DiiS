@@ -668,6 +668,52 @@ static int s_keyOpq, s_keyTr;
 static char *s_kHw;           // zero-fresh high-water mark of the front (opaque) part
 #endif
 
+// Task rec-prep-opt: POLY::face, the facing of a polygon whose vertices are all inside the clip
+// volume, from its screen outline made of the per-vertex (x+w)/(2w) (s_vtxScrX) and (y+w)/(2w)
+// (s_vtxSortY) with the polygon's viewport: rasterize.cpp's divide + viewport + clamp, as
+// gx_ds_3d_render.cpp's gxDs3dScreenXY. The GxFast gate takes its cull verdict from it instead of
+// loading the vertices (cold on hardware by VBlank end: the lists are written over the whole
+// frame). Only a sign with margin is stored (|2 x area| > 4 px^2, gxDs3dFacingVisible's fast
+// test), so the few-ulp difference from the gate's own arithmetic can't flip it; anything closer,
+// NaN, or a frame built outside GxFast stays "not known" and the gate reads the vertices as
+// before. -DDSA_GXGEOM_MUTATE_GEFACING: not computed (face is always 0).
+#if defined(GE_FLUSHKEYS) && !defined(DSA_GXGEOM_NOCLIPCODES) && !defined(DSA_GXGEOM_MUTATE_GEFACING)
+#define GE_FACING 1
+static float s_vtxScrX[4];    // (x+w)/(2w) of the vertex in each tempVertInfo.map slot
+static u32 s_faceVpKey;       // the viewport s_faceVp was decoded from
+static bool s_faceVpOk = false;
+static float s_faceVp[4];     // its width, height, x, y as floats
+static FORCEINLINE float ge_clampF(float v, float hi){ v = v < hi ? v : hi; return v > 0.0f ? v : 0.0f; }   // gxDs3dClampF
+static GE_NOINLINE void ge_polyFace(POLY &p, int a, int b, int c, int d, int n){
+	p.face = 0;
+	if (p.clipOr != 0x80 || !gxRenderModeIsFast()) return;   // a vertex outside / at the eye, or codes not known
+	if (!s_faceVpOk || viewport != s_faceVpKey) {
+		VIEWPORT vp;
+		vp.decode(viewport);
+		s_faceVp[0] = (float)vp.width; s_faceVp[1] = (float)vp.height; s_faceVp[2] = (float)vp.x; s_faceVp[3] = (float)vp.y;
+		s_faceVpKey = viewport; s_faceVpOk = true;
+	}
+	const float vw = s_faceVp[0], vh = s_faceVp[1], vx = s_faceVp[2], vy = s_faceVp[3];
+	const int sl[4] = { a, b, c, d };
+	float fx[4], fy[4];
+	for (int j = 0; j < n; ++j) {
+		const float nx = s_vtxScrX[sl[j]], ny = s_vtxSortY[sl[j]];
+		if (nx != nx || ny != ny) return;   // NaN: the gate's exact path decides
+		fx[j] = ge_clampF(nx * vw + vx, 256.0f);
+		fy[j] = ge_clampF(192.0f - (ny * vh + vy), 192.0f);
+	}
+	float facing = (fy[0] + fy[n - 1]) * (fx[0] - fx[n - 1]);
+	for (int j = 0; j < n - 1; ++j) facing += (fy[j + 1] + fy[j]) * (fx[j + 1] - fx[j]);
+	if (facing > 4.0f) p.face = 0x80;
+	else if (facing < -4.0f) p.face = 0x81;
+}
+#define GE_SCRX_MOVE(d, s) (s_vtxScrX[d] = s_vtxScrX[s])
+#define GE_POLYFACE(a, b, c, d, n) ge_polyFace(polylist->list[polylist->count], a, b, c, d, n)
+#else
+#define GE_SCRX_MOVE(d, s) do {} while (0)
+#define GE_POLYFACE(a, b, c, d, n) (polylist->list[polylist->count].face = 0)
+#endif
+
 static void ge_zeroFreshReset(bool disable){
 	s_vLim = ge_lineDown(vertlist->list + VERTLIST_SIZE);
 	s_pLim = ge_lineDown(polylist->list + POLYLIST_SIZE);
@@ -983,6 +1029,9 @@ static void SetVertex(){
 	// (the expression gfx3d_doFlush() evaluated on the stored y and w)
 	s_vtxSortY[tempVertInfo.count] = (coordTransformed[1] + coordTransformed[3]) / (2*coordTransformed[3]);
 #endif
+#ifdef GE_FACING
+	s_vtxScrX[tempVertInfo.count] = (coordTransformed[0] + coordTransformed[3]) / (2*coordTransformed[3]);
+#endif
 
 	tempVertInfo.map[tempVertInfo.count] = vertlist->count + tempVertInfo.count - continuation;
 	tempVertInfo.count++;
@@ -1002,6 +1051,7 @@ static void SetVertex(){
 				SUBMITVERTEX(2,2);
 				GE_POLYCODE(3);
 				GE_POLYSORT(0, 1, 2, 0, 3);
+				GE_POLYFACE(0, 1, 2, 0, 3);
 				vertlist->count+=3;
 				polylist->list[polylist->count].type = 3;
 				tempVertInfo.count = 0;
@@ -1017,6 +1067,7 @@ static void SetVertex(){
 				SUBMITVERTEX(3,3);
 				GE_POLYCODE(4);
 				GE_POLYSORT(0, 1, 2, 3, 4);
+				GE_POLYFACE(0, 1, 2, 3, 4);
 				vertlist->count+=4;
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.count = 0;
@@ -1031,6 +1082,7 @@ static void SetVertex(){
 				SUBMITVERTEX(2,2);
 				GE_POLYCODE(3);
 				GE_POLYSORT(0, 1, 2, 0, 3);
+				GE_POLYFACE(0, 1, 2, 0, 3);
 				polylist->list[polylist->count].type = 3;
 
 				if(triStripToggle)
@@ -1039,6 +1091,7 @@ static void SetVertex(){
 					tempVertInfo.map[0] = vertlist->count+2-continuation;
 				GE_VTXCODE_MOVE(triStripToggle ? 1 : 0, 2);
 				GE_SORTY_MOVE(triStripToggle ? 1 : 0, 2);
+				GE_SCRX_MOVE(triStripToggle ? 1 : 0, 2);
 				
 				if(tempVertInfo.first)
 					vertlist->count+=3;
@@ -1060,6 +1113,7 @@ static void SetVertex(){
 				SUBMITVERTEX(3,2);
 				GE_POLYCODE(4);
 				GE_POLYSORT(0, 1, 3, 2, 4);
+				GE_POLYFACE(0, 1, 3, 2, 4);
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.map[0] = vertlist->count+2-continuation;
 				tempVertInfo.map[1] = vertlist->count+3-continuation;
@@ -1067,6 +1121,8 @@ static void SetVertex(){
 				GE_VTXCODE_MOVE(1, 3);
 				GE_SORTY_MOVE(0, 2);
 				GE_SORTY_MOVE(1, 3);
+				GE_SCRX_MOVE(0, 2);
+				GE_SCRX_MOVE(1, 3);
 				if(tempVertInfo.first)
 					vertlist->count+=4;
 				else vertlist->count+=2;

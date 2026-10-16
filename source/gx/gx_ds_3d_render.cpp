@@ -433,41 +433,70 @@ static void gxDs3dTexConvertTrans(GxDs3dTex &t, const TexCacheItem *item)
 	s_texDirty = true;
 }
 
+// One textured polygon's texture for gxDs3dPrepareTextures; false: not available (the frame bails).
+static bool gxDs3dPrepareTex(u32 texParam, u32 pal, u32 amode, u32 seq)
+{
+	const u32 key = gxDs3dTexKey(texParam);
+	int k = gxDs3dTexFind(key, pal, amode);
+	if (k >= 0 && s_texK[k].seq == seq && s_tex[k].src) return true;   // done this frame
+	TexCacheItem *item = TexCache_SetTexture(TexFormat_15bpp, texParam, pal);
+	if (!item || !item->decoded) return false;
+	item->deleteCallback = gxDs3dTexItemDeleted;
+	if (k >= 0 && s_tex[k].src == item) { s_texK[k].seq = seq; return true; }
+	const u16 w = (u16)item->sizeX, h = (u16)item->sizeY;
+	const u32 bytes = (u32)w * h * (amode ? 4 : 2);
+	if (k >= 0 && s_tex[k].bytes != bytes) { gxDs3dTexFree(k); k = -1; }
+	if (k < 0) {
+		if (!gxDs3dTexMakeRoom(bytes, seq)) return false;
+		void *data = memalign(32, bytes);
+		if (!data) return false;
+		k = s_texCount++;
+		s_texK[k].key = key; s_texK[k].pal = pal; s_texK[k].amode = amode; s_tex[k].amode = amode;
+		s_tex[k].data = data; s_tex[k].bytes = bytes;
+		s_texBytes += bytes;
+	}
+	GxDs3dTex &t = s_tex[k];
+	t.w = w; t.h = h; t.src = item; s_texK[k].seq = seq;
+	if (amode) gxDs3dTexConvertTrans(t, item);
+	else       gxDs3dTexConvert(t, item);
+	GX_InitTexObj(&t.obj, t.data, w, h, amode ? GX_TF_RGBA8 : GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&t.obj, GX_NEAR, GX_NEAR);
+	return true;
+}
+
+// Task rec-prep-opt: the textured polygons' textures in polylist order with consecutive repeats
+// left out, collected by the gate's walk (gxDs3dFrameGate), so gxDs3dPrepareTextures doesn't walk
+// every POLY again. A repeat of the entry before it is exactly an iteration the per-polygon loop
+// skips ("done this frame": nothing ran in between that could drop its source), and an entry keeps
+// the first polygon's full texParam (the one TexCache_SetTexture saw). Repeats further apart are
+// kept (a texcache eviction in between can make the loop re-fetch them). Valid for the list the
+// gate walked to the end (s_texUseList / s_texUseCount); more than kTexUseCap entries: not used.
+// -DDSA_GXGEOM_MUTATE_TEXLIST: not built (the per-polygon walk).
+struct GxDs3dTexUse { u32 texParam, pal, amode; };
+static const int kTexUseCap = 512;           // 6 KB (.bss); SM64DS stage ~150-250
+static GxDs3dTexUse s_texUse[kTexUseCap];
+static int s_texUseN = 0;                    // entries, kTexUseCap + 1 = overflowed
+static const void *s_texUseList = NULL;
+static int s_texUseCount = -1;
+
 bool gxDs3dPrepareTextures()
 {
 	PZ_SUB_SCOPE(PZ_GX3D_TEX);
 	const u32 seq = g_gfx3dRenderSeq;
 	s_texPrepSeq = 0xFFFFFFFF;
 	const int polycount = gfx3d.polylist->count;
+#ifndef DSA_GXGEOM_MUTATE_TEXLIST
+	if (s_texUseList == gfx3d.polylist && s_texUseCount == polycount && s_texUseN <= kTexUseCap) {
+		for (int e = 0; e < s_texUseN; ++e)
+			if (!gxDs3dPrepareTex(s_texUse[e].texParam, s_texUse[e].pal, s_texUse[e].amode, seq)) return false;
+		s_texPrepSeq = seq;
+		return true;
+	}
+#endif
 	for (int i = 0; i < polycount; ++i) {
 		const POLY &p = gfx3d.polylist->list[i];
 		if (gxDs3dTexFormat(p) == 0) continue;
-		const u32 key = gxDs3dTexKey(p.texParam);
-		const u32 amode = gxDs3dTexAMode(p);
-		int k = gxDs3dTexFind(key, p.texPalette, amode);
-		if (k >= 0 && s_texK[k].seq == seq && s_tex[k].src) continue;   // done this frame
-		TexCacheItem *item = TexCache_SetTexture(TexFormat_15bpp, p.texParam, p.texPalette);
-		if (!item || !item->decoded) return false;
-		item->deleteCallback = gxDs3dTexItemDeleted;
-		if (k >= 0 && s_tex[k].src == item) { s_texK[k].seq = seq; continue; }
-		const u16 w = (u16)item->sizeX, h = (u16)item->sizeY;
-		const u32 bytes = (u32)w * h * (amode ? 4 : 2);
-		if (k >= 0 && s_tex[k].bytes != bytes) { gxDs3dTexFree(k); k = -1; }
-		if (k < 0) {
-			if (!gxDs3dTexMakeRoom(bytes, seq)) return false;
-			void *data = memalign(32, bytes);
-			if (!data) return false;
-			k = s_texCount++;
-			s_texK[k].key = key; s_texK[k].pal = p.texPalette; s_texK[k].amode = amode; s_tex[k].amode = amode;
-			s_tex[k].data = data; s_tex[k].bytes = bytes;
-			s_texBytes += bytes;
-		}
-		GxDs3dTex &t = s_tex[k];
-		t.w = w; t.h = h; t.src = item; s_texK[k].seq = seq;
-		if (amode) gxDs3dTexConvertTrans(t, item);
-		else       gxDs3dTexConvert(t, item);
-		GX_InitTexObj(&t.obj, t.data, w, h, amode ? GX_TF_RGBA8 : GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
-		GX_InitTexObjFilterMode(&t.obj, GX_NEAR, GX_NEAR);
+		if (!gxDs3dPrepareTex(p.texParam, p.texPalette, gxDs3dTexAMode(p), seq)) return false;
 	}
 	s_texPrepSeq = seq;
 	return true;
@@ -523,7 +552,7 @@ static bool gxDs3dTexColorExact(const POLY &p)
 // adds the entry instead (8-bit clamp, not the 6-bit one: <= 1 6-bit step off). Exact for
 // one index per polygon; at an index boundary it can only move by the interpolation's
 // rounding. Mutation -DDSA_GXGEOM_MUTATE_TOONBAIL puts back the flat-index-only GxFast.
-static struct { bool on; u8 rgb[3]; } s_toon;
+static struct { u8 rgb[4]; bool on; } s_toon;   // (rgb[3]: pad, gxDs3dSendColor reads it as a word)
 #ifdef DSA_GXGEOM_MUTATE_TOONBAIL
 static const bool kToonLut = false;
 #else
@@ -934,6 +963,7 @@ enum { kVisCull = 1, kVisDraw = 2, kVisSpecial = 4, kVisFogRedraw = 8 };
 #ifdef DSA_GXGEOM_VISCHECK
 // check build: every cached answer recomputed the old way; "gxds3dchk" every 64 gates
 static u32 s_chkGates, s_chkPolys, s_chkCode, s_chkCodeBad, s_chkVis, s_chkVisBad;
+static u32 s_chkFace, s_chkFaceBad, s_chkTex, s_chkTexBad;   // Task rec-prep-opt: POLY::face, the line-191 texture check
 #endif
 #ifndef DSA_GXGEOM_NOVISCACHE
 static u8 s_polyVis[POLYLIST_SIZE];
@@ -1011,6 +1041,15 @@ static bool gxDs3dFacingVisible(const POLY &p, const VERT *const *cv, int n)
 	return gxDs3dTransShapeBuild(p, cv, n, sh);
 }
 
+// Task rec-prep-opt: gxDs3dFacingVisible's verdict from POLY::face (known: the geometry engine
+// found |2 x area| > 4 px^2 on the same outline, so the sign is the exact one).
+static inline bool gxDs3dFaceVisible(const POLY &p)
+{
+	const int cull = gxDs3dShadowDraw(p) ? 2 : (p.polyAttr >> 6) & 3;
+	const bool back = p.face & 1;
+	return cull == 3 || (cull != 0 && !((cull == 1 && !back) || (cull == 2 && back)));
+}
+
 // Separating-axis test on two convex outlines: true if some edge normal of either separates
 // them, touching counts as separate. Rasterize.cpp's fill convention gives a pixel on a
 // shared edge to one side only, so interior-disjoint outlines share no pixel.
@@ -1023,11 +1062,23 @@ static bool gxDs3dTransShapesDisjoint(const GxDs3dTransShape &a, const GxDs3dTra
 	for (int pass = 0; pass < 2; ++pass) {
 		const GxDs3dTransShape &e = pass ? b : a;
 		for (int j = 0; j < e.n; ++j) {
+#ifdef DSA_GXGEOM_MUTATE_SATSEL
 			const int k = (j + 1) % e.n;
 			const double nx = e.y[k] - e.y[j], ny = e.x[j] - e.x[k];
 			double amin = 1e300, amax = -1e300, bmin = 1e300, bmax = -1e300;
 			for (int m = 0; m < a.n; ++m) { const double d = nx * a.x[m] + ny * a.y[m]; amin = fmin(amin, d); amax = fmax(amax, d); }
 			for (int m = 0; m < b.n; ++m) { const double d = nx * b.x[m] + ny * b.y[m]; bmin = fmin(bmin, d); bmax = fmax(bmax, d); }
+#else
+			// Task rec-prep-opt: compare-selects instead of the fmin/fmax libm calls (4 per point)
+			// and no integer divide. Same answer: a NaN d leaves the bound as it is in both forms
+			// (the bounds start finite and never become NaN), and only the sign of a zero bound
+			// may differ, which the <= tests below can't see.
+			const int k = j + 1 == e.n ? 0 : j + 1;
+			const double nx = e.y[k] - e.y[j], ny = e.x[j] - e.x[k];
+			double amin = 1e300, amax = -1e300, bmin = 1e300, bmax = -1e300;
+			for (int m = 0; m < a.n; ++m) { const double d = nx * a.x[m] + ny * a.y[m]; amin = d < amin ? d : amin; amax = d > amax ? d : amax; }
+			for (int m = 0; m < b.n; ++m) { const double d = nx * b.x[m] + ny * b.y[m]; bmin = d < bmin ? d : bmin; bmax = d > bmax ? d : bmax; }
+#endif
 			if (amax <= bmin || bmax <= amin) return true;
 		}
 	}
@@ -1082,6 +1133,12 @@ struct GxDs3dTagRun {
 };
 static const int kCarryBudget = 4096;    // range polygons all carried runs of a frame may redraw
 static const int kMaxTrans = 2048;       // the DS's own per-frame polygon limit
+// Task rec-prep-opt: what the gate's per-polygon walk saw, for the plans after it. gfx3d.indexlist
+// holds the opaque polygons first (gfx3d_doFlush's partition on isTranslucent()), so the walk's
+// opaque count is the indexlist position of the first translucent one. -1: no completed walk.
+static int s_gateNOpq = -1;
+static u32 s_gateOpIds[2];               // polygon IDs of the opaque polygons (bits 0-31, 32-63)
+static bool s_gateOpShadow = false;      // an opaque-list mode-3 polygon
 static u16 s_tagRun[POLYLIST_SIZE];      // per polylist index: tagged run (1-based), 0 = plain draw
 static u16 s_tagIdx[POLYLIST_SIZE];      // its 1-based position in that run (the tag it writes)
 static GxDs3dTagRun s_tagRuns[kMaxTrans + 1];
@@ -1173,7 +1230,15 @@ static int gxDs3dTransIdPlan()
 	s_planPolyCount = 0;
 	s_planVertCount = 0;
 	const int polycount = gfx3d.polylist->count;
-	for (int n = 0; n <= polycount; ++n) {
+	// Task rec-prep-opt: the opaque polygons in front only `continue` below (their s_tagRun /
+	// s_planSlot entries are read for translucent polygons only), so the walk starts at the first
+	// translucent one without loading them. -DDSA_GXGEOM_MUTATE_PLANSKIP: from 0, as before.
+#ifndef DSA_GXGEOM_MUTATE_PLANSKIP
+	const int nStart = s_gateNOpq > 0 ? s_gateNOpq : 0;
+#else
+	const int nStart = 0;
+#endif
+	for (int n = nStart; n <= polycount; ++n) {
 		POLY *pp = NULL;
 		GxDs3dTransShape *sh = NULL;
 		if (n < polycount) {
@@ -1542,7 +1607,17 @@ static bool gxDs3dShadowPlan()
 	int masks = 0, nd = 0, lastRun = 0, shRun = 0, lastDraw = -1, mk = 0;
 	GxDs3dShGroup *g = NULL;              // the open group
 	const int polycount = gfx3d.polylist->count;
-	for (int n = 0; n < polycount; ++n) {
+	// Task rec-prep-opt: without opaque-list mode-3 polygons, each opaque one only adds its ID to
+	// opIds below (g and odGrp stay at their starting values): the gate's walk has that OR, so the
+	// loop starts at the first translucent polygon. -DDSA_GXGEOM_MUTATE_PLANSKIP: from 0.
+	int nStart = 0;
+#ifndef DSA_GXGEOM_MUTATE_PLANSKIP
+	if (s_gateNOpq > 0 && !s_gateOpShadow) {
+		opIds |= ((u64)s_gateOpIds[1] << 32) | s_gateOpIds[0];
+		nStart = s_gateNOpq;
+	}
+#endif
+	for (int n = nStart; n < polycount; ++n) {
 		const int i = gfx3d.indexlist[n];
 		POLY &p = gfx3d.polylist->list[i];
 		const bool trans = p.isTranslucent();
@@ -1678,7 +1753,14 @@ static bool gxDs3dShadowPlan()
 		int lastD0 = 0;
 		for (int k = s_shGroupCount - 1; k >= 0; --k)
 			if (s_shGroups[k].d1 > s_shGroups[k].d0) { lastD0 = s_shGroups[k].d0; break; }
-		for (int n = 0; n < lastDraw; ++n) {
+		// (Task rec-prep-opt: an opaque polygon before the pass is skipped below, so the loop starts
+		// at the pass or at the first translucent polygon, whichever comes first)
+#ifndef DSA_GXGEOM_MUTATE_PLANSKIP
+		const int nFrom = s_gateNOpq < 0 ? 0 : (s_gateNOpq < s_shIdAt ? s_gateNOpq : s_shIdAt);
+#else
+		const int nFrom = 0;
+#endif
+		for (int n = nFrom; n < lastDraw; ++n) {
 			POLY &p = gfx3d.polylist->list[gfx3d.indexlist[n]];
 			const bool before = n < s_shIdAt;
 			if (!p.isTranslucent()) {
@@ -2047,11 +2129,23 @@ static int gxDs3dFrameGate(bool requireTex)
 	s_gateToon = false;
 	s_shGroupCount = 0;
 	s_shIdAt = -1;
+	// Task rec-prep-opt: the walk's by-products (s_gateNOpq, s_texUse), valid once it completes
+	s_gateNOpq = -1;
+	s_texUseList = NULL;
+	int nOpq = 0, texUseN = 0;
+	u32 opIds0 = 0, opIds1 = 0;
+	bool opShadow = false;
 #ifdef DSA_GXGEOM_MUTATE_FASTPROJ
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
 #endif
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
+		if (!p.isTranslucent()) {
+			const u32 id = (u32)gxDs3dPolyId(p);
+			++nOpq;
+			if (id < 32) opIds0 |= 1u << id; else opIds1 |= 1u << (id - 32);
+			opShadow |= gxDs3dPolyMode(p) == 3;
+		}
 		// Shadow volumes (see the shadow section): GxFast, RGB8 EFB. Task shadow-cases: opaque-list
 		// ones too, except a drawing one without POLYGON_ATTR bit 15 in a frame whose fog
 		// redraw puts the unfogged colour back (that redraw leaves mode 3 out).
@@ -2108,11 +2202,21 @@ static int gxDs3dFrameGate(bool requireTex)
 		if (gxDs3dTexFormat(p) != 0) {
 			// Every format goes through texcache's decoder (see the textured section);
 			// A3I5/A5I3 (translucent, GxFast only) are baked to RGBA8 per polygon alpha.
+			const u32 amode = gxDs3dTexAMode(p);
 			if (requireTex) {
-				const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, gxDs3dTexAMode(p));
+				const int k = gxDs3dTexFind(gxDs3dTexKey(p.texParam), p.texPalette, amode);
 				if (s_texPrepSeq != g_gfx3dRenderSeq || k < 0 || s_texK[k].seq != s_texPrepSeq)
 					return kGateTexNotReady;
 			}
+#ifndef DSA_GXGEOM_MUTATE_TEXLIST
+			if (texUseN <= kTexUseCap) {   // (kTexUseCap + 1: overflowed)
+				const GxDs3dTexUse *const u = texUseN ? &s_texUse[texUseN - 1] : NULL;
+				if (!u || gxDs3dTexKey(u->texParam) != gxDs3dTexKey(p.texParam) || u->pal != p.texPalette || u->amode != amode) {
+					if (texUseN < kTexUseCap) { GxDs3dTexUse &e = s_texUse[texUseN]; e.texParam = p.texParam; e.pal = p.texPalette; e.amode = amode; }
+					++texUseN;
+				}
+			}
+#endif
 			if (!fast && !toon && !gxDs3dTexColorExact(p)) return kGateTexColor;
 		}
 		if (p.type != 3 && p.type != 4) return kGateType;
@@ -2156,8 +2260,21 @@ static int gxDs3dFrameGate(bool requireTex)
 #endif
 				if (p.clipOr & 0x40) vis |= kVisCull;   // a vertex at the eye (above)
 				else if (gxDs3dPolyAlpha(p) != 0) {
-					for (int j = 0; j < p.type; ++j) gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
-					vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
+#ifndef DSA_GXGEOM_MUTATE_GEFACING
+					// Task rec-prep-opt: the facing the geometry engine found, without the vertex loads
+					if (p.face & 0x80) {
+						vis |= gxDs3dFaceVisible(p) ? kVisDraw : kVisCull;
+#ifdef DSA_GXGEOM_VISCHECK
+						for (int j = 0; j < p.type; ++j) gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+						++s_chkFace;
+						if (gxDs3dFaceVisible(p) != gxDs3dFacingVisible(p, gv, p.type)) ++s_chkFaceBad;
+#endif
+					} else
+#endif
+					{
+						for (int j = 0; j < p.type; ++j) gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+						vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
+					}
 				}
 			}
 #ifndef DSA_GXGEOM_NOTRIVREJECT
@@ -2234,6 +2351,13 @@ static int gxDs3dFrameGate(bool requireTex)
 #endif
 	}
 
+	s_gateNOpq = nOpq;
+	s_gateOpIds[0] = opIds0; s_gateOpIds[1] = opIds1;
+	s_gateOpShadow = opShadow;
+	s_texUseN = texUseN;
+	s_texUseList = gfx3d.polylist;
+	s_texUseCount = polycount;
+
 	// Task trans-blendclear (see the translucent section): which 3D alpha the translucent
 	// polygons leave. Not with the fog pass (its alpha LUT assumes alpha 31 under it) or
 	// shadow volumes (their passes don't keep the EFB alpha): those keep the old bails.
@@ -2279,8 +2403,9 @@ static int gxDs3dFrameGate(bool requireTex)
 #ifdef DSA_GXGEOM_VISCHECK
 	s_chkPolys += (u32)polycount;
 	if ((++s_chkGates & 63) == 0)
-		harness_profile_emitf("gxds3dchk gates=%u polys=%u code=%u codebad=%u vis=%u visbad=%u", (unsigned)s_chkGates, (unsigned)s_chkPolys,
-		                      (unsigned)s_chkCode, (unsigned)s_chkCodeBad, (unsigned)s_chkVis, (unsigned)s_chkVisBad);
+		harness_profile_emitf("gxds3dchk gates=%u polys=%u code=%u codebad=%u vis=%u visbad=%u face=%u facebad=%u tex=%u texbad=%u", (unsigned)s_chkGates, (unsigned)s_chkPolys,
+		                      (unsigned)s_chkCode, (unsigned)s_chkCodeBad, (unsigned)s_chkVis, (unsigned)s_chkVisBad,
+		                      (unsigned)s_chkFace, (unsigned)s_chkFaceBad, (unsigned)s_chkTex, (unsigned)s_chkTexBad);
 #endif
 #endif
 
@@ -2331,6 +2456,8 @@ static struct {
 } s_prepKey;
 
 // The requireTex part of gxDs3dFrameGate, for a frame the rest of the gate passed.
+// (Task rec-prep-opt: only the mutation and the check build still walk it, see gxDs3dGeomFrameSupported.)
+#if defined(DSA_GXGEOM_MUTATE_TEXREADY) || defined(DSA_GXGEOM_VISCHECK)
 static int gxDs3dFrameTexReady()
 {
 	const int polycount = gfx3d.polylist->count;
@@ -2343,6 +2470,7 @@ static int gxDs3dFrameTexReady()
 	}
 	return kGateOk;
 }
+#endif
 
 bool gxDs3dGeomFrameSupported()
 {
@@ -2355,9 +2483,22 @@ bool gxDs3dGeomFrameSupported()
 	GXDS3D_TP_BEGIN(tp0);
 #ifdef DSA_GXGEOM_NOPREPREUSE
 	const int g = gxDs3dFrameGate(true);
-#else
+#elif defined(DSA_GXGEOM_MUTATE_TEXREADY)
 	const int g = (s_prepSeq == g_gfx3dRenderSeq && s_prepKey.list == gfx3d.polylist && s_prepKey.count == count &&
 	               s_prepKey.fast == fast) ? gxDs3dFrameTexReady() : gxDs3dFrameGate(true);
+#else
+	// Task rec-prep-opt: on that path gxDs3dFrameTexReady can only pass. This seq's Prepare ran the
+	// gate and then gxDs3dPrepareTextures on this list and both passed (s_prepOk, checked above),
+	// so every textured polygon's slot has seq == s_texPrepSeq == this seq, and nothing but the
+	// next Prepare writes s_texK or s_texPrepSeq (gxDs3dTexItemDeleted only clears src, which the
+	// check doesn't read; gxDs3dTexAMode's s_atRef is latched by Prepare too). So it isn't walked
+	// (every POLY, cold by line 191). -DDSA_GXGEOM_MUTATE_TEXREADY: the walk, as before.
+	const bool prepared = s_prepSeq == g_gfx3dRenderSeq && s_prepKey.list == gfx3d.polylist && s_prepKey.count == count &&
+	                      s_prepKey.fast == fast;
+	const int g = prepared ? kGateOk : gxDs3dFrameGate(true);
+#ifdef DSA_GXGEOM_VISCHECK
+	if (prepared) { ++s_chkTex; if (gxDs3dFrameTexReady() != kGateOk) ++s_chkTexBad; }
+#endif
 #endif
 	GXDS3D_TP_END(kTpGate, tp0);
 #ifdef DSA_GXGEOM_DEBUGWHY
@@ -2571,6 +2712,7 @@ struct GxDs3dTexState {
 	bool toonLut;   // GxFast toon LUT coordinate (GX_VA_TEX1) in the vertex format
 	bool decal;     // stage 0 is the decal lerp (gxDs3dDecalTex), not GX_MODULATE
 	u32 texParam, texPal, amode;
+	u16 mtxW, mtxH;   // Task rec-prep-opt: the texture size GX_TEXMTX0's scale was loaded for (0: none)
 };
 
 static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, bool first, bool toonLut = false)
@@ -2621,9 +2763,17 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 	const u8 wt = (p.texParam & (1 << 17)) ? ((p.texParam & (1 << 19)) ? GX_MIRROR : GX_REPEAT) : GX_CLAMP;
 	GX_InitTexObjWrapMode(&t.obj, ws, wt);
 	GX_LoadTexObj(&t.obj, GX_TEXMAP0);
-	Mtx m;
-	guMtxScale(m, 1.0f / (f32)t.w, 1.0f / (f32)t.h, 1.0f);
-	GX_LoadTexMtxImm(m, GX_TEXMTX0, accurate ? GX_MTX3x4 : GX_MTX2x4);
+	// Task rec-prep-opt: a texture of the same size needs the same scale, which GX_TEXMTX0 still
+	// holds (only this function loads it, and st is per pass). -DDSA_GXGEOM_MUTATE_STATEDEDUP: always.
+#ifndef DSA_GXGEOM_MUTATE_STATEDEDUP
+	if (t.w != st.mtxW || t.h != st.mtxH)
+#endif
+	{
+		Mtx m;
+		guMtxScale(m, 1.0f / (f32)t.w, 1.0f / (f32)t.h, 1.0f);
+		GX_LoadTexMtxImm(m, GX_TEXMTX0, accurate ? GX_MTX3x4 : GX_MTX2x4);
+		st.mtxW = t.w; st.mtxH = t.h;
+	}
 	st.texParam = p.texParam;
 	st.texPal = p.texPalette;
 	st.amode = amode;
@@ -2651,7 +2801,16 @@ static inline void gxDs3dSendColor(const VERT &v, u8 alpha = 255)
 	else                      GX_Color4u8(255, 0, 255, 255);
 #else
 	const u8 *c = s_toon.on ? s_toon.rgb : v.color;   // gxDs3dToonBegin
+#if !defined(DSA_GXGEOM_MUTATE_STATEDEDUP) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	// Task rec-prep-opt: the same four FIFO bytes as one word store; gxDs3d6To8 on the three
+	// colour bytes at once (no bit crosses a byte: << 2 keeps 0xFC of each, >> 4 its high nibble)
+	u32 w;
+	static_assert(offsetof(VERT, mtxEpoch) == offsetof(VERT, color) + 3, "VERT color/mtxEpoch layout");
+	memcpy(&w, c, 4);   // (VERT::color + mtxEpoch, or s_toon.rgb + its pad byte: masked off)
+	GX_Color1u32(((w << 2) & 0xFCFCFC00u) | ((w >> 4) & 0x0F0F0F00u) | alpha);
+#else
 	GX_Color4u8(gxDs3d6To8(c[0]), gxDs3d6To8(c[1]), gxDs3d6To8(c[2]), alpha);
+#endif
 #endif
 }
 
@@ -2660,7 +2819,11 @@ static inline void gxDs3dSendColor(const VERT &v, u8 alpha = 255)
 static inline void gxDs3dToonColor(float r6, bool hl, u8 alpha)
 {
 	const u8 g = hl ? gxDs3dF6To8(r6) : 255;
+#ifndef DSA_GXGEOM_MUTATE_STATEDEDUP
+	GX_Color1u32((u32)g * 0x01010100u | alpha);   // (the same bytes, one store)
+#else
 	GX_Color4u8(g, g, g, alpha);
+#endif
 }
 
 static void gxDs3dLoadScreenOrtho()
@@ -3229,6 +3392,7 @@ struct GxDs3dFastCtx {
 	bool prefill;          // Task trans-blendclear: gxDs3dTransPrefill's draws (every fragment, no Z write)
 	const u8 *vis;         // Task 3d-percost: s_polyVis when valid for this list, else NULL
 	const float *lastMvP, *lastProjP;   // Task 3d-percost: the POLYMTX entries lastMv/lastProj hold
+	u32 projKey[7];        // Task rec-prep-opt: the projection last loaded here (valid while haveLast)
 };
 
 static void *s_tagSaveBuf = nullptr, *s_tagLoBuf = nullptr, *s_tagHiBuf = nullptr;
@@ -3240,8 +3404,11 @@ static GXTexObj s_tagCarryTex;
 // polygon it ran gxDs3dTransShapeBuild on, so the shadow ID pass (which replays the
 // polygons drawn before it) skips the ones that draw nothing and box-tests the rest on
 // their outline instead of re-projecting them. Only filled in a frame with a shadow plan
-// (s_shRec); grow-only.
-enum { kShBoxUnknown = 0, kShBoxDraws, kShBoxNone };
+// (s_shRec); grow-only. Task rec-prep-opt: kShBoxNear, the ID pass draws it without a test
+// (gxDs3dShadowPolyMayHit already ran in the main pass), and s_shRec ends with the ID pass (no
+// later polygon's entry is read); s_shPolyBox / kShBoxDraws only with -DDSA_GXGEOM_MUTATE_SHBOX.
+enum { kShBoxUnknown = 0, kShBoxDraws, kShBoxNone, kShBoxNear };
+static bool gxDs3dShadowPolyMayHit(const POLY &p);
 static bool s_shRec = false;
 static u8 *s_shBoxState = nullptr;
 static float (*s_shPolyBox)[4] = nullptr;
@@ -3249,11 +3416,18 @@ static int s_shBoxCap = 0;
 static bool gxDs3dShBoxAlloc(int n)
 {
 	if (n > s_shBoxCap) {
+#ifdef DSA_GXGEOM_MUTATE_SHBOX
 		free(s_shBoxState); free(s_shPolyBox);
 		s_shBoxState = (u8 *)malloc(n);
 		s_shPolyBox = (float (*)[4])malloc(n * sizeof(float[4]));
 		s_shBoxCap = (s_shBoxState && s_shPolyBox) ? n : 0;
 		if (!s_shBoxCap) { free(s_shBoxState); free(s_shPolyBox); s_shBoxState = nullptr; s_shPolyBox = nullptr; return false; }
+#else
+		free(s_shBoxState);
+		s_shBoxState = (u8 *)malloc(n);
+		s_shBoxCap = s_shBoxState ? n : 0;
+		if (!s_shBoxCap) return false;
+#endif
 	}
 	memset(s_shBoxState, kShBoxUnknown, n);
 	return true;
@@ -3580,6 +3754,18 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	// outline; false also when clipped away. Already known for a polygon the plan cached.
 	if (!slot) {
 		GXDS3D_TP_BEGIN(tps);
+#ifndef DSA_GXGEOM_MUTATE_SHBOX
+		if (s_shRec && !c.shIdPass) {
+			// Task rec-prep-opt: the ID pass needs only whether this polygon can reach s_shBox, and
+			// any test that never drops one that can is exact there (see gxDs3dShadowPolyMayHit):
+			// that test now, on the vertices this draw just loaded, instead of the exact outline
+			// box (gxDs3dTransShapeBuild's four divides per vertex) for the pass to test later.
+			const bool shOk = vis == kVisDraw || gxDs3dFacingVisible(p, cv, nv);
+			GXDS3D_TP_END(kTpDShape, tps);
+			s_shBoxState[&p - gfx3d.polylist->list] = shOk && gxDs3dShadowPolyMayHit(p) ? kShBoxNear : kShBoxNone;
+			if (!shOk) { GXDS3D_PS(kPsCull); return; }
+		} else if (vis != kVisDraw) {
+#else
 		if (s_shRec && !c.shIdPass) {
 			GxDs3dTransShape shape;
 			const bool shOk = gxDs3dTransShapeBuild(p, cv, nv, shape);
@@ -3589,6 +3775,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			if (shOk) { s_shPolyBox[i][0] = shape.x0; s_shPolyBox[i][1] = shape.y0; s_shPolyBox[i][2] = shape.x1; s_shPolyBox[i][3] = shape.y1; }
 			if (!shOk) { GXDS3D_PS(kPsCull); return; }
 		} else if (vis != kVisDraw) {
+#endif
 			// Only the verdict is used (the outline matters for the shadow boxes alone).
 			const bool shOk = gxDs3dFacingVisible(p, cv, nv);
 			GXDS3D_TP_END(kTpDShape, tps);
@@ -3658,7 +3845,27 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			else                               { x.proj[0][2] -= dx; x.proj[1][2] += dy; }
 		}
 #endif
+#ifndef DSA_GXGEOM_MUTATE_STATEDEDUP
+		{
+			// Task rec-prep-opt: what GX_LoadProjectionMtx sends (six entries + the type), loaded
+			// only if it differs from the last one this function loaded, which GX still holds
+			// while haveLast is set (everything else that changes the projection clears it). Most
+			// rebuilds change only the modelview. -DDSA_GXGEOM_MUTATE_STATEDEDUP: always loaded.
+			const int o = x.projType == GX_ORTHOGRAPHIC ? 3 : 2;
+			const float pv[6] = { x.proj[0][0], x.proj[0][o], x.proj[1][1], x.proj[1][o], x.proj[2][2], x.proj[2][3] };
+			u32 pk[7];
+			memcpy(pk, pv, sizeof(pv));
+			pk[6] = x.projType;
+			bool same = c.haveLast;
+			for (int k = 0; k < 7 && same; ++k) same = pk[k] == c.projKey[k];
+			if (!same) {
+				GX_LoadProjectionMtx(x.proj, x.projType);
+				memcpy(c.projKey, pk, sizeof(pk));
+			}
+		}
+#else
 		GX_LoadProjectionMtx(x.proj, x.projType);
+#endif
 		c.ortho = x.projType == GX_ORTHOGRAPHIC;
 		memcpy(c.pos, x.pos, sizeof(c.pos));
 
@@ -3789,7 +3996,12 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 					if (unclipXf && !toonLut) gxDs3dSendColor(v, va);
 					else if (s_toon.on) gxDs3dSendColor(v, va);
 					else if (toonLut) gxDs3dToonColor(r6, toonHl, va);
+#ifndef DSA_GXGEOM_MUTATE_STATEDEDUP
+					else GX_Color1u32(((u32)gxDs3dF6To8(v.fcolor[0]) << 24) | ((u32)gxDs3dF6To8(v.fcolor[1]) << 16) |
+					                  ((u32)gxDs3dF6To8(v.fcolor[2]) << 8) | va);
+#else
 					else GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
+#endif
 #endif
 					if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
 #ifdef DSA_GXGEOM_PROBE
@@ -4045,8 +4257,10 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 		if ((trans && !gxDs3dShadowA31(p)) || gxDs3dShadowMask(p)) continue;   // (opaque-list masks: Task shadow-cases)
 		// The main pass's outline of it (1/16 px, truncated: 2 px margin), else the clip-space test.
 		const int st = s_shRec ? s_shBoxState[&p - gfx3d.polylist->list] : kShBoxUnknown;
-		if (st == kShBoxNone) continue;   // culled / clipped away: draws nothing here either
-		if (st == kShBoxDraws) {
+		if (st == kShBoxNone) continue;   // culled / clipped away (or can't reach s_shBox): draws nothing here either
+		if (st == kShBoxNear) {
+			// (the main pass's gxDs3dShadowPolyMayHit, Task rec-prep-opt)
+		} else if (st == kShBoxDraws) {
 			const float *b = s_shPolyBox[&p - gfx3d.polylist->list];
 			if (b[2] + 32.0f < s_shBox[0] || b[0] - 32.0f > s_shBox[2] || b[3] + 32.0f < s_shBox[1] || b[1] - 32.0f > s_shBox[3]) continue;
 		} else if (!gxDs3dShadowPolyMayHit(p)) continue;
@@ -4054,6 +4268,9 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 		gxDs3dFastPoly(c, p, -(gxDs3dPolyId(p) + 1));
 	}
 	c.shIdPass = false;
+#ifndef DSA_GXGEOM_MUTATE_SHBOX
+	s_shRec = false;   // (Task rec-prep-opt: nothing reads a later polygon's entry)
+#endif
 	gxDs3dTagCopy(s_shIdBuf, GX_CTF_R8);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();

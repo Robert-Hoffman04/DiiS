@@ -142,7 +142,11 @@ struct POLY {
 	// bit 6 w<=0. clipOr = 0x80 | OR of the vertices' codes, clipAnd = their AND. clipOr == 0:
 	// not known (savestate load, -DDSA_GXGEOM_NOCLIPCODES): consumers read the vertices instead.
 	u8 clipOr, clipAnd;
-	u8 clipPad;
+	// Task rec-prep-opt: the facing of a polygon with no vertex outside the clip volume, from the
+	// screen outline SetVertex computed (gfx3d.cpp GE_POLYFACE): 0x80 | 1 back-facing, 0x80 front,
+	// 0 not known (clipped, |2 x area| <= 4 px^2, NaN, not GxFast, savestate load). Read by the
+	// GxFast gate instead of the vertices (gxDs3dFrameGate).
+	u8 face;
 	u16 vertIndexes[4]; //up to four verts can be referenced by this poly
 	u32 polyAttr, texParam, texPalette; //the hardware rendering params
 	u32 viewport;
@@ -194,7 +198,7 @@ struct POLY {
 		int type;
 		OSREAD(type);
 		this->type = (u8)type;
-		clipOr = clipAnd = 0;
+		clipOr = clipAnd = face = 0;
 		OSREAD(vertIndexes[0]); OSREAD(vertIndexes[1]); OSREAD(vertIndexes[2]); OSREAD(vertIndexes[3]);
 		OSREAD(polyAttr); OSREAD(texParam); OSREAD(texPalette);
 		OSREAD(viewport);
