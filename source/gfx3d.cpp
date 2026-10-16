@@ -29,6 +29,7 @@
 #include <assert.h>
 #include <math.h>
 #include <string.h>
+#include <malloc.h>
 #include "armcpu.h"
 #include "debug.h"
 #include "gfx3d.h"
@@ -68,6 +69,8 @@ But since we're not sure how we'll eventually want this, I am leaving it sort of
 in this function: */
 static void gfx3d_doFlush();
 static void gfx3d_normEpochBump();   // see s_normEpoch
+static bool s_dirMtxCheck = true;     // Task ge-opt: see gfx3d_dirMtxCheck
+static inline void gfx3d_lightProductsDirty();
 static void gfx3d_resolveDeferredRender(bool beforeVBlankFlush);
 static bool s_rasterDeferred = false;    // see gfx3d_VBlankEndSignal
 static bool s_rasterGx = false;          // gfx3d_convertedScreen is this frame's GX readback (gfx3d_ensureRendered)
@@ -512,7 +515,7 @@ static CACHE_ALIGN float PTcoords[4] = {0.0, 0.0, 0.0, 1.0};
 static u32 polyAttr=0,textureFormat=0, texturePalette=0, polyAttrPending=0;
 
 //the current vertex color, 5bit values
-static u8 colorRGB[4] = { 31,31,31,31 };
+static u8 colorRGB[4] __attribute__((aligned(4))) = { 31,31,31,31 };
 
 u32 control = 0;
 
@@ -640,6 +643,31 @@ static GE_NOINLINE void ge_zeroAhead(char **hwp, const char *end, const char *li
 #else
 #define GE_ZEROFRESH_TO(hw, end, lim) do { } while (0)
 #endif
+// Task gesort: gfx3d_doFlush()'s y-sort key (see YSortKeyCompare there).
+struct YSortKey { float maxy, miny; int idx; };
+
+// Task ge-opt: the flush's sort keys are made when a polygon completes (SetVertex), from the
+// per-vertex (y+w)/(2w) computed when the vertex was transformed, instead of by the flush
+// re-reading every POLY and its VERTs (~300 KB written over the frame, long out of the L2 by
+// VBlank on HW) and dividing per polygon corner. Opaque keys fill s_polyKeys from the front,
+// translucent ones from the back, so the flush's partition and its two sorts read only this
+// array. Same floats, same submission order, so the same std::sort permutations.
+// -DGE_MUTATE_FLUSHKEYS: the old flush (miny/maxy and partition from the lists).
+#ifndef GE_MUTATE_FLUSHKEYS
+#define GE_FLUSHKEYS 1
+static float s_vtxSortY[4];   // (y+w)/(2w) of the vertex in each tempVertInfo.map slot
+// GE_KEYCAP keys (48 KB) for the list being built: the hardware draws at most 2048 polygons a
+// frame (SM64DS stage ~2150 submitted). A list with more, or a failed allocation (s_keyCap 0),
+// leaves opq+tr != count and that flush takes the old path.
+#ifndef GE_KEYCAP
+#define GE_KEYCAP 4096   // (-DGE_KEYCAP=n: test the over-cap fallback)
+#endif
+static YSortKey *s_polyKeys;
+static int s_keyCap;          // GE_KEYCAP once allocated, else 0
+static int s_keyOpq, s_keyTr;
+static char *s_kHw;           // zero-fresh high-water mark of the front (opaque) part
+#endif
+
 static void ge_zeroFreshReset(bool disable){
 	s_vLim = ge_lineDown(vertlist->list + VERTLIST_SIZE);
 	s_pLim = ge_lineDown(polylist->list + POLYLIST_SIZE);
@@ -647,6 +675,10 @@ static void ge_zeroFreshReset(bool disable){
 	s_vHw = disable ? s_vLim : ge_lineUp(vertlist->list);
 	s_pHw = disable ? s_pLim : ge_lineUp(polylist->list);
 	s_mHw = disable ? s_mLim : ge_lineUp(polylist->mtx);
+#ifdef GE_FLUSHKEYS
+	// (front part's limit is the line of the lowest translucent key, see GE_POLYKEY)
+	s_kHw = disable ? (char *)(s_polyKeys + s_keyCap) : ge_lineUp(s_polyKeys);
+#endif
 }
 
 static void twiddleLists() {
@@ -659,6 +691,9 @@ static void twiddleLists() {
 	polylist->mtxCount = 0;
 	polylist->mtxOverflow = false;
 	s_polyMtxDirty = true;
+#ifdef GE_FLUSHKEYS
+	s_keyOpq = s_keyTr = 0;
+#endif
 	ge_zeroFreshReset(false);
 }
 
@@ -714,6 +749,12 @@ void gfx3d_init(){
 
 	if(polylists == NULL) { polylists = new POLYLIST[2]; polylist = &polylists[0]; }
 	if(vertlists == NULL) { vertlists = new VERTLIST[2]; vertlist = &vertlists[0]; }
+#ifdef GE_FLUSHKEYS
+	if(s_polyKeys == NULL) {
+		s_polyKeys = (YSortKey *)memalign(32, GE_KEYCAP * sizeof(YSortKey));
+		s_keyCap = s_polyKeys ? GE_KEYCAP : 0;
+	}
+#endif
 	makeTables();
 	gfx3d_reset();
 }
@@ -721,6 +762,8 @@ void gfx3d_init(){
 void gfx3d_reset(){
 	gfx3d = GFX3D();
 	gfx3d_normEpochBump();
+	s_dirMtxCheck = true;
+	gfx3d_lightProductsDirty();
 
 	gxf_hardware.reset();
 
@@ -819,6 +862,20 @@ void gfx3d_reset(){
 #define GE_POLYCODE(n) do {} while (0)
 #define GE_VTXCODE_MOVE(d, s) do {} while (0)
 #endif
+// Task ge-opt: the completed polygon's sort key (see s_polyKeys) from the map slots in its
+// vertIndexes order, min/max folded in the order gfx3d_doFlush() used to; and the slot moves.
+#ifdef GE_FLUSHKEYS
+#define GE_SORTY_MOVE(d, s) (s_vtxSortY[d] = s_vtxSortY[s])
+#define GE_POLYSORT(a, b, c, d, n) do { POLY &ps_ = polylist->list[polylist->count]; \
+	float mn_ = s_vtxSortY[a], mx_ = mn_; \
+	mn_ = min(mn_, s_vtxSortY[b]); mx_ = max(mx_, s_vtxSortY[b]); \
+	mn_ = min(mn_, s_vtxSortY[c]); mx_ = max(mx_, s_vtxSortY[c]); \
+	if ((n) == 4) { mn_ = min(mn_, s_vtxSortY[d]); mx_ = max(mx_, s_vtxSortY[d]); } \
+	ps_.miny = mn_; ps_.maxy = mx_; } while (0)
+#else
+#define GE_SORTY_MOVE(d, s) do {} while (0)
+#define GE_POLYSORT(a, b, c, d, n) do {} while (0)
+#endif
 //Submit a vertex to the GE
 #ifdef DSA_GXGEOM_POLYSTATS
 u32 g_gePs[8];   // Task 3d-percost (measurement): see gx_ds_3d_render.cpp's gxds3dps line
@@ -898,15 +955,33 @@ static void SetVertex(){
 	vert.objcoord[0] = coord[0];
 	vert.objcoord[1] = coord[1];
 	vert.objcoord[2] = coord[2];
+#if !defined(GE_MUTATE_VCOLOR) && defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+	{
+		// Task ge-opt: GFX3D_5TO6 on the three bytes at once (x ? 2x+1 : 0, mod 256 like the u8
+		// store), plus mtxEpoch, as one word store to color[0..2] / mtxEpoch (big endian: the
+		// fourth byte is the low one). Branch-free; was ~20 instructions and 3 branches.
+		u32 c; memcpy(&c, colorRGB, 4);
+		const u32 nz = (((c & 0x7F7F7F00u) + 0x7F7F7F00u) | c) & 0x80808000u;   // high bit = byte != 0
+		const u32 w = ((c & 0x7F7F7F00u) << 1) | (nz >> 7) | s_mtxEpoch;
+		memcpy(vert.color, &w, 4);
+		static_assert(offsetof(VERT, mtxEpoch) == offsetof(VERT, color) + 3, "VERT color/mtxEpoch layout");
+	}
+#else
 	vert.color[0] = GFX3D_5TO6(colorRGB[0]);
 	vert.color[1] = GFX3D_5TO6(colorRGB[1]);
 	vert.color[2] = GFX3D_5TO6(colorRGB[2]);
 	vert.mtxEpoch = s_mtxEpoch;
+#endif
 #ifndef DSA_GXGEOM_NOCLIPCODES
 	{
 		// the comparisons gxDs3dVertOutside / gxDs3dClipTrivialReject / the gate's w test make on these floats
 		s_vtxCode[tempVertInfo.count] = (u8)ge_outcode(coordTransformed[0], coordTransformed[1], coordTransformed[2], coordTransformed[3]);
 	}
+#endif
+
+#ifdef GE_FLUSHKEYS
+	// (the expression gfx3d_doFlush() evaluated on the stored y and w)
+	s_vtxSortY[tempVertInfo.count] = (coordTransformed[1] + coordTransformed[3]) / (2*coordTransformed[3]);
 #endif
 
 	tempVertInfo.map[tempVertInfo.count] = vertlist->count + tempVertInfo.count - continuation;
@@ -926,6 +1001,7 @@ static void SetVertex(){
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
 				GE_POLYCODE(3);
+				GE_POLYSORT(0, 1, 2, 0, 3);
 				vertlist->count+=3;
 				polylist->list[polylist->count].type = 3;
 				tempVertInfo.count = 0;
@@ -940,6 +1016,7 @@ static void SetVertex(){
 				SUBMITVERTEX(2,2);
 				SUBMITVERTEX(3,3);
 				GE_POLYCODE(4);
+				GE_POLYSORT(0, 1, 2, 3, 4);
 				vertlist->count+=4;
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.count = 0;
@@ -953,6 +1030,7 @@ static void SetVertex(){
 				SUBMITVERTEX(1,1);
 				SUBMITVERTEX(2,2);
 				GE_POLYCODE(3);
+				GE_POLYSORT(0, 1, 2, 0, 3);
 				polylist->list[polylist->count].type = 3;
 
 				if(triStripToggle)
@@ -960,6 +1038,7 @@ static void SetVertex(){
 				else
 					tempVertInfo.map[0] = vertlist->count+2-continuation;
 				GE_VTXCODE_MOVE(triStripToggle ? 1 : 0, 2);
+				GE_SORTY_MOVE(triStripToggle ? 1 : 0, 2);
 				
 				if(tempVertInfo.first)
 					vertlist->count+=3;
@@ -980,11 +1059,14 @@ static void SetVertex(){
 				SUBMITVERTEX(2,3);
 				SUBMITVERTEX(3,2);
 				GE_POLYCODE(4);
+				GE_POLYSORT(0, 1, 3, 2, 4);
 				polylist->list[polylist->count].type = 4;
 				tempVertInfo.map[0] = vertlist->count+2-continuation;
 				tempVertInfo.map[1] = vertlist->count+3-continuation;
 				GE_VTXCODE_MOVE(0, 2);
 				GE_VTXCODE_MOVE(1, 3);
+				GE_SORTY_MOVE(0, 2);
+				GE_SORTY_MOVE(1, 3);
 				if(tempVertInfo.first)
 					vertlist->count+=4;
 				else vertlist->count+=2;
@@ -1019,6 +1101,18 @@ static void SetVertex(){
 			poly.texParam = textureFormat;
 			poly.texPalette = texturePalette;
 			poly.viewport = viewport;
+#ifdef GE_FLUSHKEYS
+			if (s_keyOpq + s_keyTr < s_keyCap) {
+				YSortKey *k;
+				if (poly.isTranslucent()) {
+					k = &s_polyKeys[s_keyCap - 1 - s_keyTr++];
+				} else {
+					k = &s_polyKeys[s_keyOpq++];
+					GE_ZEROFRESH_TO(s_kHw, k + 1, ge_lineDown(s_polyKeys + s_keyCap - s_keyTr));
+				}
+				k->maxy = poly.maxy; k->miny = poly.miny; k->idx = polylist->count;
+			}
+#endif
 			polylist->count++;
 		}
 	}
@@ -1394,12 +1488,21 @@ static GE_NOINLINE void gfx3d_lightProductsRebuild(){
 	s_lightProd.valid = true;
 }
 
+// Task ge-opt: DIF_AMB / SPE_EMI / LIGHT_COLOR, reset and state load clear s_lightProd.valid
+// (gfx3d_lightProductsDirty), so the check per lit NORMAL is one load; the register compare is
+// kept with -DGE_MUTATE_LIGHTPROD.
+static inline void gfx3d_lightProductsDirty(){ s_lightProd.valid = false; }
 static FORCEINLINE void gfx3d_lightProductsUpdate(){
+#ifndef GE_MUTATE_LIGHTPROD
+	if (s_lightProd.valid)
+		return;
+#else
 	if (s_lightProd.valid && s_lightProd.diffuse == dsDiffuse && s_lightProd.ambient == dsAmbient &&
 	    s_lightProd.specular == dsSpecular && s_lightProd.lightColor[0] == lightColor[0] &&
 	    s_lightProd.lightColor[1] == lightColor[1] && s_lightProd.lightColor[2] == lightColor[2] &&
 	    s_lightProd.lightColor[3] == lightColor[3])
 		return;
+#endif
 	gfx3d_lightProductsRebuild();
 }
 
@@ -1516,6 +1619,7 @@ struct GfxNormalCacheEntry { u32 key, epoch; u8 rgb[3], lightMask; };
 #define GFX_NORMAL_CACHE_SIZE 64
 static GfxNormalCacheEntry s_normCache[GFX_NORMAL_CACHE_SIZE];
 static u32 s_normEpoch = 1;   // (the zeroed entries have epoch 0: they never match)
+static u32 s_dirMtxSnap[9];   // Task ge-opt: see gfx3d_dirMtxCheck
 
 static void gfx3d_normEpochBump(){
 	if (++s_normEpoch == 0) {
@@ -1524,11 +1628,36 @@ static void gfx3d_normEpochBump(){
 	}
 }
 
+// Task ge-opt: a matrix command in mode 1/2 no longer ends the epoch by itself; it only sets
+// s_dirMtxCheck, and the next cached NORMAL compares the directional matrix's 3x3 (the nine
+// floats MatrixMultVec3x3 reads), bit for bit, with the one the epoch's entries were computed
+// with (s_dirMtxSnap), ending the epoch only if it differs. Translations, position-only (mode 1)
+// commands, STORE, and restores / reloads of the same rotation keep the table (SM64DS stage:
+// ~87% of NORMALs missed). Invariant: s_dirMtxCheck == false => mtxCurrent[2] == s_dirMtxSnap.
+// Reset / state load set the flag (they write mtxCurrent without a matrix command).
+// -DGE_MUTATE_NRMEPOCH: every mode 1/2 matrix command ends the epoch, as before.
+static GE_NOINLINE void gfx3d_dirMtxCheck(){
+	static const u8 k3x3[9] = { 0, 1, 2, 4, 5, 6, 8, 9, 10 };
+	s_dirMtxCheck = false;
+	u32 m[9];
+	u32 diff = 0;
+	for (int i = 0; i < 9; i++) {
+		u32 b; memcpy(&b, &mtxCurrent[2][k3x3[i]], 4);
+		m[i] = b; diff |= b ^ s_dirMtxSnap[i];
+	}
+	if (diff == 0) return;
+	memcpy(s_dirMtxSnap, m, sizeof(m));
+	gfx3d_normEpochBump();
+}
+
 static GE_NOINLINE void gfx3d_glNormal(u32 v){
 	if (texCoordinateTransform == 2) {
 		gfx3d_glNormalCompute(v);
 		return;
 	}
+#ifndef GE_MUTATE_NRMEPOCH
+	if (s_dirMtxCheck) gfx3d_dirMtxCheck();
+#endif
 	GfxNormalCacheEntry &e = s_normCache[(v ^ (v >> 10) ^ (v >> 20)) & (GFX_NORMAL_CACHE_SIZE-1)];
 	if (e.key == v && e.epoch == s_normEpoch && e.lightMask == (u8)lightMask) {
 		colorRGB[0] = e.rgb[0];
@@ -1548,11 +1677,39 @@ static GE_NOINLINE void gfx3d_glNormal(u32 v){
 
 static GE_NOINLINE void gfx3d_glTexCoord(u32 val){
 
+#if defined(__PPC__) && defined(ENABLE_PAIRED_SINGLE) && !defined(GE_MUTATE_TEXCOORD)
+	{
+		// Task ge-opt: both halves dequantised by one psq_l through GQR7 (s16, 2^-12; see
+		// ge_setGqr) and scaled by 256: (s16)h * 2^-12 * 2^8 == (s16)h / 16.0f exactly (a 16-bit
+		// integer times a power of two). ps_merge10 swaps (t, s) into st[] order. Replaces two
+		// int->float conversions through the stack (~25 instructions).
+		// (One asm each: the pair must not pass through a C float, which GCC may move with fmr
+		// or spill with stfs, both of which drop ps1.)
+		u32 w = val;
+		float p;
+		if (texCoordinateTransform == 0) {
+			__asm__("psq_l %0,0(%3),0,7\n\t"
+			        "ps_muls0 %0,%0,%4\n\t"
+			        "ps_merge10 %0,%0,%0\n\t"
+			        "psq_st %0,0(%5),0,0\n\t"
+			        "psq_st %0,0(%6),0,0"
+			        : "=&f"(p), "=m"(currentTexCoord), "=m"(lastTexCoord)
+			        : "b"(&w), "f"(256.0f), "b"(currentTexCoord.st), "b"(lastTexCoord.st), "m"(w));
+			return;
+		}
+		__asm__("psq_l %0,0(%2),0,7\n\t"
+		        "ps_muls0 %0,%0,%3\n\t"
+		        "ps_merge10 %0,%0,%0\n\t"
+		        "psq_st %0,0(%4),0,0"
+		        : "=&f"(p), "=m"(currentTexCoord) : "b"(&w), "f"(256.0f), "b"(currentTexCoord.st), "m"(w));
+	}
+#else
 	currentTexCoord.t = (s16)(val>>16);
 	currentTexCoord.s = (s16)(val&0xFFFF);
 
 	currentTexCoord.t /= 16.0f;
 	currentTexCoord.s /= 16.0f;
+#endif
 
 	if (texCoordinateTransform == 1){
 
@@ -1654,6 +1811,7 @@ static void gfx3d_glTexPalette(u32 val){
 */
 static GE_NOINLINE void gfx3d_glMaterial0(u32 val){
 	gfx3d_normEpochBump();
+	gfx3d_lightProductsDirty();
 	dsDiffuse = val&0xFFFF;
 	dsAmbient = val>>16;
 
@@ -1667,6 +1825,7 @@ static GE_NOINLINE void gfx3d_glMaterial0(u32 val){
 
 static GE_NOINLINE void gfx3d_glMaterial1(u32 val){
 	gfx3d_normEpochBump();
+	gfx3d_lightProductsDirty();
 	dsSpecular = val&0xFFFF;
 	dsEmission = val>>16;
 	GFX_DELAY(4);
@@ -1689,6 +1848,7 @@ static GE_NOINLINE void gfx3d_glLightDirection (u32 v){
 
 static GE_NOINLINE void gfx3d_glLightColor (u32 v){
 	gfx3d_normEpochBump();
+	gfx3d_lightProductsDirty();
 	int index = v>>30;
 	lightColor[index] = v;
 	GFX_DELAY(1);
@@ -1990,7 +2150,11 @@ static void gfx3d_execute(u8 cmd, u32 param){
 	if (cmd >= 0x18 && cmd <= 0x1C) ++g_gePs[5];
 	if (cmd == 0x40) ++g_gePs[6];
 #endif
+#ifndef GE_MUTATE_NRMEPOCH
+#define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode != 3) ++s_mtxEpoch; if (mode - 1 <= 1u) s_dirMtxCheck = true; } while (0)
+#else
 #define GE_MTX_CMD() do { s_polyMtxDirty = true; if (mode != 3) ++s_mtxEpoch; if (mode - 1 <= 1u) gfx3d_normEpochBump(); } while (0)
+#endif
 
 	switch (cmd)
 	{
@@ -2122,6 +2286,59 @@ static void gfx3d_execute(u8 cmd, u32 param){
 	}
 }
 
+// Task ge-opt: a whole matrix command (MTX_LOAD_4x4 .. MTX_TRANS) whose parameter words are all
+// in this batch, in one call: SM64DS's stage sends ~3300 matrix words a frame (~150 MULT_3x3,
+// ~85 LOAD_4x3, ~70 MULT_4x3, ~120 SCALE), each of which used to take a dispatch, the
+// GE_MTX_CMD() and the handler's index bookkeeping. Here words 0..n-2 get what gfx3d_execute()
+// does for them (GE_MTX_CMD(), then the handler's store into its index slot, which is all a
+// non-final word does), the index is set to the last slot, and the last word goes through
+// gfx3d_execute() itself (store + the multiply / conversion tail). Only from index 0, with all
+// n entries carrying the same command byte and no ring wrap; otherwise 0 (word by word).
+// -DGE_MUTATE_MTXBATCH: always word by word.
+#ifndef GE_MUTATE_MTXBATCH
+static GE_NOINLINE u32 ge_mtxRun(u8 cmd, u32 p0, u32 head, u32 avail){
+	static const u8 k16[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	static const u8 k12[12] = { 0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14 };   // 4x3 and 3x3 (first 9)
+	const u8 *idx;
+	u32 n;
+	float *dst;
+	bool fix = false;   // SCALE / TRANS store fix2float(v), the rest (float)(s32)v
+	switch (cmd) {
+		case 0x16: if (ML4x4ind) return 0; idx = k16; n = 16; dst = mtxCurrent[mode]; break;
+		case 0x17: if (ML4x3ind) return 0; idx = k12; n = 12; dst = mtxCurrent[mode]; break;
+		case 0x18: if (MM4x4ind) return 0; idx = k16; n = 16; dst = mtxTemporal; break;
+		case 0x19: if (MM4x3ind) return 0; idx = k12; n = 12; dst = mtxTemporal; break;
+		case 0x1A: if (MM3x3ind) return 0; idx = k12; n = 9; dst = mtxTemporal; break;
+		case 0x1B: if (scaleind) return 0; idx = k16; n = 3; dst = scale; fix = true; break;
+		case 0x1C: if (transind) return 0; idx = k16; n = 3; dst = trans; fix = true; break;
+		default: return 0;
+	}
+	if (avail < n || head + (n - 1) > HACK_GXIFO_SIZE) return 0;
+	const u8 *const c = &gxFIFO.cmd[head];
+	for (u32 k = 0; k < n - 1; k++)
+		if (c[k] != cmd) return 0;
+	const u32 *const p = &gxFIFO.param[head];
+	GE_MTX_CMD();
+	dst[idx[0]] = fix ? fix2float(p0) : (float)((s32)p0);
+	for (u32 k = 1; k < n - 1; k++) {
+		GE_MTX_CMD();
+		dst[idx[k]] = fix ? fix2float(p[k - 1]) : (float)((s32)p[k - 1]);
+	}
+	const u8 last = idx[n - 1];
+	switch (cmd) {
+		case 0x16: ML4x4ind = last; break;
+		case 0x17: ML4x3ind = last; break;
+		case 0x18: MM4x4ind = last; break;
+		case 0x19: MM4x3ind = last; break;
+		case 0x1A: MM3x3ind = last; break;
+		case 0x1B: scaleind = last; break;
+		default:   transind = last; break;
+	}
+	gfx3d_execute(cmd, p[n - 2]);
+	return n;
+}
+#endif
+
 void gfx3d_execute3D(){
 	PZ_SCOPE(PZ_GPU_GE);
 	ge_setGqr();
@@ -2172,6 +2389,17 @@ void gfx3d_execute3D(){
 				i--;
 				continue;
 			}
+#ifndef GE_MUTATE_MTXBATCH
+			if ((u32)(cmd - 0x16) <= 6u) {
+				const u32 used = ge_mtxRun(cmd, param, head, i);
+				if (used) {
+					head += used - 1;
+					if (head > HACK_GXIFO_SIZE-1) head = 0;
+					i -= used - 1;
+					continue;
+				}
+			}
+#endif
 			gfx3d_execute(cmd, param);
 		} while (--i);
 		gxFIFO.head = head;
@@ -2249,7 +2477,6 @@ struct YSortCompare {
 // three values of its two polys (num == the index), and YSortKeyCompare applies the same tests in
 // the same order to the same floats, so it returns the same bool for every pair; std::sort's
 // moves depend only on those results, so the permutation is identical (ties and NaNs included).
-struct YSortKey { float maxy, miny; int idx; };
 struct YSortKeyCompare {
 	FORCEINLINE bool operator()(const YSortKey &a, const YSortKey &b) const {
 		if (a.maxy < b.maxy) return true;
@@ -2300,6 +2527,24 @@ static void gfx3d_doFlush(){
 	gfx3d.activeFlushCommand = gfx3d.pendingFlushCommand;
 
 	int polycount = polylist->count;
+#ifdef GE_FLUSHKEYS
+	// Task ge-opt: the partition and the sort keys were made per polygon (s_polyKeys); the
+	// same two std::sort calls run on the same key sequences as below.
+	if (s_keyOpq + s_keyTr == polycount) {
+		int *const idxlist = gfx3d.indexlist;
+		YSortKey *const ko = s_polyKeys;
+		YSortKey *const kt = s_polyKeys + s_keyCap - s_keyTr;
+		std::reverse(kt, kt + s_keyTr);   // (filled from the back: now in submission order)
+		std::sort(ko, ko + s_keyOpq, YSortKeyCompare());
+		if (!gfx3d.sortmode)
+			std::sort(kt, kt + s_keyTr, YSortKeyCompare());
+		for (int i = 0; i < s_keyOpq; i++) idxlist[i] = ko[i].idx;
+		for (int i = 0; i < s_keyTr; i++) idxlist[s_keyOpq + i] = kt[i].idx;
+		twiddleLists();
+		drawPending = TRUE;
+		return;
+	}
+#endif
 	// Task gedma: the list bases in locals (the float / int stores below may alias the
 	// polylist / vertlist / gfx3d.indexlist pointers, so they were re-read on every iteration).
 	POLY *const plist = polylist->list;
@@ -2789,6 +3034,8 @@ SFORMAT SF_GFX3D[]={
 void gfx3d_preloadstate()
 {
 	gfx3d_normEpochBump();
+	s_dirMtxCheck = true;
+	gfx3d_lightProductsDirty();
 	// Marks the flush args so gfx3d_loadstate() can tell a state without GFAF/GFPF.
 	gfx3d.activeFlushCommand = gfx3d.pendingFlushCommand = GFX3D_FLUSH_UNSAVED;
 }
@@ -2820,6 +3067,8 @@ void gfx3d_savestate(EMUFILE* os){
 
 bool gfx3d_loadstate(EMUFILE* is, int size){
 	gfx3d_normEpochBump();
+	s_dirMtxCheck = true;
+	gfx3d_lightProductsDirty();
 	++s_texVramGen;   // the state brings its own VRAM
 #ifndef DSA_GXGEOM_NOCLIPCODES
 	s_vtxCodeOk = false;   // tempVertInfo.map comes from the state, s_vtxCode does not
@@ -2864,6 +3113,26 @@ bool gfx3d_loadstate(EMUFILE* is, int size){
 			vertlist->count = polylist->count = 0;
 	}
 	ge_zeroFreshReset(true);   // Task gpu-ge: the loaded lists' bytes above count are not ours to zero
+#ifdef GE_FLUSHKEYS
+	// Task ge-opt: the sort keys of the loaded in-progress list, from its VERTs as
+	// gfx3d_doFlush() computed them (the state's miny/maxy were never meant to be read).
+	s_keyOpq = s_keyTr = 0;
+	for (int i = 0; i < polylist->count; i++) {
+		POLY &poly = polylist->list[i];
+		const int n = poly.type < 4 ? poly.type : 4;
+		float miny = 0, maxy = 0;
+		for (int j = 0; j < n; j++) {
+			const VERT &v = vertlist->list[poly.vertIndexes[j] < VERTLIST_SIZE ? poly.vertIndexes[j] : 0];
+			const float verty = (v.y + v.w) / (2*v.w);
+			if (j == 0) { miny = maxy = verty; }
+			else { miny = min(miny, verty); maxy = max(maxy, verty); }
+		}
+		poly.miny = miny; poly.maxy = maxy;
+		if (s_keyOpq + s_keyTr >= s_keyCap) continue;   // (over the cap: that flush takes the old path)
+		YSortKey *k = poly.isTranslucent() ? &s_polyKeys[s_keyCap - 1 - s_keyTr++] : &s_polyKeys[s_keyOpq++];
+		k->maxy = maxy; k->miny = miny; k->idx = i;
+	}
+#endif
 
 	if(version>=2){
 	
