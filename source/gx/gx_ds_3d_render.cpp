@@ -1215,8 +1215,9 @@ static int gxDs3dTransIdPlan()
 //  4. restore the colour; draw the draws for real, a TEV stage zeroing the alpha where the
 //     s texel (sampled at the fragment's screen position, as the tag test) is not 0.
 // Exact for the counter as long as each pixel sees at most one draw fragment per group and
-// there are at most 255 masks in the frame (no u8 wrap). So a draw whose outline overlaps
-// an earlier draw of its group starts a new group without masks (a convex volume's front
+// at most 255 mask fragments (no u8 wrap; GX's add saturates instead). With more than 255
+// masks in the frame, a 16x16 px grid bounds that (gxDs3dShadowMaskDepthOk). So a draw
+// whose outline overlaps an earlier draw of its group starts a new group without masks (a convex volume's front
 // faces are interior-disjoint and stay one group); that also keeps a bit-11 depth write of
 // one draw from mattering to another of the same group.
 // The opaque-ID compare uses a per-pixel opaque-ID texture built once (gxDs3dShadowIdPass),
@@ -1235,8 +1236,8 @@ static int gxDs3dTransIdPlan()
 // CPU and the LESS draw leave the clear ID).
 // Gate (`shadow`): GxAccurate (translucent polygons are GxFast only), a mode-3 polygon in
 // the opaque list (alpha 31 or 0 untextured: y-sorted among the opaque ones, and drawn
-// while the depth buffer is still being built), an RGB565 EFB (rmode->aa), > 255 masks, a
-// draw in a tagged translucent-ID run (overlapping same-ID draws), a group inside a tagged
+// while the depth buffer is still being built), an RGB565 EFB (rmode->aa), > 255 masks on
+// one grid cell, a draw in a tagged translucent-ID run (overlapping same-ID draws), a group inside a tagged
 // run (its tag buffer is reused), the alpha-31 cases. Task shadow-gate: overlapping draws of
 // one ID (a translucent-ID run of shadow draws alone) are not a tagged run any more: each
 // group adds 128 to the carried counter where its draws shade, so later groups' draws are
@@ -1285,6 +1286,37 @@ static inline bool gxDs3dShadowA31(const POLY &p)
 	return gxDs3dTexFmtTrans(gxDs3dTexFormat(p)) && gxDs3dPolyAlpha(p) == 31;
 }
 
+// Task sm64-stage-bail: can any pixel get more than 255 mask fragments (the CPU's u8 counter
+// wraps there, GX's saturating add does not)? SM64DS's Bob-omb Battlefield has up to ~360
+// masks a frame (one small volume per object, 3-16 groups), which the old frame-wide
+// "> 255 masks" bail sent to the CPU rasterizer for seconds at a time (Wii: 53-56 ms
+// frames). A mask covers a pixel at most once, and only inside its screen box
+// (gxDs3dShadowPolyBox: own vertices, 1 px margin, the whole screen if one is behind the
+// eye), so counting per 16x16 px cell the masks whose box meets it bounds every pixel's
+// fragments: no cell over 255, no wrap. Exact (only bails), so the plan stays exact for
+// the counter. Run only on frames with more than 255 masks. Mutation
+// -DDSA_GXGEOM_MUTATE_SHMASK255: the frame-wide bail again.
+static bool gxDs3dShadowMaskDepthOk()
+{
+	enum { kCell = 16, kCw = kScreenW / kCell, kCh = kScreenH / kCell };
+	static u16 cnt[kCh][kCw];
+	memset(cnt, 0, sizeof(cnt));
+	for (int k = 0; k < s_shGroupCount; ++k)
+		for (int n = s_shGroups[k].m0; n < s_shGroups[k].m1; ++n) {
+			float b[4];
+			gxDs3dShadowPolyBox(gfx3d.polylist->list[gfx3d.indexlist[n]], b);
+			// 1/16 px -> cells; the box is finite (gxDs3dScreenXY clamps), at most 1 px off screen
+			const int x0 = (int)(b[0] * (1.0f / 16.0f)), y0 = (int)(b[1] * (1.0f / 16.0f));
+			const int x1 = (int)(b[2] * (1.0f / 16.0f)), y1 = (int)(b[3] * (1.0f / 16.0f));
+			const int cx0 = x0 < 0 ? 0 : x0 / kCell, cy0 = y0 < 0 ? 0 : y0 / kCell;
+			const int cx1 = x1 >= kScreenW ? kCw - 1 : x1 / kCell, cy1 = y1 >= kScreenH ? kCh - 1 : y1 / kCell;
+			for (int cy = cy0; cy <= cy1; ++cy)
+				for (int cx = cx0; cx <= cx1; ++cx)
+					if (++cnt[cy][cx] > 255) return false;
+		}
+	return true;
+}
+
 static bool gxDs3dShadowPlan()
 {
 	static GxDs3dTransShape s_dsh[kMaxTrans];
@@ -1310,7 +1342,11 @@ static bool gxDs3dShadowPlan()
 			continue;
 		}
 		if (gxDs3dShadowMask(p)) {
-			if (++masks > 255) { GXDS3D_SHWHY(2); return false; }
+#ifdef DSA_GXGEOM_MUTATE_SHMASK255
+			if (++masks > 255) { GXDS3D_SHWHY(2); return false; }   // mutation: the frame-wide bail, for A/B
+#else
+			++masks;
+#endif
 			if (g && g->d1 > g->d0) g = NULL;   // masks after draws start the next group
 			if (!g) {
 				if (s_shGroupCount == kMaxTrans) { GXDS3D_SHWHY(3); return false; }
@@ -1374,6 +1410,7 @@ static bool gxDs3dShadowPlan()
 		s_shBox[0] = fminf(s_shBox[0], sh.x0); s_shBox[1] = fminf(s_shBox[1], sh.y0);
 		s_shBox[2] = fmaxf(s_shBox[2], sh.x1); s_shBox[3] = fmaxf(s_shBox[3], sh.y1);
 	}
+	if (masks > 255 && !gxDs3dShadowMaskDepthOk()) { GXDS3D_SHWHY(2); return false; }
 	// The ID pass replays the depth writers before it: opaque polygons and alpha-31 fragments.
 	// Any other depth write where the draws are (bit 11) would leave a pixel no replayed
 	// fragment matches; an alpha-31 fragment after it, before a draw, would change an ID it
