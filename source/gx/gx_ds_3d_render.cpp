@@ -777,6 +777,21 @@ static const char *const kGateNames[kGateCount] = {
 static bool s_gateHasTrans = false;
 // Task gxfast-fog: the frame is fogged (GxFast pass) / has opaque polygons with fog off.
 static bool s_gateFog = false, s_gateFogRedraw = false;
+// Task fog-edge (gxDs3dFrameGate's fog block): the fog pass runs / blends colour (not
+// alpha-only) / writes per-pixel alpha (fog alpha != 31), and which pixels it fogs:
+// kFogMaskGeom those the geometry wrote (GX_GREATER against the clear depth), kFogMaskAll
+// every pixel (a fogged uniform rear plane of alpha 31), kFogMaskCi those the geometry wrote
+// over a clear image (its per-pixel depths as the reference).
+enum { kFogMaskGeom = 0, kFogMaskAll, kFogMaskCi };
+static bool s_gateFogPass = false, s_gateFogColor = false, s_gateFogAlpha = false;
+static int s_fogMask = kFogMaskGeom;
+// A fogged uniform rear plane of alpha < 31: its fragment fogged on the CPU (exact), as
+// rasterize.cpp's fragment (a, b, g, r); see gxDs3dClearFrag.
+static bool s_clearFragFog = false;
+static u8 s_clearFrag[4];
+static void gxDs3dFogEnsureTable();
+static u32 s_fogTableGen = 0;          // bumped by every fog table rebuild (gxDs3dFogEnsureTable)
+static inline u32 gxDs3dFogAt(u32 depth24);
 // Task gxfast-toon: the frame has mode-2 polygons (GxFast draws them through the toon LUT).
 static bool s_gateToon = false;
 
@@ -1535,11 +1550,20 @@ static bool gxDs3dCarryShadowKeep()
 // Not exact: GX's polygon depth against a per-pixel rear plane is the 24-bit compare of
 // polygon/polygon intersections (a3_c28), now along every geometry/clear-image crossing, so
 // GxAccurate bails (`clearimage`). GxFast bails too on W-buffer frames (the K-relative depth
-// mapping, gxDs3dClearZ, would be per texel), on fog (the fog pass masks against one clear
-// depth, and the fog flag is per pixel), and translucent polygons need every texel opaque
+// mapping, gxDs3dClearZ, would be per texel), and translucent polygons need every texel opaque
 // (`transclear`, the per-pixel form of the clear-alpha-31 rule).
+// Task fog-edge: with fog, the texels whose slot-3 bit 15 is set are fogged on the CPU
+// (gxDs3dClearImageFog, exact fog value, colour to 5 bits) into s_ciFog, which then stands in
+// for s_ciColor; the fog pass masks against the per-pixel depths (kFogMaskCi). A fogged
+// texel whose alpha would leave {0, 31} (an alpha-0 one pushed toward the fog alpha, an opaque
+// one toward a fog alpha < 31) has no RGB15 form: `fog`.
 // ---------------------------------------------------------------------------------
 static u16 *s_ciColor;                 // 256 x 192 scrolled slot-2 texels (rasterize.cpp's clearImage[adr])
+static u16 *s_ciDep;                   // the same texels of slot 3 (15-bit depth, bit 15 the fog flag)
+static u16 *s_ciFog;                   // s_ciColor with the fogged texels fogged (gxDs3dClearImageFog)
+static bool s_ciFogOn;                 // this frame shows s_ciFog
+static struct { u32 ciGen, tableGen, fogColor; bool alphaOnly, valid, ok; } s_ciFogKey;
+static u32 s_ciFogGen;
 static u8 *s_ciZData;                  // 256 x 192 Z24X8 = RGBA8 tiles, R/G/B = depth bits 23-16 / 15-8 / 7-0
 static GXTexObj s_ciZTex;
 static u16 *s_ciTexData;               // 256 x 256 RGB5A3 of s_ciColor, built on demand (gxDs3dClearImageTex)
@@ -1547,6 +1571,7 @@ static GXTexObj s_ciTexObj;
 static u32 s_ciTexGen;
 static struct { u32 vramGen; const u8 *c, *d; u16 ofs; bool valid; } s_ciKey;
 static u32 s_ciGen = 1;                // bumped by every rebuild; Engine A keys its clear-only layer on it
+static u32 s_ciGenNext = 2;            // s_ciGen / s_ciFogGen come from one counter: never equal
 static u32 s_ciSeq = 0xFFFFFFFF;       // the g_gfx3dRenderSeq the snapshot is this frame's for
 static bool s_ciOpaque;                // no alpha-0 texel
 
@@ -1560,19 +1585,21 @@ static void gxDs3dClearImageSnap()
 		s_ciKey.valid = false;
 		if (!s_ciColor) s_ciColor = (u16 *)memalign(32, kScreenW * kScreenH * sizeof(u16));
 		if (!s_ciZData) s_ciZData = (u8 *)memalign(32, kScreenW * kScreenH * 4);
-		if (!s_ciColor || !s_ciZData) return;
+		if (!s_ciDep) s_ciDep = (u16 *)malloc(kScreenW * kScreenH * sizeof(u16));
+		if (!s_ciColor || !s_ciZData || !s_ciDep) return;
 		const int xo = ofs & 0xFF, yo = (ofs >> 8) & 0xFF;
 		bool opaque = true;
 		for (int y = 0; y < kScreenH; ++y) {
 			const u32 row = (u32)((y + yo) & 255) << 9;   // bytes
-			u16 *co = s_ciColor + y * kScreenW;
+			u16 *co = s_ciColor + y * kScreenW, *dp = s_ciDep + y * kScreenW;
 			u8 *zt = s_ciZData + ((y >> 2) * (kScreenW >> 2) << 6) + ((y & 3) << 3);
 			for (int x = 0; x < kScreenW; ++x) {
 				const u32 a = row + ((u32)((x + xo) & 255) << 1);
 				const u16 c = T1ReadWord(cs, a);
 				co[x] = c;
 				opaque &= (c >> 15) != 0;
-				const u32 z = gfx3d_extendDepth_15_to_24(T1ReadWord(ds, a) & 0x7FFF);
+				dp[x] = T1ReadWord(ds, a);
+				const u32 z = gfx3d_extendDepth_15_to_24(dp[x] & 0x7FFF);
 				u8 *t = zt + ((x >> 2) << 6) + ((x & 3) << 1);
 				t[0] = 0xFF; t[1] = (u8)(z >> 16); t[32] = (u8)(z >> 8); t[33] = (u8)z;
 			}
@@ -1583,7 +1610,7 @@ static void gxDs3dClearImageSnap()
 		GX_InitTexObjFilterMode(&s_ciZTex, GX_NEAR, GX_NEAR);
 		s_texDirty = true;
 		s_ciOpaque = opaque;
-		++s_ciGen;
+		s_ciGen = s_ciGenNext++;
 		s_ciKey.vramGen = vg; s_ciKey.c = cs; s_ciKey.d = ds; s_ciKey.ofs = ofs; s_ciKey.valid = true;
 	}
 	s_ciSeq = g_gfx3dRenderSeq;
@@ -1591,17 +1618,67 @@ static void gxDs3dClearImageSnap()
 
 static inline bool gxDs3dClearImageLive() { return gfx3d.enableClearImage && s_ciSeq == g_gfx3dRenderSeq; }
 
+// Task fog-edge: rasterize.cpp's fog of the clear image's fragments (those with the slot-3 fog
+// flag), for gxDs3dFrameGate (fog on, CommonSettings.GFX3D_Fog). Sets s_ciFogOn; false when a
+// fogged texel's alpha leaves {0, 31}. Rebuilt only when the image, the fog table, the fog
+// colour or the alpha-only bit changed.
+static bool gxDs3dClearImageFog()
+{
+	gxDs3dFogEnsureTable();
+	const bool alphaOnly = gfx3d.enableFogAlphaOnly;
+	if (!(s_ciFogKey.valid && s_ciFogKey.ciGen == s_ciGen && s_ciFogKey.tableGen == s_fogTableGen &&
+	      s_ciFogKey.fogColor == gfx3d.fogColor && s_ciFogKey.alphaOnly == alphaOnly)) {
+		s_ciFogKey.valid = false;
+		if (!s_ciFog) s_ciFog = (u16 *)malloc(kScreenW * kScreenH * sizeof(u16));
+		if (!s_ciFog) return false;
+		const u32 fc = gfx3d.fogColor, fa = (fc >> 16) & 0x1F;
+		const u32 fr = GFX3D_5TO6(fc & 0x1F), fg = GFX3D_5TO6((fc >> 5) & 0x1F), fb = GFX3D_5TO6((fc >> 10) & 0x1F);
+		bool ok = true, any = false;
+		for (int i = 0; i < kScreenW * kScreenH && ok; ++i) {
+			u16 c = s_ciColor[i];
+			const u16 d = s_ciDep[i];
+			if (d & 0x8000) {
+				const u32 f = gxDs3dFogAt(gfx3d_extendDepth_15_to_24(d & 0x7FFF));
+				const u32 a = (c & 0x8000) ? 31 : 0;
+				if ((((128 - f) * a + fa * f) >> 7) != a) ok = false;
+				if (f && a && !alphaOnly) {
+					// 6-bit result, kept to 5 bits (Engine A's layer and the readback read RGB15)
+					const u32 r = (((128 - f) * GFX3D_5TO6(c & 0x1F) + fr * f) >> 7) >> 1;
+					const u32 g = (((128 - f) * GFX3D_5TO6((c >> 5) & 0x1F) + fg * f) >> 7) >> 1;
+					const u32 b = (((128 - f) * GFX3D_5TO6((c >> 10) & 0x1F) + fb * f) >> 7) >> 1;
+					const u16 o = (u16)(0x8000 | r | (g << 5) | (b << 10));
+					any |= o != c;
+					c = o;
+				}
+			}
+			s_ciFog[i] = c;
+		}
+		s_ciFogKey.ciGen = s_ciGen; s_ciFogKey.tableGen = s_fogTableGen; s_ciFogKey.fogColor = fc;
+		s_ciFogKey.alphaOnly = alphaOnly; s_ciFogKey.ok = ok; s_ciFogKey.valid = true;
+		s_ciFogOn = ok && any;
+		if (s_ciFogOn) s_ciFogGen = s_ciGenNext++;
+	}
+	return s_ciFogKey.ok;
+}
+
+// The image this frame shows: s_ciFog when a fogged frame changed a texel (s_ciFogOn, set by
+// this frame's gate), else s_ciColor.
+static inline bool gxDs3dClearImageFogged() { return s_ciFogOn && s_gateFog; }
+
 const u16 *gxDs3dClearImage(u32 *gen)
 {
 	if (!gxDs3dClearImageLive()) return NULL;
-	if (gen) *gen = s_ciGen;
-	return s_ciColor;
+	const bool fogged = gxDs3dClearImageFogged();
+	if (gen) *gen = fogged ? s_ciFogGen : s_ciGen;
+	return fogged ? s_ciFog : s_ciColor;
 }
 
 GXTexObj *gxDs3dClearImageTex()
 {
-	if (!gxDs3dClearImageLive()) return NULL;
-	if (s_ciTexData && s_ciTexGen == s_ciGen) return &s_ciTexObj;
+	u32 gen;
+	const u16 *src = gxDs3dClearImage(&gen);
+	if (!src) return NULL;
+	if (s_ciTexData && s_ciTexGen == gen) return &s_ciTexObj;
 	const u32 bytes = (u32)kScreenW * 256 * sizeof(u16);
 	if (!s_ciTexData) {
 		s_ciTexData = (u16 *)memalign(32, bytes);
@@ -1610,14 +1687,14 @@ GXTexObj *gxDs3dClearImageTex()
 	}
 	for (int y = 0; y < kScreenH; ++y)
 		for (int x = 0; x < kScreenW; ++x) {
-			const u16 c = s_ciColor[y * kScreenW + x];
+			const u16 c = src[y * kScreenW + x];
 			const u16 o = (c & 0x8000) ? (u16)(0x8000 | ((c & 0x1F) << 10) | (c & 0x3E0) | ((c >> 10) & 0x1F)) : 0;
 			s_ciTexData[(((y >> 2) * (kScreenW >> 2) + (x >> 2)) << 4) + ((y & 3) << 2) + (x & 3)] = o;
 		}
 	DCFlushRange(s_ciTexData, bytes);
 	GX_InitTexObj(&s_ciTexObj, s_ciTexData, kScreenW, 256, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjFilterMode(&s_ciTexObj, GX_NEAR, GX_NEAR);
-	s_ciTexGen = s_ciGen;   // no GX call here: the caller invalidates TMEM under vidmutex
+	s_ciTexGen = gen;   // no GX call here: the caller invalidates TMEM under vidmutex
 	return &s_ciTexObj;
 }
 
@@ -1634,11 +1711,15 @@ static int gxDs3dFrameGate(bool requireTex)
 	// (see s_wK). GX's 24-bit D = 1 - K/w buckets w differently from the CPU's
 	// floor(4096*w), so near-ties can resolve differently: not exact, GxAccurate bails.
 	if (gfx3d.wbuffer && !fast) return kGateWbuffer;
-	// Rear-plane clear image (see its section): GxFast, Z-buffer, no fog, snapshot taken.
+	// Rear-plane clear image (see its section): GxFast, Z-buffer, snapshot taken.
 #ifdef DSA_GXGEOM_MUTATE_CLEARIMAGE
 	if (gfx3d.enableClearImage) return kGateClearImage;   // mutation: the pre-change bail, for A/B
-#else
+#elif defined(DSA_GXGEOM_MUTATE_FOGEDGE)
+	// mutation (Task fog-edge): the pre-change bail on clear image + fog, for A/B
 	if (gfx3d.enableClearImage && (!fast || gfx3d.wbuffer || gfx3d.enableFog || !gxDs3dClearImageLive()))
+		return kGateClearImage;
+#else
+	if (gfx3d.enableClearImage && (!fast || gfx3d.wbuffer || !gxDs3dClearImageLive()))
 		return kGateClearImage;
 #endif
 	// Antialiasing is deliberately not checked: rasterize.cpp never implements it.
@@ -1650,14 +1731,31 @@ static int gxDs3dFrameGate(bool requireTex)
 #else
 	if (gfx3d.enableEdgeMarking && !fast) return kGateEdge;
 #endif
+	s_gateFog = gfx3d.enableFog && CommonSettings.GFX3D_Fog;
+	s_gateFogPass = s_gateFogColor = s_gateFogAlpha = false;
+	s_fogMask = kFogMaskGeom;
+	s_clearFragFog = false;
 	if (gfx3d.enableFog) {
 		// Task gxfast-fog: GxFast draws fog as a post-pass (gxDs3dApplyFogFast: the GX depth
 		// buffer's top byte looked up in a 256-entry copy of the CPU's fogTable through an
 		// indirect stage, blended toward the fog colour on every pixel the geometry wrote).
-		// Not modelled, so these still go to the CPU rasterizer: GxAccurate (8-bit depth
-		// buckets are not the CPU's 15-bit fogIndex), alpha-only fog, a fog alpha other than
-		// 31 (alpha is left as drawn), and a fogged rear plane (the pass masks it out).
-		// Per-polygon fog-enable bits are not modelled: every drawn pixel is fogged.
+		// GxAccurate bails (8-bit depth buckets are not the CPU's 15-bit fogIndex).
+		// Per-polygon fog-enable bits: opaque polygons without one are redrawn unfogged
+		// (gxDs3dRenderFastDraw); translucent ones are fogged anyway (GxFast gap).
+		// Task fog-edge, the rest of rasterize.cpp's fog in GxFast:
+		// - alpha-only fog (DISP3DCNT bit 6): the colour blend is skipped.
+		// - fog alpha != 31: the pass also writes the CPU's alpha (s_gateFogAlpha, the alpha
+		//   LUT), which only an RGBA6 EFB keeps, so these frames are drawn and read back by
+		//   gxDsEngineA3dReadback (gxDs3dGeomFrameNeedsAlpha), never as the overlay.
+		// - a fogged uniform rear plane (clear colour bit 15): with clear alpha 31 the pass
+		//   fogs every pixel (kFogMaskAll: the cleared ones still hold the clear depth, and a
+		//   translucent polygon over the clear is fogged as the CPU fogs its blend); with
+		//   clear alpha < 31 the cleared pixels are not in the EFB (holes), so the clear
+		//   fragment is fogged on the CPU instead (exact; gxDs3dClearFrag, Engine A's layer).
+		// - a clear image: its fogged texels are fogged on the CPU (gxDs3dClearImageFog) and
+		//   the pass masks per pixel (kFogMaskCi).
+		// -DDSA_GXGEOM_MUTATE_FOGEDGE restores the bails on all of these.
+#ifdef DSA_GXGEOM_MUTATE_FOGEDGE
 #ifdef DSA_GXGEOM_FOGANYALPHA
 		// measurement only (a3_c29 uses fog alpha 24): skip the fog-alpha check
 		if (!fast || gfx3d.enableFogAlphaOnly ||
@@ -1667,14 +1765,46 @@ static int gxDs3dFrameGate(bool requireTex)
 		    (gfx3d_rasterClearColor() & 0x8000)) {
 			return kGateFog;
 		}
+#else
+		if (!fast) return kGateFog;
+		if (s_gateFog) {
+			const u32 fa = (gfx3d.fogColor >> 16) & 0x1F;
+			s_gateFogColor = !gfx3d.enableFogAlphaOnly;
+			s_gateFogAlpha = fa != 31;
+			if (gfx3d.enableClearImage) {
+				if (!gxDs3dClearImageFog()) return kGateFog;
+				s_fogMask = kFogMaskCi;
+			} else if (gfx3d_rasterClearColor() & 0x8000) {
+				const u32 cc = gfx3d_rasterClearColor(), ca = (cc >> 16) & 0x1F;
+				if (ca == 31) {
+					s_fogMask = kFogMaskAll;
+				} else {
+					// rasterize.cpp's clear fragment through its fog loop
+					gxDs3dFogEnsureTable();
+					const u32 f = gxDs3dFogAt(gfx3d_rasterClearDepth());
+					const u32 fc = gfx3d.fogColor;
+					const u32 c6[3] = { GFX3D_5TO6((cc >> 10) & 0x1F), GFX3D_5TO6((cc >> 5) & 0x1F), GFX3D_5TO6(cc & 0x1F) };
+					const u32 f6[3] = { GFX3D_5TO6((fc >> 10) & 0x1F), GFX3D_5TO6((fc >> 5) & 0x1F), GFX3D_5TO6(fc & 0x1F) };
+					s_clearFrag[0] = (u8)(((128 - f) * ca + fa * f) >> 7);
+					for (int k = 0; k < 3; ++k)
+						s_clearFrag[1 + k] = (u8)(s_gateFogColor ? ((128 - f) * c6[k] + f6[k] * f) >> 7 : c6[k]);
+					s_clearFragFog = true;
+				}
+			}
+			// alpha-only with fog alpha 31 leaves every pixel the pass would touch as it is
+			s_gateFogPass = s_gateFogColor || s_gateFogAlpha;
+		}
+#endif
 	}
+#ifdef DSA_GXGEOM_MUTATE_FOGEDGE
+	s_gateFogPass = s_gateFogColor = s_gateFog;
+#endif
 
 	bool anyTrans = false, anyShadow = false;
 #ifndef DSA_GXGEOM_NOVISCACHE
 	s_visKey.valid = false;
 #endif
 	s_gateHasTrans = false;
-	s_gateFog = gfx3d.enableFog && CommonSettings.GFX3D_Fog;
 	s_gateFogRedraw = false;
 	s_gateToon = false;
 	s_shGroupCount = 0;
@@ -1690,7 +1820,7 @@ static int gxDs3dFrameGate(bool requireTex)
 			}
 			anyShadow = true;
 		}
-		if (s_gateFog && !(p.polyAttr & 0x8000) && !p.isTranslucent() && gxDs3dPolyMode(p) != 3) s_gateFogRedraw = true;
+		if (s_gateFogPass && !(p.polyAttr & 0x8000) && !p.isTranslucent() && gxDs3dPolyMode(p) != 3) s_gateFogRedraw = true;
 		if (p.isTranslucent()) {
 			// GxFast only (see the translucent section): GX's 8-bit blend is +-1 LSB.
 			if (!fast) return kGateTranslucent;
@@ -1855,6 +1985,17 @@ static int gxDs3dFrameGate(bool requireTex)
 
 bool gxDs3dGeomFrameHasTranslucent() { return s_gateHasTrans; }
 
+bool gxDs3dGeomFrameNeedsAlpha() { return s_gateFogPass && s_gateFogAlpha; }
+
+bool gxDs3dClearFrag(u8 out[4])
+{
+	if (s_clearFragFog && s_gateFog) { memcpy(out, s_clearFrag, 4); return true; }
+	const u32 cc = gfx3d_rasterClearColor();
+	out[0] = (u8)((cc >> 16) & 0x1F); out[1] = (u8)GFX3D_5TO6((cc >> 10) & 0x1F);
+	out[2] = (u8)GFX3D_5TO6((cc >> 5) & 0x1F); out[3] = (u8)GFX3D_5TO6(cc & 0x1F);
+	return false;
+}
+
 // Result of this frame's gxDs3dGeomFramePrepare(). The line-191 call can only be stricter
 // (requireTex), so a frame prepare rejected is rejected again without re-running the gate.
 static u32 s_prepSeq = 0xFFFFFFFF;
@@ -1934,7 +2075,11 @@ bool gxDs3dGeomFramePrepare()
 	s_atRef = gfx3d.enableAlphaTest ? gfx3d.alphaTestRef : 0;
 	// the rear-plane clear image, read from VRAM now like the textures (its section)
 	s_ciSeq = 0xFFFFFFFF;
+#ifdef DSA_GXGEOM_MUTATE_FOGEDGE
 	if (gfx3d.enableClearImage && gxRenderModeIsFast() && !gfx3d.wbuffer && !gfx3d.enableFog)
+#else
+	if (gfx3d.enableClearImage && gxRenderModeIsFast() && !gfx3d.wbuffer)
+#endif
 		gxDs3dClearImageSnap();
 	GXDS3D_TP_BEGIN(tp0);
 	const int g = gxDs3dFrameGate(false);
@@ -3649,7 +3794,7 @@ static void gxDs3dRenderFastDraw()
 	}
 	if (c.tagMode > 0) GX_SetNumTevStages(1);
 	s_shRec = false;
-	if (s_gateFog) {
+	if (s_gateFogPass) {
 		// Task gxfast-fog: fog post-pass over everything drawn (part of the recorded list,
 		// so replayed frames get it too). The CPU fogs only pixels whose polygon has
 		// POLYGON_ATTR bit 15 set; opaque polygons without it are drawn again over the
@@ -3868,27 +4013,69 @@ static u8 s_fogLut[256];
 static u8 s_fogLutLinear[256 * kFogLutH];
 static GXTexObj s_fogLutTex;
 static void *s_fogLutTexData = nullptr;
+// Task fog-edge: the alpha LUT (fog alpha != 31): texel k = 8 * a' + 4, a' the CPU's
+// ((128 - fog) * 31 + fogAlpha * fog) >> 7 for an opaque pixel (every pixel the pass fogs
+// starts at alpha 31, see gxDs3dApplyFogFast). The RGBA6 EFB keeps 2 * a' + 1: odd, so a
+// fogged pixel of alpha 0 still reads back as covered (gxDsEngineA3dReadback).
+static u8 s_fogALut[256];
+static GXTexObj s_fogALutTex;
+static void *s_fogALutTexData = nullptr;
 static bool s_fogLutValid = false;
 // Cache key: only rebuild the (somewhat expensive, 32768-entry) table when something it
 // depends on actually changed -- FOG_TABLE's 32 density bytes, fogOffset or fogShift.
 static u8 s_fogKey[32 + 4 + 4];        // the density table inputs (s_fogTable)
+static bool s_fogTableValid = false;
+static u32 s_fogLutTableGen = 0;       // the table the LUTs were built from
 static float s_fogLutWK = -1.0f;      // the depth mapping the LUT was built for
 static bool s_fogLutWbuf = false;
+static u32 s_fogLutA = 0xFF;           // the fog alpha the alpha LUT was built for
 
-static void gxDs3dFogEnsureLut()
+// The CPU's fogTable for this frame's FOG_TABLE / offset / shift (also read on the CPU for
+// the rear plane: gxDs3dClearFragBuild, gxDs3dClearImageFog).
+static void gxDs3dFogEnsureTable()
 {
 	u8 key[sizeof(s_fogKey)];
 	memcpy(key, MMU.MMU_MEM[ARMCPU_ARM9][0x40] + 0x360, 32);
 	memcpy(key + 32, &gfx3d.fogOffset, 4);
 	memcpy(key + 36, &gfx3d.fogShift, 4);
+	if (s_fogTableValid && memcmp(key, s_fogKey, sizeof(key)) == 0) return;
+	gxDs3dFogBuildTable();
+	memcpy(s_fogKey, key, sizeof(key));
+	s_fogTableValid = true;
+	++s_fogTableGen;
+}
+
+// rasterize.cpp's per-pixel fog value: fogTable[depth >> 9] with the 127 -> 128 snap.
+static inline u32 gxDs3dFogAt(u32 depth24)
+{
+	const u32 f = s_fogTable[(depth24 & 0xFFFFFF) >> 9];
+	return f == 127 ? 128 : f;
+}
+
+static void gxDs3dFogLutTex(const u8 *lut, void **data, GXTexObj *obj)
+{
+	const u32 size = GX_GetTexBufferSize(256, kFogLutH, GX_TF_I8, GX_FALSE, 0);
+	if (!*data) *data = memalign(32, size);
+	if (!*data) return;
+	for (int row = 0; row < kFogLutH; ++row)
+		memcpy(s_fogLutLinear + row * 256, lut, 256);
+	gxSwizzle8bpp(s_fogLutLinear, (u8 *)*data, 8, 4, 256, kFogLutH);
+	DCFlushRange(*data, size);
+	GX_InitTexObj(obj, *data, 256, kFogLutH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(obj, GX_NEAR, GX_NEAR);
+}
+
+static void gxDs3dFogEnsureLut()
+{
+	gxDs3dFogEnsureTable();
 	const bool wbuf = gfx3d.wbuffer != 0;
-	const bool tableOk = s_fogLutValid && memcmp(key, s_fogKey, sizeof(key)) == 0;
+	const u32 fogA = (gfx3d.fogColor >> 16) & 0x1F;
 	// The LUT maps a GX depth byte to a DS depth, so in W mode it also depends on s_wK
 	// (gxDs3dWSetup, per frame); Z mode's mapping is fixed.
-	if (tableOk && wbuf == s_fogLutWbuf && (!wbuf || s_wK == s_fogLutWK))
+	if (s_fogLutValid && s_fogLutTableGen == s_fogTableGen && wbuf == s_fogLutWbuf &&
+	    (!wbuf || s_wK == s_fogLutWK) && fogA == s_fogLutA)
 		return;
 
-	if (!tableOk) gxDs3dFogBuildTable();
 	// Texel k = the GX depth bucket D in [k/256, (k+1)/256) (the Z8 copy's top byte),
 	// sampled at its centre and turned into the CPU's fogIndex = depth >> 9:
 	//   Z mode: GX D = DS z (gxDs3dFastXformBuild), CPU depth = floor(z*0x7FFF) << 9.
@@ -3909,25 +4096,15 @@ static void gxDs3dFogEnsureLut()
 		u32 weight = fog * 2;
 		if (weight > 255) weight = 255;
 		s_fogLut[k] = (u8)weight;
+		s_fogALut[k] = (u8)(8 * (((128 - fog) * 31 + fogA * fog) >> 7) + 4);
 	}
-
-	for (int row = 0; row < kFogLutH; ++row)
-		memcpy(s_fogLutLinear + row * 256, s_fogLut, 256);
-
-	if (!s_fogLutTexData) {
-		u32 size = GX_GetTexBufferSize(256, kFogLutH, GX_TF_I8, GX_FALSE, 0);
-		s_fogLutTexData = memalign(32, size);
-	}
-	if (s_fogLutTexData) {
-		gxSwizzle8bpp(s_fogLutLinear, (u8 *)s_fogLutTexData, 8, 4, 256, kFogLutH);
-		DCFlushRange(s_fogLutTexData, GX_GetTexBufferSize(256, kFogLutH, GX_TF_I8, GX_FALSE, 0));
-		GX_InitTexObj(&s_fogLutTex, s_fogLutTexData, 256, kFogLutH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
-		GX_InitTexObjFilterMode(&s_fogLutTex, GX_NEAR, GX_NEAR);
-	}
-	memcpy(s_fogKey, key, sizeof(key));
+	gxDs3dFogLutTex(s_fogLut, &s_fogLutTexData, &s_fogLutTex);
+	gxDs3dFogLutTex(s_fogALut, &s_fogALutTexData, &s_fogALutTex);
+	s_fogLutTableGen = s_fogTableGen;
 	s_fogLutWbuf = wbuf;
 	s_fogLutWK = s_wK;
-	s_fogLutValid = true;
+	s_fogLutA = fogA;
+	s_fogLutValid = s_fogLutTexData && s_fogALutTexData;
 }
 
 // EFB Z-copy target: top 8 bits of the 24-bit GX Z-buffer, one texel per screen pixel.
@@ -3956,10 +4133,39 @@ static void gxDs3dFogCopyZ(u16 w, u16 h)
 	GX_InitTexObjFilterMode(&s_fogZTex, GX_NEAR, GX_NEAR);
 }
 
+// The fog pass's full-screen quad: TEXCOORD0 = screen 0..1 (the Z8 copy, the clear image's
+// depths), TEXCOORD1 = the LUT's texel 0 (the indirect offset adds the depth byte).
+static void gxDs3dFogQuad(float z)
+{
+	const f32 lu = 0.5f / 256.0f, lv = 0.5f / (f32)kFogLutH;   // LUT texel 0's centre
+	GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
+		GX_Position3f32(0, 0, z);
+		GX_TexCoord2f32(0.0f, 0.0f); GX_TexCoord2f32(lu, lv);
+		GX_Position3f32((f32)kScreenW, 0, z);
+		GX_TexCoord2f32(1.0f, 0.0f); GX_TexCoord2f32(lu, lv);
+		GX_Position3f32((f32)kScreenW, (f32)kScreenH, z);
+		GX_TexCoord2f32(1.0f, 1.0f); GX_TexCoord2f32(lu, lv);
+		GX_Position3f32(0, (f32)kScreenH, z);
+		GX_TexCoord2f32(0.0f, 1.0f); GX_TexCoord2f32(lu, lv);
+	GX_End();
+}
+
+// The fog pass's Z mask (s_fogMask, see gxDs3dFrameGate's fog block).
+static void gxDs3dFogMaskZ()
+{
+#ifdef DSA_GXGEOM_MUTATE_FOGNOZMASK
+	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);   // debug: bypass the geometry Z-mask entirely
+#else
+	if (s_fogMask == kFogMaskAll) GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+	else GX_SetZMode(GX_TRUE, GX_GREATER, GX_FALSE);
+#endif
+}
+
 void gxDs3dApplyFogFast()
 {
 	if (!CommonSettings.GFX3D_Fog) return;   // as rasterize.cpp
 	gxDs3dFogEnsureLut();
+	if (!s_fogLutValid) return;
 	gxDs3dFogCopyZ(kScreenW, kScreenH);
 
 	// gxDs3dRenderFast() leaves whichever per-polygon perspective matrix its last
@@ -3980,14 +4186,49 @@ void gxDs3dApplyFogFast()
 	// quad's Z (fed the same reference value) GX_GREATER against the buffer catches
 	// exactly "something nearer was drawn here" without needing a polygon-ID buffer.
 	// (gxDs3dClearZ: the same value in W mode too, where it is K-relative.)
+	// Task fog-edge: kFogMaskAll (a fogged uniform rear plane of alpha 31) fogs every pixel,
+	// the cleared ones by the clear depth they still hold; kFogMaskCi (a clear image) takes
+	// the reference per pixel from the image's own Z texture (GX_ZT_REPLACE in a second TEV
+	// stage, the Z compare being after texturing), which is what gxDs3dClearDepthImage seeded.
 	const float clearZ = gxDs3dClearZ();
 
-	GX_LoadTexObj(&s_fogZTex, GX_TEXMAP0);
-	GX_LoadTexObj(&s_fogLutTex, GX_TEXMAP1);
-
+	GX_SetNumChans(0);
+	GX_SetCullMode(GX_CULL_NONE);
+	GX_SetDither(GX_FALSE);
+	GX_ClearVtxDesc();
+	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+	GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
+	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 	GX_SetNumTexGens(2);
 	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+
+	// Task fog-edge: a frame with translucent polygons has blended alpha in the EFB where
+	// the mask leaves the pixel alone; the CPU's is 31 there (clear alpha 31, max-blend), so
+	// the alpha pass first stamps 31 everywhere (gxDs3dGeomFrameNeedsAlpha frames only).
+	if (s_gateFogAlpha && s_gateHasTrans && s_fogMask != kFogMaskAll) {
+		GX_SetNumIndStages(0);
+		GX_SetNumTevStages(1);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+		GX_SetTevDirect(GX_TEVSTAGE0);
+		GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO);
+		GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_1);
+		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
+		GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+		GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+		GX_SetColorUpdate(GX_FALSE);
+		GX_SetAlphaUpdate(GX_TRUE);
+		gxDs3dFogQuad(clearZ);
+	}
+
+	GX_LoadTexObj(&s_fogZTex, GX_TEXMAP0);
+	GX_LoadTexObj(&s_fogLutTex, GX_TEXMAP1);
+	GX_LoadTexObj(&s_fogALutTex, GX_TEXMAP3);
 
 	GX_SetNumIndStages(1);
 	GX_SetIndTexOrder(GX_INDTEXSTAGE0, GX_TEXCOORD0, GX_TEXMAP0);
@@ -4002,9 +4243,6 @@ void gxDs3dApplyFogFast()
 	f32 indMtx[2][3] = { { 0.5f, 0.0f, 0.0f }, { 0.0f, 0.0f, 0.0f } };
 	GX_SetIndTexMatrix(GX_ITM_0, indMtx, 1);
 
-	GX_SetNumChans(0);
-	GX_SetNumTevStages(1);
-	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD1, GX_TEXMAP1, GX_COLORNULL);
 #ifdef DSA_GXGEOM_MUTATE_FOGNOINDIRECT
 	GX_SetTevIndirect(GX_TEVSTAGE0, GX_INDTEXSTAGE0, GX_ITF_8, GX_ITB_NONE, GX_ITM_OFF,
 	                   GX_ITW_OFF, GX_ITW_OFF, GX_FALSE, GX_FALSE, GX_ITBA_OFF);
@@ -4020,51 +4258,59 @@ void gxDs3dApplyFogFast()
 	fogGx.a = 255;
 	GX_SetTevKColor(GX_KCOLOR0, fogGx);
 	GX_SetTevKColorSel(GX_TEVSTAGE0, GX_TEV_KCSEL_K0);
-
 	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST);
 	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-#ifdef DSA_GXGEOM_MUTATE_FOGCONSTALPHA
-	GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_1_2);   // debug: constant 1/2 alpha, no texture/indirect involved
-	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
-#else
-	GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
-#endif
 	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	if (s_fogMask == kFogMaskCi) {
+		// stage 1 passes stage 0's result through and samples the clear image's depths
+		GX_LoadTexObj(&s_ciZTex, GX_TEXMAP2);
+		GX_SetNumTevStages(2);
+		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP2, GX_COLORNULL);
+		GX_SetTevDirect(GX_TEVSTAGE1);
+		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+		GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
+	} else {
+		GX_SetNumTevStages(1);
+	}
+	gxDs3dFogMaskZ();
 
-#ifdef DSA_GXGEOM_MUTATE_FOGNOZMASK
-	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);   // debug: bypass the geometry Z-mask entirely
+	if (s_gateFogColor) {
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD1, GX_TEXMAP1, GX_COLORNULL);
+#ifdef DSA_GXGEOM_MUTATE_FOGCONSTALPHA
+		GX_SetTevKAlphaSel(GX_TEVSTAGE0, GX_TEV_KASEL_1_2);   // debug: constant 1/2 alpha, no texture/indirect involved
+		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
 #else
-	GX_SetZMode(GX_TRUE, GX_GREATER, GX_FALSE);
+		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
 #endif
-	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
-	GX_SetColorUpdate(GX_TRUE);
-	// The CPU also blends alpha toward the fog alpha; the gate requires fog alpha 31, which
-	// leaves opaque pixels at 31 as here (translucent ones keep their own alpha: GxFast gap).
-	GX_SetAlphaUpdate(GX_FALSE);
-	GX_SetCullMode(GX_CULL_NONE);
-	GX_SetDither(GX_FALSE);
-
-	GX_ClearVtxDesc();
-	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
-	GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
-	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
-	GX_SetVtxAttrFmt(GX_VTXFMT1, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
-
-	const f32 lu = 0.5f / 256.0f, lv = 0.5f / (f32)kFogLutH;   // LUT texel 0's centre
-	GX_Begin(GX_QUADS, GX_VTXFMT1, 4);
-		GX_Position3f32(0, 0, clearZ);
-		GX_TexCoord2f32(0.0f, 0.0f); GX_TexCoord2f32(lu, lv);
-		GX_Position3f32((f32)kScreenW, 0, clearZ);
-		GX_TexCoord2f32(1.0f, 0.0f); GX_TexCoord2f32(lu, lv);
-		GX_Position3f32((f32)kScreenW, (f32)kScreenH, clearZ);
-		GX_TexCoord2f32(1.0f, 1.0f); GX_TexCoord2f32(lu, lv);
-		GX_Position3f32(0, (f32)kScreenH, clearZ);
-		GX_TexCoord2f32(0.0f, 1.0f); GX_TexCoord2f32(lu, lv);
-	GX_End();
+		GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+		GX_SetColorUpdate(GX_TRUE);
+		// The blend's alpha (weight * weight + ...) is not the CPU's; alpha is the pass below.
+		GX_SetAlphaUpdate(GX_FALSE);
+		gxDs3dFogQuad(clearZ);
+	}
+	if (s_gateFogAlpha) {
+		// Task fog-edge: the CPU blends alpha toward the fog alpha as well. Every pixel the
+		// mask passes is at alpha 31 before fog (an opaque polygon, a translucent one over a
+		// clear of alpha 31, or that clear), so a' is a function of the depth alone: written
+		// straight from the alpha LUT, colour untouched. Only gxDs3dGeomFrameNeedsAlpha frames,
+		// whose pass runs in an RGBA6 EFB and is read back (gxDsEngineA3dReadback).
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD1, GX_TEXMAP3, GX_COLORNULL);
+		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
+		GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+		GX_SetColorUpdate(GX_FALSE);
+		GX_SetAlphaUpdate(GX_TRUE);
+		gxDs3dFogQuad(clearZ);
+		GX_SetColorUpdate(GX_TRUE);
+	}
 	GX_SetAlphaUpdate(GX_TRUE);
 	GX_SetTevDirect(GX_TEVSTAGE0);
+	if (s_fogMask == kFogMaskCi) {
+		GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
+		GX_SetNumTevStages(1);
+	}
 
 	// Restore what this draw doesn't own the caller relying on (mirrors
 	// gxDs3dSetupCommonState's own contract): the next thing to run in

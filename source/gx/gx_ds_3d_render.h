@@ -122,6 +122,15 @@ bool gxDs3dGeomFramePrepare();
 // (GxFast only). They are blended over the EFB, so BG0's slot under the overlay must be the
 // clear colour, never the CPU raster (which already has them blended in): see gxDsA3dScan.
 bool gxDs3dGeomFrameHasTranslucent();
+// Task fog-edge: true iff the last accepted frame's fog pass writes per-pixel alpha (fog
+// alpha != 31). Such a frame is drawn in an RGBA6 EFB and read back (gxDsEngineA3dReadback),
+// never as the overlay or the geometry texture, which carry coverage only.
+bool gxDs3dGeomFrameNeedsAlpha();
+// Task fog-edge: the uniform rear plane's fragment as the CPU raster leaves it, in
+// gfx3d_convertedScreen's byte order (a, b, g, r; 6-bit colour): the clear colour, or, when
+// the last accepted frame fogs a rear plane of alpha < 31, that colour fogged on the CPU
+// (true then).
+bool gxDs3dClearFrag(u8 out[4]);
 
 // Task clearimage (the .cpp's clear-image section): when this frame's gate took a rear-plane
 // clear image (DISP3DCNT bit 14, GxFast), its 256x192 texels as the CPU raster reads them
@@ -162,7 +171,10 @@ bool gxDs3dFastReplayGen(u32 *gen);
 // gfx3d.fogColor. The blend weight is the GX depth buffer's top byte (EFB Z8 copy) looked up
 // through one indirect stage in a 256-entry LUT built from the CPU's own fogTable[] for the
 // frame's depth mapping (Z or W buffer). gxDs3dGeomFrameSupported()'s fog gate decides which
-// fog setups reach it. Leaves blend mode, Z mode and the vertex format dirty.
+// fog setups reach it. Task fog-edge: the mask may instead be every pixel (a fogged rear plane
+// of alpha 31) or per pixel against a clear image's depths; alpha-only fog skips the colour
+// quad, and a fog alpha != 31 adds an alpha-only quad from a second LUT (RGBA6 readback
+// frames, gxDs3dGeomFrameNeedsAlpha). Leaves blend mode, Z mode and the vertex format dirty.
 void gxDs3dApplyFogFast();
 
 // Task P1-6a-flicker (implemented in Engine A, gx_ds_engine_impl.inc): resolves a deferred

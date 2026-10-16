@@ -2692,8 +2692,13 @@ static bool gxDsA3dScan(bool clearOnly = false)
 	u32 key = (g_gfx3dRenderSeq << 1);
 	u32 ciGen = 0;
 	const u16 *ci = clearOnly ? gxDs3dClearImage(&ciGen) : NULL;
+	// rasterize.cpp SoftRastRender's clearFragmentColor, in gfx3d_convertedScreen's byte
+	// order (big-endian FragmentColor: a, b, g, r); Task fog-edge: fogged when the CPU fogs it.
+	u8 cf[4];
+	if (clearOnly) gxDs3dClearFrag(cf);
 	if (clearOnly) {
-		const u32 cc = gfx3d_rasterClearColor() & 0x1F7FFF;   // the bits the clear line reads
+		u32 cc;   // the bytes the clear line reads
+		memcpy(&cc, cf, 4);
 		if (!(s_3dScanValid && s_3dClearOnly && s_3dClearCc == cc && s_3dClearCiGen == ciGen)) {
 			++s_3dClearGen; s_3dClearCc = cc; s_3dClearCiGen = ciGen;
 		}
@@ -2708,12 +2713,7 @@ static bool gxDsA3dScan(bool clearOnly = false)
 	}
 	s_3dClearOnly = clearOnly;
 	if (clearOnly) {
-		// rasterize.cpp SoftRastRender's clearFragmentColor, in gfx3d_convertedScreen's byte
-		// order (big-endian FragmentColor: a, b, g, r).
-		const u32 cc = gfx3d_rasterClearColor();
-		const u8 t[4] = { (u8)((cc >> 16) & 0x1F), (u8)GFX3D_5TO6((cc >> 10) & 0x1F),
-		                  (u8)GFX3D_5TO6((cc >> 5) & 0x1F), (u8)GFX3D_5TO6(cc & 0x1F) };
-		for (int x = 0; x < k3dW; ++x) memcpy(s_3dClearLine + x * 4, t, 4);
+		for (int x = 0; x < k3dW; ++x) memcpy(s_3dClearLine + x * 4, cf, 4);
 	} else {
 		gfx3d_ensureRendered();
 	}
@@ -4220,11 +4220,21 @@ bool gxDsEngineA3dReadback()
 	GXTexObj *ciTex = ci && gxDs3dGeomFrameHasTranslucent() ? gxDs3dClearImageTex() : NULL;
 	if (ci && gxDs3dGeomFrameHasTranslucent() && !ciTex) return false;
 	const bool cover = ci ? !ciTex : ca != 31;
+	// Task fog-edge: a frame whose fog pass writes alpha (gxDs3dGeomFrameNeedsAlpha) runs in
+	// RGBA6 and is copied as RGBA8 (s_3dRbAlpha): colour = the EFB's 6 bits, alpha = a6 >> 1
+	// (the pass writes 2 a' + 1, opaque polygons 63); in cover mode a6 == 0 is uncovered.
+	const bool alphaRb = gxDs3dGeomFrameNeedsAlpha();
+	static u8 *s_3dRbAlpha;
+	const u32 cb32 = (u32)k3dW * k3dH * 4;
+	if (alphaRb && !s_3dRbAlpha) s_3dRbAlpha = (u8 *)memalign(32, cb32);
+	if (alphaRb && !s_3dRbAlpha) return false;
+	u8 cfrag[4];   // the uncovered pixels' fragment (fogged on the CPU when the CPU fogs it)
+	gxDs3dClearFrag(cfrag);
 
 	gxFenceWait(s_fenceTok);   // Task gpu-overlap: the pass below may re-record s_dl, which the GPU may still read
 	LWP_MutexLock(vidmutex);
 	gxDsBSetup2DState();
-	if (cover) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+	if (cover || alphaRb) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
 	GX_SetViewport(0, 0, (f32)kDsBScreenW, (f32)kDsBScreenH, 0, 1);
 	GX_SetScissor(0, 0, kDsBScreenW, kDsBScreenH);
 	// Background: the clear colour (the overlay's clear-only BG0 texel), or alpha 0 for coverage.
@@ -4257,17 +4267,49 @@ bool gxDsEngineA3dReadback()
 	gxDsA3dGeomDraw();
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	GX_SetTexCopySrc(0, 0, kDsBScreenW, kDsBScreenH);
-	GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
-	DCFlushRange(s_3dScratch, cb);   // no dirty line may be written back over the copy
-	// clear=GX_TRUE as the compositor's own copy (the corner must not ghost under draw_thread);
-	// an RGBA6 pass is cleared by a second copy once the format is back.
-	GX_CopyTex(s_3dScratch, cover ? GX_FALSE : GX_TRUE);
-	GX_PixModeSync();
-	{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
-	DCInvalidateRange(s_3dScratch, cb);
-	{
+	if (alphaRb) {
+		GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGBA8, GX_FALSE);
+		DCFlushRange(s_3dRbAlpha, cb32);
+		GX_CopyTex(s_3dRbAlpha, GX_FALSE);   // cleared by the second copy below
+		GX_PixModeSync();
+		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+		DCInvalidateRange(s_3dRbAlpha, cb32);
+		// RGBA8, 4x4 texel blocks of 64 bytes: 16 (A, R) pairs, then 16 (G, B) pairs.
+		const u8 *t = s_3dRbAlpha;
+		for (int by = 0; by < k3dH; by += 4)
+			for (int bx = 0; bx < k3dW; bx += 4, t += 64)
+				for (int j = 0; j < 16; ++j) {
+					const int y = by + (j >> 2), x = bx + (j & 3);
+					u8 *o = gfx3d_convertedScreen + ((size_t)y * k3dW + x) * 4;
+					const u8 a6 = t[2 * j] >> 2;
+					if (cover && !a6) {
+						if (ci) {
+							const u16 c = ci[y * k3dW + x];
+							o[0] = (c & 0x8000) ? 31 : 0;
+							o[1] = (u8)GFX3D_5TO6((c >> 10) & 0x1F);
+							o[2] = (u8)GFX3D_5TO6((c >> 5) & 0x1F);
+							o[3] = (u8)GFX3D_5TO6(c & 0x1F);
+						} else {
+							memcpy(o, cfrag, 4);
+						}
+						continue;
+					}
+					o[0] = a6 >> 1;
+					o[1] = t[32 + 2 * j + 1] >> 2;
+					o[2] = t[32 + 2 * j] >> 2;
+					o[3] = t[2 * j + 1] >> 2;
+				}
+	} else {
+		GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
+		DCFlushRange(s_3dScratch, cb);   // no dirty line may be written back over the copy
+		// clear=GX_TRUE as the compositor's own copy (the corner must not ghost under draw_thread);
+		// an RGBA6 pass is cleared by a second copy once the format is back.
+		GX_CopyTex(s_3dScratch, cover ? GX_FALSE : GX_TRUE);
+		GX_PixModeSync();
+		{ PZ_SUB_SCOPE(PZ_GX_WAIT); GX_DrawDone(); }
+		DCInvalidateRange(s_3dScratch, cb);
 		// RGB5A3, 4x4 texel blocks; out: gfx3d_convertedScreen's (a, b, g, r) bytes, 6-bit colour.
-		const u8 cf[4] = { ca, (u8)GFX3D_5TO6(c5[2]), (u8)GFX3D_5TO6(c5[1]), (u8)GFX3D_5TO6(c5[0]) };
+		const u8 *cf = cfrag;
 		const u16 *t = s_3dScratch;
 		for (int by = 0; by < k3dH; by += 4)
 			for (int bx = 0; bx < k3dW; bx += 4)
@@ -4295,8 +4337,9 @@ bool gxDsEngineA3dReadback()
 					}
 				}
 	}
-	if (cover) {
+	if (cover || alphaRb) {
 		GX_SetPixelFmt(rmode->aa ? GX_PF_RGB565_Z16 : GX_PF_RGB8_Z24, GX_ZC_LINEAR);   // main.cpp InitVideo's choice
+		GX_SetTexCopyDst(kDsBScreenW, kDsBScreenH, GX_TF_RGB5A3, GX_FALSE);
 		DCFlushRange(s_3dScratch, cb);
 		GX_CopyTex(s_3dScratch, GX_TRUE);
 		GX_PixModeSync();
@@ -4516,6 +4559,9 @@ static bool gxDsBRenderFrameImpl()
 	s_3dTexMode = false;
 	bool pzGate;
 	{ PZ_SUB_SCOPE(PZ_GX3D_GATE); pzGate = any3dBand && !gxRenderModeIsSoftware() && gxDs3dGeomFrameSupported(); }
+	// Task fog-edge: per-pixel 3D alpha (fog alpha != 31) only survives the readback, so such a
+	// frame's 3D layer is s_3d from gfx3d_convertedScreen (resolved by gxDsEngineA3dReadback).
+	if (pzGate && gxDs3dGeomFrameNeedsAlpha()) pzGate = false;
 	if (pzGate) {
 		geomOverlay = gxDsA3dOverlaySafe(bandCount);
 		// Not frontmost/untargeted: the pass is drawn to a texture in BG0's slot instead

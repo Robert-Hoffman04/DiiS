@@ -141,6 +141,13 @@
 //      polygon and at 0x7FFF that hide none, the fog bit on odd columns: fog is off). GxFast engaged.
 //  63  case 62 with CLRIMAGE_OFFSET x 83 / y 45 (the image wraps at 256 in both axes).
 //  64  case 34 (translucent polygons, blending) over an all-opaque clear image, scrolled x 200 / y 7.
+//  65-72  fog edge cases (Task fog-edge; GxFast). 65: case 29 (holes, fog alpha 24) with BLDCNT 2nd
+//      target = backdrop, so the fogged 3D alpha shows. 66: 65 alpha-only (DISP3DCNT bit 6).
+//      67: 65 with a fogged rear plane (CLEAR_COLOR bit 15, clear alpha 0). 68: case 29 cover
+//      (clear alpha 31) with a fogged rear plane, fog alpha 31. 69: 68 with fog alpha 10 + 2nd
+//      target backdrop. 70: case 62 (clear image) with fog, fog alpha 31, the fog bit on the
+//      opaque odd-column texels only, fogged triangles. 71: case 64 with fog (fog bit on odd
+//      columns, every polygon fogged). 72: case 62 with fog and the fog bit on alpha-0 texels too -> GxFast BAIL fog.
 
 #include <nds.h>
 #include <stdio.h>
@@ -211,6 +218,41 @@
 #define A3_CASE 34
 #endif
 #define A3_CLIPGOURAUD 0
+// 65-72: fog edge cases (see the header). A3_FOGEDGE: the variant (1-8); A3_PFOG: POLY_FOG on case 28's triangles.
+#define A3_FOGEDGE 0
+#define A3_PFOG 0
+#if A3_CASE >= 65 && A3_CASE <= 72
+#undef A3_FOGEDGE
+#if A3_CASE == 65
+#define A3_FOGEDGE 1
+#elif A3_CASE == 66
+#define A3_FOGEDGE 2
+#elif A3_CASE == 67
+#define A3_FOGEDGE 3
+#elif A3_CASE == 68
+#define A3_FOGEDGE 4
+#elif A3_CASE == 69
+#define A3_FOGEDGE 5
+#elif A3_CASE == 70
+#define A3_FOGEDGE 6
+#elif A3_CASE == 71
+#define A3_FOGEDGE 7
+#else
+#define A3_FOGEDGE 8
+#endif
+#undef A3_CASE
+#if A3_FOGEDGE <= 5
+#define A3_CASE 29
+#elif A3_FOGEDGE == 7
+#undef A3_PFOG
+#define A3_PFOG POLY_FOG
+#define A3_CASE 64
+#else
+#undef A3_PFOG
+#define A3_PFOG POLY_FOG
+#define A3_CASE 62
+#endif
+#endif
 // 62-64: rear-plane clear image (see the header). A3_CLRIMG: 1 plain, 2 scrolled, 3 opaque + scrolled.
 #define A3_CLRIMG 0
 #if A3_CASE >= 62 && A3_CASE <= 64
@@ -863,7 +905,7 @@ static void transScene(void)
 	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
 	GFX_TEX_FORMAT = 0;
 #if !A3_QUADPROBE
-	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(10));
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(10) | A3_PFOG);
 	glBegin(GL_TRIANGLES);
 		glColor3b(250, 40, 40);  glVertex3f(-1.2f,  0.9f,  0.3f);
 		glColor3b(40, 250, 40);  glVertex3f(-1.2f, -0.9f, -0.3f);
@@ -872,7 +914,7 @@ static void transScene(void)
 #endif
 	// opaque quad (list position 2; drawn first by the rasterizer's sort). Flat colour: a
 	// 4-colour Gouraud quad is not reproduced by GX's two-triangle split (case 37).
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PFOG);
 	glBegin(GL_QUADS);
 #if A3_QUADPROBE
 		glColor3b(200, 200, 60); glVertex3f(-1.4f,  0.6f, 0.0f);
@@ -890,7 +932,7 @@ static void transScene(void)
 	glEnd();
 #endif
 	// B: translucent, alpha 20, depth write on, in front of A on the right
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(11) | T_ZW);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(11) | T_ZW | A3_PFOG);
 	glBegin(GL_TRIANGLES);
 		glColor3b(250, 250, 40); glVertex3f(-0.2f,  0.8f, 0.5f);
 		glColor3b(40, 250, 250); glVertex3f(-0.2f, -0.5f, 0.5f);
@@ -898,24 +940,24 @@ static void transScene(void)
 	glEnd();
 	// C: translucent, alpha 16, no depth write, behind B (rejected where B wrote depth) and
 	// partly behind A (blended over it, A wrote no depth)
-	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(12));
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(12) | A3_PFOG);
 	glBegin(GL_TRIANGLES);
 		glColor3b(120, 250, 120); glVertex3f(-1.0f,  0.3f, 0.15f);
 		glColor3b(250, 120, 60);  glVertex3f( 1.2f,  0.9f, 0.15f);
 		glColor3b(60, 120, 250);  glVertex3f( 0.8f, -0.6f, 0.15f);
 	glEnd();
 	// A3I5, alpha 31, no depth write: opaque texels (alpha 7) write colour + depth
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13));
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13) | A3_PFOG);
 	tQuad(texA3I5, 0.1f, -1.0f, 1.4f, -0.1f, 0.2f, 0.25f, 24, 24);
 	// A5I3, alpha 20, depth write on
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(14) | T_ZW);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(14) | T_ZW | A3_PFOG);
 	tQuad(texA5I3, 0.3f, -0.3f, 1.45f, 0.95f, -0.2f, 0.35f, 16, 16);
 	// direct colour (opaque format), polygon alpha 16
-	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(15));
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(15) | A3_PFOG);
 	tQuad(texDir, -1.45f, -1.0f, -0.2f, -0.2f, 0.35f, 0.1f, 16, 16);
 #if A3_SAMEID
 	// two overlapping translucent quads, same ID 20: the second is dropped where the first drew
-	glPolyFmt(POLY_ALPHA(10) | POLY_CULL_NONE | POLY_ID(20));
+	glPolyFmt(POLY_ALPHA(10) | POLY_CULL_NONE | POLY_ID(20) | A3_PFOG);
 	GFX_TEX_FORMAT = 0;
 	glBegin(GL_QUADS);
 		glColor3b(255, 255, 255); glVertex3f(-1.3f, 1.0f, 0.45f);
@@ -1070,7 +1112,7 @@ static void draw3D(void)
 	// Y rotation from above (genuinely oblique on two axes at once, not aligned to either
 	// screen edge), four flat-coloured opaque triangles spanning a wide depth range.
 	glRotatef(15.0f, 1.0f, 0.0f, 0.0f);
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PFOG);
 	glBegin(GL_TRIANGLES);
 		// 1: near-ish, oblique in depth
 		glColor3b(220, 40, 40);
@@ -1199,7 +1241,9 @@ static void clearImageSetup(void)
 			if (((x >> 4) & 7) == 6 && ((y >> 4) & 1) == 0) d = 0x7FFF;
 			if (d > 0x7FFF) d = 0x7FFF;
 			col[y * 256 + x] = c;
-			dep[y * 256 + x] = (u16)(d | ((x & 1) << 15));
+			u32 fb = (x & 1) << 15;
+			if ((A3_FOGEDGE == 6 || A3_FOGEDGE == 7) && !(c & 0x8000)) fb = 0;   // case 70/71: opaque texels only
+			dep[y * 256 + x] = (u16)(d | fb);
 		}
 	vramSetBankA(VRAM_A_TEXTURE_SLOT2);
 	vramSetBankB(VRAM_B_TEXTURE_SLOT3);
@@ -1374,8 +1418,32 @@ int main(void)
 	glEnable(GL_ANTIALIAS);
 #endif
 	(void)fog;
+#if A3_FOGEDGE == 4 || A3_FOGEDGE == 5
+	cover = 1;
+#endif
 	if (cover) glClearColor(6, 10, 18, 31); else glClearColor(0, 0, 0, 0);
 	glClearPolyID(63);
+#if A3_FOGEDGE
+	// Task fog-edge (cases 65-72): fog colour (2, 6, 24), alpha per case; shift 0 / offset 0 as case 29.
+	glEnable(GL_FOG);
+	glFogShift(0);
+	glFogOffset(0);
+	for (int i = 0; i < 32; i++) glFogDensity(i, i * 4);
+	glFogColor(2, 6, 24, A3_FOGEDGE == 5 ? 10 : (A3_FOGEDGE <= 3 ? 24 : 31));
+#if A3_FOGEDGE == 2
+	glEnable(GL_FOG_ONLY_ALPHA);
+#endif
+#if A3_FOGEDGE <= 3
+	M_BLDCNT = (L_BD << 8);   // 3D alpha blends with the backdrop
+#elif A3_FOGEDGE == 5
+	M_BLDCNT = (L_BD << 8);
+#endif
+#if A3_FOGEDGE >= 3 && A3_FOGEDGE <= 5
+	// the rear plane fogged: CLEAR_COLOR bit 15 (write-only, so the whole value)
+	GFX_CLEAR_COLOR = cover ? (6 | (10 << 5) | (18 << 10) | 0x8000 | (31u << 16) | (63u << 24))
+	                        : (0x8000 | (63u << 24));
+#endif
+#endif
 	glClearDepth(0x7FFF);
 	glViewport(0, 0, 255, 191);
 #if A3_CLRIMG
