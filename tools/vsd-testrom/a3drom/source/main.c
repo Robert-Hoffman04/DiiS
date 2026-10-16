@@ -171,6 +171,10 @@
 //      triangle with a vertex exactly at the eye (clip (0, 0, 0, 0), not clipped).
 //  94-95  3D brighten/darken while the 3D layer is drawn as a texture (Task a3dtex-slow; BG3 in front). 94: holes,
 //      darken BG0 EVY 6, no 2nd targets. 95: cover, darken BG0 and BG3 EVY 11.
+//  96-97  windows + brighten/darken (Task winfade). With windows on, GPU.cpp fades the 3D layer wherever the
+//      region's effect bit is set, BG0 1st target or not, and the backdrop by the previous line's stale blend1.
+//      96: holes, WIN0 + darken EVY 9, 1st targets BG2|OBJ (not BG0), effect inside WIN0 only.
+//      97: cover, WIN0 + WIN1 + brighten EVY 7, 1st target BG3 only, effect in WIN1 and outside.
 
 #include <nds.h>
 #include <stdio.h>
@@ -470,6 +474,8 @@
 #define M_BG0HOFS R16(0x04000010)
 #define M_WIN0H   R16(0x04000040)
 #define M_WIN0V   R16(0x04000044)
+#define M_WIN1H   R16(0x04000042)
+#define M_WIN1V   R16(0x04000046)
 #define M_WININ   R16(0x04000048)
 #define M_WINOUT  R16(0x0400004A)
 #define M_MOSAIC  R16(0x0400004C)
@@ -1545,6 +1551,19 @@ int main(void)
 	// Task a3dtex-slow: cover, darken BG0 and BG3 (same key, EVY 11), BG3 in front
 	cover = 1;
 	M_BLDCNT = (3 << 6) | L_BG0 | L_BG3; M_BLDY = 11;
+#elif A3_CASE == 96
+	dcnt |= (1u << 13);
+	M_WIN0H = (40 << 8) | 200; M_WIN0V = (30 << 8) | 150;
+	M_WININ = (L_BG0 | L_BG2 | L_OBJ | 32); M_WINOUT = (L_BG0 | L_BG1 | L_BG2 | L_BG3 | L_OBJ);
+	M_BLDCNT = (3 << 6) | L_BG2 | L_OBJ; M_BLDY = 9;
+#elif A3_CASE == 97
+	cover = 1;
+	dcnt |= (3u << 13);
+	M_WIN0H = (20 << 8) | 140; M_WIN0V = (20 << 8) | 120;
+	M_WIN1H = (100 << 8) | 230; M_WIN1V = (60 << 8) | 170;
+	M_WININ = (L_BG0 | L_BG3 | L_OBJ) | ((L_BG0 | L_BG3 | L_OBJ | 32) << 8);
+	M_WINOUT = (L_BG0 | L_BG1 | L_BG3 | L_OBJ | 32);
+	M_BLDCNT = (2 << 6) | L_BG3; M_BLDY = 7;
 #elif A3_CASE == 14
 	;
 #elif A3_CASE == 15

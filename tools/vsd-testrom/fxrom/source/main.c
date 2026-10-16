@@ -36,6 +36,11 @@
 //  21  windows + semi sprites + alpha, effect bits differ per region
 //  22  MASTER_BRIGHT up, factor 16 (all white) 
 //  23  alpha with a mix of window regions where a layer is off inside WIN1
+//  24-26  windows + brighten/darken (task winfade). GPU.cpp's windowed backdrop fades by the stale `blend1`
+//      the previous line's last layer left (not BLDCNT bit 5), per window effect bit.
+//  24  WIN0 + WIN1 + darken EVY 7, no sprites, T1 = BG0|BG2 (backdrop NOT a target), effect off in WIN1
+//  25  WIN0 + brighten EVY 9, T1 = BG1|OBJ|BD, OBJ dropped from T1 at line 96 (HBlank IRQ)
+//  26  WIN0 + darken EVY 10, no sprites, T1 = BG0, BG0 moved to priority 3 at line 96 (HBlank IRQ)
 
 #include <nds.h>
 #include <stdio.h>
@@ -146,6 +151,21 @@ static void hb(void)
 }
 #endif
 
+#if FX_CASE == 25
+static void hb(void)
+{
+	if (REG_VCOUNT == 95) SUB_BLDCNT = (2 << 6) | L_BG1 | L_BD;
+	else if (REG_VCOUNT == 261 || REG_VCOUNT == 262) SUB_BLDCNT = (2 << 6) | L_BG1 | L_OBJ | L_BD;
+}
+#endif
+#if FX_CASE == 26
+static void hb(void)
+{
+	if (REG_VCOUNT == 95) REG_BG0CNT_SUB = (REG_BG0CNT_SUB & ~3) | BG_PRIORITY(3);
+	else if (REG_VCOUNT == 261 || REG_VCOUNT == 262) REG_BG0CNT_SUB = (REG_BG0CNT_SUB & ~3) | BG_PRIORITY(0);
+}
+#endif
+
 int main(void)
 {
 	irqEnable(IRQ_VBLANK);
@@ -242,6 +262,26 @@ int main(void)
 	SUB_WININ = (L_BG0 | L_BG1 | L_BG2 | FXB) | ((L_BG0 | L_BG2 | FXB) << 8);     // BG1 absent inside WIN1
 	SUB_WINOUT = (L_BG0 | L_BG1 | L_BG2 | FXB);
 	SUB_BLDCNT = (1 << 6) | L_BG0 | ((L_BG1 | L_BG2 | L_BD) << 8); SUB_BLDALPHA = 6 | (10 << 8);
+#elif FX_CASE == 24
+	objs = 0; SUB_DISPCNT &= ~DISPLAY_SPR_ACTIVE;
+	SUB_DISPCNT |= (3u << 13);
+	SUB_WIN0H = (20 << 8) | 140; SUB_WIN0V = (20 << 8) | 120;
+	SUB_WIN1H = (100 << 8) | 230; SUB_WIN1V = (60 << 8) | 170;
+	SUB_WININ = (L_BG0 | L_BG2 | FXB) | ((L_BG1 | L_BG2) << 8); SUB_WINOUT = (L_BG1 | L_BG2 | FXB);
+	SUB_BLDCNT = (3 << 6) | L_BG0 | L_BG2; SUB_BLDY = 7;
+#elif FX_CASE == 25
+	SUB_DISPCNT |= (1u << 13);
+	SUB_WIN0H = (40 << 8) | 200; SUB_WIN0V = (30 << 8) | 150;
+	SUB_WININ = (L_BG0 | L_OBJ | FXB); SUB_WINOUT = (L_BG1 | L_BG2 | L_OBJ | FXB);
+	SUB_BLDCNT = (2 << 6) | L_BG1 | L_OBJ | L_BD; SUB_BLDY = 9;
+	irqSet(IRQ_HBLANK, hb); irqEnable(IRQ_HBLANK);
+#elif FX_CASE == 26
+	objs = 0; SUB_DISPCNT &= ~DISPLAY_SPR_ACTIVE;
+	SUB_DISPCNT |= (1u << 13);
+	SUB_WIN0H = (40 << 8) | 200; SUB_WIN0V = (30 << 8) | 150;
+	SUB_WININ = (L_BG0 | L_BG1 | FXB); SUB_WINOUT = (L_BG0 | L_BG2 | FXB);
+	SUB_BLDCNT = (3 << 6) | L_BG0; SUB_BLDY = 10;
+	irqSet(IRQ_HBLANK, hb); irqEnable(IRQ_HBLANK);
 #endif
 
 	if (objs) setupObjs(semi, overlap);

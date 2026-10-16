@@ -234,11 +234,18 @@
        CPU in the EFB readback loop through the same per-channel tables (factor
        16 => all white / all black), i.e. after the GX composite exactly like
        GPU_RenderLine_MasterBrightness runs after the CPU one. No GX pass.
-     - Still bails: OBJ window; mosaic (BG and OBJ; unchanged); a window
-       combined with brighten/darken ("winfade": GPU.cpp's windowed backdrop tests
-       a STALE `blend1` left by the previous line's last layer, a quirk with no
-       model here); two bands needing different (mode, EVY) fade variants
-       ("fadekeys").
+     - Window combined with brighten/darken (task winfade, exact): GPU.cpp's
+       windowed backdrop tests a STALE `blend1` (the 1st-target bit of the
+       layer the PREVIOUS line composited last, not BLDCNT bit 5) and the
+       region's effect bit. Stage 0 replays that chain per line (s_bdB1: live
+       value at line 0, advanced like GPU_RenderLine_layer / skipped on a
+       saturated-MASTER_BRIGHT line), and the band draws a faded backdrop
+       quad per window run and per line span. Engine A's 3D layer with
+       windows fades by the region's effect bit alone (renderline_checkWindows
+       overwrites the BG0 1st-target seed), also reproduced.
+       -DDSB_MUTATE_WINFADE restores the old "winfade" bail.
+     - Still bails: OBJ window; mosaic (BG and OBJ; unchanged); two bands
+       needing different (mode, EVY) fade variants ("fadekeys").
      - Two big-endian bugs in the CPU reference's backdrop were fixed on the way
        (GPU.cpp GPU_RenderLine_layer): the brighten/darken backdrop fill indexed
        the fade table with a byte-swapped colour, and the windowed per-pixel

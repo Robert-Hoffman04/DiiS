@@ -246,6 +246,10 @@ static bool s_frameBaseBlocksKnown = false;
 #endif
 // Task 9: per-scanline MASTER_BRIGHT mode (0 none, 1 up, 2 down) and factor (0..16).
 static u8 s_mbMode[192], s_mbFac[192];
+// Task winfade: per scanline, the `blend1` GPU.cpp's WINDOWED backdrop path tests at that line
+// (stale state, see gxDsBLineEndBlend1), and the running value the next line will see.
+static u8 s_bdB1[192];
+static bool s_b1Run = false;
 
 // ---------------------------------------------------------------------
 // Queue item 13j: DEFERRED CPU compositing ("lazy lines").
@@ -663,6 +667,7 @@ static u16 *s_objBakeScratch;
 // BLDY fades, and GX draws read texture memory asynchronously, so the texel of an
 // earlier band must not be rewritten while its draw is still queued).
 static GXTexObj s_backdropTexObj[GX_DSB_MAX_BAND_REGS];
+static GXTexObj s_backdropFxTexObj[GX_DSB_MAX_BAND_REGS];   // task winfade: the band's faded backdrop (2nd half of the data)
 static void *s_backdropTexData;
 
 static void *s_copyBackBuf;
@@ -782,12 +787,14 @@ bool GXDS_API(RenderInit)()
 		s_objTexFx[i].tlutData = NULL;
 	}
 
-	s_backdropTexData = memalign(32, 32 * GX_DSB_MAX_BAND_REGS); // 32B = GX minimum texture allocation granularity
+	s_backdropTexData = memalign(32, 2 * 32 * GX_DSB_MAX_BAND_REGS); // 32B = GX minimum texture allocation granularity
 	if (!s_backdropTexData) return false;
-	memset(s_backdropTexData, 0, 32 * GX_DSB_MAX_BAND_REGS);
+	memset(s_backdropTexData, 0, 2 * 32 * GX_DSB_MAX_BAND_REGS);
 	for (int b = 0; b < GX_DSB_MAX_BAND_REGS; ++b) {
 		GX_InitTexObj(&s_backdropTexObj[b], (u8 *)s_backdropTexData + 32 * b, 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 		GX_InitTexObjFilterMode(&s_backdropTexObj[b], GX_NEAR, GX_NEAR); // see gxDsBBakeBgPlane
+		GX_InitTexObj(&s_backdropFxTexObj[b], (u8 *)s_backdropTexData + 32 * (GX_DSB_MAX_BAND_REGS + b), 1, 1, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_backdropFxTexObj[b], GX_NEAR, GX_NEAR);
 	}
 	gxDsBInitFadeTables();
 
@@ -1014,13 +1021,15 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 	s_frameExtObjPal = d.ExOBJPalette_Enable;
 	s_frameExtBgPalKnown = true;
 	// Task 9: WIN0/WIN1, BLDCNT effects, semi-transparent OBJ and MASTER_BRIGHT are
-	// now in scope. Still out: the OBJ window (a sprite-shaped mask), and a
-	// window combined with brighten/darken -- GPU.cpp's WINDOWED backdrop path
-	// tests `blend1 && windowEffect` where `blend1` is stale state left by
-	// whichever layer the PREVIOUS line composited last (it is not the backdrop's
-	// own BLDCNT bit), a CPU quirk this file has no model for.
+	// now in scope. Still out: the OBJ window (a sprite-shaped mask). A window
+	// combined with brighten/darken is in scope since task winfade: GPU.cpp's
+	// WINDOWED backdrop path tests `blend1 && windowEffect` where `blend1` is stale
+	// state left by whichever layer the PREVIOUS line composited last (not the
+	// backdrop's own BLDCNT bit); Stage 0 models it per line (s_bdB1).
 	if (gpu->WINOBJ_ENABLED) { DSB_WHY("objwin"); return true; }
+#ifdef DSB_MUTATE_WINFADE   // mutation: the pre-task-winfade bail
 	if ((gpu->WIN0_ENABLED || gpu->WIN1_ENABLED) && (((gpu->BLDCNT >> 6) & 3) >= 2)) { DSB_WHY("winfade"); return true; }
+#endif
 	if (!CommonSettings.showGpu.screens[GXDS_CORE]) { DSB_WHY("hidden"); return true; }
 
 	// Mosaic: only matters when a layer actually enables it. Checked on the
@@ -1052,6 +1061,22 @@ static bool gxDsBScanlineOutOfScope(GPU *gpu)
 	if (d.OBJ_Enable && !CommonSettings.dispLayers[GXDS_CORE][4]) { DSB_WHY("hiddenobj"); return true; }
 
 	return false;
+}
+
+// Task winfade: the `blend1` GPU_RenderLine_layer leaves behind: the BLDCNT 1st-target bit of
+// the last layer it composites (BGs then OBJ, priority 3 down to 0, itemsForPriority[].BGs
+// order), or `b1` unchanged if no layer is enabled.
+static bool gxDsBLineEndBlend1(const GPU *gpu, bool b1)
+{
+	if (gpu->LayersEnable[4]) return ((gpu->BLDCNT >> 4) & 1) != 0;   // OBJ always composites last
+	if (!(gpu->LayersEnable[0] || gpu->LayersEnable[1] || gpu->LayersEnable[2] || gpu->LayersEnable[3]))
+		return b1;
+	for (int prio = NB_PRIORITIES - 1; prio >= 0; --prio) {
+		const itemsForPriority_t &it = gpu->itemsForPriority[prio];
+		for (int i = 0; i < it.nbBGs; ++i)
+			if (gpu->LayersEnable[it.BGs[i]]) b1 = ((gpu->BLDCNT >> it.BGs[i]) & 1) != 0;
+	}
+	return b1;
 }
 
 static void gxDsBScanlineTrace(int line)
@@ -1100,6 +1125,20 @@ static void gxDsBScanlineTrace(int line)
 		const int m = gpu->MasterBrightMode;
 		s_mbMode[line] = (u8)((m == 1 || m == 2) ? m : 0);
 		s_mbFac[line] = (u8)((m == 1 || m == 2) ? f : 0);
+	}
+
+	// Task winfade: GPU_RenderLine_layer fills a windowed backdrop BEFORE its layer loop, so the
+	// `blend1` it tests there is whatever the previous layer pass left. Line 0 takes the live
+	// value (no line of this frame has been composited yet); every line the CPU composites then
+	// advances it, deferred or not (same rule GPU_DiscardDeferredLines replays). A saturated
+	// MASTER_BRIGHT line skips the layer pass in GPU_RenderLine and leaves it alone.
+	{
+		if (line == 0) s_b1Run = gpu->blend1;
+		s_bdB1[line] = (u8)s_b1Run;
+		const int m = gpu->MasterBrightMode;
+		const bool mbSkip = gpu->MasterBrightFactor >= 16 && (m == 1 || m == 2) &&
+		                    !(GXDS_CORE == 0 && (gpu->dispCapCnt.enabled || line == 0 || line == 191));
+		if (!mbSkip) s_b1Run = gxDsBLineEndBlend1(gpu, s_b1Run);
 	}
 
 	if (gxDsBScanlineOutOfScope(gpu)) {
@@ -2624,7 +2663,7 @@ static void gxDsBBakeObjTexture(const GxDsBObjDraw &d, GxDsBObjTexSlot &slot)
 	slot.valid = true;
 }
 
-static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
+static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl, bool fxSlot = false)
 {
 	// GPU_RenderLine_layer(): backdrop colour is BG palette entry 0 of this
 	// engine's own 1KB palette half, masked to 15 bits. With no window and a
@@ -2632,7 +2671,7 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl)
 	// (BLDCNT bit 5) the CPU fades it too (case 2/3 of its backdrop switch).
 	u16 c = (u16)(T1ReadWord(MMU.ARM9_VMEM, kDsBBgPalOff) & 0x7FFF);
 	if (fadeMode) c = gxDsBFadeColor(c, fadeMode, fadeLvl);
-	u16 *t = (u16 *)((u8 *)s_backdropTexData + 32 * band);
+	u16 *t = (u16 *)((u8 *)s_backdropTexData + 32 * (fxSlot ? GX_DSB_MAX_BAND_REGS + band : band));
 	t[0] = gxPackRGB5A3Opaque(gxExtractBGR555(c));
 	DCFlushRange(t, 32);
 }
@@ -2911,6 +2950,7 @@ struct GxDsBBandPlan {
 	u8 blendLive[3];       // per cfg, slot-indexed (BG b -> bit b, OBJ tier p -> bit 4+p): items that really alpha-blend
 	u8 tierHas, tierSemi;  // bit p: a sprite / a semi-transparent sprite of priority p touches this band
 	bool backdropFade;
+	bool backdropWinFade;  // task winfade: windows + brighten/darken -> backdrop faded per line/region (s_bdB1)
 	bool windows;
 };
 static GxDsBBandPlan s_bandPlan[GX_DSB_MAX_BAND_REGS];
@@ -3075,6 +3115,9 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 	}
 	gxDsBBuildRegions(r, y0, y1, p);
 	p.backdropFade = !p.windows && p.mode >= 2 && (p.t1 & 0x20);
+	// Windowed: GPU.cpp ignores BLDCNT bit 5 there and tests the stale `blend1` per line instead
+	// (gxDsBDrawBackdropWinFade).
+	p.backdropWinFade = p.windows && p.mode >= 2;
 
 	bool needOverlapCheck = false, anyLive = false;
 	for (int c = 0; c < 3; ++c) {
@@ -3088,6 +3131,11 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				gxDsBResolveFx(p, cf, bg, false, fade, want);
 #if GXDS_CORE == 0
 				if (bg == 0 && r.bg3d) {
+					// Task winfade: _master_setFinal3dColor seeds windowEffect with blend1 (BG0's
+					// 1st-target bit) but renderline_checkWindows then overwrites it with the
+					// region's effect bit, so with windows on the 3D layer fades wherever the
+					// region allows it, 1st target or not.
+					if (p.windows) fade = cf.effect && p.mode >= 2;
 					// The 3D layer (_master_setFinal3dColor): the alpha EFFECT is never applied to it;
 					// over a 2nd-target layer an opaque texel is written UNFADED and a translucent one
 					// is blended; over anything else it is faded iff BG0 is a 1st target.
@@ -3498,6 +3546,29 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 			if (r.bgType[bg] == (u8)BGType_Text) gxDsBDrawBgQuad(pc, r, bg, y0, y1);
 			else gxDsBDrawAffineBgQuad(pc, r, bg, y0, y1);
 			if (ab) gxDsBTevAlphaABEnd();
+		}
+	}
+}
+
+// Task winfade: GPU.cpp's windowed backdrop (___setFinalColorBck<..., WINDOW>) is faded where
+// the line's stale `blend1` (s_bdB1) and the window region's effect bit are both set. Drawn over
+// the band's plain backdrop quad, per run and per span of lines with blend1 set. Leaves the
+// scissor wherever the last quad put it (the caller restores the band's).
+static void gxDsBDrawBackdropWinFade(int b, const GxDsBBandPlan &p)
+{
+	for (int si = 0; si < p.nslab; ++si) {
+		const GxDsBSlab &sl = p.slab[si];
+		for (int y = sl.y0; y < sl.y1; ) {
+			if (!s_bdB1[y]) { ++y; continue; }
+			int ye = y + 1;
+			while (ye < sl.y1 && s_bdB1[ye]) ++ye;
+			for (int ri = 0; ri < sl.nrun; ++ri) {
+				const GxDsBRun &ru = sl.run[ri];
+				if (!p.cfg[ru.cfg].effect) continue;
+				GX_SetScissor(ru.x0, y, ru.x1 - ru.x0, ye - y);
+				gxDsBDrawQuad(&s_backdropFxTexObj[b], 0, (f32)y, (f32)kDsBScreenW, (f32)ye, 0, 0, 1, 1);
+			}
+			y = ye;
 		}
 	}
 }
@@ -4728,6 +4799,7 @@ static bool gxDsBRenderFrameImpl()
 	for (int b = 0; b < bandCount; ++b) {
 		PZ_SUB_SCOPE(PZ_2D_BAKE_BD);
 		gxDsBBakeBackdrop(b, s_bandPlan[b].backdropFade ? s_bandPlan[b].mode : 0, s_bandPlan[b].evy);
+		if (s_bandPlan[b].backdropWinFade) gxDsBBakeBackdrop(b, s_bandPlan[b].mode, s_bandPlan[b].evy, true);
 	}
 
 #if GXDS_CORE == 0
@@ -4812,6 +4884,7 @@ static bool gxDsBRenderFrameImpl()
 		// order (itemsForPriority[].BGs is filled by GPU_resortBGs() walking
 		// i = 3..0, and the sprite composite runs after the BG loop).
 		gxDsBDrawQuad(&s_backdropTexObj[b], 0, (f32)y0, (f32)kDsBScreenW, (f32)y1, 0, 0, 1, 1);
+		if (pl.backdropWinFade) { gxDsBDrawBackdropWinFade(b, pl); GX_SetScissor(0, y0, kDsBScreenW, y1 - y0); }
 
 		for (int prio = 3; prio >= 0; --prio) {
 			for (int bg = 3; bg >= 0; --bg) {
@@ -5057,7 +5130,7 @@ static bool gxDsBRenderFrameImpl()
 	for (int b = 0; b < bandCount; ++b) {
 		const GxDsBBandPlan &pl = s_bandPlan[b];
 		if (pl.windows) s_dsbFrWin = true;
-		if (pl.fadeBg || pl.fadeObj || pl.backdropFade) s_dsbFrFade = true;
+		if (pl.fadeBg || pl.fadeObj || pl.backdropFade || pl.backdropWinFade) s_dsbFrFade = true;
 		if (pl.blendLive[0] | pl.blendLive[1] | pl.blendLive[2]) s_dsbFrAlpha = true;
 	}
 	for (int i = 0; i < s_objDrawCount; ++i)
