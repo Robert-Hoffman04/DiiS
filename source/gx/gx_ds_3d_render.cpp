@@ -193,6 +193,65 @@ static bool gxDs3dFastXformBuild(const POLY &p, GxDs3dFastXform &x, bool wbuf, f
 	return true;
 }
 
+// Task gate-remaining: the projection for a polygon whose matrices gxDs3dFastXformBuild can't
+// fold (a modelview with a non-affine bottom row, a depth row not affine in w, or the zero
+// matrices of polygons loaded from a savestate, which doesn't hold them: SM64DS's first 3D
+// frame after a load). gxDs3dFastPoly then draws it from its clip-space vertices like a clipped
+// polygon (PNMTX1 = identity: (X, Y, -W) perspective, or (X/W, Y/W, Z/W) orthographic), so only
+// the projection depends on it:
+//  - W-buffer: depth is 1 - K/w whatever the matrices, the canonical W projection. Exact as
+//    any GxFast W-buffer polygon.
+//  - Z-buffer, z = alpha w + beta on the polygon's vertices (fitted from them; holds for every
+//    representable P, so for the savestate case): the perspective projection of that alpha /
+//    beta, as gxDs3dFastXformBuild's. The fit is float: depth within ~1e-6 of it.
+//  - Z-buffer, all w equal: orthographic, exact (affine = perspective interpolation then).
+//  - otherwise (depth not affine in w on this polygon): orthographic on the divided vertices.
+//    Depth and outline are the CPU's (both are linear in screen space), but colours and
+//    texcoords are interpolated affinely instead of perspective-correct: this polygon only.
+// The clipper's vertices of a clipped polygon are affine combinations of its own, so the same
+// fit holds for them.
+static void gxDs3dFastXformVerts(const POLY &p, GxDs3dFastXform &x, bool wbuf, float wK)
+{
+	memset(x.proj, 0, sizeof(x.proj));
+	x.proj[0][0] = 1; x.proj[1][1] = 1;
+	if (wbuf) {
+		x.proj[2][3] = -wK;
+		x.proj[3][2] = -1;
+		x.projType = GX_PERSPECTIVE;
+		return;
+	}
+	const VERT *v[4];
+	int a = 0, b = 0;
+	float wmax = 0;
+	for (int j = 0; j < p.type; ++j) {
+		v[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
+		if (v[j]->coord[3] < v[a]->coord[3]) a = j;
+		if (v[j]->coord[3] > v[b]->coord[3]) b = j;
+		const float aw = fabsf(v[j]->coord[3]);
+		wmax = aw > wmax ? aw : wmax;
+	}
+	const float dw = v[b]->coord[3] - v[a]->coord[3];
+	bool persp = false;
+	if (dw > 1e-4f * wmax) {
+		const float alpha = (v[b]->coord[2] - v[a]->coord[2]) / dw;
+		const float beta = v[a]->coord[2] - alpha * v[a]->coord[3];
+		persp = true;
+		for (int j = 0; j < p.type; ++j)
+			persp &= fabsf(v[j]->coord[2] - (alpha * v[j]->coord[3] + beta)) <= 1e-4f * (wmax > 1.0f ? wmax : 1.0f);
+		if (persp) {
+			x.proj[2][2] = (1.0f - alpha) * 0.5f;
+			x.proj[2][3] = beta * 0.5f;
+			x.proj[3][2] = -1;
+			x.projType = GX_PERSPECTIVE;
+		}
+	}
+	if (!persp) {
+		x.proj[2][2] = 0.5f; x.proj[2][3] = -0.5f;
+		x.proj[3][3] = 1;
+		x.projType = GX_ORTHOGRAPHIC;
+	}
+}
+
 // ---------------------------------------------------------------------------------
 // Textured polygons (gx-remaining-work.md section 1, "Textured polygons").
 //
@@ -896,7 +955,9 @@ static bool gxDs3dTransShapeBuild(const POLY &p, const VERT *const *cv, int n, G
 	VIEWPORT vp;
 	vp.decode(p.viewport);
 	float fx[MAX_CLIPPED_VERTS], fy[MAX_CLIPPED_VERTS];
-	for (int j = 0; j < n; ++j) gxDs3dScreenXY(*cv[j], vp, fx[j], fy[j]);
+	bool atEye = false;   // a vertex with w <= 0 (Task gate-remaining): GxFast draws nothing for it, see gxDs3dFrameGate
+	for (int j = 0; j < n; ++j) { gxDs3dScreenXY(*cv[j], vp, fx[j], fy[j]); atEye |= cv[j]->coord[3] <= 0.0f; }
+	if (atEye) return false;
 	float facing = (fy[0] + fy[n - 1]) * (fx[0] - fx[n - 1]);
 	for (int j = 0; j < n - 1; ++j) facing += (fy[j + 1] + fy[j]) * (fx[j + 1] - fx[j]);
 	const bool back = facing < 0;
@@ -1986,7 +2047,9 @@ static int gxDs3dFrameGate(bool requireTex)
 	s_gateToon = false;
 	s_shGroupCount = 0;
 	s_shIdAt = -1;
+#ifdef DSA_GXGEOM_MUTATE_FASTPROJ
 	const POLY *lastP = NULL;   // last polygon whose matrices passed fastproj
+#endif
 	for (int i = 0; i < polycount; ++i) {
 		POLY &p = gfx3d.polylist->list[i];   // isTranslucent() is non-const in POLY
 		// Shadow volumes (see the shadow section): GxFast, RGB8 EFB. Task shadow-cases: opaque-list
@@ -2071,6 +2134,12 @@ static int gxDs3dFrameGate(bool requireTex)
 		// (the polygon passes exactly through the eye). GxAccurate clips here to rule that out;
 		// GxFast doesn't (SM64DS clips ~1500 polygons a frame, and the gate runs on every frame):
 		// gxDs3dRenderFast skips such a polygon, where the CPU would divide by zero.
+		// Task gate-remaining: the same for an UNCLIPPED vertex with w <= 0. Inside the clip
+		// volume means -w <= x, y, z <= w, so that is only (+-0, +-0, +-0, +-0): a vertex at the
+		// eye. The CPU divides 0 by 0 there (rasterize.cpp: NaN, clamped to the screen corner
+		// (256, 192), NaN depth / colour / texcoord over the whole polygon); GxFast draws nothing
+		// for it (kVisCull, and gxDs3dTransShapeBuild's w check for the plans), GxAccurate bails.
+		// -DDSA_GXGEOM_MUTATE_WEYE: GxFast bails too, as before.
 		bool clipped = false;
 		const VERT *gv[4];
 #if !defined(DSA_GXGEOM_NOCLIPCODES) && !defined(DSA_GXGEOM_NOVISCACHE)
@@ -2082,8 +2151,11 @@ static int gxDs3dFrameGate(bool requireTex)
 			const u32 o = p.clipOr & 0x3F;
 			u8 vis = (gxDs3dPolyMode(p) == 3 || p.isTranslucent()) ? kVisSpecial : ((p.polyAttr & 0x8000) ? 0 : kVisFogRedraw);
 			if (!o) {
+#ifdef DSA_GXGEOM_MUTATE_WEYE
 				if (p.clipOr & 0x40) return kGateW;
-				if (gxDs3dPolyAlpha(p) != 0) {
+#endif
+				if (p.clipOr & 0x40) vis |= kVisCull;   // a vertex at the eye (above)
+				else if (gxDs3dPolyAlpha(p) != 0) {
 					for (int j = 0; j < p.type; ++j) gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
 					vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
 				}
@@ -2111,14 +2183,21 @@ static int gxDs3dFrameGate(bool requireTex)
 			gv[j] = &gfx3d.vertlist->list[p.vertIndexes[j]];
 			clipped |= gxDs3dVertOutside(*gv[j]);
 		}
+		bool atEye = false;
 		if (!clipped) {
 			for (int j = 0; j < p.type; ++j)
-				if (gv[j]->coord[3] <= 0.0f) return kGateW;
+				atEye |= gv[j]->coord[3] <= 0.0f;
+#ifndef DSA_GXGEOM_MUTATE_WEYE
+			if (atEye && !fast) return kGateW;
+#else
+			if (atEye) return kGateW;
+#endif
 		}
 #ifndef DSA_GXGEOM_NOVISCACHE
 		if (fast) {
 			u8 vis = (gxDs3dPolyMode(p) == 3 || p.isTranslucent()) ? kVisSpecial : ((p.polyAttr & 0x8000) ? 0 : kVisFogRedraw);
-			if (gxDs3dPolyAlpha(p) != 0) {   // gxDs3dPolyInvisible
+			if (atEye) vis |= kVisCull;   // a vertex at the eye (above)
+			else if (gxDs3dPolyAlpha(p) != 0) {   // gxDs3dPolyInvisible
 				if (!clipped) vis |= gxDs3dFacingVisible(p, gv, p.type) ? kVisDraw : kVisCull;
 #ifndef DSA_GXGEOM_NOTRIVREJECT
 				else if (gxDs3dClipTrivialReject(gv, p.type)) vis |= kVisCull;
@@ -2143,11 +2222,16 @@ static int gxDs3dFrameGate(bool requireTex)
 				}
 			}
 		}
+		// Task gate-remaining: matrices gxDs3dFastXformBuild can't fold no longer bail (the
+		// polygon is drawn from its clip-space vertices, gxDs3dFastXformVerts), so the gate
+		// doesn't build them. -DDSA_GXGEOM_MUTATE_FASTPROJ: the old check and bail.
+#ifdef DSA_GXGEOM_MUTATE_FASTPROJ
 		if (fast && (!lastP || !gxDs3dMtxEq(lastP->mvMatrix, p.mvMatrix) || !gxDs3dMtxEq(lastP->projMatrix, p.projMatrix))) {
 			GxDs3dFastXform x;
 			if (!gxDs3dFastXformBuild(p, x, gfx3d.wbuffer != 0, 1.0f)) return kGateFastProj;
 			lastP = &p;
 		}
+#endif
 	}
 
 	// Task trans-blendclear (see the translucent section): which 3D alpha the translucent
@@ -3127,6 +3211,7 @@ struct GxDs3dFastCtx {
 	float lastMv[16], lastProj[16];
 	u32 lastVp;
 	bool haveLast, first, blendOn, ortho, wbuf;
+	bool vtxXf;            // Task gate-remaining: the loaded projection is gxDs3dFastXformVerts' (clip-space draw)
 	int curMtx;            // 0: PNMTX0 (the polygon's transform), 1: PNMTX1 (identity, clipped)
 	GxDs3dTexState st;
 	Mtx pos;               // PNMTX0's matrix (tag texgen)
@@ -3558,9 +3643,11 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	if (!samePtr && (!c.haveLast || vpNew || !gxDs3dMtxEq(c.lastMv, p.mvMatrix) || !gxDs3dMtxEq(c.lastProj, p.projMatrix))) {
 		GxDs3dFastXform x;
 		GXDS3D_PS(kPsMtx);
-		if (!gxDs3dFastXformBuild(p, x, c.wbuf, s_wK))
-			return;   // unreachable: gxDs3dGeomFrameSupported() checked every poly
-		GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
+		// not foldable: this polygon's own projection from its vertices, rebuilt for every such
+		// polygon (haveLast stays false), drawn from clip space (Task gate-remaining)
+		c.vtxXf = !gxDs3dFastXformBuild(p, x, c.wbuf, s_wK);
+		if (c.vtxXf) gxDs3dFastXformVerts(p, x, c.wbuf, s_wK);
+		else GX_LoadPosMtxImm(x.pos, GX_PNMTX0);
 #ifndef DSA_GXGEOM_MUTATE_VPOFFSET
 		{
 			// Screen +0.5 px right and down (GX y down, NDC y up), as
@@ -3577,11 +3664,14 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 
 		memcpy(c.lastMv, p.mvMatrix, sizeof(c.lastMv));
 		memcpy(c.lastProj, p.projMatrix, sizeof(c.lastProj));
-		c.haveLast = true;
+		c.haveLast = !c.vtxXf;
 		c.curMtx = -1;
 	}
 	c.lastMvP = p.mvMatrix; c.lastProjP = p.projMatrix;   // lastMv / lastProj hold their values now
-	// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section).
+	// Clipped polygons: clip-space positions under PNMTX1 = identity (see the clipped section);
+	// so are unclipped ones under gxDs3dFastXformVerts (their colours: VERT::color, not fcolor).
+	const bool unclipXf = c.vtxXf && !clipped;
+	clipped |= c.vtxXf;
 	if (c.curMtx != (int)clipped) {
 		GX_SetCurrentMtx(clipped ? GX_PNMTX1 : GX_PNMTX0);
 		c.curMtx = clipped;
@@ -3695,12 +3785,18 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 #ifdef DSA_GXGEOM_PROBE
 					gxDs3dSendColor(v, va);
 #else
-					if (s_toon.on) gxDs3dSendColor(v, va);
-					else if (toonLut) gxDs3dToonColor(v.fcolor[0], toonHl, va);
+					const float r6 = unclipXf ? (float)v.color[0] : v.fcolor[0];   // (as the unclipped draw below)
+					if (unclipXf && !toonLut) gxDs3dSendColor(v, va);
+					else if (s_toon.on) gxDs3dSendColor(v, va);
+					else if (toonLut) gxDs3dToonColor(r6, toonHl, va);
 					else GX_Color4u8(gxDs3dF6To8(v.fcolor[0]), gxDs3dF6To8(v.fcolor[1]), gxDs3dF6To8(v.fcolor[2]), va);
 #endif
 					if (c.st.textured) GX_TexCoord2f32(v.texcoord[0], v.texcoord[1]);
+#ifdef DSA_GXGEOM_PROBE
 					if (toonLut) GX_TexCoord2f32((v.fcolor[0] + 0.5f) * (1.0f / 64.0f), 0.5f);
+#else
+					if (toonLut) GX_TexCoord2f32((r6 + 0.5f) * (1.0f / 64.0f), 0.5f);
+#endif
 				}
 				GX_End();
 				continue;

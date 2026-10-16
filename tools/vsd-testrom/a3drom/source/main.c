@@ -165,6 +165,10 @@
 //      so that alpha shows. 84: case 34 over a clear of alpha 0 (magenta: first fragments are written, not blended).
 //      85: case 34 over a clear of alpha 12. 86: case 34 with blending off (DISP3DCNT bit 3). 87: 86 over a clear of
 //      alpha 0. 88: case 46 (tagged same-ID runs) over a clear of alpha 0. 89: case 64 with the image's holes.
+//  90-93  matrices GxFast can't fold into GX's (Task gate-remaining). 90: case 31 with the clip matrix loaded as the
+//      modelview and an identity projection (non-affine modelview bottom row; depth still affine in w). 91: 90 with
+//      depth += x/32 (depth not affine in w). 92: 90 in W-buffer mode. 93: case 28 plus an opaque and a translucent
+//      triangle with a vertex exactly at the eye (clip (0, 0, 0, 0), not clipped).
 
 #include <nds.h>
 #include <stdio.h>
@@ -194,6 +198,28 @@
 #else
 #undef A3_CASE
 #define A3_CASE 34
+#endif
+#endif
+// 90-93: unfoldable matrices / a vertex at the eye (see the header). A3_MTX: 1 fold, 2 fold + x depth, 3 eye.
+#define A3_MTX 0
+#if A3_CASE >= 90 && A3_CASE <= 93
+#undef A3_MTX
+#if A3_CASE == 91
+#define A3_MTX 2
+#elif A3_CASE == 93
+#define A3_MTX 3
+#else
+#define A3_MTX 1
+#endif
+#if A3_CASE == 92
+#undef A3_WBUF
+#define A3_WBUF GL_WBUFFERING
+#endif
+#undef A3_CASE
+#if A3_MTX == 3
+#define A3_CASE 28
+#else
+#define A3_CASE 31
 #endif
 #endif
 // 84-89: translucent polygons whose 3D alpha stays < 31 (see the header). A3_TRANSBC: case - 83.
@@ -580,10 +606,29 @@ static void texQuad(u32 tex, float x0, float y0, float x1, float y1, float z, in
 	glEnd();
 }
 
+#if A3_MTX == 1 || A3_MTX == 2
+// 90-92: the current clip matrix as the modelview, identity projection (91: depth += x/32).
+static void a3MtxFold(void)
+{
+	int clip[16];
+	glGetFixed(GL_GET_MATRIX_CLIP, clip);
+#if A3_MTX == 2
+	for (int c = 0; c < 4; ++c) clip[4 * c + 2] += clip[4 * c + 0] / 32;
+#endif
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glMatrixMode(GL_MODELVIEW);
+	glLoadMatrix4x4((const m4x4 *)clip);
+}
+#endif
+
 static void texScene(void)
 {
 	vcol = 0;
 	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
+#if A3_MTX == 1 || A3_MTX == 2
+	a3MtxFold();
+#endif
 	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PMODE);
 	texQuad(texI4,   -1.5f,  0.05f, -0.05f, 1.0f, 0.0f,   0,   0, 32, 32);   // clamp, 1 texel ~ 1.5 px
 	texQuad(texRGBA,  0.05f, 0.05f,  1.5f,  1.0f, 0.0f,   0,   0, 40, 28);   // repeat
@@ -1292,6 +1337,28 @@ static void draw3D(void)
 		glVertex3f( 0.75f, 0.1f,  0.4f);
 		glVertex3f( 0.3f, -0.65f, 0.05f);
 	glEnd();
+#if A3_MTX == 3
+	{
+		// x' = x, y' = y, z' = -z/2, w' = -z: the object origin is clip (0, 0, 0, 0)
+		static const m4x4 eyeP = { { 4096, 0, 0, 0,   0, 4096, 0, 0,   0, 0, -2048, -4096,   0, 0, 0, 0 } };
+		glMatrixMode(GL_PROJECTION);
+		glLoadMatrix4x4(&eyeP);
+		glMatrixMode(GL_MODELVIEW);
+		glLoadIdentity();
+		glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(2));
+		glBegin(GL_TRIANGLES);
+			glColor3b(250, 250, 250); glVertex3f( 0.0f,  0.0f,  0.0f);
+			glColor3b(250, 120,  20); glVertex3f(-1.0f, -0.5f, -1.0f);
+			glColor3b( 20, 120, 250); glVertex3f( 1.0f, -0.5f, -1.0f);
+		glEnd();
+		glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(3));
+		glBegin(GL_TRIANGLES);
+			glColor3b(250, 250, 250); glVertex3f( 0.0f,  0.0f,  0.0f);
+			glColor3b(250,  20, 120); glVertex3f(-1.0f,  0.5f, -1.0f);
+			glColor3b( 20, 250, 120); glVertex3f( 1.0f,  0.5f, -1.0f);
+		glEnd();
+	}
+#endif
 	glFlush(GL_TRANS_MANUALSORT | A3_WBUF);   // Z-buffer mode (W-buffer for case 32)
 	return;
 #endif
