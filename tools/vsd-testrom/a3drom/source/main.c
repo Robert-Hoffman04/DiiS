@@ -148,6 +148,11 @@
 //      target backdrop. 70: case 62 (clear image) with fog, fog alpha 31, the fog bit on the
 //      opaque odd-column texels only, fogged triangles. 71: case 64 with fog (fog bit on odd
 //      columns, every polygon fogged). 72: case 62 with fog and the fog bit on alpha-0 texels too -> GxFast BAIL fog.
+//  73-76  decal shading (POLYGON_ATTR mode 1, Task decal; GxFast). 73: case 31 (every opaque format, Gouraud
+//      colours) as decal: colour-0 / alpha-bit holes show the vertex colour. 74: case 34 with every polygon decal
+//      (untextured ones = material colour; A3I5 alpha 31 no depth write: all texels opaque; A5I3 alpha 20; direct
+//      alpha 16) and Gouraud colours on the textured quads. 75: 74 with only the textured quads decal (decal /
+//      modulate switching). 76: case 46 (tagged same-ID runs, the A5I3 quad's alpha-0 texels now draw and stamp) all decal.
 
 #include <nds.h>
 #include <stdio.h>
@@ -158,6 +163,27 @@
 #endif
 // 32/33: cases 28/30 with GL_WBUFFERING (gx-remaining-work.md section 1, W-buffer depth mode).
 #define A3_WBUF 0
+// 73-76: decal (see the header). A3_PMODE: POLYGON_ATTR mode bits of textured polygons, A3_PMODEU untextured.
+#define A3_PMODE 0
+#define A3_PMODEU 0
+#if A3_CASE >= 73 && A3_CASE <= 76
+#undef A3_PMODE
+#define A3_PMODE (1u << 4)
+#if A3_CASE != 75
+#undef A3_PMODEU
+#define A3_PMODEU (1u << 4)
+#endif
+#if A3_CASE == 73
+#undef A3_CASE
+#define A3_CASE 31
+#elif A3_CASE == 76
+#undef A3_CASE
+#define A3_CASE 46
+#else
+#undef A3_CASE
+#define A3_CASE 34
+#endif
+#endif
 #if A3_CASE == 35
 #undef A3_WBUF
 #define A3_WBUF GL_WBUFFERING
@@ -506,7 +532,7 @@ static void texScene(void)
 {
 	vcol = 0;
 	glRotatef(10.0f, 1.0f, 0.0f, 0.0f);
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PMODE);
 	texQuad(texI4,   -1.5f,  0.05f, -0.05f, 1.0f, 0.0f,   0,   0, 32, 32);   // clamp, 1 texel ~ 1.5 px
 	texQuad(texRGBA,  0.05f, 0.05f,  1.5f,  1.0f, 0.0f,   0,   0, 40, 28);   // repeat
 	texQuad(tex4x4,  -1.5f, -1.0f,  -0.05f, -0.05f, 0.0f, -3,  -2, 35, 36);  // clamp beyond both edges
@@ -658,10 +684,18 @@ static void tQuad(u32 tex, float x0, float y0, float x1, float y1, float zl, flo
 	GFX_TEX_FORMAT = tex;
 	GFX_PAL_FORMAT = 0;
 	glBegin(GL_QUADS);
+#if A3_PMODE
+		// planar colours (c3 = c0 - c1 + c2): GX's two-triangle split of a Gouraud quad (case 37) stays out of it
+		glColor3b(200, 200, 40);  glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(x0, y1, zl);
+		glColor3b(40, 120, 80);   glTexCoord2t16(inttot16(0),  inttot16(t1)); glVertex3f(x0, y0, zl);
+		glColor3b(80, 60, 220);   glTexCoord2t16(inttot16(s1), inttot16(t1)); glVertex3f(x1, y0, zr);
+		glColor3b(240, 140, 180); glTexCoord2t16(inttot16(s1), inttot16(0));  glVertex3f(x1, y1, zr);
+#else
 		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(0),  inttot16(0));  glVertex3f(x0, y1, zl);
 		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(0),  inttot16(t1)); glVertex3f(x0, y0, zl);
 		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(s1), inttot16(t1)); glVertex3f(x1, y0, zr);
 		glColor3b(255, 255, 255); glTexCoord2t16(inttot16(s1), inttot16(0));  glVertex3f(x1, y1, zr);
+#endif
 	glEnd();
 }
 
@@ -678,7 +712,7 @@ static void tagTri(float x0, float y0, float x1, float y1, float x2, float y2, f
 static void tagScene(void)
 {
 	GFX_TEX_FORMAT = 0;
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PMODEU);
 	glBegin(GL_QUADS);
 		glColor3b(200, 190, 70); glVertex3f(-1.4f,  0.9f, 0.0f);
 		glColor3b(200, 190, 70); glVertex3f(-1.4f, -0.9f, 0.0f);
@@ -686,22 +720,22 @@ static void tagScene(void)
 		glColor3b(200, 190, 70); glVertex3f(-0.6f,  0.9f, 0.0f);
 	glEnd();
 	// run of ID 21
-	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21));
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(21) | A3_PMODEU);
 	tagTri(-1.2f, 0.8f, -1.2f, -0.6f, 0.6f, 0.1f, -0.2f, 250, 40, 40);
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21) | T_ZW);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21) | T_ZW | A3_PMODEU);
 	tagTri(-0.9f, 0.3f, 0.9f, 0.9f, 0.5f, -0.7f, 0.4f, 40, 250, 120);
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21));
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(21) | A3_PMODE);
 	tQuad(texA5I3, -0.6f, -0.8f, 0.8f, 0.5f, 0.2f, 0.3f, 16, 16);
 	GFX_TEX_FORMAT = 0;
 	// ID 22 over it
-	glPolyFmt(POLY_ALPHA(14) | POLY_CULL_NONE | POLY_ID(22));
+	glPolyFmt(POLY_ALPHA(14) | POLY_CULL_NONE | POLY_ID(22) | A3_PMODEU);
 	tagTri(-0.5f, 0.6f, -0.3f, -0.5f, 0.4f, 0.0f, 0.5f, 60, 60, 250);
 	// ID 21 again, disjoint from its first run
-	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(21));
+	glPolyFmt(POLY_ALPHA(18) | POLY_CULL_NONE | POLY_ID(21) | A3_PMODEU);
 	tagTri(1.15f, 0.9f, 1.15f, -0.2f, 1.45f, 0.4f, 0.1f, 250, 250, 40);
 	tagTri(1.15f, 0.6f, 1.45f, -0.5f, 1.45f, 0.9f, 0.3f, 250, 120, 250);
 	// ID 23: 300-triangle fan
-	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(23));
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(23) | A3_PMODEU);
 	for (int k = 0; k < 300; k++) {
 		const float a = k * 1.2f * 3.14159265f / 180.0f, b = a + 25.0f * 3.14159265f / 180.0f;
 		const float cx = 0.9f, cy = -0.6f, r = 0.35f;
@@ -905,7 +939,7 @@ static void transScene(void)
 	// A: translucent, alpha 12, no depth write, crossing the opaque quad's depth
 	GFX_TEX_FORMAT = 0;
 #if !A3_QUADPROBE
-	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(10) | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(12) | POLY_CULL_NONE | POLY_ID(10) | A3_PFOG | A3_PMODEU);
 	glBegin(GL_TRIANGLES);
 		glColor3b(250, 40, 40);  glVertex3f(-1.2f,  0.9f,  0.3f);
 		glColor3b(40, 250, 40);  glVertex3f(-1.2f, -0.9f, -0.3f);
@@ -914,7 +948,7 @@ static void transScene(void)
 #endif
 	// opaque quad (list position 2; drawn first by the rasterizer's sort). Flat colour: a
 	// 4-colour Gouraud quad is not reproduced by GX's two-triangle split (case 37).
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1) | A3_PFOG | A3_PMODEU);
 	glBegin(GL_QUADS);
 #if A3_QUADPROBE
 		glColor3b(200, 200, 60); glVertex3f(-1.4f,  0.6f, 0.0f);
@@ -932,7 +966,7 @@ static void transScene(void)
 	glEnd();
 #endif
 	// B: translucent, alpha 20, depth write on, in front of A on the right
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(11) | T_ZW | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(11) | T_ZW | A3_PFOG | A3_PMODEU);
 	glBegin(GL_TRIANGLES);
 		glColor3b(250, 250, 40); glVertex3f(-0.2f,  0.8f, 0.5f);
 		glColor3b(40, 250, 250); glVertex3f(-0.2f, -0.5f, 0.5f);
@@ -940,20 +974,20 @@ static void transScene(void)
 	glEnd();
 	// C: translucent, alpha 16, no depth write, behind B (rejected where B wrote depth) and
 	// partly behind A (blended over it, A wrote no depth)
-	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(12) | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(12) | A3_PFOG | A3_PMODEU);
 	glBegin(GL_TRIANGLES);
 		glColor3b(120, 250, 120); glVertex3f(-1.0f,  0.3f, 0.15f);
 		glColor3b(250, 120, 60);  glVertex3f( 1.2f,  0.9f, 0.15f);
 		glColor3b(60, 120, 250);  glVertex3f( 0.8f, -0.6f, 0.15f);
 	glEnd();
 	// A3I5, alpha 31, no depth write: opaque texels (alpha 7) write colour + depth
-	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13) | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(13) | A3_PFOG | A3_PMODE);
 	tQuad(texA3I5, 0.1f, -1.0f, 1.4f, -0.1f, 0.2f, 0.25f, 24, 24);
 	// A5I3, alpha 20, depth write on
-	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(14) | T_ZW | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(20) | POLY_CULL_NONE | POLY_ID(14) | T_ZW | A3_PFOG | A3_PMODE);
 	tQuad(texA5I3, 0.3f, -0.3f, 1.45f, 0.95f, -0.2f, 0.35f, 16, 16);
 	// direct colour (opaque format), polygon alpha 16
-	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(15) | A3_PFOG);
+	glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_ID(15) | A3_PFOG | A3_PMODE);
 	tQuad(texDir, -1.45f, -1.0f, -0.2f, -0.2f, 0.35f, 0.1f, 16, 16);
 #if A3_SAMEID
 	// two overlapping translucent quads, same ID 20: the second is dropped where the first drew

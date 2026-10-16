@@ -80,6 +80,10 @@ static inline int gxDs3dTexFormat(const POLY &p)
 }
 // Shadow-volume roles (mode 3): polygon ID 0 = mask (stencil only), any other = draw.
 static inline int gxDs3dPolyId(const POLY &p) { return (int)((p.polyAttr >> 24) & 0x3F); }
+// Textured decal (mode 1; GxFast only, see the decal section): the texel's alpha blends it
+// over the vertex colour and the fragment alpha is the polygon's. Untextured decal is
+// shaded with the material colour (rasterize.cpp's mode 4), like untextured modulate.
+static inline bool gxDs3dDecalTex(const POLY &p) { return gxDs3dPolyMode(p) == 1 && gxDs3dTexFormat(p) != 0; }
 static inline bool gxDs3dShadowMask(const POLY &p) { return gxDs3dPolyMode(p) == 3 && gxDs3dPolyId(p) == 0; }
 static inline bool gxDs3dShadowDraw(const POLY &p) { return gxDs3dPolyMode(p) == 3 && gxDs3dPolyId(p) != 0; }
 
@@ -276,9 +280,11 @@ static u32 s_atRef = 0;   // alpha test ref (0 = off), latched at VBlank end wit
 static inline int gxDs3dPolyAlpha(const POLY &p) { return (int)((p.polyAttr >> 16) & 0x1F); }
 static inline bool gxDs3dTexFmtTrans(int fmt) { return fmt == 1 || fmt == 6; }
 static inline u8 gxDs3dGxAlpha(int a) { return a >= 31 ? 255 : (a <= 0 ? 0 : (u8)(8 * (a + 1))); }
+static const u32 kTexADecal = 0x40000000u;   // amode bit: A3I5/A5I3 with the raw texel alpha (decal)
 static inline u32 gxDs3dTexAMode(const POLY &p)
 {
 	if (!gxDs3dTexFmtTrans(gxDs3dTexFormat(p))) return 0;
+	if (gxDs3dPolyMode(p) == 1) return 0x80000000u | kTexADecal;
 	return 0x80000000u | (s_atRef << 8) | (u32)gxDs3dPolyAlpha(p);
 }
 
@@ -334,7 +340,8 @@ static void gxDs3dTexConvert(GxDs3dTex &t, const TexCacheItem *item)
 
 // A3I5/A5I3 (see the translucent section): GX RGBA8, 4x4 tiles of 32 bytes AR then 32 GB.
 // Alpha is the final GX blend alpha of the modulated fragment, 0 where rasterize.cpp
-// writes nothing (a == 0 or below the alpha test ref).
+// writes nothing (a == 0 or below the alpha test ref). Decal (kTexADecal): the texel's own
+// 5-bit alpha, round(a * 255 / 31), the TEV lerp factor (see the decal section).
 static void gxDs3dTexConvertTrans(GxDs3dTex &t, const TexCacheItem *item)
 {
 	const u32 *src = (const u32 *)item->decoded;
@@ -348,7 +355,8 @@ static void gxDs3dTexConvertTrans(GxDs3dTex &t, const TexCacheItem *item)
 			const int t6 = GFX3D_5TO6((int)(c >> 24));
 			const int a = (((t6 + 1) * (p6 + 1) - 1) >> 6) >> 1;
 			u8 *tile = dst + (((y >> 2) * (w >> 2) + (x >> 2)) << 6) + ((((y & 3) << 2) + (x & 3)) << 1);
-			tile[0]  = (a == 0 || a < ref) ? 0 : gxDs3dGxAlpha(a);
+			if (t.amode & kTexADecal) tile[0] = (u8)(((c >> 24) * 255 + 15) / 31);
+			else tile[0]  = (a == 0 || a < ref) ? 0 : gxDs3dGxAlpha(a);
 			tile[1]  = gxDs3d6To8Tex((u8)(c & 0x3F));
 			tile[32] = gxDs3d6To8Tex((u8)((c >> 8) & 0x3F));
 			tile[33] = gxDs3d6To8Tex((u8)((c >> 16) & 0x3F));
@@ -542,6 +550,47 @@ static void gxDs3dToonTev(int stage, int texgens, bool hl)
 	GX_SetTevColorOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 	GX_SetTevAlphaIn(st, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
 	GX_SetTevAlphaOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+}
+
+// ---------------------------------------------------------------------------------
+// Decal shading (POLYGON_ATTR mode 1), GxFast only (Task decal).
+//
+// rasterize.cpp's Shader::shade case 1: per 6-bit channel out = (tex * a + vtx * (31 - a)) >> 5
+// with a the texel's 5-bit alpha (decal_table), fragment alpha = polygon alpha; so a texel of
+// alpha 0 still draws (the vertex colour), and the texel alpha never reaches the blend, the
+// alpha test or the depth/ID rules. Untextured decal is plain material colour (mode 4), drawn
+// as untextured modulate. GX: stage 0 = lerp(vertex, texel, texel alpha) with alpha = vertex
+// alpha (gxDs3dBindPoly), the texel alpha 0/255 for the RGB5A3 formats and round(a*255/31)
+// for A3I5/A5I3 (their own decal texture, kTexADecal); the vertex alpha is the polygon's
+// (gxDs3dGxAlpha) even for A3I5/A5I3. Then one stage after the tag stages (the toon LUT's
+// slot, toonKey 3, never both) scales by K2 = kDecalScale / 256: the CPU's >> 5 is a 31/32
+// of the a/31 lerp. 243, not 248, because TEV rounds each stage (+128) where the CPU floors;
+// modelled exhaustively over t, v, a with Dolphin's TEV lerp (results/decal/model.py): 4.3%
+// of 5-bit outputs 1 LSB off (none more), against 20% for GxFast modulate. Inexact (TEV
+// rounding is HW's), so GxAccurate keeps the `polymode` bail.
+static const u8 kDecalScale = 243;
+
+static void gxDs3dDecalTev(int stage, int texgens)
+{
+	const u8 st = (u8)(GX_TEVSTAGE0 + stage);
+	const GXColor k2 = { kDecalScale, kDecalScale, kDecalScale, 0 };
+	GX_SetNumTexGens(texgens);
+	GX_SetNumTevStages(stage + 1);
+	GX_SetTevDirect(st);
+	GX_SetTevOrder(st, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+	GX_SetTevKColor(GX_KCOLOR2, k2);
+	GX_SetTevKColorSel(st, GX_TEV_KCSEL_K2);
+	GX_SetTevColorIn(st, GX_CC_ZERO, GX_CC_CPREV, GX_CC_KONST, GX_CC_ZERO);
+	GX_SetTevColorOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+	GX_SetTevAlphaIn(st, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+	GX_SetTevAlphaOp(st, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+}
+
+// The stage after the tag stages (toonKey: 1 toon multiply, 2 highlight add, 3 decal scale).
+static inline void gxDs3dPostTev(int stage, int texgens, int key)
+{
+	if (key == 3) gxDs3dDecalTev(stage, texgens);
+	else          gxDs3dToonTev(stage, texgens, key == 2);
 }
 
 // ---------------------------------------------------------------------------------
@@ -908,12 +957,12 @@ static bool gxDs3dTransShapesDisjoint(const GxDs3dTransShape &a, const GxDs3dTra
 }
 
 // Does this translucent polygon draw anything (see gxDs3dRenderFast)? Alpha-0 polygons
-// never do; a uniform-alpha one (not A3I5/A5I3) is dropped whole by the alpha test.
+// never do; a uniform-alpha one (not A3I5/A5I3, or a decal) is dropped whole by the alpha test.
 static bool gxDs3dTransDraws(const POLY &p)
 {
 	const int a = gxDs3dPolyAlpha(p);
 	if (a == 0) return false;
-	return gxDs3dTexFmtTrans(gxDs3dTexFormat(p)) || a >= (int)s_atRef;
+	return (gxDs3dTexFmtTrans(gxDs3dTexFormat(p)) && gxDs3dPolyMode(p) != 1) || a >= (int)s_atRef;
 }
 
 // Translucent polygon-ID rule: a translucent fragment (0 < a < 31) is dropped, with no
@@ -1837,10 +1886,15 @@ static int gxDs3dFrameGate(bool requireTex)
 #else
 		if ((p.polyAttr & (1 << 14)) && (!fast || gxDs3dPolyMode(p) == 3)) return kGateDepthEqual;
 #endif
-		// modulate, toon/highlight (as a flat colour, gxDs3dToonOk) and shadow (above) only:
-		// decal needs its own TEV
+		// modulate, toon/highlight (as a flat colour, gxDs3dToonOk), shadow (above) and, GxFast
+		// only, decal (its TEV lerp + 31/32 scale is not the CPU's integer table, see the decal
+		// section). -DDSA_GXGEOM_MUTATE_DECAL: decal bails in GxFast too.
 		const bool toon = gxDs3dPolyMode(p) == 2;
+#ifdef DSA_GXGEOM_MUTATE_DECAL
 		if (gxDs3dPolyMode(p) == 1) return kGatePolyMode;
+#else
+		if (gxDs3dPolyMode(p) == 1 && !fast) return kGatePolyMode;
+#endif
 		if (toon && !gxDs3dToonOk(p, fast)) return kGateToon;
 		s_gateToon |= toon;
 		if (gxDs3dTexFormat(p) != 0) {
@@ -2259,13 +2313,15 @@ static void gxDs3dRestoreState()
 struct GxDs3dTexState {
 	bool textured;
 	bool toonLut;   // GxFast toon LUT coordinate (GX_VA_TEX1) in the vertex format
+	bool decal;     // stage 0 is the decal lerp (gxDs3dDecalTex), not GX_MODULATE
 	u32 texParam, texPal, amode;
 };
 
 static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, bool first, bool toonLut = false)
 {
 	const bool textured = gxDs3dTexFormat(p) != 0;
-	if (first || textured != st.textured || toonLut != st.toonLut) {
+	const bool decal = !accurate && gxDs3dDecalTex(p);
+	if (first || textured != st.textured || toonLut != st.toonLut || decal != st.decal) {
 		GXDS3D_PS(kPsDesc);
 		GX_ClearVtxDesc();
 		GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
@@ -2278,7 +2334,15 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 			if (accurate) GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_NRM, GX_TEXMTX0);
 			else          GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_TEXMTX0);
 			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
-			GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+			if (decal) {
+				// colour = lerp(vertex, texel, texel alpha), alpha = vertex (polygon) alpha
+				GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_RASC, GX_CC_TEXC, GX_CC_TEXA, GX_CC_ZERO);
+				GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+				GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_RASA);
+				GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+			} else {
+				GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+			}
 		} else {
 			GX_SetNumTexGens(0);
 			GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
@@ -2286,6 +2350,7 @@ static void gxDs3dBindPoly(const POLY &p, bool accurate, GxDs3dTexState &st, boo
 		}
 		st.textured = textured;
 		st.toonLut = toonLut;
+		st.decal = decal;
 		st.texParam = 0xFFFFFFFF;
 	}
 	const u32 amode = gxDs3dTexAMode(p);
@@ -2902,7 +2967,7 @@ struct GxDs3dFastCtx {
 	bool shId;             // the opaque-ID texture is built (gxDs3dShadowIdPass): shadow draws test it
 	bool shIdPass;         // drawing that texture: translucent polygons give their alpha-31 fragments only
 	bool toonLut;          // the toon LUT is loaded (gxDs3dToonLutEnsure): mode-2 polygons use it
-	int toonKey;           // LUT stage installed after the tag stages: 0 none, 1 multiply, 2 highlight add
+	int toonKey;           // stage installed after the tag stages: 0 none, 1 toon multiply, 2 highlight add, 3 decal scale
 	bool zEqBase;          // every polygon draws with GX_EQUAL / no Z write (the fog redraw), not LESS / write
 	const u8 *vis;         // Task 3d-percost: s_polyVis when valid for this list, else NULL
 	const float *lastMvP, *lastProjP;   // Task 3d-percost: the POLYMTX entries lastMv/lastProj hold
@@ -3152,6 +3217,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	// and the fog redraw already draw everything GX_EQUAL without a depth write.
 	const bool deq = (p.polyAttr & (1 << 14)) && !c.shIdPass && !c.zEqBase;
 	const bool toonLut = c.toonLut && gxDs3dPolyMode(p) == 2;
+	const bool decal = gxDs3dDecalTex(p);
 	const bool trans = p.isTranslucent() && !c.shCount;
 	const VERT *cv[MAX_CLIPPED_VERTS];
 	bool clipped;
@@ -3245,7 +3311,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 		if (!gxDs3dTransDraws(p)) { GXDS3D_PS(kPsCull); return; }
 		GXDS3D_PS(kPsTrans);
 		const bool texTrans = gxDs3dTexFmtTrans(gxDs3dTexFormat(p));
-		if (!texTrans) va = gxDs3dGxAlpha(gxDs3dPolyAlpha(p));
+		if (!texTrans || decal) va = gxDs3dGxAlpha(gxDs3dPolyAlpha(p));   // (decal: a == 31 only at alpha 31, two-pass as below)
 		zw = (p.polyAttr >> 11) & 1;
 #ifdef DSA_GXGEOM_MUTATE_TRANSZW
 		zw = true;   // mutation: translucent polygons always write depth, must fail a3_c34
@@ -3313,14 +3379,14 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	}
 
 	const bool textured = gxDs3dTexFormat(p) != 0;
-	const bool rebound = c.first || textured != c.st.textured || toonLut != c.st.toonLut;
+	const bool rebound = c.first || textured != c.st.textured || toonLut != c.st.toonLut || decal != c.st.decal;
 	gxDs3dBindPoly(p, false, c.st, c.first, toonLut);
 	c.first = false;
 	const int mode = c.shTest ? (tagWrite ? 4 : 3) : tag == 0 ? 0 : (tagWrite ? 1 : 2);
 	// Toon LUT stage (see the toon section) after the colour-passing stages: plain draws and
 	// tag tests; a tag write's colour is its tag, so none there.
 	const bool toonHl = toonLut && textured && gfx3d.shading == GFX3D::HIGHLIGHT;
-	const int toonKey = (toonLut && (mode == 0 || mode == 2)) ? 1 + toonHl : 0;
+	const int toonKey = (mode != 0 && mode != 2) ? 0 : toonLut ? 1 + toonHl : decal ? 3 : 0;
 	const int toonStage = mode == 0 ? 1 : (c.tagTwo ? 3 : 2) + (c.tagCarry ? 1 : 0);
 	const int toonGens = (textured ? 1 : 0) + (mode == 2);
 	if (rebound || mode != c.tagMode || (mode && textured != c.tagTextured) || (c.toonKey && !toonKey)) {
@@ -3332,7 +3398,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 	}
 	if (toonKey && toonKey != c.toonKey) {
 		GXDS3D_PS(kPsToonTev);
-		gxDs3dToonTev(toonStage, toonGens, toonKey == 2);
+		gxDs3dPostTev(toonStage, toonGens, toonKey);
 		c.toonKey = toonKey;
 	}
 	if (mode >= 3) {
@@ -3372,7 +3438,7 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 			// pass 0 has no tag stages: the LUT stage moves to stage 1 (over the first tag
 			// stage), and pass 1 puts the tag stages back.
 			if (pass == 1) gxDs3dTagTev(mode, textured, c.tagTwo, c.tagCarry);
-			gxDs3dToonTev(pass == 0 ? 1 : toonStage, toonGens, toonKey == 2);
+			gxDs3dPostTev(pass == 0 ? 1 : toonStage, toonGens, toonKey);
 		} else if (mode == 2 && twoPass) {
 			// Task tidwhy-a31: pass 1 sets the tag stages again, not just the stage count.
 			// libogc sizes the texcoords (SU_SSIZE/TSIZE) only for the stages active when it
