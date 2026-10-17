@@ -5,11 +5,6 @@
 # master) keeps the *target* branch's copy instead of applying the deletion,
 # so the docs come back intact once this branch lands.
 #
-# (docs/PLAN.md and docs/BUILD_FLAGS.md are NOT listed here -- they're
-# gitignored/untracked local files shared across the whole working tree, not
-# per-branch, so they were moved aside to docs/.arm9-jit-infra-*.md instead of
-# deleted; see that rename in the gx-rewrite branch history for why.)
-#
 # IMPORTANT: merge=ours requires a driver definition that git does not ship
 # by default and does NOT travel with the repo -- whoever performs that merge
 # must first run, once, in their local checkout:
