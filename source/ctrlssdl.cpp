@@ -19,6 +19,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
+#include <ogc/lwp_watchdog.h>
 #include "ctrlssdl.h"
 #include "harness/harness.h"
 #include "saves.h"
@@ -132,8 +133,26 @@ void load_default_config(const u16 kbCfg[])
 /* Set cursor coordinates */
 static void set_cursor_coord(signed long x,signed long y)
 {
-  if(x<0) x = 0; else if(x>255) x = 255;
-  if(y<0) y = 0; else if(y>192) y = 192;
+  // The cursor may roam the whole 640x480 TV canvas (in DS touch-screen units), so
+  // it can reach the other screen in every layout; touches only register on the
+  // touch screen itself (see DSExec()).
+  long xmin = -bottomX, xmax = 255, ymin = -bottomY, ymax = 191;
+  if (scalex > 0.0f) xmax = (long)(640.0f / scalex) - bottomX - 1;
+  if (scaley > 0.0f) ymax = (long)(480.0f / scaley) - bottomY - 1;
+  if (xmax < 255) xmax = 255;
+  if (ymax < 191) ymax = 191;
+  if (xmin > 0) xmin = 0;
+  if (ymin > 0) ymin = 0;
+  // A touch held down keeps the cursor on the touch screen (games use the stylus like
+  // a joystick; a touch dragged off would stop their input). Only a touch that began
+  // on the screen counts: one started off it never touched anything.
+  static bool wasDown = false, heldOnScreen = false;
+  if (cursor.down && !wasDown)
+    heldOnScreen = cursor.x >= 0 && cursor.x <= 255 && cursor.y >= 0 && cursor.y <= 191;
+  wasDown = cursor.down;
+  if (cursor.down && heldOnScreen) { xmin = 0; xmax = 255; ymin = 0; ymax = 191; }
+  if(x<xmin) x = xmin; else if(x>xmax) x = xmax;
+  if(y<ymin) y = ymin; else if(y>ymax) y = ymax;
   cursor.x = x;
   cursor.y = y;
 }
@@ -288,10 +307,16 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 	}
 
 	// Cursor movement: C-stick is analog (speed scales with deflection past the
-	// dead zone, up to kCursorMaxSpeed DS px/frame); D-pad moves at full speed.
+	// dead zone, up to kCursorMaxSpeed DS px per 1/60 s); D-pad moves at full speed.
+	// Scaled by real elapsed time, so the speed doesn't depend on the emulated fps.
 	// Sub-pixel motion accumulates so slow pushes still move smoothly.
 	{
-		const float kCursorMaxSpeed = 2.0f, kDead = 20.0f, kFull = 80.0f;
+		static u64 lastTick = 0;
+		const u64 now = gettime();
+		float dt60 = lastTick ? diff_usec(lastTick, now) * (60.0f / 1000000.0f) : 1.0f;
+		lastTick = now;
+		if (dt60 > 6.0f) dt60 = 6.0f;   // cap a long stall (pause, load) at 0.1 s
+		const float kCursorMaxSpeed = 3.0f, kDead = 20.0f, kFull = 80.0f;
 		static float accX = 0.0f, accY = 0.0f;
 		auto axis = [&](s32 v) -> float {
 			const float a = (float)(v < 0 ? -v : v);
@@ -306,7 +331,7 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 		if (wpad_h & WPAD_BUTTON_DOWN)  dy =  kCursorMaxSpeed;
 		if (dx == 0.0f) accX = 0.0f;
 		if (dy == 0.0f) accY = 0.0f;
-		accX += dx; accY += dy;
+		accX += dx * dt60; accY += dy * dt60;
 		const long mx = (long)accX, my = (long)accY;   // truncates toward zero
 		cursor.x += mx; cursor.y += my;
 		accX -= mx; accY -= my;
@@ -326,10 +351,8 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 	if (wd_one->ir.valid && scalex != 0.0f && scaley != 0.0f){
 		signed long ir_x = (signed long)(wd_one->ir.x / scalex) - bottomX;
 		signed long ir_y = (signed long)(wd_one->ir.y / scaley) - bottomY;
-		if (ir_x >= 0 && ir_x <= 255 && ir_y >= 0 && ir_y <= 192){
-			cursor.x = ir_x;
-			cursor.y = ir_y;
-		}
+		cursor.x = ir_x;   // anywhere on the TV; set_cursor_coord() bounds it
+		cursor.y = ir_y;
 	}
 
 	set_cursor_coord( cursor.x, cursor.y );  

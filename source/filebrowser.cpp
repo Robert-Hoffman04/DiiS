@@ -73,6 +73,8 @@ static void browse_back(char *str){
 }
 
 
+bool sys_exit_requested();   // main.cpp: console Reset/Power pressed
+
 static ret_action textFileBrowser(file_browser_st *file_struct){
 
 	// Set everything up to read
@@ -169,7 +171,8 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 		WPAD_ScanPads();
 		GECKO_Update();   // USB Gecko / EXI debug-serial input (gekko_utils/geckoinput.h)
 
-		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z))
+		if((WPAD_ButtonsHeld(0) & WPAD_BUTTON_HOME) || (PAD_ButtonsHeld(0) & PAD_TRIGGER_Z)
+		   || sys_exit_requested())   // console Reset / Power (main.cpp)
 			return BROWSER_CANCELED;
 
 		if(GetHeld(UP, UP, UP)){

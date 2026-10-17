@@ -194,6 +194,25 @@ static bool abort_thread = false;
 static float nds_screen_size_ratio = 1.0f;
 static u16 keypad;
 static bool quit_game = false;
+
+// Console Reset / Power and Wiimote power buttons. The callbacks run in interrupt
+// context, so they only set flags; the game loop (or the ROM browser) sees quit_game,
+// shuts the emulator down normally, then sys_exit() acts on the request. Dolphin's
+// Stop presses Power and waits for the program to exit on its own, so without these
+// it had to ask twice and force-stop.
+static volatile bool sys_power_requested = false, sys_reset_requested = false;
+static void on_reset_button(u32, void *) { sys_reset_requested = true; quit_game = true; }
+static void on_power_button() { sys_power_requested = true; quit_game = true; }
+static void on_wpad_power(s32) { sys_power_requested = true; quit_game = true; }
+bool sys_exit_requested() { return sys_power_requested || sys_reset_requested; }
+
+// Power: turn the console off. Reset or a normal quit: back to the loader.
+static void sys_exit()
+{
+	if (sys_power_requested)
+		SYS_ResetSystem(SYS_POWEROFF, 0, 0);
+	exit(0);
+}
 volatile bool execute = false;
 static bool show_console = true;
 static int SkipFrame = 0;
@@ -338,6 +357,8 @@ int main(int argc, char **argv){
 	if(FileBrowser(rom_filename) != 0)
 		quit_game = true;
 #endif
+	if (quit_game)   // browser cancelled, or Reset/Power pressed in it
+		sys_exit();
 
 	// Harness transport bring-up. Probes NET -> GECKO -> SD (or a
 	// pinned backend). No-op without -DDIIS_HARNESS; on failure it disables
@@ -490,7 +511,7 @@ int main(int argc, char **argv){
 
 	Execute();
 	
-	exit(0);
+	sys_exit();
 }
 
 //////////////////////////////////////////////////////////////////
@@ -507,6 +528,9 @@ void init(){
 	// button initialization
 	PAD_Init();
 	WPAD_Init();
+	SYS_SetResetCallback(on_reset_button);
+	SYS_SetPowerCallback(on_power_button);
+	WPAD_SetPowerButtonCallback(on_wpad_power);
 	GECKO_InputInit();   // USB Gecko / EXI debug-serial input routing (gekko_utils/geckoinput.h)
 	VIDEO_Init();
 
@@ -1670,8 +1694,13 @@ void DSExec(){
 	pad |= harness_input_down();
 	
 	// Update cursor position and click
+	// The cursor can leave the touch screen; only touch while it is on it, and lift
+	// the stylus when a held touch is dragged off.
 	if(cursor.down) {
-		NDS_setTouchPos(cursor.x, cursor.y);//ir.x, ir.y
+		if (cursor.x >= 0 && cursor.x <= 255 && cursor.y >= 0 && cursor.y <= 191)
+			NDS_setTouchPos(cursor.x, cursor.y);
+		else
+			NDS_releaseTouch();
 	}
 	
 	if(cursor.click){ 
@@ -2068,6 +2097,7 @@ void DSExec(){
 void Pause(){
 	for(;;){
 		WPAD_ScanPads();
+		if (sys_exit_requested()) sys_exit();   // console Reset / Power
 		if(WPAD_ButtonsDown(WPAD_CHAN_0)&WPAD_BUTTON_A)
 			break;
 	}
@@ -2117,6 +2147,7 @@ bool PickDevice(){
 		WPAD_ScanPads();
 		GECKO_Update();   // USB Gecko / EXI debug-serial input (gekko_utils/geckoinput.h);
 		                  // every other input loop in this file calls it, this one hadn't.
+		if (sys_exit_requested()) sys_exit();   // console Reset / Power
 
 		printf("\x1b[2J");
 		printf("\x1b[2;0H");
@@ -2184,6 +2215,7 @@ void ShowCredits() {
 	while(true){
 	    PAD_ScanPads();
 		WPAD_ScanPads();
+		if (sys_exit_requested()) sys_exit();   // console Reset / Power
 		if(GetInput(A, A, A))
 		    break;
 	}
