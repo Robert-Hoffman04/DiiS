@@ -81,6 +81,13 @@ void gxDsLazyIoWriteSlow(u32 adr, u32 size)
 				const u32 reload = latch ? (1u << (((off >> 2) & 1) + (off >= 0x38 ? 2 : 0))) : 0u;
 				if (seg && ((adr & 0x1000u) ? gxDsEngineBLazySegWrite(reload) : gxDsEngineALazySegWrite(reload)))
 					return;
+			} else if (off < 4) {
+				// Task 2d-bails-3: DISPCNT, a segment too (with GPU_setVideoProp's derived state).
+#ifdef DSLZ_STATS
+				if (adr & 0x1000u) gxDsEngineBLazyStatDc(); else gxDsEngineALazyStatDc();
+#endif
+				if ((adr & 0x1000u) ? gxDsEngineBLazySegWrite(0) : gxDsEngineALazySegWrite(0))
+					return;
 			}
 #ifdef DSLZ_STATS
 			if (adr & 0x1000u) gxDsEngineBLazyStatIo(off); else gxDsEngineALazyStatIo(off);

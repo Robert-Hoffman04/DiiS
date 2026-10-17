@@ -585,6 +585,8 @@ bool gxDsEngineBLazySegWrite(u32 reload);
 #ifdef DSLZ_STATS
 void gxDsEngineALazyStatIo(u32 off);
 void gxDsEngineBLazyStatIo(u32 off);
+void gxDsEngineALazyStatDc();
+void gxDsEngineBLazyStatDc();
 #endif
 bool gxDsEngineALazyPending();
 bool gxDsEngineBLazyPending();

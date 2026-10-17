@@ -62,6 +62,13 @@
 //        at 100, palette at 150;  3 one byte of BG2X at 50 (8-bit: still a flush), BG2PD at 90, BG2X at 91,
 //        palette at 130;  4 BG2X rewritten at 7 lines (more segments than the cap), palette at 150;
 //      5 BG2PA-PD (32-bit pairs) + BG2X at 60, BG2X again at 61, BG0VOFS at 62 (GX handles).
+//  29  mid-frame DISPCNT writes become register segments (task 2d-bails-3). Per frame (f % 6):
+//      0 B: same-value DISPCNT (32-bit) at 56, palette at 130 (segments replayed on the CPU);
+//      1 B: BG1 off at 60, OBJ off at 80, BG1 on at 100, OBJ on at 120, palette at 150;  2 the same, no palette (GX);
+//      3 B: OBJ 1D boundary 32 -> 64 KB at 70 (the sprite tiles move), same-value high half (16-bit) at 90, palette at 140;
+//      4 B: 8-bit write of DISPCNT byte 1 (BG0 off; DeSmuME re-derives nothing) at 50, display mode 0 at 90 (out of
+//        scope: the pending lines are flushed with their segments), palette at 60;
+//      5 A: same-value DISPCNT at 40 (GX), BG2 off at 70, WIN0 on at 100, palette at 150.
 
 #include <nds.h>
 #include <stdio.h>
@@ -345,6 +352,35 @@ static void hb(void)
 			if (L == 61) B_BG0VOFS = 11;
 		}
 	}
+#elif LZ_CASE == 29
+	{
+		const int v = ff % 6;
+		const u32 bd = B_DISPCNT;
+		if (v == 0) {
+			if (L == 55) B_DISPCNT = bd;
+			if (L == 129) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v <= 2) {
+			if (L == 59) B_DISPCNT = bd & ~(1u << 9);
+			if (L == 79) B_DISPCNT = bd & ~(1u << 12);
+			if (L == 99) B_DISPCNT = bd | (1u << 9);
+			if (L == 119) B_DISPCNT = bd | (1u << 12);
+			if (v == 1 && L == 149) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v == 3) {
+			if (L == 69) B_DISPCNT = (bd & ~(3u << 20)) | (1u << 20);
+			if (L == 89) R16(0x04001002) = R16(0x04001002);
+			if (L == 139) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v == 4) {
+			if (L == 49) *(volatile u8 *)0x04001001 = (u8)((bd >> 8) & ~1u);
+			if (L == 59) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+			if (L == 89) B_DISPCNT = bd & ~(3u << 16);
+		} else {
+			const u32 ad = A_DISPCNT;
+			if (L == 39) A_DISPCNT = ad;
+			if (L == 69) A_DISPCNT = ad & ~(1u << 10);
+			if (L == 99) A_DISPCNT = ad | (1u << 13);
+			if (L == 149) { for (int i = 1; i < 16; i++) BG_PALETTE[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		}
+	}
 #elif LZ_CASE == 22
 	if ((ff % 3) == 0) { if (L == 49) A_BG0HOFS = 33; else if (L == 149) A_BG0HOFS = 0; if (L == 59) B_BG0VOFS = 17; else if (L == 159) B_BG0VOFS = 0; }
 #endif
@@ -405,6 +441,13 @@ int main(void)
 		B_BG0HOFS = 0; B_BG0VOFS = 0;
 		B_WIN0H = (16 << 8) | 240; B_WIN0V = (8 << 8) | 180; B_WININ = L_BG0 | L_BG2 | L_OBJ; B_WINOUT = L_BG1 | L_BG2;
 		if ((f % 6) == 2) B_DISPCNT |= (1u << 13); else B_DISPCNT &= ~(1u << 13);
+#endif
+#if LZ_CASE == 29
+		videoSetMode(dcnt);
+		videoSetModeSub(MODE_0_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG1_ACTIVE | DISPLAY_SPR_ACTIVE | DISPLAY_SPR_1D);
+		A_WIN0H = (40 << 8) | 200; A_WIN0V = (20 << 8) | 170; A_WININ = L_BG0 | L_OBJ; A_WINOUT = L_BG1 | L_BG3;
+		for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 3 + 5) & 31, (i * 9 + 14) & 31, (i * 5 + 2) & 31);
+		for (int i = 1; i < 16; i++) BG_PALETTE[i] = RGB15((i * 5 + 9) & 31, (i * 11 + 4) & 31, (i * 7 + 17) & 31);
 #endif
 #if LZ_CASE == 27
 		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);
