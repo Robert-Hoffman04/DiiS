@@ -75,7 +75,7 @@ bench_preflight
 # TESTDEFS common to every perf mode: harness net transport + always-on
 # perf-zones breakdown (cheap - see perf_zones.cpp) + fixed test ROM slot.
 perf_defs_for() {
-	local base="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -DDESMUME_FORCE_CORE=1"
+	local base="-DDIIS_FORCE_ROM -DDIIS_AUTOLOADSTATE -DDIIS_HARNESS -DHARNESS_TRANSPORT_NET -DDIIS_PERFZONES -DDIIS_FORCE_CORE=1"
 	case "$1" in
 		sw|gx|gxa|gxf|interp|jit) echo "$base" ;;
 		*) die "unknown mode '$1' (want sw gx gxa gxf interp jit)" ;;
@@ -185,7 +185,7 @@ if [ "$DO_WRESTLERS" = 1 ]; then
 
 		if [ "$DO_BUILD" = 1 ]; then
 			build_dol "wrestler_$id" \
-				"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=1" \
+				"-DDIIS_FORCE_ROM -DDIIS_HARNESS -DHARNESS_TRANSPORT_NET -DDIIS_PERFZONES -D$probeflag -DDIIS_FORCE_CORE=1" \
 				""
 		fi
 

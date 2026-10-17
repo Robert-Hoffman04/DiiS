@@ -19,7 +19,7 @@
 @ detection right.
 @
 @ Results (u32 elapsed Timer0 ticks each) land in EWRAM so the host-side
-@ probe (-DDESMUME_GBA_WAITCNT_SOAK, source/main.cpp) can read them once
+@ probe (-DDIIS_GBA_WAITCNT_SOAK, source/main.cpp) can read them once
 @ both runs finish:
 @   EWRAM+0x00  slow_elapsed  (WAITCNT=0x0000)
 @   EWRAM+0x04  fast_elapsed  (WAITCNT=0x0018)

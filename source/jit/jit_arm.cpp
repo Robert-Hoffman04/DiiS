@@ -67,7 +67,7 @@
 
 #include "jit_trace.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include "jit_ppc_emitter.h"
 #include "../NDSSystem.h"
@@ -2072,4 +2072,4 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 op)
 	ctx.endBlock = true;   // everything else -> interpreter (later B-groups)
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

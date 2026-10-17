@@ -1,11 +1,11 @@
 /*
     harness_frame.cpp - see harness_frame.h. Compiles to nothing without
-    -DDESMUME_HARNESS -DHARNESS_FRAME.
+    -DDIIS_HARNESS -DHARNESS_FRAME.
 */
 #include "harness.h"
 #include "harness_frame.h"
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_FRAME)
+#if defined(DIIS_HARNESS) && defined(HARNESS_FRAME)
 
 #include "harness_wire.h"
 #include "../GPU.h"
@@ -106,4 +106,4 @@ void harness_frame_tick(u32 frame)
 		harness_frame_capture(0);
 }
 
-#endif // DESMUME_HARNESS && HARNESS_FRAME
+#endif // DIIS_HARNESS && HARNESS_FRAME

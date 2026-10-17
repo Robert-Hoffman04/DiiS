@@ -1,10 +1,10 @@
 /*
     harness_net.cpp - see harness_net.h. Compiles to nothing without
-    -DDESMUME_HARNESS (verify: `nm build/harness_net.o | grep harness_` empty).
+    -DDIIS_HARNESS (verify: `nm build/harness_net.o | grep harness_` empty).
 */
 #include "harness_net.h"
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 
 #include "harness_config.h"
 #include "harness_wire.h"
@@ -190,4 +190,4 @@ void harness_net_close(void)
 
 bool harness_net_ok(void) { return s_ok; }
 
-#endif // DESMUME_HARNESS
+#endif // DIIS_HARNESS

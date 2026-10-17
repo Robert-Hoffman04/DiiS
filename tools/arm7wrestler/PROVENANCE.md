@@ -91,13 +91,13 @@ Produces `out/arm7wrestler.nds`.
 
 ## Running against DiiS
 
-Build DiiS with `-DDESMUME_ARM7WRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDIIS_ARM7WRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM9 JIT (this ROM's ARM9
 side is a trivial idle/vram-copy stub -- nothing to gain there; **leaves the
-ARM7 JIT setting alone**, unlike `-DDESMUME_ARMWRESTLER_PROBE` which forces
+ARM7 JIT setting alone**, unlike `-DDIIS_ARMWRESTLER_PROBE` which forces
 it off, since exercising the ARM7 JIT is the entire point here), and polls
 slot-2 for the sentinel once per frame; on completion it writes
 `sd:/arm7wrestler.log` (ARM + THUMB pass/fail counts, plus each failing
 test's name and raw bitmask) and quits. Stage `out/arm7wrestler.nds` as
-`sd:/DS/ROMS/test.nds` and boot with `-DDESMUME_FORCE_ROM
--DDESMUME_FORCE_CORE=1` for a fully headless run.
+`sd:/DS/ROMS/test.nds` and boot with `-DDIIS_FORCE_ROM
+-DDIIS_FORCE_CORE=1` for a fully headless run.

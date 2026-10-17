@@ -46,7 +46,7 @@
 #include "matrix.h"
 #include "readwrite.h"
 #include "MMU_timing.h"
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 #include "jit/jit.h"
 #endif
 
@@ -1131,7 +1131,7 @@ void MMU_Reset()
 	MMU_timing.arm9codeCache.Reset();
 	MMU_timing.arm9dataCache.Reset();
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// P4: the memsets above (MAIN_MEM/ARM7_ERAM/SWIRAM) are raw buffer clears,
 	// not _MMU_write* calls -- they bypass every SMC hook. Called on every ROM
 	// (re)load via NDS_Reset(), so any block compiled against the previous
@@ -2175,7 +2175,7 @@ void DmaController::exec()
 // todo <= 0x200000, so checking both ends of each span covers it.
 static bool dmaGxFifoBlockOk(u32 src, u32 srcinc, u32 dst, u32 dstinc, u32 todo)
 {
-#if defined(HAVE_LUA) || (defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING))
+#if defined(HAVE_LUA) || (defined(DIIS_JIT) && defined(JIT_DIFFERENTIAL_TESTING))
 	return false;
 #else
 	const u32 dstLast = dst + (todo-1)*dstinc;
@@ -2390,7 +2390,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 
 	mmu_log_debug_ARM9(adr, "(write08) 0x%02X", val);
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// ARM9 code lives in ITCM (adr < 0x02000000) and shared WRAM (bank 0x03);
 	// bank 0x02 main-RAM writes are already hooked in MMU.h before dispatch.
 	// g_jitOn first: Interpreter mode skips the hook (see _MMU_write08, MMU.h).
@@ -2643,7 +2643,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 
 	mmu_log_debug_ARM9(adr, "(write16) 0x%04X", val);
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	if(g_jitOn && (adr < 0x02000000 || (adr >> 24) == 3)) jitCacheArm9.invalidateSMCTarget(adr);
 #endif
 
@@ -3223,7 +3223,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 {
 	mmu_log_debug_ARM9(adr, "(write32) 0x%08X", val);
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	if(g_jitOn && (adr < 0x02000000 || (adr >> 24) == 3)) jitCacheArm9.invalidateSMCTarget(adr);
 #endif
 
@@ -3887,7 +3887,7 @@ void FASTCALL _MMU_ARM7_write08(u32 adr, u8 val)
 	
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	MMU.MMU_MEM[ARMCPU_ARM7][adr>>20][adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20]]=val;
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// P4: catch-all SMC guard for every ARM7-sourced write this function's
 	// earlier special cases didn't already return out of (interpreter stores,
 	// ARM7 DMA, BIOS-HLE) -- covers bank 0x03 (shared WRAM / ARM7_ERAM), where
@@ -4202,7 +4202,7 @@ void FASTCALL _MMU_ARM7_write16(u32 adr, u16 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteWord(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	if (g_jitOn) jitInvalidateSMC(adr); // see _MMU_ARM7_write08's comment
 #endif
 }
@@ -4352,7 +4352,7 @@ void FASTCALL _MMU_ARM7_write32(u32 adr, u32 val)
 
 	// Removed the &0xFF as they are implicit with the adr&0x0FFFFFFF [shash]
 	T1WriteLong(MMU.MMU_MEM[ARMCPU_ARM7][adr>>20], adr&MMU.MMU_MASK[ARMCPU_ARM7][adr>>20], val);
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	if (g_jitOn) jitInvalidateSMC(adr); // see _MMU_ARM7_write08's comment
 #endif
 }

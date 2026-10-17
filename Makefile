@@ -37,12 +37,12 @@ INCLUDES	:=
 OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizations -flto=auto -funroll-loops
 
 # TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
-#   make TESTDEFS="-DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM"
+#   make TESTDEFS="-DDIIS_FORCE_CORE=1 -DDIIS_FORCE_ROM"
 # to skip the on-screen device/renderer picker and file browser and boot
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 
 # The ARM9 + ARM7 trace JIT (source/jit/) is always compiled in: a plain  make
-# builds it (-DDESMUME_JIT, the master gate every JIT #ifdef checks). Whether it
+# builds it (-DDIIS_JIT, the master gate every JIT #ifdef checks). Whether it
 # actually runs is a RUNTIME choice with two values -- Interpreter (both cores
 # interpreted) or JIT (both cores JITted, the default) -- picked on the startup
 # menu's CPU line or with the harness PKT_CTRL command  cpumode interp|jit  (see
@@ -63,14 +63,14 @@ JITDEFS     ?=
 ifeq ($(strip $(NOJIT)),1)
 JITCORE     :=
 else
-JITCORE     :=  -DDESMUME_JIT
+JITCORE     :=  -DDIIS_JIT
 endif
 
 CFLAGS	    =   -D__BIG_ENDIAN__ -DENABLE_PAIRED_SINGLE -g $(OPTFLAGS) -fsigned-char -Wall $(MACHDEP) $(INCLUDE) $(TESTDEFS) $(JITCORE) $(JITDEFS)
 CXXFLAGS	=	$(CFLAGS)
 # .S files (jit_trampoline.S) are built with -x assembler-with-cpp and see only
 # CPPFLAGS/ASFLAGS, not CFLAGS -- carry JITCORE/JITDEFS through so the
-# DESMUME_JIT guard reaches the assembler too.
+# DIIS_JIT guard reaches the assembler too.
 ASFLAGS	    =	$(JITCORE) $(JITDEFS)
 LDFLAGS	    =	-g $(MACHDEP) $(OPTFLAGS) -Wl,-Map,$(notdir $@).map $(TESTLDFLAGS)
 

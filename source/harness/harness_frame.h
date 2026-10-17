@@ -1,7 +1,7 @@
 /*
     harness_frame.h - on-demand video buffer readout.
 
-    Generalises the fixed-frame -DDESMUME_FBDUMP block (main.cpp, hardcoded
+    Generalises the fixed-frame -DDIIS_FBDUMP block (main.cpp, hardcoded
     frame, SD-only) into a PKT_FRAME stream with three triggers:
       1. every N frames        - manifest "frame_every=N" / harness_frame_set_every()
       2. an in-code call site  - DEBUG_FRAME("label")
@@ -11,7 +11,7 @@
     toggle): nothing is sent until frame_every is set or a capture is
     explicitly requested.
 
-    Follows the perf_zones.h pattern: real bodies under DESMUME_HARNESS &&
+    Follows the perf_zones.h pattern: real bodies under DIIS_HARNESS &&
     HARNESS_FRAME, static-inline no-ops otherwise.
 */
 #ifndef HARNESS_FRAME_H
@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_FRAME)
+#if defined(DIIS_HARNESS) && defined(HARNESS_FRAME)
 
 void harness_frame_set_every(u32 n);          // 0 = off
 void harness_frame_request(const char *label); // one-shot, sent on next tick

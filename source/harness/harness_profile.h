@@ -9,7 +9,7 @@
       2. jit_debug.h's JIT_LOG_* string macros - previously ((void)0), now
          routed to harness_profile_emitf() under HARNESS_PROFILE.
       3. debug.h's Logger/LOGC channels - Logger::vprintf() also fans every
-         line into PKT_LOG via harness_profile_log() when DESMUME_HARNESS is
+         line into PKT_LOG via harness_profile_log() when DIIS_HARNESS is
          defined. No call-site changes.
 
     Follows the perf_zones.h pattern: real bodies under the compile flag,
@@ -24,10 +24,10 @@
 extern "C" {
 #endif
 
-#if defined(DESMUME_HARNESS)
+#if defined(DIIS_HARNESS)
 
 // Fan-in for debug.h's Logger channels: one already-formatted log line out as
-// a PKT_LOG frame. Gated only on DESMUME_HARNESS (not HARNESS_PROFILE) so the
+// a PKT_LOG frame. Gated only on DIIS_HARNESS (not HARNESS_PROFILE) so the
 // generic log channel survives -DHARNESS_NO_PROFILE.
 void harness_profile_log(const char *line);
 
@@ -35,10 +35,10 @@ void harness_profile_log(const char *line);
 static inline void harness_profile_log(const char *line) { (void)line; }
 #endif
 
-#if (defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)) || defined(DESMUME_GXSTATS)
+#if (defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)) || defined(DIIS_GXSTATS)
 
 // One already-formatted profile record (CSV row, stat block, ...) as PKT_PROFILE.
-// Task hw-measure: without the harness, -DDESMUME_GXSTATS gives these a body that
+// Task hw-measure: without the harness, -DDIIS_GXSTATS gives these a body that
 // appends to sd:/gxstats.log instead (source/gxstats_log.cpp), so the -DDSB_STATS /
 // -DDSA_GXGEOM_TEXSTATS / ... stat lines can be collected on real hardware.
 #define HARNESS_PROFILE_SINK 1

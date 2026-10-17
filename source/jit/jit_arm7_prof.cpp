@@ -1,6 +1,6 @@
-// Task ph-arm7: -DDESMUME_ARM7PROF diagnostic. See jit_arm7_prof.h.
+// Task ph-arm7: -DDIIS_ARM7PROF diagnostic. See jit_arm7_prof.h.
 #include "jit_arm7_prof.h"
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

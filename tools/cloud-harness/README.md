@@ -15,9 +15,9 @@ misses its caches, so treat them as a guide, not as hardware timings.
 | Path | What it does |
 |---|---|
 | `setup.sh` | One-time setup: devkitPPC docker image, Dolphin from source, packages, script install. |
-| `perf/bench.sh <tree> <label>` | Builds a `-DDESMUME_PERFZONES -DDESMUME_BENCH` dol (GxFast via `-DDESMUME_FORCE_RENDERMODE=2`, forced ROM) in docker and runs 1800 frames. It pulls `sd:/perfzones.log` off the live SD image and prints mean ms/frame per zone for frames >= 180. Use a distinct `DISP` per concurrent run: each display gets its own Dolphin user dir. |
+| `perf/bench.sh <tree> <label>` | Builds a `-DDIIS_PERFZONES -DDIIS_BENCH` dol (GxFast via `-DDIIS_FORCE_RENDERMODE=2`, forced ROM) in docker and runs 1800 frames. It pulls `sd:/perfzones.log` off the live SD image and prints mean ms/frame per zone for frames >= 180. Use a distinct `DISP` per concurrent run: each display gets its own Dolphin user dir. |
 | `perf/compare.py a.csv b.csv` | Per-zone deltas between two runs. |
-| `correct/check.sh <tree>` | Correctness gate (about 9 min). It runs armwrestler, arm7wrestler and rockwrestler under the JIT, compared with `baseline/`. It runs `JIT_DIFFERENTIAL_TESTING` on the three wrestlers plus the game, which must show 0 mismatches. It also hashes guest state (main RAM, TCMs, WRAM, VRAM, palette/OAM, both CPUs' registers, timers, screens, GE output) at frames 300, 600 and 900 and compares the hashes with the baseline. The state hash comes from `lib/state_hash.patch`, applied to a copy of the tree under `-DDESMUME_STATE_HASH -DDESMUME_DETERMINISTIC_RTC`. Run `--update-baseline` once on a known-good tree. |
+| `correct/check.sh <tree>` | Correctness gate (about 9 min). It runs armwrestler, arm7wrestler and rockwrestler under the JIT, compared with `baseline/`. It runs `JIT_DIFFERENTIAL_TESTING` on the three wrestlers plus the game, which must show 0 mismatches. It also hashes guest state (main RAM, TCMs, WRAM, VRAM, palette/OAM, both CPUs' registers, timers, screens, GE output) at frames 300, 600 and 900 and compares the hashes with the baseline. The state hash comes from `lib/state_hash.patch`, applied to a copy of the tree under `-DDIIS_STATE_HASH -DDIIS_DETERMINISTIC_RTC`. Run `--update-baseline` once on a known-good tree. |
 | `ab/ab.sh` | End-to-end A/B of two commits without perf zones, from `sd:/bench.log`. |
 
 **Notes**

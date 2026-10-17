@@ -245,7 +245,7 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 	GECKO_Update();
 	// §3.5: advance the transport-agnostic remote-input core in lockstep and
 	// fold its level mask in alongside the Gecko's. Self-stubs to 0 without
-	// -DDESMUME_HARNESS -DHARNESS_INPUT.
+	// -DDIIS_HARNESS -DHARNESS_INPUT.
 	harness_input_update();
 	u32 gecko_h = GECKO_ButtonsHeld() | harness_input_held();
 

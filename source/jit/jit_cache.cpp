@@ -40,13 +40,13 @@
 // P0: retargeted includes + build guard. Body unchanged.
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include <ogc/cache.h>
-#if defined(DESMUME_JIT_TRACE_FIRST) || defined(DESMUME_ARM_TIME_SPLIT)
+#if defined(DIIS_JIT_TRACE_FIRST) || defined(DIIS_ARM_TIME_SPLIT)
 #include <stdio.h>
 #endif
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 #include <stdlib.h>   // §3.3: installFrame[] shadow array (calloc/free)
 #endif
 
@@ -94,7 +94,7 @@ JITCache::JITCache() {
 	arenaSize = 0;
 	isInitialized = false;
 	smcBankMask = 0;
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 	installFrame = nullptr;
 	installSeq = 0;
 	arenaPeak = 0;
@@ -123,7 +123,7 @@ void JITCache::initialize(u32* arenaPtr, size_t arenaBytes, BasicBlock* blockPtr
 	smcPageFlags = smcFlagsPtr;
 	smcBankMask = trackedBankMask;
 	arenaOffset = 0;
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 	if (!installFrame)
 		installFrame = (u32*)calloc(BLOCK_TABLE_SLOTS, sizeof(u32));
 #ifdef JIT_HASH_HISTO
@@ -148,7 +148,7 @@ void JITCache::destroy() {
 	arenaOffset = 0;
 	arenaSize = 0;
 	isInitialized = false;
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 	free(installFrame);
 	installFrame = nullptr;
 #ifdef JIT_HASH_HISTO
@@ -539,7 +539,7 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 	// two caches now, via jitInvalidateSMC() even if only one is up).
 	if (!isInitialized) return;
 	g_jitSmcChecks++;
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	{
 		static u64 s_lastReport = 0;
 		if (g_jitSmcChecks - s_lastReport >= 200000) {
@@ -617,7 +617,7 @@ void JITCache::invalidateSMCTarget(u32 targetEA) {
 // =========================================================================
 // §3.3 JIT cache-pressure telemetry (HARNESS_PROFILE only)
 // =========================================================================
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 
 void JITCache::profCacheHit() { profStats.hits++; }
 
@@ -771,7 +771,7 @@ void JITCache::profEmitReport(const char* tag) {
 	lastHeuristic = verdict;
 }
 
-#endif // DESMUME_HARNESS && HARNESS_PROFILE
+#endif // DIIS_HARNESS && HARNESS_PROFILE
 
 #ifdef JIT_CORE_COST_HISTO
 void JITCache::ccBlockLenReport(const char* tag) {
@@ -787,4 +787,4 @@ void JITCache::ccBlockLenReport(const char* tag) {
 }
 #endif
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

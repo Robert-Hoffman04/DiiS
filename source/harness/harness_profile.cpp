@@ -1,11 +1,11 @@
 /*
     harness_profile.cpp - see harness_profile.h. Compiles to nothing without
-    -DDESMUME_HARNESS (verify: `nm ... | grep harness_profile` empty).
+    -DDIIS_HARNESS (verify: `nm ... | grep harness_profile` empty).
 */
 #include "harness.h"          // pulls the sub-flag fan-out + harness_transport.h
 #include "harness_profile.h"
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 
 #include "harness_wire.h"
 
@@ -41,4 +41,4 @@ void harness_profile_emitf(const char *fmt, ...)
 
 #endif // HARNESS_PROFILE
 
-#endif // DESMUME_HARNESS
+#endif // DIIS_HARNESS

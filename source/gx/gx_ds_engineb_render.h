@@ -342,7 +342,7 @@
      -DDSB_STATS      counts engaged/bailed frames, affine-BG / affine-OBJ
                       frames, the last bail reason and DISPCNT/BG types into
                       the harness profile log every 30 frames (needs
-                      DESMUME_HARNESS + HARNESS_PROFILE). Task 10 adds a `dsbk`
+                      DIIS_HARNESS + HARNESS_PROFILE). Task 10 adds a `dsbk`
                       line: bakes per BG plane (plain / fade variant) and per
                       OAM index, plus `old_bg` / `old_obj`, the bakes the
                       pre-task-10 whole-region gate WOULD have done on the same

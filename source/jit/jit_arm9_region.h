@@ -11,8 +11,8 @@
  * Keep the rule here only, so the two can never disagree.
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_ARM9_REGION_H
-#define DESMUME_JIT_ARM9_REGION_H
+#ifndef DIIS_JIT_ARM9_REGION_H
+#define DIIS_JIT_ARM9_REGION_H
 
 #include "../types.h"
 #include "../MMU.h"
@@ -29,7 +29,7 @@
 // land in later B-groups.
 static inline bool jitArm9CanEnter(u32 pc, bool thumb)
 {
-#ifdef DESMUME_JIT_ARM9_THUMB_ONLY
+#ifdef DIIS_JIT_ARM9_THUMB_ONLY
 	// A5 isolation knob: keep the ARM9 THUMB JIT but route every ARM-mode block
 	// to the interpreter, to tell an ARM-front-end (B1-B7c) bug apart from a
 	// pre-existing THUMB (A2) one.
@@ -48,4 +48,4 @@ static inline bool jitArm9CanEnter(u32 pc, bool thumb)
 	return false;
 }
 
-#endif // DESMUME_JIT_ARM9_REGION_H
+#endif // DIIS_JIT_ARM9_REGION_H

@@ -11,12 +11,12 @@
  *
  * This needs no scheduler integration (P3): it drives armcpu_exec<ARM7>()
  * directly and calls the block through ExecuteJITTrace() with a jit_cpu_state
- * pointing straight at NDS_ARM7. Compiled only when DESMUME_JIT_SELFTEST is set.
+ * pointing straight at NDS_ARM7. Compiled only when DIIS_JIT_SELFTEST is set.
  ***************************************************************************/
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT) && defined(DESMUME_JIT_SELFTEST)
+#if defined(DIIS_JIT) && defined(DIIS_JIT_SELFTEST)
 
 #include "jit_trace.h"
 #include "../armcpu.h"
@@ -201,4 +201,4 @@ int jitThumbSelfTest()
 	return fail;
 }
 
-#endif // DESMUME_JIT && DESMUME_JIT_SELFTEST
+#endif // DIIS_JIT && DIIS_JIT_SELFTEST

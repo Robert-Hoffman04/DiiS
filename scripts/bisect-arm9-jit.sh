@@ -23,14 +23,14 @@ CLEAN_EACH_BUILD="${CLEAN_EACH_BUILD:-1}"                 # 1 = `make clean` bef
 # the F1 runtime CPU-mode commit on, the JIT is compiled in by default and
 # defaults to on, so these two names are simply ignored (harmless unused
 # defines) and a newer commit is tested with both JITs on just the same.
-JITDEFS="${JITDEFS:--DDESMUME_JIT_ARM7 -DDESMUME_JIT_ARM9_ON}"
-TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the file browser
+JITDEFS="${JITDEFS:--DDIIS_JIT_ARM7 -DDIIS_JIT_ARM9_ON}"
+TESTDEFS="${TESTDEFS:--DDIIS_FORCE_CORE=1 -DDIIS_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the file browser
 #
 # Notes:
 # - DEVKITPPC must already be exported in your shell (as the Makefile requires).
-# - DESMUME_FORCE_ROM boots straight into sd:/DS/ROMS/test.nds (or usb:/... if
-#   you set DESMUME_FORCE_USB=1). Make sure that ROM exists on the SD image
-#   Dolphin points at, or drop -DDESMUME_FORCE_ROM from TESTDEFS and pick the
+# - DIIS_FORCE_ROM boots straight into sd:/DS/ROMS/test.nds (or usb:/... if
+#   you set DIIS_FORCE_USB=1). Make sure that ROM exists on the SD image
+#   Dolphin points at, or drop -DDIIS_FORCE_ROM from TESTDEFS and pick the
 #   ROM by hand each run.
 # - DOLPHIN_CMD is an array so multi-word launchers (flatpak run ...) work.
 #   Other examples if you switch setups later:
@@ -42,7 +42,7 @@ TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM}"  # 1 = softwa
 
 # ---------------------------------------------------------------------------
 # On commits before 657008d, `jitArm9Enabled` is hardcoded `false` with no
-# #ifdef gate -- -DDESMUME_JIT_ARM9_ON has no effect there, so the ARM9 JIT
+# #ifdef gate -- -DDIIS_JIT_ARM9_ON has no effect there, so the ARM9 JIT
 # never actually runs no matter what JITDEFS says. This patches the literal
 # `false` to `true` on those older commits so the front-end code that *does*
 # exist gets genuinely exercised. On commits that already have the real gate,
@@ -51,12 +51,12 @@ TESTDEFS="${TESTDEFS:--DDESMUME_FORCE_CORE=1 -DDESMUME_FORCE_ROM}"  # 1 = softwa
 force_arm9_if_ungated() {
     local f="source/jit/jit_exec.cpp"
     [ -f "$f" ] || return 0
-    if grep -q "DESMUME_JIT_ARM9_ON" "$f"; then
+    if grep -q "DIIS_JIT_ARM9_ON" "$f"; then
         return 0
     fi
     if grep -q "^bool jitArm9Enabled = false;" "$f"; then
         sed -i 's/^bool jitArm9Enabled = false;/bool jitArm9Enabled = true;  \/\/ forced by bisect script -- pre-A3 commit, no ifdef gate yet/' "$f"
-        echo "  (this commit predates the DESMUME_JIT_ARM9_ON gate -- patched jitArm9Enabled to true so it's actually exercised)"
+        echo "  (this commit predates the DIIS_JIT_ARM9_ON gate -- patched jitArm9Enabled to true so it's actually exercised)"
     fi
 }
 

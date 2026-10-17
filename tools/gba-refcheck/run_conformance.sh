@@ -2,7 +2,7 @@
 #-----------------------------------------------------------------------------
 # tools/gba-refcheck/run_conformance.sh - GBA conformance suite driver
 #
-# Builds a dedicated .dol per gbaconf.conf row (one -DDESMUME_GBA_*_SOAK
+# Builds a dedicated .dol per gbaconf.conf row (one -DDIIS_GBA_*_SOAK
 # probe + its companion synthetic ROM, same pattern as the individual
 # item-2/3/4/6/7 soaks this session), runs it headless under Dolphin over
 # the unified test harness's network transport, captures the probe's
@@ -112,7 +112,7 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 	echo ">> gba-conformance $id ($label)"
 	if [ "$DO_BUILD" = 1 ]; then
 		BENCH_HERE="$HERE" DOLDIR="$DOLDIR" build_dol "gbaconf_$id" \
-			"-DDESMUME_FORCE_ROM -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -D$probeflag -DDESMUME_FORCE_CORE=1" \
+			"-DDIIS_FORCE_ROM -DDIIS_HARNESS -DHARNESS_TRANSPORT_NET -DDIIS_PERFZONES -D$probeflag -DDIIS_FORCE_CORE=1" \
 			"$jitdefs" "$makevars"
 	elif [ ! -f "$DOLDIR/gbaconf_$id.dol" ]; then
 		die "--no-build but $DOLDIR/gbaconf_$id.dol is missing"
@@ -134,7 +134,7 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 		continue
 	fi
 
-	# Keep only this suite's own marker lines - drop the DESMUME_PERFZONES
+	# Keep only this suite's own marker lines - drop the DIIS_PERFZONES
 	# CSV rows (wall_us is never expected to be byte-identical run to run,
 	# only used here to drive --until-frame) and anything else on the wire.
 	actual="$outdir/profile.filtered.log"

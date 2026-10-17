@@ -13,7 +13,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include <stdio.h>
 #include <string.h>
@@ -98,4 +98,4 @@ bool jitSelfTest()
 	return ok;
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

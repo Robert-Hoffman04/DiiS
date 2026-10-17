@@ -112,7 +112,7 @@ static const u8 gfx3d_commandTypes[] = {
 // Task gedma: T1ReadLong_guaranteedAligned() as one byte-reversed load (lwbrx). GCC turns the
 // __builtin_bswap32 of a load into lwz + rotlwi + 2x rlwimi here.
 static FORCEINLINE u32 ldle32(const u8 *mem, u32 off){
-#if defined(__PPC__) && defined(DESMUME_FAST_LE_ACCESS)
+#if defined(__PPC__) && defined(DIIS_FAST_LE_ACCESS)
 	u32 v;
 	__asm__("lwbrx %0,%y1" : "=r"(v) : "Z"(*(const u32 *)(mem + off)));
 	return v;

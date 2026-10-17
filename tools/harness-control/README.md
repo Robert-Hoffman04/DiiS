@@ -24,7 +24,7 @@ concern, kept separate on purpose.
 tools/harness-control/wii_control.py --host 127.0.0.1 --port 4300 \
     --out harness-out --map diis.elf.map
 
-# terminal 2 - launch a DESMUME_HARNESS build in headless Dolphin
+# terminal 2 - launch a DIIS_HARNESS build in headless Dolphin
 tools/harness-control/launch.sh dolphin build/diis.dol
 ```
 

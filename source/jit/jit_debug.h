@@ -12,8 +12,8 @@
  *   (c) Daryl Borth, GPL v2+  --  see jit/upstream/PROVENANCE.md
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_DEBUG_H
-#define DESMUME_JIT_DEBUG_H
+#ifndef DIIS_JIT_DEBUG_H
+#define DIIS_JIT_DEBUG_H
 
 #include "../harness/harness.h"   // §3.2 PKT_PROFILE sink; self-stubs otherwise
 
@@ -24,7 +24,7 @@
 // In getBlock() the local `block` points at the hash slot -> its startPC tells a
 // cold miss (slot == 0) from a collision miss. The rest of PROFILER_* stay
 // no-ops (timer / bin / bailout instrumentation not ported).
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 #define PROFILER_CACHE_HIT()              this->profCacheHit()
 #define PROFILER_CACHE_MISS()             this->profCacheMiss(block ? block->startPC : 0u)
 #define PROFILER_CACHE_EVICT(evicted, pc, idx) this->profCacheEvict((evicted), (pc), (idx))
@@ -50,7 +50,7 @@
 #define PROFILER_FRAG_STATS(count, blockLen, bailed)           ((void)0)
 
 // -- JIT trace / cache logging -------------------------------------------------
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 // §3.3 follow-up: cache_event fires once per registerBlock() -- ~750/frame on
 // ARM9 in steady state, which drowns the stream. The §3.3 periodic per-core
 // stat block (jit_cache.cpp profEmitReport) is the always-on aggregate; the
@@ -95,4 +95,4 @@
 #define JIT_DIFFERENTIAL_THUMB_HOOK(pc, block)                 ((void)0)
 #define JIT_RECORD_MEMORY_WRITE(addr, value, size)             ((void)0)
 
-#endif // DESMUME_JIT_DEBUG_H
+#endif // DIIS_JIT_DEBUG_H

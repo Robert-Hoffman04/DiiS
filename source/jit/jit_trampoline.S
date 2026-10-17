@@ -47,7 +47,7 @@
  *   r3       cycle accumulator (out); r4  next PC (out) / scratch
  ***************************************************************************/
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 .global ExecuteJITTrace
 .type ExecuteJITTrace, @function
@@ -110,4 +110,4 @@ ExecuteJITTrace_Return:
     addi 1, 1, 128
     blr
 
-#endif /* DESMUME_JIT */
+#endif /* DIIS_JIT */

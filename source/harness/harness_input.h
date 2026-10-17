@@ -30,7 +30,7 @@
     path - path.h/driver/xstring/backupDevice wiring absent from the Wii build;
     deferred.)
 
-    perf_zones.h pattern: real bodies under DESMUME_HARNESS && HARNESS_INPUT,
+    perf_zones.h pattern: real bodies under DIIS_HARNESS && HARNESS_INPUT,
     static-inline no-ops otherwise, so call sites carry no #ifdef.
 */
 #ifndef HARNESS_INPUT_H
@@ -42,7 +42,7 @@
 extern "C" {
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_INPUT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_INPUT)
 
 // Stamp the tap timers from a run of protocol bytes (any length, any framing).
 void harness_input_feed_bytes(const void *buf, int n);
@@ -62,7 +62,7 @@ void harness_input_movie_cmd(const char *arg);
 // (and stops at end-of-file).
 void harness_input_movie_tick(u16 *keypad);
 
-#else // !(DESMUME_HARNESS && HARNESS_INPUT)
+#else // !(DIIS_HARNESS && HARNESS_INPUT)
 
 static inline void harness_input_feed_bytes(const void *b, int n) { (void)b; (void)n; }
 static inline void harness_input_update(void) {}

@@ -11,7 +11,7 @@
 @ gbaIrqDispatchIfPending() takes the genuine armcpu_irqException() path
 @ (not the Halt/IntrWait flags-word HLE fallback), and runs a JIT-hot main
 @ busy loop concurrently. Five u32 counters in EWRAM let the host-side
-@ probe (-DDESMUME_GBA_IRQ_SOAK, source/main.cpp) verify, from outside,
+@ probe (-DDIIS_GBA_IRQ_SOAK, source/main.cpp) verify, from outside,
 @ that both the ISR and the interrupted main loop keep making correct,
 @ uncorrupted forward progress across the whole run:
 @   EWRAM+0x00 total_irq        every dispatched IRQ, any source

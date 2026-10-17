@@ -72,7 +72,7 @@ address's bit 0 -- the naive `mov lr,pc; bx target+1` / `pop {..,pc}`
 idiom that broke on ARM7 (ARMv4T) is exactly correct here.
 
 Both `jitArm7Enabled` and `jitArm9Enabled` are left alone by the probe
-(`-DDESMUME_ROCKWRESTLER_PROBE`, `source/main.cpp`) -- unlike
+(`-DDIIS_ROCKWRESTLER_PROBE`, `source/main.cpp`) -- unlike
 armwrestler/arm7wrestler, which each isolate one CPU's JIT because the
 other side is a stub, RockWrestler's IPC/WRAMCNT/VRAMCNT/TCM tests
 genuinely exercise both CPUs together, which is the point of adopting it
@@ -90,12 +90,12 @@ Needs `devkitARM` (`arm-none-eabi-g++`/`-objcopy`) and `ndstool` on `PATH`
 
 ## Running against DiiS
 
-Build DiiS with `-DDESMUME_ROCKWRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDIIS_ROCKWRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon and polls it once per frame; on
 completion it writes `sd:/rockwrestler.log` (total run/failed, plus each
 failing test's name and detail number) and quits. Stage
 `out/rockwrestler.nds` as `sd:/DS/ROMS/test.nds` and boot with
-`-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1` for a fully headless run. The
+`-DDIIS_FORCE_ROM -DDIIS_FORCE_CORE=1` for a fully headless run. The
 JIT is compiled in and on by default; for the interpreter baseline send the
 harness command `cpumode interp` (`tools/benchmark/run.sh --probe-cpumode
 interp`) or build with `make NOJIT=1`. Predicated Bcc/BLcc compile unconditionally now -- the old

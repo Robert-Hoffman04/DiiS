@@ -16,10 +16,10 @@
 
 #include "jit_trace.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include "jit_ppc_emitter.h"
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 #include <stdio.h>
 #endif
 
@@ -871,4 +871,4 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 	}
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

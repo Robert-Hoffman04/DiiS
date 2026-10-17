@@ -1,7 +1,7 @@
 /*
     harness_crash.h - host crash reporting and pass/fail assertions.
 
-    Two things, both gated on DESMUME_HARNESS && HARNESS_CRASH:
+    Two things, both gated on DIIS_HARNESS && HARNESS_CRASH:
 
       1. harness_crash_init() installs a PPC exception "panic" hook. On any
          unhandled trap (DSI/ISI/Program/Alignment/...) it reads PC/LR/MSR/CR
@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+#if defined(DIIS_HARNESS) && defined(HARNESS_CRASH)
 
 // Install the exception panic hook. Idempotent; safe to call before the
 // transport is up (the CRASH packet is simply best-effort either way).

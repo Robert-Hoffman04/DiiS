@@ -51,10 +51,10 @@
 #include "gx/gx_ds_present.h"
 #include "firmware.h"
 #include "path.h"
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 #include "jit/jit.h"
 #endif
-#include "perf_zones.h"   // no-op macros unless -DDESMUME_PERFZONES
+#include "perf_zones.h"   // no-op macros unless -DDIIS_PERFZONES
 #ifdef DSLZ_FRAMECRC
 #include "harness/harness_profile.h"
 #endif
@@ -72,7 +72,7 @@ void dsHeapStats(const char *when)
 		(SYS_GetArena1Size() + SYS_GetArena2Size() + mi.fordblks) >> 10);
 }
 #endif
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 #include <ogc/lwp_watchdog.h>
 #include <stdio.h>
 #endif
@@ -193,16 +193,16 @@ int NDS_Init( void) {
 	armcpu_new(&NDS_ARM7,1);
 	armcpu_new(&NDS_ARM9,0);
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	jitInit();
-#ifdef DESMUME_JIT_SELFTEST_BOOT
+#ifdef DIIS_JIT_SELFTEST_BOOT
 	// P1 JIT-bringup smoke test (trampoline/arena/cache/linker-stub round
 	// trip) - stale scaffolding once P2+ landed, so no longer run on every
-	// DESMUME_JIT boot (that includes normal/production JIT builds,
+	// DIIS_JIT boot (that includes normal/production JIT builds,
 	// not just test builds). Opt in explicitly if this is ever needed again.
 	jitSelfTest();
 #endif
-#ifdef DESMUME_JIT_SELFTEST
+#ifdef DIIS_JIT_SELFTEST
 	jitThumbSelfTest();
 #endif
 #ifdef JIT_DIFFERENTIAL_TESTING
@@ -233,7 +233,7 @@ int NDS_Init( void) {
 }
 
 void NDS_DeInit(void) {
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	jitShutdown();
 #endif
 	if(MMU.CART_ROM != MMU.UNUSED_RAM)
@@ -1822,7 +1822,7 @@ FORCEINLINE void arm9log()
 #ifdef LOG_ARM9
 	if(dolog)
 	{
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 		jitSyncPipeline(JIT_ARM9);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 		char dasmbuf[4096];
@@ -1845,7 +1845,7 @@ FORCEINLINE void arm7log()
 #ifdef LOG_ARM7
 	if(dolog)
 	{
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 		jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 		char dasmbuf[4096];
@@ -1880,11 +1880,11 @@ static FORCEINLINE s32 minarmtime(s32 arm9, s32 arm7)
 		return arm7;
 }
 
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 // P5 diagnostic: split armInnerLoop's wall time between the two cores to
 // figure out whether an ARM7-JIT-enabled build's boot-window slowdown is
 // coming from the ARM7 side at all, or from something else entirely.
-// Independent of DESMUME_JIT so Interpreter mode / a NOJIT=1 build can be
+// Independent of DIIS_JIT so Interpreter mode / a NOJIT=1 build can be
 // compared 1:1.
 // gettime() is a cheap timebase read (a couple of mfspr's under libogc), but
 // calling it twice per dispatched guest instruction still perturbs the very
@@ -1929,7 +1929,7 @@ static void arm7TraceRecordAndCheck()
 	e.r4  = NDS_ARM7.R[4];
 	e.r13 = NDS_ARM7.R[13];
 	e.r14 = NDS_ARM7.R[14];
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	jitSyncPipeline(JIT_ARM7);   // cpu.instruction is fetched lazily after a JIT run
 #endif
 	e.op  = NDS_ARM7.instruction;
@@ -1970,10 +1970,10 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			if(!NDS_ARM9.waitIRQ)
 			{
 				arm9log();
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 #endif
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 				if (jit)
 				{
 					// Budget = ARM9 cycles until the next scheduled hardware event;
@@ -1990,7 +1990,7 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				else
 #endif
 				{ PZ_SCOPE(PZ_ARM9_INTERP); arm9 += armcpu_exec<ARMCPU_ARM9>(); }
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 				g_arm9Ticks += gettime() - _t0;
 				splitMaybeReport();
 #endif
@@ -2005,12 +2005,12 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 			if(!NDS_ARM7.waitIRQ)
 			{
 				arm7log();
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 				u64 _t0 = gettime();
 				g_arm7RunHits++;
 				arm7TraceRecordAndCheck();
 #endif
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 				if (jit)
 				{
 					// Same budget in ARM7 cycles: ARM7 time is doubled onto the
@@ -2023,14 +2023,14 @@ static /*donotinline*/ std::pair<s32,s32> armInnerLoop(
 				else
 #endif
 				{ PZ_SCOPE(PZ_ARM7_INTERP); arm7 += (armcpu_exec<ARMCPU_ARM7>()<<1); }
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 				g_arm7Ticks += gettime() - _t0;
 				splitMaybeReport();
 #endif
 			}
 			else
 			{
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 				g_arm7WaitIRQHits++;
 #endif
 				arm7 = min(s32next, arm7 + kIrqWait);
@@ -2178,7 +2178,7 @@ void NDS_exec(s32 nb)
 	// since the last frame (harness "cpumode", main.cpp) is applied here, and
 	// the mode is then read once for the whole frame. It picks which
 	// armInnerLoop instantiation runs, so a change can never land mid-frame.
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	jitApplyPendingMode();
 	const bool jit = g_jitOn;
 #else
@@ -2756,7 +2756,7 @@ void NDS_DebugForceGBAMode(bool enable)
 	// MMU.isGBA's comment in MMU.h. Any future code that sets
 	// gameInfo.isGBA from real ROMTYPE_GBA detection must set this too.
 	MMU.isGBA = enable;
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// roadmap #20 (GBA compat), §12.3 step 5: swap which JitCpuProfile
 	// jitRunArm7() sees -- see jitSetArm7GBAMode()'s comment in jit.h. A
 	// third mirror of this same flag, for the same "MMU.h/jit_trace.cpp

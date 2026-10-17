@@ -66,7 +66,7 @@ def parse_profile_log(path):
                 continue
             if line.startswith("frame,wall_us"):
                 cols = line.split(",")[2:]              # drop frame, wall_us
-                # strip "_us"; -DDESMUME_PERFZONES_PMC appends pmcset + <zone>_pmcN columns
+                # strip "_us"; -DDIIS_PERFZONES_PMC appends pmcset + <zone>_pmcN columns
                 zone_names = [c[:-3] for c in cols if c.endswith("_us")]
                 continue
             m = FRAMETIME_RE.match(line)

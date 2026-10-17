@@ -2,7 +2,7 @@
 @ FIFO A path end to end -- Timer0 for sample-rate cadence, DMA channel 1
 @ (Special/Sound-FIFO timing, dst 0x040000A0) for refill, SOUNDCNT_H/X for
 @ routing/volume/enable -- with a known, deterministic 8-bit PCM pattern so
-@ the host-side probe (-DDESMUME_GBA_APU_SOAK, source/main.cpp) and the
+@ the host-side probe (-DDIIS_GBA_APU_SOAK, source/main.cpp) and the
 @ mGBA reference driver (tools/gba-refcheck/mgba_headless.c) can both be
 @ checked against a known-good expected value.
 @

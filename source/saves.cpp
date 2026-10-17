@@ -64,7 +64,7 @@
 
 int lastSaveState = 0;		//Keeps track of last savestate used for quick save/load functions
 
-#ifdef DESMUME_SAVESTATE_DIAG
+#ifdef DIIS_SAVESTATE_DIAG
 // Each call opens/appends/closes sd:/savestate_trace.log so a checkpoint
 // survives even if the very next line hangs the emu thread -- printf() over
 // gecko doesn't help when nobody's holding a Gecko socket open for a manual
@@ -1092,7 +1092,7 @@ bool savestate_save (const char *file_name)
 extern SFORMAT SF_RTC[];
 
 static void writechunks(EMUFILE* os) {
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// The SF_ARM* chunks store cpu.instruction ("9INS"/"7INS"), which the JIT
 	// dispatcher fetches lazily -- materialise it so the
 	// state is self-consistent for a loader (or a non-JIT build) that runs
@@ -1101,7 +1101,7 @@ static void writechunks(EMUFILE* os) {
 	jitSyncPipeline(JIT_ARM7);
 #endif
 	SF_MEM_rebind();   // heap MMU buffers -> SF_MEM[].v (see SF_MEM above)
-#ifdef DESMUME_SAVESTATE_DIAG
+#ifdef DIIS_SAVESTATE_DIAG
 	// ftell() delta around each chunk -- works uniformly for both
 	// savestate_WriteChunk() overloads (one returns a byte count, the other
 	// void) and is what actually correlates with the file growing between
@@ -1182,12 +1182,12 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 				break;
 		}
 		if(!ret) {
-#ifdef DESMUME_SAVESTATE_DIAG
+#ifdef DIIS_SAVESTATE_DIAG
 			printf("[ss] ReadStateChunks FAILED at chunk t=%u size=%u\n", t, size);
 #endif
 			return false;
 		}
-#ifdef DESMUME_SAVESTATE_DIAG
+#ifdef DIIS_SAVESTATE_DIAG
 		printf("[ss] chunk t=%u size=%u ok\n", t, size);
 #endif
 	}
@@ -1223,7 +1223,7 @@ static void loadstate()
 
 	SetupMMU();
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	// P4: a state load (or rewind) overwrites MAIN_MEM/SWIRAM/ARM7_ERAM in bulk
 	// via direct buffer copies (ReadStateChunks -> mmu_loadstate), completely
 	// bypassing every _MMU_write* SMC hook above. Any block already compiled

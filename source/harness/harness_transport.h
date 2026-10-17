@@ -18,7 +18,7 @@
               the file" scripts keep working with no listener. harness_recv()
               is a no-op (one-way).
 
-    Follows the perf_zones.h pattern: real bodies under DESMUME_HARNESS,
+    Follows the perf_zones.h pattern: real bodies under DIIS_HARNESS,
     static-inline no-ops otherwise, so call sites never need their own #ifdef.
 */
 #ifndef HARNESS_TRANSPORT_H
@@ -31,7 +31,7 @@
 extern "C" {
 #endif
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 
 // Pick a backend (see probe order above) and bring it up. Returns false only
 // when a pinned backend fails; AUTO always succeeds (SD is the floor). On
@@ -50,7 +50,7 @@ u32 harness_recv(u8 *out_type, void *buf, u32 bufsize);
 // "net" / "gecko" / "sd" / "none" - which backend won the probe.
 const char *harness_transport_name(void);
 
-#else // !DESMUME_HARNESS
+#else // !DIIS_HARNESS
 
 static inline bool harness_transport_init(void) { return false; }
 static inline void harness_transport_close(void) {}
@@ -60,7 +60,7 @@ static inline u32 harness_recv(u8 *out_type, void *buf, u32 bufsize)
 	{ (void)out_type; (void)buf; (void)bufsize; return 0; }
 static inline const char *harness_transport_name(void) { return "off"; }
 
-#endif // DESMUME_HARNESS
+#endif // DIIS_HARNESS
 
 #ifdef __cplusplus
 }

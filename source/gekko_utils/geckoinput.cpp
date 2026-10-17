@@ -13,13 +13,13 @@
 
 #include "geckoinput.h"
 
-/* -DDESMUME_NO_GECKO_INPUT compiles the EXI/USB-Gecko *input* path out entirely:
+/* -DDIIS_NO_GECKO_INPUT compiles the EXI/USB-Gecko *input* path out entirely:
    the four public entry points become inert stubs. Use it when the same Gecko
    channel is carrying debug-serial *output* (log_console.cpp) -- Dolphin's
    emulated Gecko can loop that TX text back into RX, and byte_to_slot() then
    turns stray letters ('a','l','r','s','u','d',...) into phantom button holds,
    which reads as "controller input is broken". Gecko log output is unaffected. */
-#ifdef DESMUME_NO_GECKO_INPUT
+#ifdef DIIS_NO_GECKO_INPUT
 void         GECKO_InputInit(void)   {}
 void         GECKO_Update(void)      {}
 unsigned int GECKO_ButtonsDown(void) { return 0; }
@@ -129,4 +129,4 @@ unsigned int GECKO_ButtonsDown(void) { return g_down; }
 unsigned int GECKO_ButtonsHeld(void) { return g_held; }
 int          GECKO_Available(void)   { return g_alive; }
 
-#endif /* DESMUME_NO_GECKO_INPUT */
+#endif /* DIIS_NO_GECKO_INPUT */

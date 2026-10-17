@@ -6,7 +6,7 @@ set -e
 SRC=$(realpath "$1"); L=$2; [ -n "$SRC" ] && [ -n "$L" ] || { echo "usage: $0 <src> <label>"; exit 1; }
 P=/home/user/tools/perf; T=/home/user/tools
 FRAMES=${FRAMES:-1800}; TMO=${TMO:-1500}; DISP=${DISP:-:60}
-DEFS="-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1 -DDESMUME_PERFZONES -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=$FRAMES -DDESMUME_FORCE_RENDERMODE=2 $EXTRA_DEFS"
+DEFS="-DDIIS_FORCE_ROM -DDIIS_FORCE_CORE=1 -DDIIS_PERFZONES -DDIIS_BENCH -DDIIS_BENCH_FRAMES=$FRAMES -DDIIS_FORCE_RENDERMODE=2 $EXTRA_DEFS"
 TREE=$P/trees/$L; mkdir -p $TREE $P/results
 pgrep dockerd >/dev/null || { (nohup dockerd >/tmp/dockerd.log 2>&1 &); sleep 8; }
 python3 $P/sync.py "$SRC" $TREE
@@ -43,7 +43,7 @@ echo "[run] host time $(( $(date +%s) - S ))s"
 mcopy -o -i $I@@$OFF ::/perfzones.log $P/results/$L.raw
 python3 - $P/results/$L.raw $P/results/$L.csv <<'P'
 import sys; L=open(sys.argv[1],'rb').read().decode('latin1').split('\n')
-n=next(l for l in L if l.startswith('frame,')).count(',')   # header; a -DDESMUME_PERFZONES_PMC log has a '# pmc sets' line first
+n=next(l for l in L if l.startswith('frame,')).count(',')   # header; a -DDIIS_PERFZONES_PMC log has a '# pmc sets' line first
 keep=[l for l in L if l.startswith('#') or l.startswith('frame') or (l and l.count(',')==n)]
 open(sys.argv[2],'w').write('\n'.join(keep)+'\n')
 P

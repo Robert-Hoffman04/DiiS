@@ -14,12 +14,12 @@
  * cost is a compile-time sum of JitCpuProfile::cyclesForThumb.
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_TRACE_H
-#define DESMUME_JIT_TRACE_H
+#ifndef DIIS_JIT_TRACE_H
+#define DIIS_JIT_TRACE_H
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 // Lazily allocates the ARM9 JIT slot (arena/block table/SMC tables) on first
 // real ARM9 JIT dispatch instead of unconditionally in jitInit() -- see
@@ -643,6 +643,6 @@ void jitArmEmitOne(JitTraceCtx& ctx, u32 opcode);     // jit_arm.cpp
 
 BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& cpu, bool thumb);
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT
 
-#endif // DESMUME_JIT_TRACE_H
+#endif // DIIS_JIT_TRACE_H

@@ -13,8 +13,8 @@
  * trace (jitInterpFallback) instead of ending the block.
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_H
-#define DESMUME_JIT_H
+#ifndef DIIS_JIT_H
+#define DIIS_JIT_H
 
 #include "../types.h"
 #include "jit_debug.h"
@@ -38,7 +38,7 @@ struct JITResult {
 	u32 smcAddress;  // written EA when smcHit
 } __attribute__((aligned(32)));
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 // Hand-written PowerPC ABI bridge (jit_trampoline.S). startCycles seeds the
 // r3 cycle accumulator (0 == the old fixed JIT_YIELD_NUMBER quota); the
@@ -172,12 +172,12 @@ bool jitDiffJournalSelfTest();
 // stub miss path -> return). Returns true on success; logs either way.
 bool jitSelfTest();
 
-#if defined(DESMUME_JIT_SELFTEST)
+#if defined(DIIS_JIT_SELFTEST)
 // Synthetic interpreter-vs-JIT differential over a table of THUMB vectors
 // (jit_thumb_test.cpp). Returns the number of failing vectors.
 int jitThumbSelfTest();
 #endif
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT
 
-#endif // DESMUME_JIT_H
+#endif // DIIS_JIT_H

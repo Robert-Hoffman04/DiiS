@@ -4,7 +4,7 @@
     The Dolphin-vs-real-hardware cutover is a one-line change here (or
     an override on the build command line):
 
-        make TESTDEFS='-DDESMUME_HARNESS -DHARNESS_HOST=\"192.168.1.50\"'
+        make TESTDEFS='-DDIIS_HARNESS -DHARNESS_HOST=\"192.168.1.50\"'
 
     HARNESS_HOST may be a dotted-quad or a hostname. Against Dolphin with Wii
     network passthrough it is the host machine's address (LAN IP is safest;

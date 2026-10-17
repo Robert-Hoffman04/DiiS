@@ -16,14 +16,14 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include "../MMU.h"
 #include "../armcpu.h"
 #include "../MMU_timing.h"
 #include "../perf_zones.h"
 #include "jit_arm7_prof.h"
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 #include <ogc/lwp_watchdog.h>
 #define A7P_T0 const u64 _a7t0 = gettime();
 #define A7P_MEM(a,s,w) a7pMem((a),(s),(w),(u32)(gettime()-_a7t0))
@@ -290,4 +290,4 @@ JitCpuProfile* jitBuildArm7Profile()
 	return &s_arm7Profile;
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

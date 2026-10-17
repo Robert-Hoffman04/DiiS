@@ -2291,7 +2291,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 			// jump-table dispatch on every sprite pixel. Hoist it: pick the
 			// blend-mode template once, run a straight-line loop.
 			const int nbPixelsX = item->nbPixelsX;
-			#define DESMUME_SPR_COMPOSITE(FUNC, WIN) \
+			#define DIIS_SPR_COMPOSITE(FUNC, WIN) \
 				for (int i=0; i < nbPixelsX; i++) { \
 					const u16 px = item->PixelsX[i]; \
 					_master_setFinalOBJColor<FUNC, WIN>(gpu, gpu->currDst, \
@@ -2299,16 +2299,16 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 				}
 			switch(gpu->setFinalColorSpr_funcNum)
 			{
-				case 0x0: DESMUME_SPR_COMPOSITE(None,     false); break;
-				case 0x1: DESMUME_SPR_COMPOSITE(Blend,    false); break;
-				case 0x2: DESMUME_SPR_COMPOSITE(Increase, false); break;
-				case 0x3: DESMUME_SPR_COMPOSITE(Decrease, false); break;
-				case 0x4: DESMUME_SPR_COMPOSITE(None,     true);  break;
-				case 0x5: DESMUME_SPR_COMPOSITE(Blend,    true);  break;
-				case 0x6: DESMUME_SPR_COMPOSITE(Increase, true);  break;
-				case 0x7: DESMUME_SPR_COMPOSITE(Decrease, true);  break;
+				case 0x0: DIIS_SPR_COMPOSITE(None,     false); break;
+				case 0x1: DIIS_SPR_COMPOSITE(Blend,    false); break;
+				case 0x2: DIIS_SPR_COMPOSITE(Increase, false); break;
+				case 0x3: DIIS_SPR_COMPOSITE(Decrease, false); break;
+				case 0x4: DIIS_SPR_COMPOSITE(None,     true);  break;
+				case 0x5: DIIS_SPR_COMPOSITE(Blend,    true);  break;
+				case 0x6: DIIS_SPR_COMPOSITE(Increase, true);  break;
+				case 0x7: DIIS_SPR_COMPOSITE(Decrease, true);  break;
 			}
-			#undef DESMUME_SPR_COMPOSITE
+			#undef DIIS_SPR_COMPOSITE
 		}
 	}
 }

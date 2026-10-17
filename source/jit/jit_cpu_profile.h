@@ -16,8 +16,8 @@
  * later phases require (inline memory page tables land in P6, etc.).
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_CPU_PROFILE_H
-#define DESMUME_JIT_CPU_PROFILE_H
+#ifndef DIIS_JIT_CPU_PROFILE_H
+#define DIIS_JIT_CPU_PROFILE_H
 
 #include "../types.h"
 
@@ -143,4 +143,4 @@ struct JitPageDesc {
 enum { JIT_ARM9 = 0, JIT_ARM7 = 1 };
 extern JitCpuProfile* jitProfile[2];
 
-#endif // DESMUME_JIT_CPU_PROFILE_H
+#endif // DIIS_JIT_CPU_PROFILE_H

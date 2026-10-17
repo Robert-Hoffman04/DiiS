@@ -3,13 +3,13 @@ index b77abae..36ba410 100644
 --- a/source/main.cpp
 +++ b/source/main.cpp
 @@ -1067,6 +1067,101 @@ void ShowFPS() {
- #define DESMUME_BENCH_BLOCK 60
+ #define DIIS_BENCH_BLOCK 60
  #endif
  
-+#ifdef DESMUME_STATE_HASH
++#ifdef DIIS_STATE_HASH
 +//---------------------------------------------------------------------------
-+// Determinism/regression gate (-DDESMUME_STATE_HASH, needs -DDESMUME_BENCH).
-+// At each frame in DESMUME_STATE_HASH_FRAMES (comma list, default 300,600,900)
++// Determinism/regression gate (-DDIIS_STATE_HASH, needs -DDIIS_BENCH).
++// At each frame in DIIS_STATE_HASH_FRAMES (comma list, default 300,600,900)
 +// writes per-region FNV-1a-64 hashes of guest-visible state to sd:/statehash.log:
 +// main RAM, ITCM/DTCM, shared WRAM, ARM7 WRAM, LCD VRAM, palette/OAM, both CPUs'
 +// R0-R15/CPSR/SPSR, nds_timer, and the composited GPU_screen. The whole file is
@@ -18,8 +18,8 @@ index b77abae..36ba410 100644
 +//---------------------------------------------------------------------------
 +#include "gfx3d.h"
 +#include <string.h>
-+#ifndef DESMUME_STATE_HASH_FRAMES
-+#define DESMUME_STATE_HASH_FRAMES 300,600,900
++#ifndef DIIS_STATE_HASH_FRAMES
++#define DIIS_STATE_HASH_FRAMES 300,600,900
 +#endif
 +static u64 sh_fnv(const void* p, size_t n, u64 h = 0xcbf29ce484222325ULL)
 +{
@@ -71,7 +71,7 @@ index b77abae..36ba410 100644
 +}
 +static void state_hash_tick(u32 frame)
 +{
-+	static const u32 cps[] = { DESMUME_STATE_HASH_FRAMES };
++	static const u32 cps[] = { DIIS_STATE_HASH_FRAMES };
 +	static char buf[8192];
 +	static int  len = 0;
 +	static bool any = false;
@@ -99,7 +99,7 @@ index b77abae..36ba410 100644
 +		if (f) { fwrite(buf, 1, (size_t)len, f); fclose(f); }
 +	}
 +}
-+#endif // DESMUME_STATE_HASH
++#endif // DIIS_STATE_HASH
 +
  static void bench_tick(u64 exec_ticks, u64 draw_ticks)
  {
@@ -108,7 +108,7 @@ index b77abae..36ba410 100644
  	}
  
  	frame++;
-+#ifdef DESMUME_STATE_HASH
++#ifdef DIIS_STATE_HASH
 +	state_hash_tick(frame);
 +#endif
  	acc_exec += ticks_to_microsecs(exec_ticks);

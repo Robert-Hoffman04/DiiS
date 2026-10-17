@@ -30,9 +30,9 @@
 
 // Host wall-clock is the only non-deterministic input to the emulated RTC (games such as
 // SM64DS seed their RNG from it, which changes 3D texture/particle output run to run).
-// -DDESMUME_DETERMINISTIC_RTC pins it to a fixed instant (2010-01-01 12:00:00 local) so
+// -DDIIS_DETERMINISTIC_RTC pins it to a fixed instant (2010-01-01 12:00:00 local) so
 // harness captures are reproducible. Off by default: real builds keep the host clock.
-#ifdef DESMUME_DETERMINISTIC_RTC
+#ifdef DIIS_DETERMINISTIC_RTC
 #define RTC_HOST_TIME(tm) do { struct tm _f = {}; _f.tm_year = 110; _f.tm_mday = 1; _f.tm_hour = 12; _f.tm_isdst = -1; (tm) = mktime(&_f); } while (0)
 #else
 #define RTC_HOST_TIME(tm) time(&(tm))

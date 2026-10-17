@@ -5,7 +5,7 @@
     packets out, so the Dolphin network-passthrough path can be proven with a
     LOG round-trip before §3.0/§3.1 build the full transport abstraction on top.
 
-    Follows the perf_zones.h pattern: real declarations under DESMUME_HARNESS,
+    Follows the perf_zones.h pattern: real declarations under DIIS_HARNESS,
     static-inline no-ops otherwise, so call sites never need their own #ifdef.
 */
 #ifndef HARNESS_NET_H
@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 
 // Bring the Wii network stack up and connect to HARNESS_HOST:HARNESS_PORT.
 // Returns false (and disables itself) on any failure - the app then runs
@@ -39,7 +39,7 @@ u32 harness_net_recv(u8 *out_type, void *buf, u32 bufsize);
 void harness_net_close(void);
 bool harness_net_ok(void);
 
-#else // !DESMUME_HARNESS
+#else // !DIIS_HARNESS
 
 static inline bool harness_net_init(void) { return false; }
 static inline void harness_net_send(u8 packet_type, const void *payload, u32 len)
@@ -50,7 +50,7 @@ static inline u32 harness_net_recv(u8 *out_type, void *buf, u32 bufsize)
 static inline void harness_net_close(void) {}
 static inline bool harness_net_ok(void) { return false; }
 
-#endif // DESMUME_HARNESS
+#endif // DIIS_HARNESS
 
 #ifdef __cplusplus
 }

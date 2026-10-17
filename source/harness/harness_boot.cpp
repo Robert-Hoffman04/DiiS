@@ -1,11 +1,11 @@
 /*
     harness_boot.cpp - see harness_boot.h. Compiles to nothing without
-    -DDESMUME_HARNESS -DHARNESS_BOOT.
+    -DDIIS_HARNESS -DHARNESS_BOOT.
 */
 #include "harness.h"
 #include "harness_boot.h"
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 
 #include "harness_wire.h"
 #include "../NDSSystem.h"
@@ -154,4 +154,4 @@ void harness_boot_announce(void)
 		harness_send(HARNESS_PKT_CTRL, buf, (u32)n);
 }
 
-#endif // DESMUME_HARNESS && HARNESS_BOOT
+#endif // DIIS_HARNESS && HARNESS_BOOT

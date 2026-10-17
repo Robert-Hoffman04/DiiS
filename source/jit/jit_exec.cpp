@@ -22,7 +22,7 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include "jit_trace.h"
 #include "jit_arm9_region.h"
@@ -32,7 +32,7 @@
 #include "../NDSSystem.h"
 #include "../perf_zones.h"
 #include "jit_arm7_prof.h"
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 #include <ogc/lwp_watchdog.h>
 #endif
 #include "../harness/harness.h"
@@ -45,7 +45,7 @@
 // §3.0: the JIT heap canary/minefield poll is crash-detection and only runs
 // under the master harness flag (+ HARNESS_CRASH). Without it jitCheckCanaries()
 // is a no-op stub and these poll sites compile away entirely.
-#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+#if defined(DIIS_HARNESS) && defined(HARNESS_CRASH)
   #define JIT_CANARY_WATCH 1
 #endif
 
@@ -203,7 +203,7 @@ extern "C" void jitCoreCostEmit(u32 frame)
 #endif
 static void jitMaybeReport()
 {
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	static u64 s_lastReport = 0;
 	if (g_jitAttempts - s_lastReport < 50000) return;
 	s_lastReport = g_jitAttempts;
@@ -221,7 +221,7 @@ static void jitMaybeReport()
 #include "jit_differential.h"
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 // §3.3: periodic per-core JIT cache-pressure stat block over PKT_PROFILE. Both
 // cores report (ARM7 always, ARM9 whenever its dispatcher runs). Throttled by a
 // shared dispatch tick rather than a frame boundary (frames land in §3.3b).
@@ -239,8 +239,8 @@ static inline void jitHarnessCacheReport() {}
 // A2 coverage profiler (the port of VBA's Profiler): per-ARM9-step tally of
 // ARM vs THUMB vs JIT-compilable-THUMB, so the THUMB-only front-end's reach can
 // be reported before A3's benchmark. Dumped to sd:/jit.log with the other
-// telemetry; DESMUME_JIT_TRACE_FIRST-gated, zero cost otherwise.
-#ifdef DESMUME_JIT_TRACE_FIRST
+// telemetry; DIIS_JIT_TRACE_FIRST-gated, zero cost otherwise.
+#ifdef DIIS_JIT_TRACE_FIRST
 // per-ARM9-step tally: arm-jit / thumb-jit == steps the respective front-end can
 // take; region-out == a mode whose canEnter*() said no (uncompilable address).
 u64 g_jit9Steps = 0, g_jit9ArmOk = 0, g_jit9ThumbOk = 0, g_jit9RegionOut = 0;
@@ -299,7 +299,7 @@ template<int PROCNUM, bool THUMB>
 static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
 {
 	PZ_SCOPE(PROCNUM == ARMCPU_ARM9 ? PZ_JIT9_FB : PZ_JIT7_FB);
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 	const u64 _a7t0 = gettime();
 #endif
 	armcpu_t& cpu = (PROCNUM == ARMCPU_ARM9) ? NDS_ARM9 : NDS_ARM7;
@@ -338,7 +338,7 @@ static FORCEINLINE u32 jitInterpFallback(u32 opcode, u32 pc)
 		ret |= JIT_FALLBACK_EXIT_CHAIN;
 
 	JCC_FALLBACK(PROCNUM == ARMCPU_ARM9 ? 1 : 0, ret);
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 	if (PROCNUM == ARMCPU_ARM7) a7pFb(pc, opcode, THUMB, (u32)(gettime() - _a7t0));
 #endif
 	return ret;
@@ -405,7 +405,7 @@ void jitSyncPipelineSlow(int core)
 
 // F1 runtime CPU mode -- see jit.h. Default JIT: a build that never touches
 // the setting (forced-boot test builds skip the startup picker) runs both
-// JITs, exactly like the old -DDESMUME_JIT_ARM9_ON default.
+// JITs, exactly like the old -DDIIS_JIT_ARM9_ON default.
 bool g_jitOn = true;
 s8   g_jitModePending = -1;
 
@@ -503,13 +503,13 @@ u32 jitRunArm7(s32 budget)
 	JITResult r;
 	jitResultInit(r);
 	JCC_EXEC_BEGIN();
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 	const u64 _a7t0 = gettime();
 #endif
 	{ PZ_SCOPE(PZ_JIT7_EXEC); ExecuteJITTrace(b->execute, &r, &st, start); }
 	JCC_EXEC_END(0);
 	r.cycles -= start;
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 	a7pRun(pc | (thumb ? 1u : 0u), r.cycles, r.instructions, (u32)(gettime() - _a7t0), r.nextPC);
 #endif
 	g_jitAttempts++;
@@ -517,7 +517,7 @@ u32 jitRunArm7(s32 budget)
 	if (r.smcHit)
 		jitCacheArm7.invalidateSMCTarget(r.smcAddress);
 
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	if (g_jitAttempts <= 60) {
 		FILE* f = fopen("sd:/jit.log", "a");
 		if (f) { fprintf(f, "[jit] blk %s pc=%08x op=%08x len=%u ins=%u bail=%u smc=%u cyc=%u npc=%08x\n",
@@ -617,7 +617,7 @@ u32 jitRunArm7(s32 budget)
 // harness.
 //
 // jitArm9Enabled (defined above, next to jitArm7Enabled) follows the runtime
-// CPU mode -- the old -DDESMUME_JIT_ARM9_ON opt-in is gone now that the ARM9
+// CPU mode -- the old -DDIIS_JIT_ARM9_ON opt-in is gone now that the ARM9
 // JIT is the default. The ~17 MB ARM9 slot is lazily allocated on the first
 // real dispatch through here (jitEnsureArm9(), jit_trace.cpp), so a DS
 // session pays for it only once actually needed and a GBA session (which
@@ -668,7 +668,7 @@ u32 jitRunArm9(s32 budget)
 	const bool canEnter = jitArm9CanEnter(pc, thumb);
 	JCC_CALL(1);
 
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	g_jit9Steps++;
 	if (!canEnter)   g_jit9RegionOut++;
 	else if (thumb)  g_jit9ThumbOk++;
@@ -679,7 +679,7 @@ u32 jitRunArm9(s32 budget)
 	if (!canEnter) { JCC_NOENTER(1); return 0; }   // uncompilable region / ARM off
 
 	BasicBlock* b = jitCacheArm9.getBlock(pc);
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	const bool wasMiss = !b || (b->execute == nullptr && b->insnCount() == 0) || b->thumbCompiled() != thumb;
 #endif
 #ifdef JIT_CORE_COST_HISTO
@@ -710,7 +710,7 @@ u32 jitRunArm9(s32 budget)
 	JCC_EXEC_END(1);
 	r.cycles -= start;
 
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	{
 		static u64 s_disp = 0, s_comp = 0, s_bail0 = 0, s_arm = 0, s_armbail0 = 0, s_lastRep = 0;
 		static u64 s_insns = 0, s_entries = 0, s_blk0 = 0;
@@ -805,7 +805,7 @@ u32 jitRunArm9(s32 budget)
 
 	const u32 npc = r.nextPC;
 
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	// One-shot diagnostic: an ARM9 JIT block whose resume PC lands outside every
 	// executable region -- the runaway's first observable symptom. Dump the
 	// block's opcodes so the offending emitter is identifiable.
@@ -838,4 +838,4 @@ u32 jitRunArm9(s32 budget)
 	return r.cycles ? r.cycles : 1;
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

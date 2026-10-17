@@ -1,19 +1,19 @@
 /****************************************************************************
  * DiiS - gxstats_log.cpp   (see gxstats_log.h)
  *
- * Compiled to nothing unless -DDESMUME_GXSTATS without -DDESMUME_HARNESS.
+ * Compiled to nothing unless -DDIIS_GXSTATS without -DDIIS_HARNESS.
  ***************************************************************************/
 #include "gxstats_log.h"
 
-#if defined(DESMUME_GXSTATS) && !defined(DESMUME_HARNESS)
+#if defined(DIIS_GXSTATS) && !defined(DIIS_HARNESS)
 
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include "harness/harness_profile.h"
 
-#ifndef DESMUME_GXSTATS_BLOCK
-#define DESMUME_GXSTATS_BLOCK 60
+#ifndef DIIS_GXSTATS_BLOCK
+#define DIIS_GXSTATS_BLOCK 60
 #endif
 
 // One block's lines. A full buffer is written out early rather than dropping lines.
@@ -57,7 +57,7 @@ void harness_profile_emitf(const char *fmt, ...)
 
 void gxStatsFrameTick(void)
 {
-	if (++s_frame % DESMUME_GXSTATS_BLOCK == 0) gxs_flush();
+	if (++s_frame % DIIS_GXSTATS_BLOCK == 0) gxs_flush();
 }
 
 #endif

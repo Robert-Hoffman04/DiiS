@@ -44,62 +44,62 @@
 #include "saves.h"
 #include "rasterize.h"
 #include "perf_zones.h"
-#include "gxstats_log.h"   // Task hw-measure: -DDESMUME_GXSTATS sd:/gxstats.log (no-op otherwise)
+#include "gxstats_log.h"   // Task hw-measure: -DDIIS_GXSTATS sd:/gxstats.log (no-op otherwise)
 #include "fps_overlay.h"
 #include "harness/harness.h"
 #include "gx/gx_gba_render.h"
 #include "gx/gx_rendermode.h"
 #include "gx/gx_ds_present.h"
 #include "gx/gx_fence.h"      // Task gpu-overlap
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 // F1 runtime CPU mode (Interpreter / JIT): the startup picker's CPU line, the
 // harness "cpumode" command, and the wrestler probes' per-core overrides.
 #include "jit/jit.h"
 #endif
 
-#ifdef DESMUME_FORCE_ROM
+#ifdef DIIS_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below. Declared here, ahead of the more specific probe blocks
-// below, since DESMUME_FORCE_ROM alone (no other probe macro) is now a
+// below, since DIIS_FORCE_ROM alone (no other probe macro) is now a
 // valid, supported combination -- e.g. a plain single-ROM boot test.
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_ARMWRESTLER_PROBE
+#ifdef DIIS_ARMWRESTLER_PROBE
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_ARM7WRESTLER_PROBE
+#ifdef DIIS_ARM7WRESTLER_PROBE
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_ROCKWRESTLER_PROBE
+#ifdef DIIS_ROCKWRESTLER_PROBE
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_GBA_APU_SOAK
+#ifdef DIIS_GBA_APU_SOAK
 #include "addons.h"
 #include "gba_apu.h"
 #endif
 
-#ifdef DESMUME_GBA_IRQ_SOAK
+#ifdef DIIS_GBA_IRQ_SOAK
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_GBA_WAITCNT_SOAK
+#ifdef DIIS_GBA_WAITCNT_SOAK
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_GBA_DMA_SOAK
+#ifdef DIIS_GBA_DMA_SOAK
 #include "addons.h"
 #endif
 
-#ifdef DESMUME_GBA_SAVESTATE_SOAK
+#ifdef DIIS_GBA_SAVESTATE_SOAK
 // gba-conformance sstest: addonsChangePak()/
 // NDS_ADDON_NONE below (this soak's own CFlash-boot-hang sidestep, same as
 // its siblings above) needs this declared -- missing here until the
 // gba-conformance harness's first real build of this flag combo caught it
 // (a plain compile error, not a behavior bug: every prior session that
-// exercised DESMUME_GBA_SAVESTATE_SOAK apparently did so incrementally
+// exercised DIIS_GBA_SAVESTATE_SOAK apparently did so incrementally
 // against a tree where another *_SOAK flag was still also defined and had
 // already pulled this header in).
 #include "addons.h"
@@ -320,10 +320,10 @@ int main(int argc, char **argv){
 		sprintf(rom_filename, "usb:/DS/ROMS");
 	}
 
-#ifdef DESMUME_FORCE_ROM
+#ifdef DIIS_FORCE_ROM
 	// Hardcoded ROM path for automated testing (see Makefile TESTDEFS).
 	strcpy(rom_filename, device ? "usb:/DS/ROMS/test.nds" : "sd:/DS/ROMS/test.nds");
-#elif defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#elif defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 	// §3.4 boot manifest: sd:/harness.cfg (or usb:/) with >=1 rom= line drives
 	// the playlist; no manifest -> fall through to the FileBrowser path.
 	if (harness_boot_load(device ? "usb:" : "sd:") > 0) {
@@ -346,11 +346,11 @@ int main(int argc, char **argv){
 #endif
 
 	// Harness transport bring-up. Probes NET -> GECKO -> SD (or a
-	// pinned backend). No-op without -DDESMUME_HARNESS; on failure it disables
+	// pinned backend). No-op without -DDIIS_HARNESS; on failure it disables
 	// itself and boot continues.
 	harness_transport_init();
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 	// The core=/rendermode= manifest keys are applied above, before the
 	// transport exists -- harness_send() is a silent no-op until
 	// harness_transport_init() has picked a backend, so that printf never
@@ -367,12 +367,12 @@ int main(int argc, char **argv){
 
 	// §3.6: install the PPC exception panic hook now that the transport is up,
 	// so any later trap ships a PKT_CRASH register dump + backtrace before the
-	// machine halts. No-op without -DDESMUME_HARNESS / -DHARNESS_CRASH.
+	// machine halts. No-op without -DDIIS_HARNESS / -DHARNESS_CRASH.
 	harness_crash_init();
 
 	cflash_disk_image_file = NULL;
 
-#ifdef DESMUME_FORCE_ROM
+#ifdef DIIS_FORCE_ROM
 	// Root cause: the default CFlash slot-2 passthrough
 	// (addonsInit()'s default pak) defaults to ADDON_CFLASH_MODE_Path with
 	// an empty CFlash_Path (never assigned anywhere outside the interactive
@@ -380,8 +380,8 @@ int main(int argc, char **argv){
 	// then recursively scans whatever the empty path resolves to on the
 	// active filesystem device instead of failing cleanly, which is what
 	// produced the "Using CFlash directory:"-then-frozen boot hang for any
-	// GBA ROM staged as sd:/DS/ROMS/test.nds under -DDESMUME_FORCE_ROM
-	// (reproduced twice, isolated as reachable from every -DDESMUME_FORCE_ROM
+	// GBA ROM staged as sd:/DS/ROMS/test.nds under -DDIIS_FORCE_ROM
+	// (reproduced twice, isolated as reachable from every -DDIIS_FORCE_ROM
 	// single-ROM test build, GBA or DS, not merely the five GBA soaks below
 	// that each used to carry their own copy of this same sidestep). None
 	// of these automated single-ROM test/bench builds exercise slot-2 CFlash
@@ -390,13 +390,13 @@ int main(int argc, char **argv){
 	addonsChangePak(NDS_ADDON_NONE);
 #endif
 
-#ifdef DESMUME_ARMWRESTLER_PROBE
+#ifdef DIIS_ARMWRESTLER_PROBE
 	// Slot-2 = flat host RAM (see armwrestler_probe_tick() below) instead of
 	// the default CFlash passthrough, before MMU_Init()/addonsInit() runs.
 	addonsChangePak(NDS_ADDON_EXPMEMORY);
 	// ExpMemory_reset() allocates expMemSize with `new` every NDS_Reset();
 	// left at its 8MB default, a build with the JIT subsystem compiled in
-	// (-DDESMUME_JIT, i.e. any build without NOJIT=1 -- at the time this was
+	// (-DDIIS_JIT, i.e. any build without NOJIT=1 -- at the time this was
 	// found the ARM7 slot was allocated at boot regardless of whether either
 	// core's JIT was runtime-enabled) reliably freezes very early, before
 	// even the first SMC-tracked memory access -- confirmed to be memory
@@ -408,7 +408,7 @@ int main(int argc, char **argv){
 	// there is no reason for this probe to ever want 8MB of slot-2 RAM.
 	extern u32 expMemSize;
 	expMemSize = 64 * 1024;
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 	// armwrestler's ARM7 side (armwrestler-arm7.asm) is a one-instruction
 	// stub -- `arm7_main: b arm7_main`, an intentional idle spin -- ARM7 is
 	// never used for anything real here, so there is nothing for its JIT to
@@ -418,14 +418,14 @@ int main(int argc, char **argv){
 #endif
 #endif
 
-#ifdef DESMUME_ARM7WRESTLER_PROBE
+#ifdef DIIS_ARM7WRESTLER_PROBE
 	// §18 arm7wrestler gate -- same slot-2 addon trick as §17's armwrestler
 	// probe (see the block above), same 8MB-vs-64KB MEM1 exhaustion fix
 	// applies here for the same reason.
 	addonsChangePak(NDS_ADDON_EXPMEMORY);
 	extern u32 expMemSize;
 	expMemSize = 64 * 1024;
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 	// Opposite of §17's armwrestler probe: here the ARM7 side is the real
 	// test content and the ARM9 side (armwrestler-arm9.asm) is upstream's
 	// own trivial idle/vram-copy stub -- nothing for the ARM9 JIT to
@@ -439,7 +439,7 @@ int main(int argc, char **argv){
 #endif
 #endif
 
-#ifdef DESMUME_ROCKWRESTLER_PROBE
+#ifdef DIIS_ROCKWRESTLER_PROBE
 	// §19 rockwrestler gate -- same slot-2 addon trick as §17/§18, same
 	// 8MB-vs-64KB MEM1 exhaustion fix applies here for the same reason.
 	addonsChangePak(NDS_ADDON_EXPMEMORY);
@@ -481,7 +481,7 @@ int main(int argc, char **argv){
 		exit(0);
 	}
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 	// §3.4: manifest-driven savestate jump for the first playlist ROM (later
 	// ROMs get it inside harness_boot_advance()). -1 / no manifest -> skipped.
 	if (harness_boot_autoload_slot() >= 0)
@@ -1000,7 +1000,7 @@ void Execute() {
 	if(vidthread == LWP_THREAD_NULL)
 		LWP_CreateThread(&vidthread, draw_thread, NULL, NULL, 0, 67);
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 	// §3.4 multi-ROM playlist: advance after frames_per_rom or a host "next_rom",
 	// reloading via NDS_LoadROM each time. #ifdef'd (not just stubbed) so a
 	// release build keeps the original loop's codegen byte-for-byte.
@@ -1085,9 +1085,9 @@ void ShowFPS() {
 	}
 }
 
-#ifdef DESMUME_BENCH
+#ifdef DIIS_BENCH
 //---------------------------------------------------------------------------
-// Renderer runtime benchmark (-DDESMUME_BENCH).
+// Renderer runtime benchmark (-DDIIS_BENCH).
 //
 // Measures how many NDS frames the emulator actually completes per second of
 // real (Wii timebase) wall-clock time - i.e. emulation speed relative to a
@@ -1108,11 +1108,11 @@ void ShowFPS() {
 #include <stdio.h>
 #include <ogc/lwp_watchdog.h>
 
-#ifndef DESMUME_BENCH_FRAMES
-#define DESMUME_BENCH_FRAMES 2400
+#ifndef DIIS_BENCH_FRAMES
+#define DIIS_BENCH_FRAMES 2400
 #endif
-#ifndef DESMUME_BENCH_BLOCK
-#define DESMUME_BENCH_BLOCK 60
+#ifndef DIIS_BENCH_BLOCK
+#define DIIS_BENCH_BLOCK 60
 #endif
 
 static void bench_tick(u64 exec_ticks, u64 draw_ticks)
@@ -1150,7 +1150,7 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 	{ extern void jitCodeStatsTick(u32 frame); jitCodeStatsTick(frame); }
 #endif
 
-	if (frame % DESMUME_BENCH_BLOCK == 0) {
+	if (frame % DIIS_BENCH_BLOCK == 0) {
 		u64 block_us = ticks_to_microsecs(now - t_block);
 		u64 wall_us  = ticks_to_microsecs(now - t_first);
 		FILE *f = fopen("sd:/bench.log", "a");
@@ -1165,7 +1165,7 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 		acc_draw = 0;
 	}
 
-	if (frame >= DESMUME_BENCH_FRAMES) {
+	if (frame >= DIIS_BENCH_FRAMES) {
 		u64 wall_us = ticks_to_microsecs(now - t_first);
 		double secs = wall_us / 1000000.0;
 		double fps  = secs > 0.0 ? frame / secs : 0.0;
@@ -1179,11 +1179,11 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 		quit_game = true;
 	}
 }
-#endif // DESMUME_BENCH
+#endif // DIIS_BENCH
 
-#ifdef DESMUME_ARMWRESTLER_PROBE
+#ifdef DIIS_ARMWRESTLER_PROBE
 //---------------------------------------------------------------------------
-// §17 armwrestler gate (-DDESMUME_ARMWRESTLER_PROBE).
+// §17 armwrestler gate (-DDIIS_ARMWRESTLER_PROBE).
 //
 // The patched armwrestler ROM (see tools/) auto-runs every
 // ARM9 ARM and THUMB CPU test with no input and harvests pass/fail results
@@ -1280,11 +1280,11 @@ static void armwrestler_probe_tick()
 	}
 	if (frame >= s_awQuitAtFrame) quit_game = true;
 }
-#endif // DESMUME_ARMWRESTLER_PROBE
+#endif // DIIS_ARMWRESTLER_PROBE
 
-#ifdef DESMUME_ARM7WRESTLER_PROBE
+#ifdef DIIS_ARM7WRESTLER_PROBE
 //---------------------------------------------------------------------------
-// §18 arm7wrestler gate (-DDESMUME_ARM7WRESTLER_PROBE).
+// §18 arm7wrestler gate (-DDIIS_ARM7WRESTLER_PROBE).
 //
 // Mechanically identical to armwrestler_probe_tick() above (see its comment
 // for the slot-2/ExpMemory mechanism) -- the two differences are: the
@@ -1297,7 +1297,7 @@ static void armwrestler_probe_tick()
 extern u8* expMemory;
 
 // Local copy of the armwrestler probe's le32() (that one is scoped inside
-// -DDESMUME_ARMWRESTLER_PROBE, which this build may not have) -- same
+// -DDIIS_ARMWRESTLER_PROBE, which this build may not have) -- same
 // byte-reassembly reasoning, see that comment.
 static inline u32 le32_7(const u8* p)
 {
@@ -1363,11 +1363,11 @@ static void arm7wrestler_probe_tick()
 	}
 	if (frame >= s_aw7QuitAtFrame) quit_game = true;
 }
-#endif // DESMUME_ARM7WRESTLER_PROBE
+#endif // DIIS_ARM7WRESTLER_PROBE
 
-#ifdef DESMUME_ROCKWRESTLER_PROBE
+#ifdef DIIS_ROCKWRESTLER_PROBE
 //---------------------------------------------------------------------------
-// §19 RockWrestler gate (-DDESMUME_ROCKWRESTLER_PROBE).
+// §19 RockWrestler gate (-DDIIS_ROCKWRESTLER_PROBE).
 //
 // Same slot-2/ExpMemory mechanism as armwrestler_probe_tick()/
 // arm7wrestler_probe_tick() above, with RockWrestler's own layout (see the
@@ -1441,11 +1441,11 @@ static void rockwrestler_probe_tick()
 	}
 	if (frame >= s_rwQuitAtFrame) quit_game = true;
 }
-#endif // DESMUME_ROCKWRESTLER_PROBE
+#endif // DIIS_ROCKWRESTLER_PROBE
 
-#ifdef DESMUME_GBA_BOOT_PROBE
+#ifdef DIIS_GBA_BOOT_PROBE
 //---------------------------------------------------------------------------
-// roadmap #20 (GBA compat) boot probe (-DDESMUME_GBA_BOOT_PROBE).
+// roadmap #20 (GBA compat) boot probe (-DDIIS_GBA_BOOT_PROBE).
 //
 // Unlike the armwrestler-family probes above, a real commercial GBA ROM has
 // no idea this emulator or its slot-2/ExpMemory reporting convention exist
@@ -1525,10 +1525,10 @@ static void gba_boot_probe_tick()
 	}
 	if (s_gbaHaveResult && frame >= s_gbaQuitAtFrame) quit_game = true;
 }
-#endif // DESMUME_GBA_BOOT_PROBE
+#endif // DIIS_GBA_BOOT_PROBE
 
-#if !defined(DESMUME_HARNESS) && !defined(DESMUME_BENCH)
-// DSExec()/NDS_exec() themselves have no pacing at all (see the DESMUME_BENCH
+#if !defined(DIIS_HARNESS) && !defined(DIIS_BENCH)
+// DSExec()/NDS_exec() themselves have no pacing at all (see the DIIS_BENCH
 // comment block above: "Nothing here throttles"), so without this, gameplay
 // -- physics, animation timers,
 // and audio pitch all derive from frame rate here -- simply runs at whatever
@@ -1537,7 +1537,7 @@ static void gba_boot_probe_tick()
 // the same NDS_exec()/DSExec() frame cadence (see SPU.cpp's own single
 // 59.8261 Hz constant, used unconditionally for both).
 //
-// Deliberately compiled out under -DDESMUME_HARNESS/-DDESMUME_BENCH: those
+// Deliberately compiled out under -DDIIS_HARNESS/-DDIIS_BENCH: those
 // builds exist specifically to measure that unthrottled speed (tools/
 // benchmark's "eff.fps"/"% realtime" columns), so pacing them to real time
 // would make the measurement meaningless.
@@ -1572,9 +1572,9 @@ static void frameLimiterTick()
 	// own deadline even though the average frame was slower than real time.
 	// Carrying the debt means we only sleep when genuinely ahead on average.
 }
-#endif // !DESMUME_HARNESS && !DESMUME_BENCH
+#endif // !DIIS_HARNESS && !DIIS_BENCH
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 // Drain any host -> device packets (§3.4 playlist control, §3.5 input). Called
 // once per frame from the end of DSExec(), and once more before the very
 // first frame (see the top of DSExec()) so commands the host sends right at
@@ -1618,7 +1618,7 @@ static void harness_poll_host()
 				const char *_m = _rx + 7;
 				while (*_m == ' ') _m++;
 				int _on = !strncmp(_m, "interp", 6) ? 0 : !strncmp(_m, "jit", 3) ? 1 : -1;
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 				if (_on >= 0) jitRequestMode(_on != 0);
 #else
 				if (_on == 1) _on = -2;   // NOJIT=1 build: JIT not available
@@ -1638,7 +1638,7 @@ static void harness_poll_host()
 #endif
 
 void DSExec(){
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 	{
 		static bool s_polledBeforeFirstFrame = false;
 		if (!s_polledBeforeFirstFrame) { s_polledBeforeFirstFrame = true; harness_poll_host(); }
@@ -1659,7 +1659,7 @@ void DSExec(){
 	pad |= GECKO_ButtonsDown();
 	// §3.5: same for the transport-agnostic remote-input core (network feed);
 	// process_ctrls_event() above already advanced it. Self-stubs to nothing
-	// without -DDESMUME_HARNESS -DHARNESS_INPUT.
+	// without -DDIIS_HARNESS -DHARNESS_INPUT.
 	pad |= harness_input_down();
 	
 	// Update cursor position and click
@@ -1673,7 +1673,7 @@ void DSExec(){
 	}
 
 	// §3.5: deterministic keypad record/replay. Record appends this frame's
-	// keypad; replay overwrites it. No-op without -DDESMUME_HARNESS -DHARNESS_INPUT
+	// keypad; replay overwrites it. No-op without -DDIIS_HARNESS -DHARNESS_INPUT
 	// or when no movie is active.
 	harness_input_movie_tick(&keypad);
 
@@ -1705,8 +1705,8 @@ void DSExec(){
 		else if (pad & PAD_TRIGGER_R)
 			loadstate_slot(0);
 	}
-#ifdef DESMUME_AUTOLOADSTATE
-	// Headless benchmark savestate jump (-DDESMUME_AUTOLOADSTATE): rather than
+#ifdef DIIS_AUTOLOADSTATE
+	// Headless benchmark savestate jump (-DDIIS_AUTOLOADSTATE): rather than
 	// direct-boot + a frame window chosen to sit past the intro, load a
 	// savestate slot exactly once, early, so every benched frame is real
 	// in-game content from a fixed known point. The benchmark harness stages
@@ -1715,22 +1715,22 @@ void DSExec(){
 	// with this flag still runs scenes that ship no state. The load waits a few
 	// frames so NDS_LoadROM()/direct boot has fully brought up the MMU before
 	// the NDS_Reset() inside savestate_load() runs.
-	#ifndef DESMUME_AUTOLOADSTATE_FRAME
-	#define DESMUME_AUTOLOADSTATE_FRAME 90
+	#ifndef DIIS_AUTOLOADSTATE_FRAME
+	#define DIIS_AUTOLOADSTATE_FRAME 90
 	#endif
-	#ifndef DESMUME_AUTOLOADSTATE_SLOT
-	#define DESMUME_AUTOLOADSTATE_SLOT 0
+	#ifndef DIIS_AUTOLOADSTATE_SLOT
+	#define DIIS_AUTOLOADSTATE_SLOT 0
 	#endif
 	{
 		static unsigned alsFrame = 0;
 		static bool alsDone = false;
-		if (!alsDone && alsFrame++ >= (unsigned)DESMUME_AUTOLOADSTATE_FRAME) {
+		if (!alsDone && alsFrame++ >= (unsigned)DIIS_AUTOLOADSTATE_FRAME) {
 			alsDone = true;
-			loadstate_slot(DESMUME_AUTOLOADSTATE_SLOT);
+			loadstate_slot(DIIS_AUTOLOADSTATE_SLOT);
 		}
 	}
 #endif
-#ifdef DESMUME_SAVESTATE_DIAG
+#ifdef DIIS_SAVESTATE_DIAG
 	{
 		static unsigned dframe = 0;
 		unsigned gh = GECKO_ButtonsHeld(), gd = GECKO_ButtonsDown();
@@ -1775,7 +1775,7 @@ void DSExec(){
 		(wpad & WPAD_CLASSIC_BUTTON_HOME))
 		quit_game = true;
 
-#ifdef DESMUME_BENCH
+#ifdef DIIS_BENCH
 	u64 _b0 = gettime();
 	NDS_exec<TRUE>(0);
 	u64 _b1 = gettime();
@@ -1791,7 +1791,7 @@ void DSExec(){
 	pzSet(PZ_HOST);   // Task pzones: loop glue until the next NDS_exec() re-anchors to PZ_OTHER
 	gxStatsFrameTick();
 
-#ifdef DESMUME_GBA_IRQ_SOAK
+#ifdef DIIS_GBA_IRQ_SOAK
 	// Sustained ARM7-JIT-vs-GBA-IRQ soak probe.
 	// The companion synthetic ROM (tools/gba-refcheck/irqsoak.s) maintains
 	// five u32 counters at GBA_EWRAM+0x0/0x4/0x8/0xC/0x10 (total_irq,
@@ -1821,9 +1821,9 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_GBA_SAVESTATE_SOAK
+#ifdef DIIS_GBA_SAVESTATE_SOAK
 	// GBA savestate determinism test. Rides on the same
-	// irqsoak.gba ROM/counters as DESMUME_GBA_IRQ_SOAK above (timers +
+	// irqsoak.gba ROM/counters as DIIS_GBA_IRQ_SOAK above (timers +
 	// VBlank IRQ + a main-loop counter, all continuously active) instead of
 	// a new synthetic ROM. `sframe` is a host-side counter, untouched by
 	// savestate_load()'s internal NDS_Reset()/chunk restore, so it keeps
@@ -1896,7 +1896,7 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_GBA_APU_SOAK
+#ifdef DIIS_GBA_APU_SOAK
 	// APU: DirectSound FIFO reference-check probe.
 	// The companion synthetic ROM (tools/gba-refcheck/dsound.s) arms Timer0
 	// (32768 Hz cadence) + DMA1 Special-timing FIFO-A refill with a known,
@@ -1921,7 +1921,7 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_GBA_WAITCNT_SOAK
+#ifdef DIIS_GBA_WAITCNT_SOAK
 	// WAITCNT-driven cartridge ROM wait-state cost
 	// verification. The companion synthetic ROM (tools/gba-refcheck/
 	// waitcnt.s) times a fixed number of non-sequential cartridge-ROM
@@ -1944,7 +1944,7 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_GBA_DMA_SOAK
+#ifdef DIIS_GBA_DMA_SOAK
 	// DMA3 Video Capture Special-timing trigger
 	// verification. The companion synthetic ROM (tools/gba-refcheck/
 	// dmavcap.s) arms DMA3 with src fixed at REG_VCOUNT and dst incrementing
@@ -1984,7 +1984,7 @@ void DSExec(){
 
 	FPSOverlay_Tick();
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 	{
 		harness_poll_host();
 
@@ -2007,15 +2007,15 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_FBDUMP
-	// Renderer correctness A/B (-DDESMUME_FBDUMP): on a deterministic direct-boot
+#ifdef DIIS_FBDUMP
+	// Renderer correctness A/B (-DDIIS_FBDUMP): on a deterministic direct-boot
 	// ROM, snapshot the composited framebuffer at a fixed frame and write it to
 	// sd:/fb.dump. Two builds that render identically produce a byte-identical
-	// dump. Pair with -DDESMUME_BENCH so the run has a frame budget; pull
+	// dump. Pair with -DDIIS_BENCH so the run has a frame budget; pull
 	// sd:/fb.dump after killing the emulator.
-	//   make TESTDEFS="-DDESMUME_FORCE_ROM -DDESMUME_BENCH -DDESMUME_FBDUMP [-DDESMUME_FBDUMP_FRAME=N] -DDESMUME_FORCE_CORE=1"
-#ifndef DESMUME_FBDUMP_FRAME
-#define DESMUME_FBDUMP_FRAME 600
+	//   make TESTDEFS="-DDIIS_FORCE_ROM -DDIIS_BENCH -DDIIS_FBDUMP [-DDIIS_FBDUMP_FRAME=N] -DDIIS_FORCE_CORE=1"
+#ifndef DIIS_FBDUMP_FRAME
+#define DIIS_FBDUMP_FRAME 600
 #endif
 	{
 		// Snapshot GPU_screen at a fixed frame (the ROM's frame counter is
@@ -2026,7 +2026,7 @@ void DSExec(){
 		static u8  _fbsnap[sizeof(GPU_screen)];
 		static bool _fbhave = false;
 		++_fbframe;
-		if (_fbframe == DESMUME_FBDUMP_FRAME) {
+		if (_fbframe == DIIS_FBDUMP_FRAME) {
 			gxDsPresentResolveAll(); // Task directpresent
 			memcpy(_fbsnap, GPU_screen, sizeof(_fbsnap));
 			_fbhave = true;
@@ -2038,22 +2038,22 @@ void DSExec(){
 	}
 #endif
 
-#ifdef DESMUME_ARMWRESTLER_PROBE
+#ifdef DIIS_ARMWRESTLER_PROBE
 	armwrestler_probe_tick();
 #endif
-#ifdef DESMUME_ARM7WRESTLER_PROBE
+#ifdef DIIS_ARM7WRESTLER_PROBE
 	arm7wrestler_probe_tick();
 #endif
-#ifdef DESMUME_ROCKWRESTLER_PROBE
+#ifdef DIIS_ROCKWRESTLER_PROBE
 	rockwrestler_probe_tick();
 #endif
-#ifdef DESMUME_GBA_BOOT_PROBE
+#ifdef DIIS_GBA_BOOT_PROBE
 	gba_boot_probe_tick();
 #endif
 
 	if(showfps) ShowFPS();
 
-#if !defined(DESMUME_HARNESS) && !defined(DESMUME_BENCH)
+#if !defined(DIIS_HARNESS) && !defined(DIIS_BENCH)
 	frameLimiterTick();
 #endif
 }
@@ -2070,18 +2070,18 @@ bool PickDevice(){
 	bool device = false;
 	current3Dcore = 1; //Soft Raster (only 3D core; see core3DList)
 
-#ifdef DESMUME_FORCE_CORE
+#ifdef DIIS_FORCE_CORE
 	// Hardcoded selection for automated testing (see Makefile TESTDEFS).
-	// DESMUME_FORCE_CORE: 1 = software raster (only option; see core3DList)
-	// DESMUME_FORCE_USB:  0 = SD, 1 = USB
+	// DIIS_FORCE_CORE: 1 = software raster (only option; see core3DList)
+	// DIIS_FORCE_USB:  0 = SD, 1 = USB
 	// The CPU and render-mode lines below are skipped too, so the runtime CPU
 	// mode keeps its default (JIT, g_jitOn in jit_exec.cpp) and the render
 	// mode keeps its default (GxAccurate, gx_rendermode.cpp); a test that
 	// wants otherwise sends the harness command "cpumode interp" / the
 	// rendermode= boot-manifest key (applied after PickDevice() either way).
-	current3Dcore = DESMUME_FORCE_CORE;
-#ifdef DESMUME_FORCE_USB
-	return DESMUME_FORCE_USB;
+	current3Dcore = DIIS_FORCE_CORE;
+#ifdef DIIS_FORCE_USB
+	return DIIS_FORCE_USB;
 #else
 	return false;
 #endif
@@ -2091,7 +2091,7 @@ bool PickDevice(){
 	// cores JITted, the default). Same toggle idiom the old renderer line
 	// used: Left/Right flips the device, Up/Down flips the CPU. A NOJIT=1
 	// build has only the interpreter, so it shows that and ignores Up/Down.
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 	bool useJit = true;
 #else
 	const bool useJit = false;
@@ -2125,7 +2125,7 @@ bool PickDevice(){
 			device = !device;
 		}
 
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 		if(GetInput(UP, UP, UP) || GetInput(DOWN, DOWN, DOWN)) {
 			useJit = !useJit;
 		}
@@ -2136,7 +2136,7 @@ bool PickDevice(){
 		}
 
 		if(GetInput(A, A, A)){
-#ifdef DESMUME_JIT
+#ifdef DIIS_JIT
 			// Pre-boot (NDS_Init() hasn't run), so apply at once rather than
 			// via jitRequestMode(): nothing is running, and the wrestler
 			// probes' per-core overrides further down main() still win.

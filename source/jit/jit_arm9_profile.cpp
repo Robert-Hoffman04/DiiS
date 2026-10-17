@@ -23,14 +23,14 @@
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include "../MMU.h"
 #include "../armcpu.h"
 #include "jit_arm9_region.h"
 #include "../perf_zones.h"
 
-#ifdef DESMUME_PERFZONES
+#ifdef DIIS_PERFZONES
 // perf_zones: which slow-memory zone an ARM9 compiled-code C call lands in.
 static inline PerfZone arm9MemZone(u32 addr)
 {
@@ -90,7 +90,7 @@ static u32  arm9_swiHandler(u32 comment) { (void)comment; return 0; }   // A5
 
 // Region rule (ITCM / main RAM / shared WRAM / ARM9 BIOS, DTCM window
 // excluded) lives in jit_arm9_region.h, shared with jitRunArm9()'s direct
-// (non-indirect) call. canEnterArm honours DESMUME_JIT_ARM9_THUMB_ONLY there.
+// (non-indirect) call. canEnterArm honours DIIS_JIT_ARM9_THUMB_ONLY there.
 static bool arm9_canEnterThumb(u32 pc) { return jitArm9CanEnter(pc, true);  }
 static bool arm9_canEnterArm(u32 pc)   { return jitArm9CanEnter(pc, false); }
 
@@ -315,4 +315,4 @@ JitCpuProfile* jitBuildArm9Profile()
 	return &s_arm9Profile;
 }
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

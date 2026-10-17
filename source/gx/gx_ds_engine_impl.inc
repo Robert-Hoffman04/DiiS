@@ -45,9 +45,9 @@
 #include "../harness/harness_profile.h"   // sets HARNESS_PROFILE_SINK when the lines go anywhere
 #endif
 // -DDSB_STATS's per-band / per-frame debug dumps (planband, mask3d, transdbg, ...) are
-// harness investigation aids; the -DDESMUME_GXSTATS hardware log keeps only the
+// harness investigation aids; the -DDIIS_GXSTATS hardware log keeps only the
 // periodic counter lines (Task hw-measure).
-#if defined(DSB_STATS) && !defined(DESMUME_GXSTATS)
+#if defined(DSB_STATS) && !defined(DIIS_GXSTATS)
 #define DSB_STATS_DBG 1
 #endif
 #include "gx_mask.h"

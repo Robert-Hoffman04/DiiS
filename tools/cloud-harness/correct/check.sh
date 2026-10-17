@@ -49,9 +49,9 @@ for t in tree-n tree-d tree-i; do
   { [ "$t" = tree-i ] && [ $INTERP = 0 ]; } && continue
   { [ "$t" = tree-d ] && ! has diff; } && continue
   mkdir -p "$C/cache/$t"; sync_tree "$SRC" $t
-  # state-hash instrumentation is a tiny -DDESMUME_STATE_HASH-gated patch to main.cpp (lib/state_hash.patch);
+  # state-hash instrumentation is a tiny -DDIIS_STATE_HASH-gated patch to main.cpp (lib/state_hash.patch);
   # a tree that already carries it (e.g. current DiiS worktree) is used as-is.
-  if ! grep -q DESMUME_STATE_HASH "$C/cache/$t/source/main.cpp"; then
+  if ! grep -q DIIS_STATE_HASH "$C/cache/$t/source/main.cpp"; then
     patch -s -p1 -d "$C/cache/$t" < "$C/lib/state_hash.patch" || { echo "state_hash.patch does not apply to $SRC"; exit 2; }
   fi
 done
@@ -68,9 +68,9 @@ for w in armwrestler arm7wrestler rockwrestler; do
 done
 
 # ---------------------------------------------------------------- 1. builds
-FD="-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1 -DDESMUME_DETERMINISTIC_RTC"
-HASHD="$FD -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=$HT -DDESMUME_STATE_HASH -DDESMUME_STATE_HASH_FRAMES=$HF -DDESMUME_FORCE_RENDERMODE=$RM"
-DIFFD="$FD -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=$((DF+30)) -DDESMUME_STATE_HASH -DDESMUME_STATE_HASH_FRAMES=$DF -DDESMUME_FORCE_RENDERMODE=$RM"
+FD="-DDIIS_FORCE_ROM -DDIIS_FORCE_CORE=1 -DDIIS_DETERMINISTIC_RTC"
+HASHD="$FD -DDIIS_BENCH -DDIIS_BENCH_FRAMES=$HT -DDIIS_STATE_HASH -DDIIS_STATE_HASH_FRAMES=$HF -DDIIS_FORCE_RENDERMODE=$RM"
+DIFFD="$FD -DDIIS_BENCH -DDIIS_BENCH_FRAMES=$((DF+30)) -DDIIS_STATE_HASH -DDIIS_STATE_HASH_FRAMES=$DF -DDIIS_FORCE_RENDERMODE=$RM"
 bd() { # tree name testdefs jitdefs makevars jobs
   local st="$(cat "$C/cache/$1/.synchash")|$PSUM|$3|$4|$5"
   [ -f "$C/cache/dols/$2.dol" ] && [ "$(cat "$C/cache/dols/$2.stamp" 2>/dev/null)" = "$st" ] && { echo "cached $2" >&2; return 0; }

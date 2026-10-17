@@ -16,7 +16,7 @@
 #include "../harness/harness_profile.h"
 #endif
 
-#include "../perf_zones.h"   // Task profile/pzones: GX 3D sub-zones (no-op without -DDESMUME_PERFZONES)
+#include "../perf_zones.h"   // Task profile/pzones: GX 3D sub-zones (no-op without -DDIIS_PERFZONES)
 #ifdef DSA_GXGEOM_TAGPROF
 // Task tagcost: CPU time of the recording frame's pieces, averaged per recorded pass.
 #include <ogc/lwp_watchdog.h>
@@ -2551,7 +2551,7 @@ bool gxDs3dGeomFramePrepare()
 	if (g == kGateShadow) harness_profile_emitf("shbail why=%d", s_shWhy);
 #endif
 	++s_frames;
-#ifndef DESMUME_GXSTATS   // Task hw-measure: the hardware log skips this extra ID-plan pass (it would inflate g3prep)
+#ifndef DIIS_GXSTATS   // Task hw-measure: the hardware log skips this extra ID-plan pass (it would inflate g3prep)
 	if (gfx3d.polylist && gfx3d.vertlist && gfx3d.polylist->count > 0) {
 		const int nt = gxDs3dTransIdPlan();
 		if (nt < 0) ++s_tidClash; else s_tidPolys += (u32)nt;
@@ -4515,7 +4515,7 @@ static u32 s_rpRec, s_rpHit, s_rpOver, s_rpCalls;
 void gxDs3dRenderFast()
 {
 	const int count = gfx3d.polylist->count;
-#ifdef DESMUME_PERFZONES
+#ifdef DIIS_PERFZONES
 	const bool pzHit = s_dlSize && s_dlKey.seq == g_gfx3dRenderSeq && s_dlKey.list == gfx3d.polylist && s_dlKey.count == count;
 	PZ_SUB_SCOPE(pzHit ? PZ_GX3D_REPLAY : PZ_GX3D_REC);
 	PZ_SUB_CLS(pzHit ? 2 : 1);

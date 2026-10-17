@@ -13,7 +13,7 @@
 #include "../perf_zones.h"
 #include "../harness/harness.h"
 
-#if defined(DESMUME_JIT)
+#if defined(DIIS_JIT)
 
 #include <malloc.h>
 #include <stdlib.h>
@@ -27,7 +27,7 @@
 // PKT_CRASH, ...) rather than a hardcoded sd:/jit.log open. Without the flag
 // the whole apparatus compiles to nothing and jitCheckCanaries() is a no-op,
 // so a release JIT build is untouched.
-#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+#if defined(DIIS_HARNESS) && defined(HARNESS_CRASH)
   #define JIT_CANARY_WATCH 1
 #endif
 
@@ -2453,7 +2453,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	if (ctx.instrCount == 0) {
 		// Nothing compilable at startPC -- cache a length-1 fallback so the
 		// dispatcher resolves straight to the interpreter next time.
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 		{
 			static u32 s_seen[256]; static u32 s_cnt[256]; static int s_n = 0;
 			static u64 s_tot = 0; s_tot++;
@@ -2566,7 +2566,7 @@ BasicBlock* jitCompileTrace(u32 startPC, JITCache& cache, const JitCpuProfile& c
 	// overwrite, corrupting this still-registered, still-executable block.
 	// Loud and visible rather than a silent arena corruption + eventual wild
 	// jump if JIT_MAX_INSTR_RESERVE_WORDS is ever undersized for a new format.
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 	if (diff < 0) {
 		FILE* f = fopen("sd:/jit.log", "a");
 		if (f) { fprintf(f, "[jit] !!! ARENA OVERRUN pc=%08x emittedWords=%u over=%d\n",
@@ -2752,4 +2752,4 @@ void jitCodeStatsTick(u32 frame)
 }
 #endif // JIT_CODE_STATS
 
-#endif // DESMUME_JIT
+#endif // DIIS_JIT

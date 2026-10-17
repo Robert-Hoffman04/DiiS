@@ -2,8 +2,8 @@
     harness_boot.h - boot manifest + multi-ROM playlist + watchdog.
 
     A single text file - sd:/harness.cfg (or usb:/harness.cfg, or pushed as a
-    companion file over wiiload) - replaces the -DDESMUME_FORCE_ROM /
-    -DDESMUME_FORCE_CORE / -DDESMUME_FORCE_USB compile-time flags:
+    companion file over wiiload) - replaces the -DDIIS_FORCE_ROM /
+    -DDIIS_FORCE_CORE / -DDIIS_FORCE_USB compile-time flags:
 
         core=1                 # index into core3DList[] (main.cpp): 0=null (no 3D),
                                # 1=CPU SoftRasterizer (only real option -- there is
@@ -24,7 +24,7 @@
     heartbeat with the current ROM. No manifest -> every accessor is inert and
     main() falls through to the existing FileBrowser path unchanged.
 
-    Follows the perf_zones.h pattern: real bodies under DESMUME_HARNESS &&
+    Follows the perf_zones.h pattern: real bodies under DIIS_HARNESS &&
     HARNESS_BOOT, static-inline no-ops otherwise, so call sites never #ifdef.
 */
 #ifndef HARNESS_BOOT_H
@@ -36,10 +36,10 @@
 extern "C" {
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_BOOT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 
 // Parse "<mount>/harness.cfg" (mount = "sd:" or "usb:"). Safe to call once,
-// early, right where the -DDESMUME_FORCE_ROM branch used to sit. Returns the
+// early, right where the -DDIIS_FORCE_ROM branch used to sit. Returns the
 // number of rom= entries found (0 = no usable manifest).
 int  harness_boot_load(const char *mount);
 

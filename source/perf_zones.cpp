@@ -1,11 +1,11 @@
 /****************************************************************************
  * DiiS - perf_zones.cpp   (see perf_zones.h)
  *
- * Compiled to nothing unless -DDESMUME_PERFZONES.
+ * Compiled to nothing unless -DDIIS_PERFZONES.
  ***************************************************************************/
 #include "perf_zones.h"
 
-#ifdef DESMUME_PERFZONES
+#ifdef DIIS_PERFZONES
 
 #include <stdio.h>
 #include <string.h>
@@ -16,17 +16,17 @@
 u64 g_pzAcc[PZ_COUNT];
 u64 g_pzHits[PZ_COUNT];
 
-#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT)
+#if defined(JIT_CORE_COST_HISTO) && defined(DIIS_JIT)
 extern "C" void jitCoreCostEmit(u32 frame);   // jit/jit_exec.cpp
 #endif
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 extern "C" void a7pEmit(u32 frame);           // jit/jit_arm7_prof.cpp (Task ph-arm7)
 #endif
 
 static PerfZone s_cur  = PZ_OTHER;
 static u64      s_last = 0;      // timebase of the last bank(); 0 => not started
 
-#ifdef DESMUME_PERFZONES_PMC
+#ifdef DIIS_PERFZONES_PMC
 //---------------------------------------------------------------------------
 // Task hw-measure: per-zone Broadway (PowerPC 750CL) performance-monitor counts.
 //
@@ -94,7 +94,7 @@ static inline void bank(void)
 	u64 now = gettime();
 	if (s_last) g_pzAcc[s_cur] += now - s_last;
 	s_last = now;
-#ifdef DESMUME_PERFZONES_PMC
+#ifdef DIIS_PERFZONES_PMC
 	// 32-bit wrapping deltas: the counters keep counting through the OV bit.
 	const u32 p0 = pmcRead(0), p1 = pmcRead(1), p2 = pmcRead(2), p3 = pmcRead(3);
 	u64 *a = g_pzPmc[s_cur];
@@ -149,20 +149,20 @@ const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 // benchmark's own block_us because the frame-loop glue outside NDS_exec()/
 // Draw() isn't zoned.
 //
-// Sink (§3.2): with -DDESMUME_HARNESS the row goes out as a PKT_PROFILE frame
+// Sink (§3.2): with -DDIIS_HARNESS the row goes out as a PKT_PROFILE frame
 // (harness_send routes it to the listener, or to sd:/perfzones.log via the SD
 // backend when there's none). Without the harness it's written to
 // sd:/perfzones.log directly, exactly as before.
 //---------------------------------------------------------------------------
-#ifndef DESMUME_PERFZONES_BLOCK
-#define DESMUME_PERFZONES_BLOCK 60
+#ifndef DIIS_PERFZONES_BLOCK
+#define DIIS_PERFZONES_BLOCK 60
 #endif
 
-// Task hw-measure: with -DDESMUME_PERFZONES_PMC the header and every row gain
+// Task hw-measure: with -DDIIS_PERFZONES_PMC the header and every row gain
 // ",pmcset" plus four columns per zone (<zone>_pmc1..4 = PMC1..PMC4 counts for the
 // block); which events those are depends on the row's pmcset (the "# pmc sets"
 // comment line lists them). Readers find zones by the _us/_hits suffixes.
-#ifdef DESMUME_PERFZONES_PMC
+#ifdef DIIS_PERFZONES_PMC
 #define PZ_LINE_MAX 8192
 #define PZ_PMC_COMMENT "# pmc sets: 0=instr,l1imiss,l1dmiss,cycles 1=instr,l2imiss,l2dmiss,bmispred 2=instr,imisscyc,ldmisscyc,dtlbcyc\n"
 static int pz_fmt_pmc_header(char *line, int n, int cap)
@@ -188,7 +188,7 @@ static inline int pz_fmt_pmc_header(char *, int n, int) { return n; }
 static inline int pz_fmt_pmc_row(char *, int n, int) { return n; }
 #endif
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 
 //---------------------------------------------------------------------------
 // §3.3b frame-time percentiles. A ring of the last PZ_FT_RING per-frame
@@ -236,7 +236,7 @@ static void pz_emit_header(void)
 {
 	static char line[PZ_LINE_MAX];
 	int n = snprintf(line, sizeof(line),
-		"# diis perfzones  block=%d\n" PZ_PMC_COMMENT "frame,wall_us", DESMUME_PERFZONES_BLOCK);
+		"# diis perfzones  block=%d\n" PZ_PMC_COMMENT "frame,wall_us", DIIS_PERFZONES_BLOCK);
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
 		n += snprintf(line + n, sizeof(line) - n, ",%s_us", pzName(i));
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
@@ -270,7 +270,7 @@ static void pz_emit_header(void)
 {
 	FILE* f = fopen("sd:/perfzones.log", "w");
 	if (!f) return;
-	fprintf(f, "# diis perfzones  block=%d\n", DESMUME_PERFZONES_BLOCK);
+	fprintf(f, "# diis perfzones  block=%d\n", DIIS_PERFZONES_BLOCK);
 	fprintf(f, PZ_PMC_COMMENT "frame,wall_us");
 	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_us", pzName(i));
 	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_hits", pzName(i));
@@ -349,7 +349,7 @@ void pzFrameTick(void)
 		// prime the interval so the first block doesn't count startup time
 		u64 t[PZ_COUNT], h[PZ_COUNT];
 		pzHarvest(t, h);
-#ifdef DESMUME_PERFZONES_PMC
+#ifdef DIIS_PERFZONES_PMC
 		pmcProgram(0);
 		memset(g_pzPmc, 0, sizeof(g_pzPmc));
 #endif
@@ -368,18 +368,18 @@ void pzFrameTick(void)
 		pz_cls_add(frame, t, frame_us);
 	}
 
-	if (frame % DESMUME_PERFZONES_BLOCK == 0) {
+	if (frame % DIIS_PERFZONES_BLOCK == 0) {
 		pz_emit_row(frame, acc_ticks, acc_hits);
 		pz_emit_percentiles(frame);   // §3.3b
 		pz_cls_emit(frame);
-#if defined(JIT_CORE_COST_HISTO) && defined(DESMUME_JIT)
+#if defined(JIT_CORE_COST_HISTO) && defined(DIIS_JIT)
 		jitCoreCostEmit(frame);       // -DJIT_CORE_COST_HISTO per-core dispatch accounting
 #endif
-#ifdef DESMUME_ARM7PROF
+#ifdef DIIS_ARM7PROF
 		a7pEmit(frame);               // Task ph-arm7 diagnostic
 #endif
 		for (int i = 0; i < PZ_COUNT; i++) { acc_ticks[i] = 0; acc_hits[i] = 0; }
-#ifdef DESMUME_PERFZONES_PMC
+#ifdef DIIS_PERFZONES_PMC
 		// next event set; the counts banked since the last pzHarvest() (the row
 		// emission itself) are dropped along with the old set.
 		pmcProgram((s_pmcSet + 1) % PZ_PMC_SETS);
@@ -388,4 +388,4 @@ void pzFrameTick(void)
 	}
 }
 
-#endif // DESMUME_PERFZONES
+#endif // DIIS_PERFZONES

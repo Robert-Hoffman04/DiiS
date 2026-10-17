@@ -2,7 +2,7 @@
 # usage: ab.sh <label> <run-id> ; tree in /home/user/tools/ab/src/<label>; no perfzones. Private userdir, DISP=:66
 set -e
 L=$1; R=$2; A=/home/user/tools/ab; T=/home/user/tools; DISP=:66; TMO=${TMO:-1500}
-DEFS="-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1 -DDESMUME_BENCH -DDESMUME_BENCH_FRAMES=1800 -DDESMUME_FORCE_RENDERMODE=2"
+DEFS="-DDIIS_FORCE_ROM -DDIIS_FORCE_CORE=1 -DDIIS_BENCH -DDIIS_BENCH_FRAMES=1800 -DDIIS_FORCE_RENDERMODE=2"
 TREE=$A/src/$L
 pgrep dockerd >/dev/null || { (nohup dockerd >/tmp/dockerd.log 2>&1 &); sleep 8; }
 if [ ! -f $TREE/$L.dol ] || [ "$REBUILD" = 1 ]; then

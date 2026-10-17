@@ -30,12 +30,12 @@
  * jitArm9Enabled so a full boot+gameplay capture exercises it.
  ***************************************************************************/
 
-#ifndef DESMUME_JIT_DIFFERENTIAL_H
-#define DESMUME_JIT_DIFFERENTIAL_H
+#ifndef DIIS_JIT_DIFFERENTIAL_H
+#define DIIS_JIT_DIFFERENTIAL_H
 
 #include "jit.h"
 
-#if defined(DESMUME_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
+#if defined(DIIS_JIT) && defined(JIT_DIFFERENTIAL_TESTING)
 
 struct armcpu_t;
 
@@ -46,4 +46,4 @@ u32 jitRunArm9Checked(armcpu_t* cpu, BasicBlock* block, u32 pc, u32 start);
 
 #endif
 
-#endif // DESMUME_JIT_DIFFERENTIAL_H
+#endif // DIIS_JIT_DIFFERENTIAL_H

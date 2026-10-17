@@ -27,7 +27,7 @@
 #define cpu (&ARMPROC)
 #define TEMPLATE template<int PROCNUM>
 
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
 #include <stdio.h>
 // P5 diagnostic: how many times wait4IRQ() (SWI 0x06 / the tail of
 // intrWaitARM) actually runs per CPU -- to see whether ARM7 keeps trying to
@@ -226,7 +226,7 @@ TEMPLATE static u32 WaitByLoop()
 TEMPLATE static u32 wait4IRQ()
 {
      //execute= FALSE;
-#ifdef DESMUME_ARM_TIME_SPLIT
+#ifdef DIIS_ARM_TIME_SPLIT
      g_wait4IRQCalls[PROCNUM]++;
      if ((g_wait4IRQCalls[PROCNUM] & 0xFFFFF) == 0) {
           FILE* f = fopen("sd:/split.log", "a");

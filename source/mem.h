@@ -50,7 +50,7 @@ enum MMU_ACCESS_TYPE
 // load/store raises an alignment interrupt on a misaligned effective address on
 // the 750, so the un-guaranteed entry points keep the safe byte path.
 #if defined(WORDS_BIGENDIAN) && defined(__GNUC__)
-# define DESMUME_FAST_LE_ACCESS 1
+# define DIIS_FAST_LE_ACCESS 1
 #endif
 
 static INLINE u8 T1ReadByte(u8* const mem, const u32 addr)
@@ -61,7 +61,7 @@ static INLINE u8 T1ReadByte(u8* const mem, const u32 addr)
 static INLINE u16 T1ReadWord_guaranteedAligned(void* const mem, const u32 addr)
 {
 	assert((addr&1)==0);
-#ifdef DESMUME_FAST_LE_ACCESS
+#ifdef DIIS_FAST_LE_ACCESS
    return __builtin_bswap16(*(const u16*)((const u8*)mem + addr));
 #elif defined(WORDS_BIGENDIAN)
    return (((u8*)mem)[addr + 1] << 8) | ((u8*)mem)[addr];
@@ -82,7 +82,7 @@ static INLINE u16 T1ReadWord(void* const mem, const u32 addr)
 static INLINE u32 T1ReadLong_guaranteedAligned(u8* const  mem, const u32 addr)
 {
 	assert((addr&3)==0);
-#ifdef DESMUME_FAST_LE_ACCESS
+#ifdef DIIS_FAST_LE_ACCESS
    return __builtin_bswap32(*(const u32*)(mem + addr));
 #elif defined(WORDS_BIGENDIAN)
    return (mem[addr + 3] << 24 | mem[addr + 2] << 16 |
@@ -96,7 +96,7 @@ static INLINE u32 T1ReadLong_guaranteedAligned(u8* const  mem, const u32 addr)
 static INLINE u32 T1ReadLong(u8* const  mem, u32 addr)
 {
    addr &= ~3;
-#ifdef DESMUME_FAST_LE_ACCESS
+#ifdef DIIS_FAST_LE_ACCESS
    return __builtin_bswap32(*(const u32*)(mem + addr));
 #elif defined(WORDS_BIGENDIAN)
    return (mem[addr + 3] << 24 | mem[addr + 2] << 16 |
@@ -138,7 +138,7 @@ static INLINE void T1WriteWord(u8* const mem, const u32 addr, const u16 val)
 static INLINE void T1WriteWord_guaranteedAligned(u8* const mem, const u32 addr, const u16 val)
 {
 	assert((addr&1)==0);
-#ifdef DESMUME_FAST_LE_ACCESS
+#ifdef DIIS_FAST_LE_ACCESS
    *(u16*)(mem + addr) = __builtin_bswap16(val);
 #elif defined(WORDS_BIGENDIAN)
    mem[addr + 1] = val >> 8;
@@ -164,7 +164,7 @@ static INLINE void T1WriteLong(u8* const mem, const u32 addr, const u32 val)
 static INLINE void T1WriteLong_guaranteedAligned(u8* const mem, const u32 addr, const u32 val)
 {
 	assert((addr&3)==0);
-#ifdef DESMUME_FAST_LE_ACCESS
+#ifdef DIIS_FAST_LE_ACCESS
    *(u32*)(mem + addr) = __builtin_bswap32(val);
 #elif defined(WORDS_BIGENDIAN)
    mem[addr + 3] = val >> 24;

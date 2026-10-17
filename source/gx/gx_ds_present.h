@@ -18,7 +18,7 @@
         rotation handling are unchanged: it only picks the texture).
       - Every reader or partial writer of GPU_screen calls gxDsPresentResolve*() first,
         which does the old unswizzle + conversion (bit-exact) and clears the pending
-        state. Readers: harness PKT_FRAME, DSLZ_FRAMECRC, DESMUME_FBDUMP, NDS_WritePNG,
+        state. Readers: harness PKT_FRAME, DSLZ_FRAMECRC, DIIS_FBDUMP, NDS_WritePNG,
         gpu_savestate. Writers: GPU_RenderLine (bail frames, skipped-line MASTER_BRIGHT,
         display-off/VRAM/FIFO modes, capture), gpu_loadstate / Screen_Reset (these
         overwrite the whole buffer, so they just drop the pending state).

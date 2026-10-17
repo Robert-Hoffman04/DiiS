@@ -224,7 +224,7 @@ class JITCache {
 		void flushCache();
 		void invalidateSMCTarget(u32 targetEA);
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_PROFILE)
+#if defined(DIIS_HARNESS) && defined(HARNESS_PROFILE)
 		// §3.3 JIT cache-pressure telemetry. One counter set per core; the
 		// PROFILER_CACHE_* macros (jit_debug.h) drive these from getBlock() /
 		// registerBlock() / flushCache(). installFrame[] shadows blockTable[]
@@ -306,7 +306,7 @@ class JITCache {
 			return nullptr;
 		}
 
-#ifdef DESMUME_JIT_TRACE_FIRST
+#ifdef DIIS_JIT_TRACE_FIRST
 		// Raw slot peek for edge telemetry (jit_exec.cpp): unlike getBlock() this
 		// returns the slot even when a different PC occupies it, so the caller can
 		// tell a hash collision from a never-compiled / SMC-killed slot. Returns a

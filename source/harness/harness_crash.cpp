@@ -1,12 +1,12 @@
 /*
     harness_crash.cpp - see harness_crash.h. Compiles to nothing without
-    -DDESMUME_HARNESS -DHARNESS_CRASH (verify: `nm ... | grep harness_crash`
+    -DDIIS_HARNESS -DHARNESS_CRASH (verify: `nm ... | grep harness_crash`
     and `grep harness_expect_fail` both empty on a release build).
 */
 #include "harness.h"            // sub-flag fan-out + harness_transport.h
 #include "harness_crash.h"
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_CRASH)
+#if defined(DIIS_HARNESS) && defined(HARNESS_CRASH)
 
 #include "harness_wire.h"
 
@@ -121,4 +121,4 @@ void harness_expect_fail(const char *expr, const char *msg,
 	harness_send(HARNESS_PKT_ASSERT, payload, len);
 }
 
-#endif // DESMUME_HARNESS && HARNESS_CRASH
+#endif // DIIS_HARNESS && HARNESS_CRASH

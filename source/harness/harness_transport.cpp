@@ -1,12 +1,12 @@
 /*
     harness_transport.cpp - see harness_transport.h.
 
-    Compiles to nothing without -DDESMUME_HARNESS
+    Compiles to nothing without -DDIIS_HARNESS
     (verify: `nm build/harness_transport.o | grep harness_` empty).
 */
 #include "harness_transport.h"
 
-#ifdef DESMUME_HARNESS
+#ifdef DIIS_HARNESS
 
 #include "harness_config.h"
 #include "harness_net.h"
@@ -128,4 +128,4 @@ const char *harness_transport_name(void)
 	}
 }
 
-#endif // DESMUME_HARNESS
+#endif // DIIS_HARNESS

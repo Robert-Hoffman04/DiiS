@@ -2,7 +2,7 @@
 """Perf-zones table (Task pzones).
 
 Reads the profile.log of one or more capture runs (capture.py output, a
-DESMUME_PERFZONES build) and prints every zone sorted by cost, as
+DIIS_PERFZONES build) and prints every zone sorted by cost, as
 "% of frame (ms/frame)", one column per run:
 
   tools/benchmark/pztable.py software=RUN_DIR accurate=RUN_DIR fast=RUN_DIR
@@ -18,7 +18,7 @@ DESMUME_PERFZONES build) and prints every zone sorted by cost, as
                         the last --blocks x 60 frames (the counters are cumulative)
 
 A RUN may also be a bare perfzones.log / profile.log file (e.g. sd:/perfzones.log
-from a real Wii). If it has -DDESMUME_PERFZONES_PMC columns, a second table per run
+from a real Wii). If it has -DDIIS_PERFZONES_PMC columns, a second table per run
 shows the Broadway performance counters per zone (Task hw-measure): CPI, L1 I/D
 misses per 1000 instructions (set 0), L2 I/D misses and branch mispredicts per 1000
 instructions (set 1), and the share of the zone's cycles spent in I-fetch miss /

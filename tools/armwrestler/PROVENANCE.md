@@ -57,10 +57,10 @@ Produces `out/armwrestler.nds`.
 
 ## Running against DiiS
 
-Build DiiS with `-DDESMUME_ARMWRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDIIS_ARMWRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM7 JIT (armwrestler's
 ARM7 side is a no-op stub, nothing to gain there), and polls slot-2 for the
 sentinel once per frame; on completion it writes `sd:/armwrestler.log` (ARM
 + THUMB pass/fail counts, plus each failing test's name and raw bitmask) and
 quits. Stage `out/armwrestler.nds` as `sd:/DS/ROMS/test.nds` and boot with
-`-DDESMUME_FORCE_ROM -DDESMUME_FORCE_CORE=1` for a fully headless run.
+`-DDIIS_FORCE_ROM -DDIIS_FORCE_CORE=1` for a fully headless run.

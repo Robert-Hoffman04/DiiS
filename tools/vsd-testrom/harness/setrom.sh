@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # setrom.sh <path-to.nds>
 # Installs a ROM as sd:/DS/ROMS/test.nds inside the Dolphin FAT image that a
-# -DDESMUME_FORCE_ROM build of DiiS boots.
+# -DDIIS_FORCE_ROM build of DiiS boots.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 

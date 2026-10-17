@@ -1,6 +1,6 @@
 /*
     harness_input.cpp - see harness_input.h. Compiles to nothing without
-    -DDESMUME_HARNESS -DHARNESS_INPUT.
+    -DDIIS_HARNESS -DHARNESS_INPUT.
 
     The tap-timer / edge-detection logic here is a deliberate verbatim copy of
     geckoinput.cpp's - the two feeds (network, gecko) must behave identically.
@@ -8,7 +8,7 @@
 #include "harness.h"
 #include "harness_input.h"
 
-#if defined(DESMUME_HARNESS) && defined(HARNESS_INPUT)
+#if defined(DIIS_HARNESS) && defined(HARNESS_INPUT)
 
 #include <gccore.h>
 #include <stdio.h>
@@ -170,4 +170,4 @@ void harness_input_movie_tick(u16 *keypad)
 	}
 }
 
-#endif // DESMUME_HARNESS && HARNESS_INPUT
+#endif // DIIS_HARNESS && HARNESS_INPUT

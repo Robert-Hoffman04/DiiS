@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 LABEL_A=before LABEL_B=after
 STASH=0
-TESTDEFS="-DDESMUME_FORCE_ROM -DDESMUME_AUTOLOADSTATE -DDESMUME_HARNESS -DHARNESS_TRANSPORT_NET -DDESMUME_PERFZONES -DDESMUME_FORCE_CORE=1"
+TESTDEFS="-DDIIS_FORCE_ROM -DDIIS_AUTOLOADSTATE -DDIIS_HARNESS -DHARNESS_TRANSPORT_NET -DDIIS_PERFZONES -DDIIS_FORCE_CORE=1"
 # JITDEFS now only carries JIT debug/diagnostic defines (e.g.
 # -DJIT_CORE_COST_HISTO): the JIT itself is always compiled in and both legs
 # run in the default runtime CPU mode (JIT). The Interpreter-vs-JIT A/B is
