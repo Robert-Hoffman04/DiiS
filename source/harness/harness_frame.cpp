@@ -21,7 +21,7 @@
 #define FRAME_PIX (FRAME_W * FRAME_H)
 
 static u32  s_every  = 0;
-static char s_label[32];
+static char s_label[128];   // matches the 128-byte harness_recv buffer in main.cpp
 static int  s_pending = 0;
 static u32  s_target  = 0;   // 0 = capture at the next tick; N = capture exactly when the frame counter reaches N
 
@@ -35,7 +35,7 @@ void harness_frame_request(const char *label)
 {
 	s_label[0] = 0;
 	s_target = 0;
-	char tmp[32];
+	char tmp[128];
 	if (label) {
 		strncpy(tmp, label, sizeof tmp - 1); tmp[sizeof tmp - 1] = 0;
 		char *at = strchr(tmp, '@');

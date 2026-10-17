@@ -7,6 +7,10 @@ DESMUME_PERFZONES build) and prints every zone sorted by cost, as
 
   tools/benchmark/pztable.py software=RUN_DIR accurate=RUN_DIR fast=RUN_DIR
   options: --blocks N   average the last N 60-frame blocks (default 2)
+           --range A:B  use the blocks whose frame number is in A..B instead
+                        (either end may be empty: "3000:" or ":9000")
+           --median     per-zone median of the per-block ms/frame instead of the mean
+                        (robust to load spikes and paused stretches)
            --classes    also print the per-frame-class split (pzcls lines:
                         GxFast record / replay, CPU raster, GxAccurate pass)
            --gxstats F  (Task hw-measure) also print the GX gate/bail stat lines of
@@ -21,7 +25,7 @@ instructions (set 1), and the share of the zone's cycles spent in I-fetch miss /
 L1 load-miss / DTLB-search stalls (set 2; cycles = zone time x 729 MHz). The event
 set rotates every block, so these average the last max(--blocks, 6) blocks.
 """
-import os, re, sys
+import os, re, statistics, sys
 
 CLS_NAMES = {0: "no 3D pass", 1: "GxFast record", 2: "GxFast replay", 4: "CPU raster",
              8: "GxAcc pass", 12: "GxAcc+raster", 5: "record+raster", 6: "replay+raster"}
@@ -32,7 +36,7 @@ PMC_SETS = {0: ("instr", "l1imiss", "l1dmiss", "cycles"), 1: ("instr", "l2imiss"
 CORE_MHZ = 729.0   # Broadway core clock (= timebase x 12)
 
 
-def load(run, blocks):
+def load(run, blocks, rng=None, median=False):
     path = os.path.join(run, "profile.log") if os.path.isdir(run) else run
     hdr, rows, cls, pmcidx, pmc = None, [], {}, None, []
     for l in open(path, errors="replace").read().splitlines():
@@ -51,10 +55,21 @@ def load(run, blocks):
             cls.setdefault(int(kv["frame"]), []).append(kv)
     if not rows:
         sys.exit(f"{path}: no perf-zones rows")
-    last = rows[-blocks:]
+    if rng:
+        lo, hi = rng
+        last = [r for r in rows if (lo is None or r[0] >= lo) and (hi is None or r[0] <= hi)]
+        if not last:
+            sys.exit(f"{path}: no blocks in frame range {lo}..{hi}")
+        pmc = [b for b in pmc if any(b[1] is r[2] for r in last)]
+    else:
+        last = rows[-blocks:]
     nfr = sum(60 for _ in last)
-    mean = {k: sum(r[2][k] for r in last) / nfr / 1000.0 for k in hdr}
-    wall = sum(r[1] for r in last) / nfr / 1000.0
+    if median:
+        mean = {k: statistics.median(r[2][k] for r in last) / 60 / 1000.0 for k in hdr}
+        wall = statistics.median(r[1] for r in last) / 60 / 1000.0
+    else:
+        mean = {k: sum(r[2][k] for r in last) / nfr / 1000.0 for k in hdr}
+        wall = sum(r[1] for r in last) / nfr / 1000.0
     C = {}
     for f, _, _ in last:
         for kv in cls.get(f, []):
@@ -62,7 +77,7 @@ def load(run, blocks):
             for k, v in kv.items():
                 if k not in ("frame", "cls"):
                     a[k] = a.get(k, 0) + int(v)
-    return hdr, mean, wall, C, pmc[-max(blocks, 6):]
+    return hdr, mean, wall, C, (pmc if rng else pmc[-max(blocks, 6):]), len(last)
 
 
 def pmc_table(lab, hdr, pmc):
@@ -172,25 +187,34 @@ def table(cols, title):
 
 def main():
     args = sys.argv[1:]
-    blocks, classes, runs, gxs = 2, False, [], None
+    blocks, classes, runs, gxs, rng, median = 2, False, [], None, None, False
     while args:
         a = args.pop(0)
         if a == "--blocks": blocks = int(args.pop(0))
         elif a == "--classes": classes = True
         elif a == "--gxstats": gxs = args.pop(0)
+        elif a == "--range":
+            lo, _, hi = args.pop(0).partition(":")
+            rng = (int(lo) if lo else None, int(hi) if hi else None)
+        elif a == "--median": median = True
         else:
             lab, _, d = a.partition("=")
             runs.append((lab, d) if d else (os.path.basename(a.rstrip("/")), a))
-    data = [(lab, load(d, blocks)) for lab, d in runs]
-    table(data, f"zones, ms per frame (mean of last {blocks} x 60 frames)")
-    for lab, (hdr, _, _, _, pmc) in data:
+    data = [(lab, load(d, blocks, rng, median)) for lab, d in runs]
+    what = "median" if median else "mean"
+    if rng:
+        n = ",".join(str(x[1][5]) for x in data)
+        table(data, f"zones, ms per frame ({what} of {n} x 60-frame blocks, frames {rng[0] or ''}..{rng[1] or ''})")
+    else:
+        table(data, f"zones, ms per frame ({what} of last {blocks} x 60 frames)")
+    for lab, (hdr, _, _, _, pmc, _) in data:
         if pmc:
             pmc_table(lab, hdr, pmc)
     if gxs:
         gxstats(gxs, blocks)
     if not classes:
         return
-    for lab, (hdr, _, _, C, _) in data:
+    for lab, (hdr, _, _, C, _, _) in data:
         if not C:
             continue
         cols = []

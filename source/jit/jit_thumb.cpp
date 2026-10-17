@@ -312,20 +312,23 @@ void jitThumbEmitOne(JitTraceCtx& ctx, u16 opcode)
 		}
 		else {
 			// op 2/3/4/7 : LSL/LSR/ASR/ROR by register
-			// PPC slw/srw/sraw take a 6-bit shift count: amounts 32..63 give 0
-			// (slw/srw) or all-sign (sraw), matching the interpreter's >=32
-			// handling for Rd. Carry is exact for amounts 0..32; for amounts
-			// >32 the ASR/ROR carry can differ by the sign/low bit -- a rare
-			// edge the differential harness flags (TODO: clamp).
+			// PPC slw/srw/sraw take a 6-bit shift count, so LSL/LSR/ASR amounts
+			// are clamped to 32 (64..255 would otherwise wrap): 32 gives 0
+			// (slw/srw) or all-sign (sraw) and the ARM >=32 carry. ROR rotates
+			// by amt & 31 (rlwnm) and takes its carry from bit (amt-1) & 31.
 			const u8 hRs = ctx.readReg(rs, lockedMask);
 			const u8 hRd = ctx.writeReg(rd, false, lockedMask);
 			*emitPtr++ = PPC_RLWINM(PPC_R12, hRs, 0, 24, 31);      // R12 = Rs & 0xFF
 			*emitPtr++ = PPC_CMPWI(0, PPC_R12, 0);
 			u32* skipZero = emitPtr++;                             // amount 0: only N/Z
+			if (op != 7) { *emitPtr++ = PPC_CMPLI(0, PPC_R12, 32);
+			               *emitPtr++ = PPC_BLE(8);
+			               *emitPtr++ = PPC_LI(PPC_R12, 32); }            // clamp amt to 32
 			if (op == 2) { *emitPtr++ = PPC_LI(PPC_R11, 32);
 			               *emitPtr++ = PPC_SUBF(PPC_R11, PPC_R12, PPC_R11);  // 32 - amt
 			               *emitPtr++ = PPC_SRW(PPC_R10, hRd, PPC_R11); }
 			else         { *emitPtr++ = PPC_ADDI(PPC_R11, PPC_R12, -1);       // amt - 1
+			               if (op == 7) *emitPtr++ = PPC_RLWINM(PPC_R11, PPC_R11, 0, 27, 31);  // & 31
 			               *emitPtr++ = PPC_SRW(PPC_R10, hRd, PPC_R11); }
 			ctx.emitFlagBit(JITF_C, PPC_R10, 0);
 			if (op == 2)      *emitPtr++ = PPC_SLW (hRd, hRd, PPC_R12);
