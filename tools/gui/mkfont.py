@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Noto Sans (TTF, SIL OFL 1.1) -> source/gui/gui_font_data.h: the GUI's two bitmap fonts.
+
+Body: Noto Sans Regular 20 px. Title: Noto Sans SemiBold 28 px. Both share one I4 atlas
+(4-bit coverage, GX 8x8 tiles), drawn one texel per 640x480 canvas pixel. Glyphs are
+rendered by FreeType with hinting (PIL basic layout, hinted integer advances); kerning
+comes from the font's GPOS table (PIL raqm layout) for the letter/digit/punctuation pairs
+of ASCII + Latin-1. Coverage: ASCII, Latin-1, Latin Extended-A and the punctuation and
+symbols DS banner titles use (TM, (R), (C), quotes, dashes, ellipsis, euro). Glyph 0 of
+each font is a box drawn for every code point the font doesn't have.
+
+Run from the repo root:  python3 tools/gui/mkfont.py [fontdir]
+The licence goes next to the header as source/gui/gui_font_LICENSE.txt."""
+import sys
+from PIL import Image, ImageDraw, ImageFont, features
+
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+FONTDIR = ARGS[0] if ARGS else "/usr/share/fonts/truetype/noto"
+FONTS = [("BODY", "NotoSans-Regular.ttf", 20), ("TITLE", "NotoSans-SemiBold.ttf", 28)]
+ATLAS_W = 512
+PAD = 1
+
+CPS = list(range(0x20, 0x7F)) + list(range(0xA0, 0x180)) + [
+    0x2013, 0x2014, 0x2018, 0x2019, 0x201A, 0x201C, 0x201D, 0x201E, 0x2022, 0x2026,
+    0x2030, 0x2039, 0x203A, 0x20AC, 0x2122]
+KERN_CPS = [c for c in range(0x21, 0x7F)] + [c for c in range(0xC0, 0x100)]
+
+
+def q4(v):
+    return (v * 15 + 127) // 255
+
+
+def render(font, ch):
+    """Glyph bitmap (L, 4-bit levels) cropped to its ink, and its offset from the pen/baseline."""
+    l, t, r, b = font.getbbox(ch, anchor="ls")
+    w, h = r - l + 8, b - t + 8
+    im = Image.new("L", (max(w, 1), max(h, 1)), 0)
+    ImageDraw.Draw(im).text((4 - l, 4 - t), ch, font=font, fill=255, anchor="ls")
+    im = im.point(lambda v: q4(v) * 17)
+    box = im.getbbox()
+    if not box:
+        return None, 0, 0
+    return im.crop(box), box[0] - 4 + l, box[1] - 4 + t
+
+
+def notdef(font):
+    """Hollow box, cap height tall, half an em wide (pen-relative like render())."""
+    _, top, _, _ = font.getbbox("H", anchor="ls")
+    capH = -top
+    w = max(4, font.size // 2 - 2)
+    im = Image.new("L", (w, capH), 0)
+    ImageDraw.Draw(im).rectangle((0, 0, w - 1, capH - 1), outline=255)
+    return im, 1, -capH, font.size // 2 + 1
+
+
+def main():
+    assert features.check("raqm"), "PIL without raqm: no GPOS kerning"
+    from fontTools.ttLib import TTFont
+    fonts = []
+    for name, file, size in FONTS:
+        path = f"{FONTDIR}/{file}"
+        cmap = TTFont(path).getBestCmap()
+        fb = ImageFont.truetype(path, size, layout_engine=ImageFont.Layout.BASIC)
+        fr = ImageFont.truetype(path, size, layout_engine=ImageFont.Layout.RAQM)
+        asc, desc = fb.getmetrics()
+        capH = -fb.getbbox("H", anchor="ls")[1]
+        glyphs = []   # (cp, img, ox, oy, adv16)
+        im, ox, oy, adv = notdef(fb)
+        glyphs.append((0, im, ox, oy, adv * 16))
+        for cp in CPS:
+            if cp not in cmap:
+                continue
+            ch = chr(cp)
+            im, ox, oy = render(fb, ch)
+            glyphs.append((cp, im, ox, oy, round(fb.getlength(ch) * 16)))
+        kern = []
+        have = set(cp for cp, *_ in glyphs)
+        kc = [c for c in KERN_CPS if c in have]
+        single = {c: fr.getlength(chr(c)) for c in kc}
+        for a in kc:
+            for b in kc:
+                k = round((fr.getlength(chr(a) + chr(b)) - single[a] - single[b]) * 16)
+                if abs(k) >= 4:   # a quarter pixel or more
+                    kern.append((a, b, max(-128, min(127, k))))
+        fonts.append(dict(name=name, file=file, size=size, asc=asc, desc=desc, capH=capH,
+                          glyphs=glyphs, kern=kern))
+
+    # Shelf-pack every glyph of both fonts, tallest first.
+    items = [(fi, gi) for fi, f in enumerate(fonts) for gi, g in enumerate(f["glyphs"]) if g[1]]
+    items.sort(key=lambda it: -fonts[it[0]]["glyphs"][it[1]][1].size[1])
+    place = {}
+    x = y = shelfH = 0
+    for fi, gi in items:
+        w, h = fonts[fi]["glyphs"][gi][1].size
+        if x + w + PAD > ATLAS_W:
+            x, y, shelfH = 0, y + shelfH + PAD, 0
+        place[(fi, gi)] = (x, y)
+        x += w + PAD
+        shelfH = max(shelfH, h)
+    H = (y + shelfH + 7) & ~7
+    assert H <= 1024, H
+    atlas = Image.new("L", (ATLAS_W, H), 0)
+    for (fi, gi), (px, py) in place.items():
+        atlas.paste(fonts[fi]["glyphs"][gi][1], (px, py))
+    if "--png" in sys.argv:
+        atlas.save("gui_font_atlas.png")
+
+    pix = atlas.load()
+    data = bytearray()
+    for ty in range(0, H, 8):
+        for tx in range(0, ATLAS_W, 8):
+            for yy in range(8):
+                for xx in range(0, 8, 2):
+                    data.append((q4(pix[tx + xx, ty + yy]) << 4) | q4(pix[tx + xx + 1, ty + yy]))
+
+    with open("source/gui/gui_font_data.h", "w") as f:
+        f.write("// Generated by tools/gui/mkfont.py from Noto Sans (SIL Open Font License 1.1,\n")
+        f.write("// see gui_font_LICENSE.txt). Do not edit.\n")
+        f.write("// One I4 atlas (GX 8x8 tiles) shared by both fonts; one texel per 640x480 canvas pixel.\n")
+        f.write("// Advances and kerning are in 1/16 px. Glyph 0 of each font is the missing-glyph box.\n")
+        f.write("#pragma once\n")
+        f.write(f"#define GUI_FONT_ATLAS_W {ATLAS_W}\n#define GUI_FONT_ATLAS_H {H}\n")
+        f.write(f"static u8 GuiFontAtlas[GUI_FONT_ATLAS_W * GUI_FONT_ATLAS_H / 2] __attribute__((aligned(32))) = {{\n")
+        for i in range(0, len(data), 16):
+            f.write("\t" + ",".join(f"0x{v:02X}" for v in data[i:i + 16]) + ",\n")
+        f.write("};\n")
+        for fi, fo in enumerate(fonts):
+            n = fo["name"]
+            f.write(f"\n// {fo['file']} {fo['size']} px\n")
+            f.write(f"#define GUI_FONT_{n}_ASCENT {fo['asc']}\n#define GUI_FONT_{n}_DESCENT {fo['desc']}\n")
+            f.write(f"#define GUI_FONT_{n}_CAP {fo['capH']}\n")
+            f.write(f"static const GuiGlyph GuiFont{n.title()}Glyphs[] = {{\n")
+            for gi, (cp, im, ox, oy, adv) in enumerate(fo["glyphs"]):
+                px, py = place.get((fi, gi), (0, 0))
+                w, h = im.size if im else (0, 0)
+                f.write(f"\t{{ 0x{cp:04X}, {px}, {py}, {w}, {h}, {ox}, {oy}, {adv} }},\n")
+            f.write("};\n")
+            f.write(f"static const GuiKern GuiFont{n.title()}Kern[] = {{\n")
+            for a, b, k in fo["kern"]:
+                f.write(f"\t{{ 0x{(a << 16) | b:08X}, {k} }},\n")
+            if not fo["kern"]:
+                f.write("\t{ 0xFFFFFFFF, 0 },\n")
+            f.write("};\n")
+    print(f"atlas {ATLAS_W}x{H} ({len(data)} bytes); " +
+          ", ".join(f"{fo['name']}: {len(fo['glyphs'])} glyphs {len(fo['kern'])} kern pairs" for fo in fonts))
+
+
+main()

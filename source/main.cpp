@@ -67,6 +67,9 @@
 #include "library/library.h"
 #include "path.h"
 #endif
+#ifdef DIIS_GUI_DEMO
+#include "gui/gui.h"
+#endif
 
 #ifdef DIIS_FORCE_ROM
 // Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below. Declared here, ahead of the more specific probe blocks
@@ -341,6 +344,12 @@ int main(int argc, char **argv){
 		}
 		libInit(appOnUsb ? "usb:/DiiS" : "sd:/DiiS", "sd:/DS/SAVES");
 	}
+#ifdef DIIS_GUI_DEMO
+	// GUI framework demo (gui/gui_demo.cpp): straight into the demo screen,
+	// no device menu; leaving it (Home/Reset/Power) leaves the app.
+	guiDemoRun();
+	sys_exit();
+#endif
 #endif
 
 	bool device = PickDevice();
