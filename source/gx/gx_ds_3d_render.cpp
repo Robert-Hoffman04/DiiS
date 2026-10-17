@@ -326,9 +326,12 @@ static inline u32 gxDs3dTexKey(u32 texParam) { return texParam & 0x3FF0FFFF; }
 //    the alpha is max(src, dst) (gxDs3dTransAlphaSub: subtract + add, exact), and pixels
 //    that start at alpha 0 (clear alpha 0, or clear-image holes) take their first fragment
 //    unblended, which gxDs3dTransPrefill reproduces by pre-filling them with it. Bails
-//    (`transclear` / `transblend` as before): GxAccurate, the fog pass (its alpha LUT
-//    assumes 31 under it), shadow volumes (their passes don't keep the EFB alpha).
-//    -DDSA_GXGEOM_MUTATE_TRANSCLEAR / _TRANSBLEND restore the old bails.
+//    (`transclear` / `transblend` as before): GxAccurate; blending off with the fog pass (its
+//    alpha LUT assumes 31 under it) or shadow volumes; kTransDstAlpha with the fog pass over
+//    a fogged rear plane or a clear image. Task transclear-fogsh: kTransDstAlpha takes shadow
+//    volumes (gxDs3dIntPassBegin) and the fog pass over an unfogged uniform rear plane
+//    (masked to opaque pixels, gxDs3dApplyFogFast). -DDSA_GXGEOM_MUTATE_TRANSCLEAR /
+//    _TRANSBLEND / _TCFOGSH restore the old bails.
 //  - the polygon-ID rule has no GX dst compare: runs of same-ID polygons that overlap go
 //    through a tag pass (gxDs3dTransIdPlan, gxDs3dTagRunPrepass); overlap with a same-ID
 //    polygon of an earlier run carries the ID stamp through that pass. Bails (`transid`):
@@ -2058,8 +2061,8 @@ static int gxDs3dFrameGate(bool requireTex)
 		// buffer's top byte looked up in a 256-entry copy of the CPU's fogTable through an
 		// indirect stage, blended toward the fog colour on every pixel the geometry wrote).
 		// GxAccurate bails (8-bit depth buckets are not the CPU's 15-bit fogIndex).
-		// Per-polygon fog-enable bits: opaque polygons without one are redrawn unfogged
-		// (gxDs3dRenderFastDraw); translucent ones are fogged anyway (GxFast gap).
+		// Per-polygon fog-enable bits: pixels whose opaque polygon has none are masked out of
+		// the pass (gxDs3dFogRedrawMask); translucent ones are fogged anyway (GxFast gap).
 		// Task fog-edge, the rest of rasterize.cpp's fog in GxFast:
 		// - alpha-only fog (DISP3DCNT bit 6): the colour blend is skipped.
 		// - fog alpha != 31: the pass also writes the CPU's alpha (s_gateFogAlpha, the alpha
@@ -2367,7 +2370,17 @@ static int gxDs3dFrameGate(bool requireTex)
 		const bool clearOpaque = gfx3d.enableClearImage ? s_ciOpaque : ((gfx3d_rasterClearColor() >> 16) & 0x1F) == 31;
 		if (!gfx3d.enableAlphaBlending) s_transMode = kTransBlendOff;
 		else if (!clearOpaque) s_transMode = kTransDstAlpha;
-		if (s_transMode != kTransPlain && (s_gateFogPass || anyShadow))
+		// Task transclear-fogsh: kTransDstAlpha keeps shadow volumes (their integer passes run in
+		// RGB8, gxDs3dIntPassBegin) and the fog pass over an unfogged uniform rear plane
+		// (gxDs3dApplyFogFast's alpha mask); -DDSA_GXGEOM_MUTATE_TCFOGSH restores the bails.
+#ifdef DSA_GXGEOM_MUTATE_TCFOGSH
+		const bool fxBail = s_transMode != kTransPlain && (s_gateFogPass || anyShadow);
+#else
+		const bool fxBail = s_transMode == kTransBlendOff ? (s_gateFogPass || anyShadow) :
+		                    s_transMode == kTransDstAlpha && s_gateFogPass &&
+		                    (gfx3d.enableClearImage || (gfx3d_rasterClearColor() & 0x8000));
+#endif
+		if (fxBail)
 			return clearOpaque ? kGateTransBlend : kGateTransClear;
 		s_transPrefill = s_transMode == kTransDstAlpha &&
 		                 (gfx3d.enableClearImage || ((gfx3d_rasterClearColor() >> 16) & 0x1F) == 0);
@@ -4041,7 +4054,10 @@ static void gxDs3dFastPoly(GxDs3dFastCtx &c, POLY &p, int tag)
 // the CPU draws there (the earliest one passing the opaque depth: nothing drew there before it,
 // so no translucent depth write or ID stamp can have rejected it) and every other pixel keeps
 // its colour. The forward draws then blend that fragment over its own colour (a no-op), which
-// is the CPU's dst-alpha-0 plain write.
+// is the CPU's dst-alpha-0 plain write. Shadow polygons are left out (Task transclear-fogsh):
+// masks write no colour, and a draw shades only where a mask failed the depth test, which over
+// a pixel nothing drew yet (the clear depth) needs a mask at or past the rear plane (GxFast gap:
+// such a draw's pixel is blended over the EFB colour instead of written).
 static void gxDs3dTransPrefill(GxDs3dFastCtx &c, int n0)
 {
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_INVDSTALPHA, GX_BL_DSTALPHA, GX_LO_CLEAR);
@@ -4050,7 +4066,7 @@ static void gxDs3dTransPrefill(GxDs3dFastCtx &c, int n0)
 	c.prefill = true;
 	for (int n = gfx3d.polylist->count - 1; n >= n0; --n) {
 		POLY &q = gfx3d.polylist->list[gfx3d.indexlist[n]];
-		if (q.isTranslucent()) gxDs3dFastPoly(c, q, 0);
+		if (q.isTranslucent() && gxDs3dPolyMode(q) != 3) gxDs3dFastPoly(c, q, 0);
 	}
 	c.prefill = false;
 	c.blendOn = false;
@@ -4096,6 +4112,26 @@ static void gxDs3dTagCopy(void *dst, u32 fmt)
 	GX_SetTexCopySrc(0, 0, kScreenW, kScreenH);
 	GX_SetTexCopyDst(kScreenW, kScreenH, fmt, GX_FALSE);
 	GX_CopyTex(dst, GX_FALSE);
+}
+
+// Task transclear-fogsh: the tag, opaque-ID and shadow-counter passes write integers into the
+// colour channels (a tag byte, ID + 1, counter steps of 1), which an RGBA6 EFB truncates to 6
+// bits. A gxDs3dGeomFrameNeedsAlpha frame runs in RGBA6 (gxDsEngineA3dReadback), so between
+// the RGBA8 save of the EFB colour and its restore those passes switch the EFB to RGB8 (same
+// Z24 plane; the passes overwrite the whole colour plane first, and the RGBA8 save restores
+// the 6-bit colour and alpha exactly). -DDSA_GXGEOM_MUTATE_INTPASS6: left in RGBA6, as before.
+static inline void gxDs3dIntPassBegin()
+{
+#ifndef DSA_GXGEOM_MUTATE_INTPASS6
+	if (gxDs3dGeomFrameNeedsAlpha()) GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+#endif
+}
+
+static inline void gxDs3dIntPassEnd()
+{
+#ifndef DSA_GXGEOM_MUTATE_INTPASS6
+	if (gxDs3dGeomFrameNeedsAlpha()) GX_SetPixelFmt(GX_PF_RGBA6_Z24, GX_ZC_LINEAR);
+#endif
 }
 
 // Task tidwhy-a31: a chained segment's stamp mask (see gxDs3dTransIdPlan) into the EFB's red
@@ -4146,6 +4182,7 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 	const GxDs3dTagRun &run = s_tagRuns[r];
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
+	gxDs3dIntPassBegin();
 	gxDs3dTagScreenQuad(NULL);
 
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
@@ -4201,6 +4238,7 @@ static void gxDs3dTagRunPrepass(GxDs3dFastCtx &c, int r)
 	if (c.tagTwo) gxDs3dTagCopy(s_tagHiBuf, GX_CTF_B8);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
+	gxDs3dIntPassEnd();
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
 	GX_LoadTexObj(&s_tagLoTex, GX_TEXMAP1);
 	GX_LoadTexObj(&s_tagHiTex, GX_TEXMAP2);
@@ -4245,6 +4283,7 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 {
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
+	gxDs3dIntPassBegin();
 	gxDs3dTagScreenQuad(NULL, (u8)(((gfx3d_rasterClearColor() >> 24) & 0x3F) + 1));
 	c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1;
 	c.blendOn = true;   // blend off (the screen quad's), owned here
@@ -4274,6 +4313,7 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 	gxDs3dTagCopy(s_shIdBuf, GX_CTF_R8);
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
+	gxDs3dIntPassEnd();
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
 	GX_LoadTexObj(&s_shIdTex, GX_TEXMAP5);
 	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
@@ -4284,6 +4324,63 @@ static void gxDs3dShadowIdPass(GxDs3dFastCtx &c)
 #endif
 }
 
+// Task transclear-fogsh: the fog pass's unfogged-pixel mask (s_fogRMask). The CPU leaves a pixel
+// unfogged when its last opaque write came from a polygon without POLYGON_ATTR bit 15, whatever
+// translucent fragments blend over it later (rasterize.cpp ANDs their flags in). Right after the
+// opaque polygons (the depth buffer then holds theirs), those polygons are drawn again with
+// GX_EQUAL depth, no Z write, colour 1 over a cleared EFB (an integer pass like the ID pass:
+// colour saved and restored), and R is copied out as an I8 mask that gxDs3dApplyFogFast reads.
+// It replaces redrawing them over the fogged result, which also overwrote the translucent
+// polygons blended over them (Spirit Tracks' sea). Not exact where a later translucent depth
+// write moves the surface (as before). -DDSA_GXGEOM_MUTATE_FOGREDRAW: the redraw.
+static void *s_fogRBuf = nullptr;
+static GXTexObj s_fogRTex;
+static bool s_fogRMask = false;   // this recording built the mask (gxDs3dApplyFogFast tests it)
+
+static void gxDs3dFogRedrawMask(GxDs3dFastCtx &c)
+{
+	if (!s_fogRBuf) {
+		const u32 ib = GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0);
+		s_fogRBuf = memalign(32, ib);
+		if (!s_fogRBuf) return;
+		DCInvalidateRange(s_fogRBuf, ib);
+		GX_InitTexObj(&s_fogRTex, s_fogRBuf, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&s_fogRTex, GX_NEAR, GX_NEAR);
+	}
+	if (!gxDs3dTagBuffers()) return;
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
+	gxDs3dIntPassBegin();
+	gxDs3dTagScreenQuad(NULL);
+	c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1;
+	c.blendOn = true;   // blend off (the screen quad's), owned here
+	c.zEqBase = true;
+	GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	for (int n = 0; n < gfx3d.polylist->count; ++n) {
+		const int i = gfx3d.indexlist[n];
+		if (c.vis) {
+			if (!(c.vis[i] & kVisFogRedraw)) continue;
+			if (c.vis[i] & kVisCull) continue;   // draws nothing
+			gxDs3dFastPoly(c, gfx3d.polylist->list[i], -1);
+			continue;
+		}
+		POLY &p = gfx3d.polylist->list[i];
+		if ((p.polyAttr & 0x8000) || p.isTranslucent() || gxDs3dPolyMode(p) == 3) continue;
+		gxDs3dFastPoly(c, p, -1);
+	}
+	c.zEqBase = false;
+	gxDs3dTagCopy(s_fogRBuf, GX_CTF_R8);
+	GX_PixModeSync();
+	GX_InvalidateTexAll();
+	gxDs3dIntPassEnd();
+	gxDs3dTagScreenQuad(&s_tagSaveTex);
+	GX_SetZMode(GX_TRUE, GX_LESS, GX_TRUE);
+	GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	c.first = true; c.haveLast = false; c.curMtx = -1; c.blendOn = false; c.tagMode = -1;
+	s_fogRMask = true;
+}
+
 // Steps 1-3 of the shadow section for group g; leaves c forcing a full rebind. cntValid: an
 // earlier group left a counter in s_shCntBuf.
 static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
@@ -4291,6 +4388,7 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 	const GxDs3dShGroup &g = s_shGroups[gi];
 	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
 	gxDs3dTagCopy(s_tagSaveBuf, GX_TF_RGBA8);
+	gxDs3dIntPassBegin();
 	if (cntValid) {
 		GX_InvalidateTexAll();
 		gxDs3dTagScreenQuad(&s_shCntTex);
@@ -4339,6 +4437,7 @@ static void gxDs3dShadowPrepass(GxDs3dFastCtx &c, int gi, bool &cntValid)
 	c.shCount = false;
 	GX_PixModeSync();
 	GX_InvalidateTexAll();
+	gxDs3dIntPassEnd();
 	gxDs3dTagScreenQuad(&s_tagSaveTex);
 	GX_LoadTexObj(sTex, GX_TEXMAP4);
 	// an opaque-list draw sets neither (Task shadow-cases; translucent ones set their own)
@@ -4384,7 +4483,13 @@ static void gxDs3dRenderFastDraw()
 	s_shRec = sh && s_shIdAt >= 0 && gxDs3dShBoxAlloc(gfx3d.polylist->count);
 	bool shCnt = false;
 	int sg = 0;
-	bool prefill = s_transPrefill;   // (no shadow polygons then, gxDs3dFrameGate)
+	bool prefill = s_transPrefill;
+	s_fogRMask = false;
+#ifdef DSA_GXGEOM_MUTATE_FOGREDRAW
+	bool fogMask = false;
+#else
+	bool fogMask = s_gateFogPass && s_gateFogRedraw && CommonSettings.GFX3D_Fog;
+#endif
 	const int polycount = gfx3d.polylist->count;
 	for (int n = 0; n < polycount; ++n) {
 		// gfx3d.indexlist: opaque polygons first, then the translucent ones in the order
@@ -4399,6 +4504,8 @@ static void gxDs3dRenderFastDraw()
 			continue;
 		}
 		POLY &p = gfx3d.polylist->list[i];
+		if (fogMask && p.isTranslucent()) { gxDs3dFogRedrawMask(c); fogMask = false; }
+		if (prefill && p.isTranslucent()) { gxDs3dTransPrefill(c, n); prefill = false; }
 		if (gxDs3dPolyMode(p) == 3) {   // only in a frame the shadow plan passed
 			if (sh && n == s_shIdAt) gxDs3dShadowIdPass(c);
 			if (sh && sg < s_shGroupCount && n == s_shGroups[sg].m0) gxDs3dShadowPrepass(c, sg++, shCnt);
@@ -4409,7 +4516,6 @@ static void gxDs3dRenderFastDraw()
 			continue;
 		}
 		if (sh && n == s_shIdAt) gxDs3dShadowIdPass(c);
-		if (prefill && p.isTranslucent()) { gxDs3dTransPrefill(c, n); prefill = false; }
 		const int r = (tags && p.isTranslucent()) ? s_tagRun[i] : 0;
 		if (r && r != curRun) {
 			GXDS3D_TP_BEGIN(tp0);
@@ -4427,15 +4533,20 @@ static void gxDs3dRenderFastDraw()
 	}
 	if (c.tagMode > 0) GX_SetNumTevStages(1);
 	s_shRec = false;
+	if (fogMask) {   // no translucent polygon
+		gxDs3dFogRedrawMask(c);
+		if (c.tagMode > 0) GX_SetNumTevStages(1);
+	}
 	if (s_gateFogPass) {
 		// Task gxfast-fog: fog post-pass over everything drawn (part of the recorded list,
 		// so replayed frames get it too). The CPU fogs only pixels whose polygon has
-		// POLYGON_ATTR bit 15 set; opaque polygons without it are drawn again over the
-		// fogged result with GX_EQUAL depth (same transform, so the same depth: like the
-		// shadow ID pass), which puts their unfogged colour back wherever they are the
-		// visible surface. (Translucent ones without it stay fogged: GxFast gap.)
+		// POLYGON_ATTR bit 15 set: the pass skips those whose visible opaque polygon has it
+		// clear (s_fogRMask, gxDs3dFogRedrawMask). Without the mask (heap, or the mutation)
+		// such polygons are drawn again over the fogged result with GX_EQUAL depth, which
+		// puts their unfogged colour back but loses what blended over them.
+		// (Translucent ones without it stay fogged: GxFast gap.)
 		gxDs3dApplyFogFast();
-		if (s_gateFogRedraw) {
+		if (s_gateFogRedraw && !s_fogRMask) {
 			gxDs3dSetupCommonState();
 			GX_SetZMode(GX_TRUE, GX_EQUAL, GX_FALSE);
 			c.first = true; c.haveLast = false; c.curMtx = -1; c.tagMode = -1; c.blendOn = false;
@@ -4472,6 +4583,11 @@ static void gxDs3dRenderFastDraw()
 // the replaying frames; the caller re-sets everything the 2D pass uses either way.
 // Overflow (GX_EndDispList returns 0, nothing reached the GPU): the pass is drawn
 // directly and the next recording gets a buffer twice the size, up to kDlMax.
+// Task transclear-fogsh: Dolphin doesn't report it (no FIFO wrap flag): a list past the
+// buffer's end wrapped to its start and GX_EndDispList returned the wrapped size, so the
+// call drew the list's tail only (MKDS's shadow frames, ~410 KB: an empty 3D layer). The last
+// 32 bytes hold a sentinel before recording; a list that reached them overflowed too.
+// -DDSA_GXGEOM_MUTATE_DLSENTINEL: GX_EndDispList's verdict only.
 // ---------------------------------------------------------------------------------
 static const u32 kDlMin = 256 * 1024, kDlMax = 1024 * 1024;
 static void *s_dl = nullptr;
@@ -4541,11 +4657,21 @@ void gxDs3dRenderFast()
 	}
 	if (s_dl) {
 		const bool texDirty = s_texDirty;
+		static const u32 kDlSentinel = 0xDEADC0DEu;
+		u32 *const tail = (u32 *)((u8 *)s_dl + s_dlCap - 32);
+		for (int k = 0; k < 8; ++k) tail[k] = kDlSentinel;
+		DCFlushRange(tail, 32);
 		GX_BeginDispList(s_dl, s_dlCap);
 		GXDS3D_TP_BEGIN(tpd);
 		gxDs3dRenderFastDraw();
 		GXDS3D_TP_END(kTpDraw, tpd);
-		const u32 n = GX_EndDispList();
+		u32 n = GX_EndDispList();
+#ifndef DSA_GXGEOM_MUTATE_DLSENTINEL
+		DCInvalidateRange(tail, 32);
+		for (int k = 0; k < 8; ++k)
+			if (tail[k] != kDlSentinel) n = 0;
+		if (n + 32 > s_dlCap) n = 0;
+#endif
 #ifdef DSA_GXGEOM_POLYSTATS
 		s_ps[kPsDl] += n; s_ps[kPsList] += (u32)count; s_ps[kPsVList] += (u32)gfx3d.vertlist->count;
 		if ((++s_psRec & 31) == 0) {
@@ -4766,6 +4892,25 @@ static void gxDs3dFogCopyZ(u16 w, u16 h)
 	GX_InitTexObjFilterMode(&s_fogZTex, GX_NEAR, GX_NEAR);
 }
 
+// Task transclear-fogsh: the EFB alpha as an I8 mask (GX_CTF_A8: a6 63 -> 255), TEXMAP4.
+static GXTexObj s_fogAMaskTex;
+static void *s_fogAMaskData = nullptr;
+
+static bool gxDs3dFogCopyAlpha()
+{
+	if (!s_fogAMaskData) s_fogAMaskData = memalign(32, GX_GetTexBufferSize(kScreenW, kScreenH, GX_TF_I8, GX_FALSE, 0));
+	if (!s_fogAMaskData) return false;
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	GX_SetTexCopySrc(0, 0, kScreenW, kScreenH);
+	GX_SetTexCopyDst(kScreenW, kScreenH, GX_CTF_A8, GX_FALSE);
+	GX_CopyTex(s_fogAMaskData, GX_FALSE);
+	GX_PixModeSync();
+	GX_InvalidateTexAll();
+	GX_InitTexObj(&s_fogAMaskTex, s_fogAMaskData, kScreenW, kScreenH, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjFilterMode(&s_fogAMaskTex, GX_NEAR, GX_NEAR);
+	return true;
+}
+
 // The fog pass's full-screen quad: TEXCOORD0 = screen 0..1 (the Z8 copy, the clear image's
 // depths), TEXCOORD1 = the LUT's texel 0 (the indirect offset adds the depth byte).
 static void gxDs3dFogQuad(float z)
@@ -4839,10 +4984,22 @@ void gxDs3dApplyFogFast()
 	GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 	GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
 
+	// Task transclear-fogsh: with kTransDstAlpha (clear alpha < 31, a rear plane the CPU doesn't
+	// fog, gxDs3dFrameGate) the EFB alpha is the CPU's. A pixel below alpha 31 never took an
+	// opaque write, so its fog flag is the clear's (0) ANDed with its translucent fragments' and
+	// the CPU leaves it alone; every other pixel is at 31, as the LUTs assume. The pass fogs only
+	// where the EFB alpha is 63 (aMask: a TEV stage on the alpha copied out here, alpha compare),
+	// which also drops the cleared pixels a translucent depth write moved past the Z mask.
+	// -DDSA_GXGEOM_MUTATE_FOGAMASK: no mask.
+#ifdef DSA_GXGEOM_MUTATE_FOGAMASK
+	const bool aMask = false;
+#else
+	const bool aMask = s_transMode == kTransDstAlpha && s_gateHasTrans && s_fogMask == kFogMaskGeom && gxDs3dFogCopyAlpha();
+#endif
 	// Task fog-edge: a frame with translucent polygons has blended alpha in the EFB where
 	// the mask leaves the pixel alone; the CPU's is 31 there (clear alpha 31, max-blend), so
 	// the alpha pass first stamps 31 everywhere (gxDs3dGeomFrameNeedsAlpha frames only).
-	if (s_gateFogAlpha && s_gateHasTrans && s_fogMask != kFogMaskAll) {
+	if (s_gateFogAlpha && s_gateHasTrans && s_fogMask != kFogMaskAll && s_transMode != kTransDstAlpha) {
 		GX_SetNumIndStages(0);
 		GX_SetNumTevStages(1);
 		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
@@ -4894,20 +5051,38 @@ void gxDs3dApplyFogFast()
 	GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_KONST);
 	GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 	GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-	if (s_fogMask == kFogMaskCi) {
-		// stage 1 passes stage 0's result through and samples the clear image's depths
-		GX_LoadTexObj(&s_ciZTex, GX_TEXMAP2);
-		GX_SetNumTevStages(2);
-		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, GX_TEXMAP2, GX_COLORNULL);
-		GX_SetTevDirect(GX_TEVSTAGE1);
-		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
-		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-		GX_SetTevAlphaIn(GX_TEVSTAGE1, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
-		GX_SetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-		GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
-	} else {
-		GX_SetNumTevStages(1);
+	// Mask stages after stage 0 (Task transclear-fogsh): alpha = (texel == K) ? alpha : 0, the
+	// alpha compare dropping the pixel (a fog weight of 0 leaves it as it is either way; the
+	// alpha LUT is >= 4). aMask: the EFB alpha is 255 (opaque); s_fogRMask: the unfogged-polygon
+	// mask is 0 (gxDs3dFogRedrawMask). The clear image's Z stage stays last (GX_SetZTexture
+	// takes the last stage's texel).
+	int ns = 1;
+	for (int k = 0; k < 2; ++k) {
+		if (!(k ? s_fogRMask : aMask)) continue;
+		const u8 stage = (u8)(GX_TEVSTAGE0 + ns++), map = k ? GX_TEXMAP5 : GX_TEXMAP4;
+		GX_LoadTexObj(k ? &s_fogRTex : &s_fogAMaskTex, map);
+		GX_SetTevOrder(stage, GX_TEXCOORD0, map, GX_COLORNULL);
+		GX_SetTevDirect(stage);
+		GX_SetTevKAlphaSel(stage, GX_TEV_KASEL_1);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(stage, GX_CA_TEXA, k ? GX_CA_ZERO : GX_CA_KONST, GX_CA_APREV, GX_CA_ZERO);
+		GX_SetTevAlphaOp(stage, GX_TEV_COMP_A8_EQ, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetAlphaCompare(GX_GREATER, 0, GX_AOP_AND, GX_ALWAYS, 0);
 	}
+	if (s_fogMask == kFogMaskCi) {
+		// one more stage passes the result through and samples the clear image's depths
+		const u8 stage = (u8)(GX_TEVSTAGE0 + ns++);
+		GX_LoadTexObj(&s_ciZTex, GX_TEXMAP2);
+		GX_SetTevOrder(stage, GX_TEXCOORD0, GX_TEXMAP2, GX_COLORNULL);
+		GX_SetTevDirect(stage);
+		GX_SetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_CPREV);
+		GX_SetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_APREV);
+		GX_SetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+		GX_SetZTexture(GX_ZT_REPLACE, GX_TF_Z24X8, 0);
+	}
+	GX_SetNumTevStages((u8)ns);
 	gxDs3dFogMaskZ();
 
 	if (s_gateFogColor) {
@@ -4940,10 +5115,8 @@ void gxDs3dApplyFogFast()
 	}
 	GX_SetAlphaUpdate(GX_TRUE);
 	GX_SetTevDirect(GX_TEVSTAGE0);
-	if (s_fogMask == kFogMaskCi) {
-		GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
-		GX_SetNumTevStages(1);
-	}
+	if (s_fogMask == kFogMaskCi) GX_SetZTexture(GX_ZT_DISABLE, GX_TF_Z8, 0);
+	if (ns > 1) GX_SetNumTevStages(1);
 
 	// Restore what this draw doesn't own the caller relying on (mirrors
 	// gxDs3dSetupCommonState's own contract): the next thing to run in
