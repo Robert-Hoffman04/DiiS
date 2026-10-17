@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 //
-// DEFERRED-CPU-COMPOSITING TRANSITION fixture (gx-next-steps-log.md queue item 13j).
+// DEFERRED-CPU-COMPOSITING TRANSITION fixture.
 //
 // The 2D CPU compositor is skipped on frames the GX path handles and only rendered (late) when a
 // barrier / an out-of-scope line / a GX bail asks for it. Every case here changes behaviour

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 //
 // DS Engine B (sub screen) AFFINE fixture for the GX 2D compositor
-// (gx-next-steps-log.md task 8; source/gx/gx_ds_engineb_render.cpp).
+// (source/gx/gx_ds_engineb_render.cpp).
 //
 // Everything is static after setup, so a capture at any frame past boot is
 // byte-stable and can be A/B-compared between the GX path and the forced-CPU

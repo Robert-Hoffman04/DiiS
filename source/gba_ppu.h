@@ -32,8 +32,8 @@
 // Implements GBATEK-accurate windows (WIN0/WIN1/OBJ window, WININ/WINOUT),
 // mosaic (MOSAIC, BG and OBJ), and color special effects (BLDCNT/BLDALPHA/
 // BLDY alpha-blend/brighten/darken, including OBJ semi-transparent mode) --
-// see gba_ppu.cpp's renderScanline()/renderObjLine()/composePixel() and
-// gx-next-steps-log.md task 1. Not implemented: the green-swap mode (a
+// see gba_ppu.cpp's renderScanline()/renderObjLine()/composePixel().
+// Not implemented: the green-swap mode (a
 // stereo/debug display curiosity, not used by real content).
 
 #include "types.h"
@@ -77,7 +77,7 @@ enum
 	IO_IME      = 0x208,
 };
 
-// Stage 0 (see nds-wii-render-pipeline.md / source/gx/gx_frameplan.h) draw
+// Stage 0 (see docs/ARCHITECTURE.md / source/gx/gx_frameplan.h) draw
 // plan for the GBA PPU - the first engine instance wired up, since it's the
 // narrowest of the three (no 3D layer, no capture unit). gbaPpuReset()
 // sizes the dirty bitmaps; gbaPpuBeginFrame() clears the accumulated trace

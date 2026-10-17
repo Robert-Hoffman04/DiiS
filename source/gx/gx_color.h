@@ -49,7 +49,7 @@ inline u16 gxPackRGB5A3Opaque(GxRgb5 c)
 
 // RGB5A3 alpha sub-format: top bit clear, 3-bit alpha (0-7, caller-supplied
 // - already the NDS's own alpha width for every case this engine hits: see
-// nds-wii-texture-format-mapping.md), RGB truncated 5->4 bits by dropping
+// docs/ARCHITECTURE.md), RGB truncated 5->4 bits by dropping
 // the LSB (simple, deterministic; a rounding upgrade is a later tuning
 // pass, not a correctness requirement).
 inline u16 gxPackRGB5A3Alpha(u8 alpha3, GxRgb5 c)

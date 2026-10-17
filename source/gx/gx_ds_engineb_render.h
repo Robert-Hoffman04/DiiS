@@ -1,13 +1,13 @@
 /*
     gx_ds_engineb_render.h - Stage 0 (Frame Analysis) + Stage 1 (Resource
     Sync) + Stage 4 (2D Compositing) GX implementation for the **DS 2D
-    Engine B** instance (nds-wii-render-pipeline.md's "three engine
+    Engine B** instance (docs/ARCHITECTURE.md's "three engine
     instances" section).
 
     This is the second engine instance wired up, after the GBA PPU vertical
     slice (source/gx/gx_gba_render.*). It deliberately mirrors that file's
     ORIGINAL, pre-task-1..6 scope rather than its fully-evolved one -- see
-    gx-next-steps-log.md's task 7 section and "Scope" below. Engine A (the
+    "Scope" below. Engine A (the
     DS main/top screen) is completely untouched by this file: it still runs
     the unmodified CPU compositor (GPU.cpp's GPU_RenderLine) exactly as
     before, and so does Engine B on every frame this file bails on.
@@ -331,7 +331,7 @@
      bails on capture armed / display mode != 1 / mid-frame DISPCNT base-block change; both
      engines bail on a mid-frame screen swap (`screenswap`); Engine A TLUT names are
      GX_TLUT6-10; GxDsBBandRegs has a `bg3d` field (always 0 for B); test hooks:
-     -DDSA_FORCE_CPU, -DDSB_ABCMP. See gx-next-steps-log.md "Task 13".
+     -DDSA_FORCE_CPU, -DDSB_ABCMP.
 
     ------------------------------------------------------------------
     Test hooks (compile-time, zero cost when undefined)
@@ -433,8 +433,7 @@
        saturated MASTER_BRIGHT (GPU_RenderLine skips the render, and its
        parms advance). Engine A / B are independent (their own pending sets
        and visibility maps). Measured on SM64DS: zero barriers per frame,
-       so engaged frames cost no CPU compositor time at all
-       (gx-next-steps-log.md task 13j). Test hooks: -DDS2D_NOLAZY (pre-13j
+       so engaged frames cost no CPU compositor time at all. Test hooks: -DDS2D_NOLAZY (pre-13j
        eager behaviour), -DDSLZ_FORCE_LAZY (with -DDSA/DSB_FORCE_CPU: defer
        every frame and always flush -- a pure replay-exactness build),
        -DDSLZ_STATS, -DDSLZ_FRAMECRC (per-frame output hash),
@@ -454,8 +453,8 @@
        its EFB copy, and holds `vidmutex` for the whole GX sequence so
        draw_thread cannot interleave its own quads into the same FIFO
        mid-render. (gx_gba_render.cpp does neither today; not changed here,
-       since GBA mode is explicitly out of this task's scope -- flagged in
-       gx-next-steps-log.md task 7 as a real follow-up for that file.)
+       since GBA mode is explicitly out of this task's scope -- flagged
+       as a real follow-up for that file.)
 
     GX-only (libogc), like gx_gba_render.* -- verified by cross-compilation
     and Dolphin capture, not by a host-side unit test.

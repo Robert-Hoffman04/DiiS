@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 //
 // DS Engine B (sub screen) DIRTY-GATING fixture for the GX 2D compositor
-// (gx-next-steps-log.md task 10; source/gx/gx_ds_engineb_render.cpp).
+// (source/gx/gx_ds_engineb_render.cpp).
 //
 // The compositor bakes each BG plane / OBJ slot into a cached texture and re-bakes
 // it only when a byte it actually read (recorded in LCDC space), its config, or the

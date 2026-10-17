@@ -1,6 +1,6 @@
 @ windowcheck.s - Synthetic GBA ROM exercising WIN0/WINOUT layer gating,
-@ BG mosaic, and BLDCNT/BLDALPHA alpha-blend together in one frame (see
-@ gx-next-steps-log.md task 1). Mode 0, two text BGs:
+@ BG mosaic, and BLDCNT/BLDALPHA alpha-blend together in one frame
+@ (task 1). Mode 0, two text BGs:
 @  - BG0: 4bpp red/blue 8x8-tile checkerboard, BG0CNT mosaic bit set,
 @    MOSAIC = 12x12 blocks. 12 is deliberately NOT a multiple of the 8px
 @    tile period: a mosaic size that divides evenly into 2*tile (e.g. 16)

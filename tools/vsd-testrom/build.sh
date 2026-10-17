@@ -91,7 +91,7 @@ cp "$HERE"/mergerom/merge_normal.nds "$HERE"/mergerom/merge_det.nds \
    "$HERE"/mergerom/merge_frozen.nds "$HERE"/mergerom/merge_fblend.nds \
    "$HERE"/mergerom/merge_mbright.nds "$HERE"/mergerom/merge_mbsplit.nds "$OUT"/
 
-# --- affinerom (gx-next-steps-log.md task 8) ---------------------------------
+# --- affinerom ---------------------------------
 # DS Engine B affine/extended-affine/large-8bpp BG + affine OBJ fixtures for
 # source/gx/gx_ds_engineb_render.cpp. One scenario per ROM (see the header of
 # affinerom/source/main.c): aff_c0 .. aff_c16.
@@ -101,7 +101,7 @@ docker run --rm -v "$HERE/affinerom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do cp "$HERE"/affinerom/aff_c$c.nds "$OUT"/; done
 
-# --- fxrom (gx-next-steps-log.md task 9) -------------------------------------
+# --- fxrom -------------------------------------
 # DS Engine B window / BLDCNT effect / semi-transparent OBJ / MASTER_BRIGHT
 # fixtures for source/gx/gx_ds_engineb_render.cpp: fx_c0 .. fx_c26 (see the
 # header of fxrom/source/main.c for the case list).
@@ -111,7 +111,7 @@ docker run --rm -v "$HERE/fxrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26; do cp "$HERE"/fxrom/fx_c$c.nds "$OUT"/; done
 
-# --- dirtyrom (gx-next-steps-log.md task 10) ----------------------------------
+# --- dirtyrom ----------------------------------
 # DS Engine B dirty-gating fixtures for source/gx/gx_ds_engineb_render.cpp:
 # dr_c0 .. dr_c8 (see the header of dirtyrom/source/main.c for the case list).
 docker run --rm -v "$HERE/dirtyrom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
@@ -120,7 +120,7 @@ docker run --rm -v "$HERE/dirtyrom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/dirtyrom/dr_c$c.nds "$OUT"/; done
 
-# --- cirom (gx-next-steps-log.md task 11) --------------------------------------
+# --- cirom --------------------------------------
 # DS Engine B native CI4/CI8+TLUT fixtures for source/gx/gx_ds_engineb_render.cpp:
 # ci_c0 .. ci_c8 (see the header of cirom/source/main.c for the case list).
 docker run --rm -v "$HERE/cirom":/proj -w /proj "$IMAGE" rm -rf build 2>/dev/null || true
@@ -129,7 +129,7 @@ docker run --rm -v "$HERE/cirom":/proj -w /proj "$IMAGE" bash -lc "$BDS"'
 '
 for c in 0 1 2 3 4 5 6 7 8; do cp "$HERE"/cirom/ci_c$c.nds "$OUT"/; done
 
-# --- Engine A fixtures (gx-next-steps-log.md task 13) --------------------------
+# --- Engine A fixtures --------------------------
 bash "$HERE/build_enga.sh"
 
 echo

@@ -1,6 +1,6 @@
 /*
     gx_ds_enginea_render.h - DS Engine A (main screen) instance of the GX 2D
-    compositor, queue item 13 phase 1 (gx-next-steps-log.md "Task 13").
+    compositor, queue item 13 phase 1.
 
     THE CODE IS SHARED WITH ENGINE B: source/gx/gx_ds_engine_impl.inc is compiled once as
     Engine B (gx_ds_engineb_render.cpp) and once as Engine A (gx_ds_enginea_render.cpp).

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 mkenga.py <in main.c> <out main.c> -- turn an Engine B (sub screen) GX fixture into the same
-scene on Engine A (main screen), for gx-next-steps-log.md task 13.
+scene on Engine A (main screen).
 
 The Engine B fixtures (affinerom / fxrom / cirom) drive the SUB engine and leave the MAIN
 engine on a flat backdrop. This swaps the two: every sub-engine register / palette / OAM /

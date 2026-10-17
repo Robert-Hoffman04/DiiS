@@ -1,7 +1,6 @@
 /*
     gx_texformat.h - GX destination texture/TLUT formats and block shapes,
-    for the from-scratch GX render engine (see nds-wii-render-pipeline.md
-    and nds-wii-texture-format-mapping.md at the project root).
+    for the from-scratch GX render engine (see docs/ARCHITECTURE.md).
 
     GX textures are not stored linearly - the hardware fetches them as an
     array of fixed-size rectangular blocks (Hollywood/Flipper TEV texture
@@ -16,7 +15,7 @@
 
 // Destination GX texture formats actually used by the NDS->GX mapping table.
 // (GX also defines C4/C8/C14X2/CMPR/RGBA8 variants not needed here - see
-// nds-wii-texture-format-mapping.md for why CMPR is deliberately not used.)
+// docs/ARCHITECTURE.md for why CMPR is deliberately not used.)
 enum GXTexFmt {
 	GXTEXFMT_I4,       // 4bpp intensity, no alpha
 	GXTEXFMT_I8,       // 8bpp intensity, no alpha

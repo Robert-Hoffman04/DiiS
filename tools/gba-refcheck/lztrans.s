@@ -1,5 +1,5 @@
-@ lztrans.s - Synthetic GBA ROM for gx-next-steps-log.md queue item 13j (deferred CPU scanline
-@ compositing). Every frame runs one of six schedules (f mod 6), each writing video state MID-FRAME
+@ lztrans.s - Synthetic GBA ROM for deferred CPU scanline
+@ compositing. Every frame runs one of six schedules (f mod 6), each writing video state MID-FRAME
 @ at fixed scanlines (busy-polled VCOUNT), so a single run contains quiet frames the GX path handles
 @ and frames that force a barrier flush, an out-of-scope line, or a GX bail -- in both directions.
 @ The test compares a per-frame hash of the output against the forced-CPU build (every frame must be

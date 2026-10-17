@@ -150,7 +150,7 @@ static bool gxIsLayoutRegister(u32 offset)
 
 // GXHOT_OBJWIN now means specifically "OBJ window (DISPCNT's WINOBJ enable
 // bit) is active this frame", not "any window feature" as it did before
-// gx-next-steps-log.md's task 2: WIN0/WIN1 are implemented natively in
+// WIN0/WIN1 are implemented natively in
 // gx_gba_render.cpp now (rectangular GX scissor decomposition, exact), so
 // they no longer need to force a CPU-bail; OBJ window's sprite-shaped mask
 // still does, since it isn't expressible as a GX scissor rect -- see that
@@ -323,7 +323,7 @@ void gbaPpuReset()
 	// write doesn't mark every sprite dirty. VRAM's 256-byte pages (96KB /
 	// 256 = 384 pages, comfortably under GxDirtyBitmap::kMaxPages) land
 	// mid-way between a single tile (32-64 bytes) and the DS bank
-	// granularity nds-wii-render-pipeline.md's Stage 0 describes (16KB) -
+	// granularity docs/ARCHITECTURE.md's Stage 0 describes (16KB) -
 	// proportional for VRAM two orders of magnitude smaller.
 	g_gbaFramePlan.vram.init(sizeof(MMU.GBA_VRAM), 256);
 	g_gbaFramePlan.palette.init(sizeof(MMU.GBA_PALETTE), 32);

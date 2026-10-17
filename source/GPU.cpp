@@ -2127,7 +2127,7 @@ static void GPU_RenderLine_layer(NDS_Screen * screen, u16 l)
 	// plain fill was right on both endiannesses; the fade fills and the windowed
 	// per-pixel path used the swapped value where the numeric one belongs, which
 	// on a big-endian host (this Wii port) produced garbage backdrops for any
-	// brighten/darken-of-backdrop or windowed frame (gx-next-steps-log.md task 9).
+	// brighten/darken-of-backdrop or windowed frame.
 	// A no-op on little-endian hosts, where the two are identical.
 	const u16 backdrop_num = T1ReadWord(MMU.ARM9_VMEM, gpu->core * 0x400) & 0x7FFF;
 	u16 backdrop_color = LE_TO_LOCAL_16(backdrop_num);
@@ -2396,7 +2396,7 @@ template<bool SKIP> static void GPU_RenderLine_DispCapture(u16 l, u8 *srcALine =
 		if(!skip)
 		if (l < gpu->dispCapCnt.capy)
 		{
-			// gx-next-steps-log.md task 10: the capture unit writes guest VRAM directly,
+			// the capture unit writes guest VRAM directly,
 			// bypassing the MMU write funnel that feeds Engine B's LCDC-space dirty
 			// tracking, so tag its destination line (<= 512 bytes) here.
 			gxDsMarkVram(cap_dst_adr, 512);

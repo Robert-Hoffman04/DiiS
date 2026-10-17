@@ -29,8 +29,7 @@ void harness_frame_set_every(u32 n) { s_every = n; }
 
 // label may carry a trailing "@N" (e.g. "frame @200"): capture exactly at device frame N instead
 // of at whichever frame the request happens to be drained. Without it the captured frame depends
-// on host->device network latency, which made animated scenes hash differently run to run
-// (gx-next-steps-log.md task 24).
+// on host->device network latency, which made animated scenes hash differently run to run.
 void harness_frame_request(const char *label)
 {
 	s_label[0] = 0;

@@ -1,5 +1,5 @@
-@ Synthetic GBA ROM for gx-next-steps-log.md task 4 (per-OAM-index OBJ
-@ texture caching). Three 4bpp regular (non-affine) 16x16 sprites, mode 0,
+@ Synthetic GBA ROM for per-OAM-index OBJ
+@ texture caching. Three 4bpp regular (non-affine) 16x16 sprites, mode 0,
 @ 1D OBJ mapping, no BG layer (pure black backdrop for contrast):
 @
 @   OAM index 0 (x=20,y=20):  tile 2,  pal0 (red).     Never touched again

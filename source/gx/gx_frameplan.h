@@ -1,5 +1,5 @@
 /*
-    gx_frameplan.h - Stage 0 (Frame Analysis), see nds-wii-render-pipeline.md.
+    gx_frameplan.h - Stage 0 (Frame Analysis), see docs/ARCHITECTURE.md.
 
     Not a snapshot taken before the frame starts: built from a trace of
     dirty memory ranges and register writes accumulated as the frame's CPU
@@ -59,7 +59,7 @@ private:
 // auto-increment (e.g. affine reference-point accumulation) is not a
 // boundary source - only an explicit CPU rewrite is, since the
 // auto-increment case is handled by updating a texture-matrix uniform,
-// not by re-banding (see nds-wii-render-pipeline.md Stage 4).
+// not by re-banding (see docs/ARCHITECTURE.md Stage 4).
 // ---------------------------------------------------------------------
 class GxBandTracker {
 public:

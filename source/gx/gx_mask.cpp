@@ -4,7 +4,7 @@
 
 // main.cpp's InitVideo() sets GX_SetCopyFilter(rmode->aa, rmode->sample_pattern,
 // GX_TRUE, rmode->vfilter) exactly once as part of the "present" state
-// (gx-next-steps-log.md task 7/12's GxRestorePresentState() pattern) and
+// (the GxRestorePresentState() pattern) and
 // nothing else in the renderer ever touches it again - every ordinary
 // EFB->XFB display copy is meant to use that AA/deflicker filter. But
 // GX_SetTexCopySrc/GX_SetTexCopyDst/GX_CopyTex here share the SAME hardware
@@ -20,8 +20,8 @@
 // This was Task 13d's "GX_TF_I8 came back majority neither-0-nor-255 even
 // for a flat single-colour full-screen quad" symptom: rmode's filter was
 // never disabled for the mask copy, so it was never actually an unfiltered
-// 1:1 EFB->texture readback. Root-caused and fixed 2026-09-22 (see
-// gx-next-steps-log.md "Task gx_mask-fix"): force the filter off for the
+// 1:1 EFB->texture readback. Root-caused and fixed 2026-09-22
+// ("Task gx_mask-fix"): force the filter off for the
 // mask's own copy and restore rmode's real filter immediately after, the
 // same save/restore discipline GxRestorePresentState() already applies to
 // the other present-state registers this primitive doesn't own.

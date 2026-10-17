@@ -2680,7 +2680,7 @@ void gfx3d_VBlankSignal(bool next3DSkip){
 
 u32 g_gfx3dRenderSeq = 0;
 
-// gx-remaining-work.md section 1 ("skip the CPU software rasterizer on frames GX draws"):
+// ("skip the CPU software rasterizer on frames GX draws"):
 // the raster is DEFERRED, not skipped, and it runs the first time anything needs
 // gfx3d_convertedScreen (gfx3d_ensureRendered). Only GxFast frames the GX geometry pass
 // could draw are deferred (gxDs3dGeomFramePrepare(): opaque, no fog / edge marking /
@@ -2805,7 +2805,7 @@ void gfx3d_VBlankEndSignal(bool skipFrame){
 	if(skipFrame) return;
 
 	drawPending = FALSE;
-	// gx-next-steps-log.md task 13: the GX Engine A compositor re-bakes its 3D-layer texture
+	// the GX Engine A compositor re-bakes its 3D-layer texture
 	// from gfx3d_convertedScreen only when this counter moved (both writers below/in the
 	// rasterizer run only after this point).
 	++g_gfx3dRenderSeq;

@@ -1,5 +1,5 @@
 /*
-    gx_fence.h - non-blocking GPU fences (Task gpu-overlap, gx-next-steps-log.md).
+    gx_fence.h - non-blocking GPU fences (Task gpu-overlap).
 
     A fence is a PE draw-sync token (GX_SetDrawSync) pushed into the FIFO after a batch of GX
     work; the GPU writes it to the PE token register once everything before it is through the

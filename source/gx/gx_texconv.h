@@ -1,7 +1,7 @@
 /*
     gx_texconv.h - NDS texture/tile format -> GX format conversion.
 
-    Implements the mapping table in nds-wii-texture-format-mapping.md.
+    Implements the mapping table in docs/ARCHITECTURE.md.
     Every function here is a pure buffer-to-buffer transform: callers
     decode NDS VRAM/palette data down to a plain word/byte array first
     (the "which bank, which offset" bookkeeping is Stage 1 - resource sync
@@ -80,7 +80,7 @@ void gxConvertBitmapBufferRGB5A3(const u16 *ndsColors, u16 *outRGB5A3, int count
 
 // ---- TEXMODE_4X4 (NDS block-compressed) -> uncompressed RGB5A3 ----
 // Decodes straight to full RGB5A3 texels rather than GX's CMPR - see
-// nds-wii-texture-format-mapping.md for why re-compressing into CMPR is a
+// docs/ARCHITECTURE.md for why re-compressing into CMPR is a
 // deliberate non-goal. Mirrors the interpolation modes from the real
 // hardware's per-block palette-select scheme (mode 0: color0/1/2 direct +
 // transparent; mode 1: color0/1 + their average, no slot 3; mode 2:

@@ -253,14 +253,14 @@ static void gxDs3dFastXformVerts(const POLY &p, GxDs3dFastXform &x, bool wbuf, f
 }
 
 // ---------------------------------------------------------------------------------
-// Textured polygons (gx-remaining-work.md section 1, "Textured polygons").
+// Textured polygons ("Textured polygons").
 //
 // Texels come from the CPU rasterizer's own decoder (texcache.cpp, TexFormat_15bpp),
 // so every NDS format (I2/I4/I8 paletted, 4x4 compressed, direct 16bpp) yields the
 // exact texel values rasterize.cpp samples, and texcache's VRAM-mapping validation is
 // shared. Each decoded 6665 texture is re-packed once into a GX RGB5A3 texture
 // (opaque texels 1:5:5:5 lossless, transparent ones alpha 0) owned by the small cache
-// below. Deviation from nds-wii-texture-format-mapping.md (native CI4/CI8 + TLUT for
+// below. Deviation from docs/ARCHITECTURE.md (native CI4/CI8 + TLUT for
 // the paletted formats, TLUT slots 0-5): not needed for exactness and not done in this
 // slice; RGB5A3 costs 2 bytes/texel instead of 0.5-1 plus a TLUT.
 //
@@ -301,7 +301,7 @@ static int s_texLastHit = 0;
 static inline u32 gxDs3dTexKey(u32 texParam) { return texParam & 0x3FF0FFFF; }
 
 // ---------------------------------------------------------------------------------
-// Translucent polygons (gx-remaining-work.md section 1), GxFast only.
+// Translucent polygons, GxFast only.
 //
 // rasterize.cpp draws them after the opaque ones in gfx3d.indexlist order (gfx3d_doFlush:
 // opaque y-sorted, then translucent in list order or y-sorted per sortmode), and per
@@ -523,7 +523,7 @@ static bool gxDs3dTexColorExact(const POLY &p)
 }
 
 // ---------------------------------------------------------------------------------
-// Toon/highlight shading (POLYGON_ATTR mode 2, gx-remaining-work.md item 7).
+// Toon/highlight shading (POLYGON_ATTR mode 2).
 //
 // rasterize.cpp's Shader::shade looks the fragment's interpolated vertex red up in the
 // toon table, toonTable[r >> 1] (TOON_TABLE's 5-bit entries through GFX3D_5TO6), and:
@@ -691,7 +691,7 @@ static inline void gxDs3dPostTev(int stage, int texgens, int key)
 }
 
 // ---------------------------------------------------------------------------------
-// Clipped polygons (gx-remaining-work.md section 1, "Clipped polygons").
+// Clipped polygons ("Clipped polygons").
 //
 // rasterize.cpp draws GFX3D_Clipper's output, not the polygon: Sutherland-Hodgman against
 // the six planes (strict |coord| > w test, gfx3d.cpp), new vertices linearly interpolated in
@@ -1432,7 +1432,7 @@ static int gxDs3dTransIdPlan()
 }
 
 // ---------------------------------------------------------------------------------
-// Shadow volumes (POLYGON_ATTR mode 3; gx-remaining-work.md items 6a/12), GxFast only.
+// Shadow volumes (POLYGON_ATTR mode 3), GxFast only.
 //
 // rasterize.cpp keeps an 8-bit per-pixel stencil counter, zeroed with the frame clear and
 // never again. A mode-3 fragment that passes depth (it writes no depth itself):
@@ -1850,7 +1850,7 @@ static bool gxDs3dCarryShadowKeep()
 }
 
 // ---------------------------------------------------------------------------------
-// Rear-plane clear image (DISP3DCNT bit 14, gx-remaining-work.md item 11; Task clearimage).
+// Rear-plane clear image (DISP3DCNT bit 14; Task clearimage).
 // GxFast only.
 //
 // rasterize.cpp's SoftRastRender replaces the uniform clear fragment's colour, depth and fog
@@ -2838,7 +2838,7 @@ static void gxDs3dLoadScreenOrtho()
 }
 
 // ---------------------------------------------------------------------------------
-// W-buffer depth (gfx3d.wbuffer; gx-remaining-work.md section 1, "W-buffer depth mode").
+// W-buffer depth (gfx3d.wbuffer).
 // GxFast only.
 //
 // The CPU tests depth = u32floor(4096*w) per pixel (LESS), with w = 1/invw and invw
@@ -3248,7 +3248,7 @@ void gxDs3dRenderAccurate()
 			// makes GX break sample-on-edge ties differently (29 bad px vs 15 unsnapped).
 			sx += kGxDs3dSampleOffset;
 			sy += kGxDs3dSampleOffset;
-			// Found this pass (see gx-next-steps-log.md's Task 13e-precision section):
+			// Found this pass (Task 13e-precision):
 			// guOrtho(mt,t,b,l,r,n,f)'s "-z axis" convention (per libogc's own gu.h doc
 			// comment) means the visible eye-space Z range for near=0,far=1 is [-1,0],
 			// NOT [0,1] -- feeding the DS's natural 0=near/1=far sz straight into
@@ -4460,7 +4460,7 @@ static void gxDs3dRenderFastDraw()
 }
 
 // ---------------------------------------------------------------------------------
-// Task replay (gx-remaining-work.md section 1, "Batch draw calls"): each 3D frame
+// Task replay ("Batch draw calls"): each 3D frame
 // (g_gfx3dRenderSeq) is composited on two 60 Hz frames, and the pass's GX stream is a
 // pure function of the seq's inputs (lists, latched raster values, the VBlank-end
 // texture snapshot, whose buffers only gxDs3dGeomFramePrepare rewrites). So the first
@@ -4594,7 +4594,7 @@ void gxDs3dRenderFast()
 
 // ---------------------------------------------------------------------------------
 // Task 13f-fog: fog post-process, GxFast only (see gx_ds_3d_render.h's comment on
-// gxDs3dApplyFogFast() and gx-13f-design.md section 2 for the full precision writeup).
+// gxDs3dApplyFogFast() and docs/ARCHITECTURE.md section 2 for the full precision writeup).
 // ---------------------------------------------------------------------------------
 
 // Mirrors rasterize.cpp's own fast fogTable[] build (~line 1268) exactly -- this is the
@@ -4632,7 +4632,7 @@ static void gxDs3dFogBuildTable()
 // to GX's hardware alpha blender instead of a manual TEV lerp -- see gxDs3dApplyFogFast).
 // Indexed by the TOP 8 BITS of the GX Z-buffer's 24-bit depth, i.e. one entry per 128
 // consecutive real fogIndex values (fogIndex = depth>>9 is 15-bit) -- the precision loss
-// gx-13f-design.md section 2 characterizes as the real, accepted GxFast error source.
+// docs/ARCHITECTURE.md section 2 characterizes as the real, accepted GxFast error source.
 // I8's GX block shape is 8 wide x 4 tall (gx_texformat.h) -- a texture's stored bytes
 // are tiled into 8x4 blocks, not row-major linear, so the LUT's actual texture height
 // must be a multiple of 4 and its bytes swizzled with gxSwizzle8bpp (found this pass:

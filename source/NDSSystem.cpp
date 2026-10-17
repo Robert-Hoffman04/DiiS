@@ -1433,7 +1433,7 @@ static void execHardware_hblank()
 		{
 			PZ_SCOPE(PZ_GPU_2D);
 			const bool skip2d = frameSkipper.ShouldSkip2D();
-			// gx-next-steps-log.md task 13: Stage 0 for DS Engine A. Sampled BEFORE
+			// Stage 0 for DS Engine A. Sampled BEFORE
 			// this scanline's Engine-A CPU render (unlike Engine B's, which follows
 			// Engine A's line), so the affine reference point it reads at line 0 is
 			// still the pre-latch value, exactly like Engine B's hook sees it.
@@ -1445,7 +1445,7 @@ static void execHardware_hblank()
 			const bool deferA = !skip2d && gxDsEngineAScanline(nds.VCount);
 			if (!deferA)
 				{ PZ_SUB_SCOPE(PZ_2DA_CPU); GPU_RenderLine(&MainScreen, nds.VCount, skip2d); }
-			// gx-next-steps-log.md task 7: Stage 0 for DS Engine B. Sampled
+			// Stage 0 for DS Engine B. Sampled
 			// here, immediately before this scanline's Engine-B CPU render,
 			// so the layout state it records is exactly the state that
 			// scanline was drawn with. A skipped 2D frame is deliberately
@@ -2370,7 +2370,7 @@ void NDS_Reset()
 
 	DEBUG_reset();
 
-	// gx-next-steps-log.md task 10: a reset / savestate load (which calls this) rewrites VRAM,
+	// a reset / savestate load (which calls this) rewrites VRAM,
 	// palette and OAM without going through the MMU write funnel, so every dirty-gated
 	// Engine B cache is stale by construction.
 	gxDsInvalidateAll();

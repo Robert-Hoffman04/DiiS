@@ -1,4 +1,4 @@
-@ gx-next-steps-log.md task 6: DISPCNT mode 4 (8bpp palette-indexed bitmap
+@ DISPCNT mode 4 (8bpp palette-indexed bitmap
 @ BG2) coverage -- no existing tools/gba-refcheck ROM exercises any bitmap
 @ mode at all. Fills the mode-4 front buffer (VRAM page 0) with a left/right
 @ split: left half = palette index 1 (red), right half = palette index 2

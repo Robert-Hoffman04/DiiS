@@ -260,12 +260,12 @@ struct VERT {
 	// Not saved (like objcoord).
 	u8 mtxEpoch;
 	float fcolor[3];
-	// Task 13e (gx-next-steps-log.md#task-13e / gx-13e-design.md): the DS-space OBJECT-space
+	// Task 13e (docs/ARCHITECTURE.md): the DS-space OBJECT-space
 	// position (post float16table decode, pre mtxCurrent[0] clip transform) -- SetVertex()
 	// (gfx3d.cpp) overwrites coord[]/x,y,z,w in place with the clip-space result and never
 	// otherwise retains the pre-transform value, so the GX-Fast geometry producer (which needs
 	// to feed GX's own hardware transform an object-space vertex, not a pre-transformed one --
-	// see gx-13e-design.md section 2's revised matrix row) has nothing to read without this.
+	// see docs/ARCHITECTURE.md section 2's revised matrix row) has nothing to read without this.
 	// Purely additive: nothing else in this codebase reads it, so it does not affect
 	// savestate format (deliberately not in save()/load() below) or CPU rasterizer behaviour.
 	float objcoord[3];
@@ -290,7 +290,7 @@ struct VERT {
 	}
 };
 
-// Task heap (gx-next-steps-log.md): was 100000. The DS holds at most 6144 vertices per frame
+// Task heap: was 100000. The DS holds at most 6144 vertices per frame
 // (GBATEK); 20000 keeps >3x that for pre-clip submissions (this list also holds vertices of
 // polygons the hardware would cull or clip away). Two lists are allocated (gfx3d.cpp
 // `vertlists`), 52 bytes per VERT with 13e's objcoord, so this frees ~8.3MB of heap.

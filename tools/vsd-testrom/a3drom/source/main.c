@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 //
 // DS Engine A (main screen) 3D-LAYER / DISPCNT / CAPTURE fixture for the GX 2D compositor
-// (gx-next-steps-log.md task 13; source/gx/gx_ds_engine_impl.inc built as Engine A).
+// (source/gx/gx_ds_engine_impl.inc built as Engine A).
 //
 // Static scenes (the 3D list is re-submitted identically every frame, so a capture at any
 // frame past boot is byte-stable), one per build (-DA3_CASE=N), A/B-compared GX vs
@@ -43,8 +43,8 @@
 //  25  same as case 6 (BLDCNT 2nd targets BG1|BG2|BD, priorities/config identical) but the 3D
 //      list is never submitted (BG0's 3D slot stays enabled in DISPCNT/BG0CNT, fully transparent
 //      every pixel) -- isolates whether BG1-3's own GX draw is correct in this exact
-//      window-region/2nd-target config with the 3D layer contributing nothing (gx-next-steps-log.md
-//      task 13d-blendleaklead's next lead / this task, "13d-bg13only")
+//      window-region/2nd-target config with the 3D layer contributing nothing (task
+//      13d-blendleaklead's next lead / this task, "13d-bg13only")
 //  26  same as case 6's BLDCNT/priorities but DISPCNT BG0_3D is off entirely (BG0 is a plain text
 //      BG, not routed through the 3D-layer/mask3d path at all) -- the other half of the "test it
 //      both ways" instruction
@@ -52,10 +52,10 @@
 //      colour variation, no quad, no second polygon), Z-buffer mode (glFlush WITHOUT
 //      GL_WBUFFERING -- every other case in this file uses W-buffering). Deliberately simpler
 //      than case 0: this is the true first byte-exact target for the GX geometry pass
-//      (gx-next-steps-log.md task 13e / gx-13e-design.md section 3's "suggested first
+//      (task 13e / docs/ARCHITECTURE.md's "suggested first
 //      fixture"), proving vertex placement + depth before any texturing/lighting/translucency
 //      plumbing is layered on. holes (clear alpha 0), no effects -> engaged like case 1.
-//  28  item 13e-precision fixture (Task 13e-precision, gx-next-steps-log.md): FOUR flat-coloured
+//  28  item 13e-precision fixture (Task 13e-precision): FOUR flat-coloured
 //      opaque untextured triangles, Z-buffer mode, an extra X-axis rotation stacked on the usual
 //      27-degree Y rotation (genuinely off-axis, not aligned to either screen axis), spanning a
 //      wide depth range (near/steeply-oblique, far/small, and a long thin sliver placed close to
@@ -64,14 +64,14 @@
 //      triangle was proven too simple to expose any drift. Also exercises multi-polygon submission
 //      (item 13e-slice's known gap: only ever tested with N=1). holes (clear alpha 0), no effects.
 //  29  item 13f fog fixture (see the case body).
-//  30  textured polygons (gx-remaining-work.md section 1): four textured quads + one textured
+//  30  textured polygons: four textured quads + one textured
 //      triangle, every opaque format (I4 colour-0 transparent, direct 16bpp with alpha-bit holes,
 //      4x4 compressed in all four modes, I8, I2), clamp / repeat / repeat+flip / flip-only,
 //      white vertex colour, Z-buffer mode, perspective tilt, isolated like 27/28.
 //  31  case 30 with arbitrary per-vertex (Gouraud) colours: modulate precision (GxFast only).
 //  32  case 28 in W-buffer mode (GL_WBUFFERING): intersecting untextured geometry, W depth.
 //  33  case 30 in W-buffer mode: textured + intersecting, W depth (GxFast; GxAccurate bails).
-//  34  translucent polygons (gx-remaining-work.md section 1): cover (clear alpha 31), blending +
+//  34  translucent polygons: cover (clear alpha 31), blending +
 //      alpha test (ref 5) on, one opaque Gouraud quad submitted between translucent ones (sorting),
 //      untextured translucent triangles with depth-write (POLYGON_ATTR bit 11) on and off crossing
 //      each other and the opaque quad in depth, an A3I5 quad of alpha 31 without depth write
@@ -82,7 +82,7 @@
 //      dropped where the first drew): GxFast bails `transid`.
 //  37  diagnostic: case 34's opaque quad alone with four different vertex colours (a Gouraud
 //      quad; the DS interpolates quads natively, GX splits them into two triangles).
-//  38  clipped polygons (gx-remaining-work.md section 1): identity modelview, a textured floor
+//  38  clipped polygons: identity modelview, a textured floor
 //      quad (direct, repeat) from behind the eye (w < 0) to beyond the far plane, also crossing
 //      the left and bottom planes; a textured 4x4 quad (clamp) crossing the near, right and top
 //      planes; a large flat untextured triangle crossing far, right, top and bottom, behind the
@@ -96,7 +96,7 @@
 //      quad (alpha-0 texels neither draw nor stamp); then ID 22 on top of them; then ID 21 again,
 //      disjoint from its first run (two overlapping quads); then ID 23, a 300-triangle fan whose
 //      k-th triangle only wins the sliver it adds (tags past 255).
-//  47  toon shading (gx-remaining-work.md item 7): POLYGON_ATTR mode 2, Z-buffer, isolated like 30.
+//  47  toon shading: POLYGON_ATTR mode 2, Z-buffer, isolated like 30.
 //      A toon table of arbitrary entries except 0 (0,31,31) and 31 (31,0,31); untextured toon
 //      triangle + quad (flat red, Gouraud green/blue, which toon ignores) crossing a modulate
 //      Gouraud triangle in depth; two textured toon quads (I8 repeat+flip at index 31, direct
@@ -104,7 +104,7 @@
 //  48  case 47 with the textured quads at indexes 20/9 (arbitrary entries): GxFast only.
 //  49  case 47 in highlight mode (DISP3DCNT bit 1) without the textured quads (untextured
 //      highlight = toon on the CPU rasterizer) -> engaged; 50: with them -> BAIL toon.
-//  51  shadow volumes (POLYGON_ATTR mode 3, gx-remaining-work.md items 6a/12), SM64DS's
+//  51  shadow volumes (POLYGON_ATTR mode 3), SM64DS's
 //      layout: a box of mask polygons (ID 0, back faces) then the same box as draw polygons
 //      (front faces, alpha 15), straddling an opaque floor (ID 1) and an opaque block (ID 3).
 //      Cover, blending on, Z-buffer, manual sort, isolated like 30. GxFast engaged.
@@ -183,7 +183,7 @@
 #ifndef A3_CASE
 #define A3_CASE 0
 #endif
-// 32/33: cases 28/30 with GL_WBUFFERING (gx-remaining-work.md section 1, W-buffer depth mode).
+// 32/33: cases 28/30 with GL_WBUFFERING (W-buffer depth mode).
 #define A3_WBUF 0
 // 73-76: decal (see the header). A3_PMODE: POLYGON_ATTR mode bits of textured polygons, A3_PMODEU untextured.
 #define A3_PMODE 0
@@ -441,7 +441,7 @@
 #endif
 #endif
 
-// 41-45: cases 1/0/11/10/2 in Z-buffer mode (gx-remaining-work.md section 1, "3D at its real
+// 41-45: cases 1/0/11/10/2 in Z-buffer mode ("3D at its real
 // priority": BG3 and sprites sit above BG0/3D, so the GX pass is drawn to a texture; Z-buffer so
 // GxAccurate takes them too). 41 holes; 42 cover + BG3 alpha over 3D; 43 3D as alpha 1st target
 // over BG1/backdrop; 44 WIN0; 45 BG0HOFS 37.
@@ -551,7 +551,7 @@ static void setupObjs(int semiMask)
 }
 
 #if A3_CASE == 30 || A3_CASE == 31 || A3_CASE == 38 || A3_CASE == 47
-// Textured-polygon fixture (gx-remaining-work.md section 1, "Textured polygons"): every
+// Textured-polygon fixture ("Textured polygons"): every
 // opaque texture format, noisy texels so any texel mis-selection shows, colour-0 and
 // alpha-bit holes, clamp / repeat / flip, Z-buffer mode with one overlapping triangle.
 // Textures are written straight to LCDC VRAM and selected with raw TEXIMAGE_PARAM /

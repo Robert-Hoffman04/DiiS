@@ -1,6 +1,6 @@
 /*
     gx_gba_render.h - Stage 1 (Resource Sync) + Stage 4 (2D Compositing) GX
-    implementation for the GBA PPU vertical slice (nds-wii-render-pipeline.md).
+    implementation for the GBA PPU vertical slice (docs/ARCHITECTURE.md).
 
     Scope: all DISPCNT display modes (0-5) and both regular and affine OBJ.
     Affine BG (modes 1/2) and affine OBJ are drawn as a single textured quad
@@ -16,7 +16,7 @@
     fall outside the real content clamps onto that transparent border
     instead of smearing the edge row/column.
 
-    gx-next-steps-log.md task 2: WIN0/WIN1 rectangular windows and
+    WIN0/WIN1 rectangular windows and
     BLDCNT/BLDALPHA/BLDY blend (alpha-blend, brighten, darken) are now
     implemented natively in this file -- see "Windows" and "Blend" below.
     gxGbaRenderFrame() still returns false (CPU fallback via
@@ -50,8 +50,7 @@
        follow-up rather than something to force into this change --
        narrower and more precisely bounded than task 1's original
        blanket bail, but still a real remaining gap, not a convenience
-       shortcut. See gx-next-steps-log.md's task 2 section for the full
-       reasoning.
+       shortcut.
      - alpha blend specifically (BLDCNT effect field == 1, including
        semi-transparent OBJ's forced-1st-target case) when this frame's
        blend configuration doesn't satisfy the precondition documented
@@ -90,8 +89,7 @@
     (needs a 2048 texture) now bails to the CPU compositor
     (gxAffinePlaneUnsupported). Result: byte-identical to the CPU reference
     on all gba-refcheck fixtures incl. rotated/zoomed affinezoom/affinemag/
-    affineshrink/affinenowrap. Fixture hashes were re-baselined -- see
-    gx-next-steps-log.md task 19.
+    affineshrink/affinenowrap. Fixture hashes were re-baselined.
 
     ### Blend (BLDCNT/BLDALPHA/BLDY)
 
@@ -125,12 +123,12 @@
     covered by the same precondition check, treating each such sprite as
     an implicit extra 1st-target layer for that computation.
 
-    ### Native CI4/CI8 (gx-next-steps-log.md task 6)
+    ### Native CI4/CI8
 
     The BASE (non-effect, toEffectScratch==false) persistent-cache bake path
     now uploads raw GBA palette-index texels via GX_InitTexObjCI + a TLUT
     built from the live GBA palette bank at bake time, instead of resolving
-    each texel to RGB5A3 at bake time -- see nds-wii-texture-format-mapping.md
+    each texel to RGB5A3 at bake time -- see docs/ARCHITECTURE.md
     ("2D BG/OBJ 4bpp/8bpp tiles"). Converted:
      - Affine BG planes (gxBakeAffineBgPlane): always CI8 -- affine map
        entries are a full byte with no per-tile palette selection, direct
@@ -149,7 +147,7 @@
        a 256-entry TLUT spanning the whole BG palette bank -- still a real,
        correct bandwidth/TMEM win over RGB5A3 (8 bits/texel vs 16), just not
        CI4's maximal 4-bit win. A per-palette-group multi-draw scheme (see
-       nds-wii-texture-format-mapping.md's "Extended-palette 2D BGs") would
+       docs/ARCHITECTURE.md's "Extended-palette 2D BGs") would
        get the maximal win but is a materially larger change, not attempted
        this pass -- documented follow-up.
      - Bitmap mode 4 (gxBakeBitmapMode, mode==4 only): CI8, direct idx 0-255
@@ -250,7 +248,7 @@
        frame-final register value to decide dirtiness, consistent with what
        gxBakeBgPlane/gxBakeAffineBgPlane themselves bake from -- it inherits
        this simplification rather than working around it.
-     - OBJ textures: gx-next-steps-log.md task 4 closed this gap for OBJ
+     - OBJ textures: task 4 closed this gap for OBJ
        specifically -- each OAM index's baked texture (s_objTex[]) now
        carries the OAM fields (tile-index/shape/size/color-mode/
        palette-index) and DISPCNT 1D/2D bit it was baked from, and is only
@@ -259,7 +257,7 @@
        configuration depends on were written (via gx_frameplan.h's
        GxDirtyBitmap::isPageDirty(), not just the coarse anyDirty() the
        bullet above still describes for bitmap-mode planes).
-     - BG textures: gx-next-steps-log.md task 5 closed this gap for the
+     - BG textures: task 5 closed this gap for the
        backdrop and all four BG planes, replicating task 4's OBJ pattern.
        The backdrop (gxBackdropNeedsRebake) gates on exactly its one
        dependency, BG palette color 0 (2 bytes). Each BG plane
@@ -291,7 +289,7 @@
           use different sub-palettes still all re-bake together on any BG
           palette write, even one none of them actually reads -- a
           deliberate, documented conservative simplification, not an
-          oversight (see gx-next-steps-log.md task 5's own section for the
+          oversight (see tools/gba-refcheck/bgcache.s for the
           synthetic-ROM proof this surfaced during testing).
        HOFS/VOFS (scroll) and, for affine, PA/PB/PC/PD/reference-point are
        deliberately NOT part of any BG fingerprint, for the same reason
@@ -328,7 +326,7 @@
        code (which expects GBA_screen as a plain RGB565-family buffer)
        working unchanged.
 
-       gx-next-steps-log.md task 3 narrowed, rather than removed, this gap:
+       Task 3 narrowed, rather than removed, this gap:
        a genuinely direct EFB->XFB present (skipping GBA_screen entirely)
        was ruled out as unsafe for this task -- gxGbaRenderFrame() runs on
        the emulation thread (called from gbaPpuEndFrame(), itself called
@@ -355,8 +353,7 @@
        RGB15_REVERSE per-pixel reconversion back up to RGB5A3. GBA_screen
        and GPU_screen are still populated exactly as before, unconditionally,
        every frame -- this is strictly additive, not a replacement of that
-       path. See gxGbaBlitNativeTop()'s own comment below and
-       gx-next-steps-log.md's task 3 section for the full reasoning,
+       path. See gxGbaBlitNativeTop()'s own comment below for the full reasoning,
        including why draw_thread and Draw() being already serialized by
        vidmutex is what makes even this narrower change safe.
 
@@ -373,7 +370,7 @@
        threading model, not scoped to this file, and affects DS-mode
        present too -- a separate task.
 
-    Deferred CPU scanlines + GX decision point (gx-next-steps-log.md queue item
+    Deferred CPU scanlines + GX decision point (item
     13j): gba_ppu.cpp no longer runs renderScanline() at every visible line's
     HDraw end. The lines are DEFERRED and rendered late, by the CPU, only if a
     barrier (a write to a video register / VRAM / palette / OAM, flushed BEFORE
@@ -393,7 +390,7 @@
     -DGBA_FORCE_CPU (always bail), -DGBA_NOLAZY, -DDSLZ_FORCE_LAZY (with
     GBA_FORCE_CPU: always defer + flush), -DDSLZ_STATS, -DDSLZ_FRAMECRC.
 
-    Present-state hygiene (gx-next-steps-log.md task 12): gxGbaRenderFrame()
+    Present-state hygiene: gxGbaRenderFrame()
     holds vidmutex (non-recursive; never called with it held) across its whole
     GX sequence, calls main.cpp's GxRestorePresentState() before unlock, and
     does its EFB->texture copy with clear=GX_TRUE so the raw 240x160 draw does
@@ -462,7 +459,7 @@ bool gxGbaRenderFrame();
 // gxGbaRenderFrame() could handle a frame at all (gates deferred CPU line rendering).
 bool gxGbaRenderReady();
 
-// gx-next-steps-log.md task 3 (Stage 7 partial present win): when the most
+// Task 3 (Stage 7 partial present win): when the most
 // recent gxGbaRenderFrame() call rendered this frame via the real GX
 // draw+GX_CopyTex path (not a CPU-bail return, and not the forced-blank
 // early return -- see gxGbaRenderFrame()'s header comment), that call's

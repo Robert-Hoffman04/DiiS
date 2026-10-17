@@ -1,6 +1,6 @@
 @ winblend.s - Synthetic GBA ROM exercising WIN0/WINOUT layer gating and
-@ BLDCNT/BLDALPHA alpha-blend *without* mosaic (see gx-next-steps-log.md
-@ task 2). Deliberately windowcheck.s minus mosaic: task 2 ports WIN0/WIN1
+@ BLDCNT/BLDALPHA alpha-blend *without* mosaic
+@ (task 2). Deliberately windowcheck.s minus mosaic: task 2 ports WIN0/WIN1
 @ and BLDCNT/BLDALPHA/BLDY blend natively into the GX path
 @ (gx_gba_render.cpp) but leaves mosaic (all forms) CPU-bailed, so
 @ windowcheck.s's own mosaic bit means g_gbaFramePlan.isHot(GXHOT_MOSAIC)

@@ -1,5 +1,5 @@
-@ dirtygate.s - Synthetic GBA ROM for gx-next-steps-log.md queue item 21 (GBA per-frame
-@ dirty-bitmap hole). g_gbaFramePlan.beginFrame() clears the VRAM/palette dirty bitmaps
+@ dirtygate.s - Synthetic GBA ROM for the GBA per-frame
+@ dirty-bitmap hole. g_gbaFramePlan.beginFrame() clears the VRAM/palette dirty bitmaps
 @ every frame and the GX path only ran a texture's rebake gate while that layer / sprite
 @ was drawn, so a dependency byte written while a BG is disabled (or an OBJ is parked /
 @ OBJ-disabled) was lost and the stale cached texture showed the frame it came back.

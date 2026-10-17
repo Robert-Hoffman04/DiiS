@@ -1,5 +1,5 @@
 /*
-    gx_rendermode.h - central runtime render-mode switch (nds-wii-render-pipeline.md,
+    gx_rendermode.h - central runtime render-mode switch (docs/ARCHITECTURE.md,
     "Target end state: three runtime-switchable render modes").
 
     Single small global, not per-engine state: all three GX engine instances (GBA PPU,

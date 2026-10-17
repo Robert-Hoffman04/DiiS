@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Engine A (main screen) fixtures for source/gx/gx_ds_enginea_render.cpp
-# (gx-next-steps-log.md task 13). Called from build.sh; also runnable on its own.
+# Engine A (main screen) fixtures for source/gx/gx_ds_enginea_render.cpp.
+# Called from build.sh; also runnable on its own.
 #
 #  (1) the Engine B fixtures re-targeted at the MAIN engine by mkenga.py (generated projects
 #      under .gen/, gitignored): fxa_c* (windows/effects/MASTER_BRIGHT), cia_c* (CI4/CI8+TLUT,

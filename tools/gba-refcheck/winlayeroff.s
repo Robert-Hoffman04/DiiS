@@ -1,5 +1,5 @@
 @ winlayeroff.s - Synthetic GBA ROM for the GBA window "layer enabled
-@ outside but disabled inside a window" bug (gx-next-steps-log.md task 16).
+@ outside but disabled inside a window" bug.
 @ The old GX scheme drew each layer over the whole band for WINOUT then
 @ overdrew scissored WIN1/WIN0 rects, so a layer ON in WINOUT and OFF in
 @ WIN0/WIN1 was never erased inside the window.

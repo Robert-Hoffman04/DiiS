@@ -1,4 +1,4 @@
-@ dirtybmp.s - Synthetic GBA ROM for gx-next-steps-log.md queue item 21, bitmap-mode layers.
+@ dirtybmp.s - Synthetic GBA ROM for bitmap-mode layer dirty tracking.
 @ Mode 4 bitmap (BG2), page 0: top half idx1 (red), bottom half idx3 (blue); page 1: idx4 (yellow).
 @ Timeline (vblanks): 40 DISPCNT=mode 0 with nothing enabled (bitmap layer not drawn); 50 while
 @ off: bottom half rewritten idx3->idx2 (green) and palette idx1 red->cyan; 60 mode 4 again

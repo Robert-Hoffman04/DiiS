@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 //
 // DS Engine B (sub screen) NATIVE CI4/CI8 + TLUT fixture for the GX 2D compositor
-// (gx-next-steps-log.md task 11; source/gx/gx_ds_engineb_render.cpp).
+// (source/gx/gx_ds_engineb_render.cpp).
 //
 // Static scenes (byte-stable after boot; case 7 has a schedule that ends at f=150), one
 // per build (-DCI_CASE=N), A/B-compared GX vs forced-CPU (-DDSB_FORCE_CPU) and, for the

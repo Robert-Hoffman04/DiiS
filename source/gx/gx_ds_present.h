@@ -1,6 +1,6 @@
 /*
     gx_ds_present.h - DS direct present of the engines' EFB copies (Task directpresent,
-    gx-next-steps-log.md; nds-wii-render-pipeline.md Stage 7).
+    docs/ARCHITECTURE.md Stage 7).
 
     Before this, a DS engine frame handled on GX went EFB -> GX_CopyTex (tiled RGB5A3)
     -> CPU unswizzle + RGB5A3->X-B5-G5-R5 into GPU_screen -> Draw() re-swizzled

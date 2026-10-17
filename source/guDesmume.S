@@ -19,7 +19,7 @@ texCoordTrans:
 	blr
 
 	// Only volatile FPRs (f0-f13): f14-f31 are callee-saved in the PPC EABI, and these
-	// routines don't save anything (they used to clobber f14-f19; see gx-next-steps-log.md Task rslatch).
+	// routines don't save anything (they used to clobber f14-f19).
 	.globl ps_MatrixMultVec4x4
 	//r3 = mtx, r4= vec
 ps_MatrixMultVec4x4:

@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // gx_ds_engine_impl.inc -- the DS 2D GX compositor body, compiled TWICE (queue item
-// 13, gx-next-steps-log.md "Task 13"): once as Engine B (gx_ds_engineb_render.cpp,
+// 13): once as Engine B (gx_ds_engineb_render.cpp,
 // GXDS_CORE 1, the original tasks 7-11 code) and once as Engine A
 // (gx_ds_enginea_render.cpp, GXDS_CORE 0). The two TUs each get their own copy of
 // every file-static below (plane / sprite caches, band plan, dirty gates, TLUT owner
@@ -401,7 +401,7 @@ struct GxDsA3dTex {
 	u16 cfgFx;
 };
 static GxDsA3dTex s_3d, s_3dFx;
-// gx-remaining-work.md section 1 ("3D at its real priority"): the GX geometry pass's own
+// ("3D at its real priority"): the GX geometry pass's own
 // output, EFB-copied (RGB5A3, same 256x256 layout as s_3d) and drawn in BG0's slot like s_3d
 // when the 3D layer is not frontmost/untargeted (gxDsA3dRenderGeomTex). texData is the copy
 // target (memalign'd, never CPU-written after init); only texObj/texData are used.
@@ -3018,7 +3018,7 @@ static void gxDsBBakeBackdrop(int band, int fadeMode, int fadeLvl, bool fxSlot =
 // translucency scan and both textures are keyed on that counter (+ the fade key);
 // gxDsEngineAInvalidateAll() (reset / savestate load) drops them.
 //
-// gx-remaining-work.md section 1: `clearOnly` (the caller has established that this frame's
+// `clearOnly` (the caller has established that this frame's
 // 3D is drawn by the GX geometry pass on top, and the software raster is still deferred)
 // scans a uniform clear-colour layer instead of gfx3d_convertedScreen, so the raster never
 // runs. The deferred raster's buffer is the clear fragment everywhere except under the
@@ -3473,7 +3473,7 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 						                       (int)s_3dScanValid, s_3dScanSeq, g_gfx3dRenderSeq);
 #endif
 						if ((under & ~p.t2) || trans) {
-							// Task 13d-texfmt / nds-wii-render-pipeline.md "three runtime-switchable
+							// Task 13d-texfmt / docs/ARCHITECTURE.md "three runtime-switchable
 							// render modes": the two-pass draw (gxDsBBuildUnder3DMask /
 							// gxDsA3dDrawBandTwoPass) is structurally correct, but NOT exact: a
 							// translucent 3D texel over a 2nd target comes out +-1 LSB vs the CPU
@@ -3500,8 +3500,8 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 					// above it blend against the 3D layer alone: `under` restarts at {BG0}. This is what
 					// lets SM64DS's BG3-over-3D alpha blend (BLDCNT 2nd target = BG0 only) be native.
 					//
-					// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug --
-					// see gx-next-steps-log.md): that restart is only sound for the OLD single-pass
+					// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug):
+					// that restart is only sound for the OLD single-pass
 					// draw, where a "covered" band really does leave the 3D layer's own drawn colour
 					// as the pixel's complete history (an unconditional REPLACE, or an unconditional
 					// blend, with no per-pixel split). The two-pass MASKED draw exists precisely
@@ -3530,7 +3530,7 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 				if (fade) p.fadeBg |= (u8)(1 << bg);
 				if (want && (under & p.t2)) {
 #if GXDS_CORE == 0
-					// P0-4 (gx-next-steps-log.md Task P0-4): a 2D layer alpha-blended over the 3D
+					// P0-4: a 2D layer alpha-blended over the 3D
 					// layer as 2nd target comes out 1 LSB off the CPU (EFB /255 lerp vs the CPU's
 					// 6-bit-3D-colour blend; SM64DS letter text, row 162). GxAccurate bails it,
 					// GxFast keeps the characterized +-1 LSB.
@@ -3611,8 +3611,8 @@ static bool gxDsBPlanBand(const GxDsBBandRegs &r, int y0, int y1, GxDsBBandPlan 
 	// Task 13d-statefix follow-up lead: dump the per-cfg planning outputs
 	// (mask3dCfg, blendLive, fade3dCfg/fadeBg/fadeObj) directly, not just the
 	// final draw-time `alpha` bool, to check for a planning miscomputation
-	// beyond the already-tried `under`-collapse fix (see
-	// gx-next-steps-log.md Task 13d-statefix's "Outcome" section).
+	// beyond the already-tried `under`-collapse fix
+	// (Task 13d-statefix).
 	harness_profile_emitf(GXDS_TAG "planband y0=%d y1=%d mask3dCfg=%02x blendLive=%02x,%02x,%02x fade3dCfg=%02x fadeBg=%02x fadeObj=%d t1=%02x t2=%02x mode=%d bg0prio=%d",
 	                       y0, y1, p.mask3dCfg, p.blendLive[0], p.blendLive[1], p.blendLive[2],
 	                       p.fade3dCfg, p.fadeBg, (int)p.fadeObj, p.t1, p.t2, p.mode, r.bgPrio[0]);
@@ -3649,7 +3649,7 @@ static void gxDsBTevAlpha(int k)
 	// stale REPLACE alpha wiring in place -- silently breaking constant-alpha
 	// blending for the next alpha-blended layer in the band (root cause of the
 	// 13d whole-frame corruption even after the mask primitive itself was
-	// fixed; see gx-next-steps-log.md's gx_mask-fix follow-up).
+	// fixed; gx_mask-fix follow-up).
 	if (s_tevK < 0) {
 		GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_TEXC);
 		GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
@@ -3807,8 +3807,8 @@ static void gxDsBDrawBgLayer(int b, int bg, const GxDsBBandRegs &r, const GxDsBB
 			if (bg == 0 && r.bg3d) {   // task 13: the 3D layer (never alpha-blended by BLDCNT)
 				if ((p.mask3dCfg >> ru.cfg) & 1) {   // task 13d: mixed under -> two-pass draw
 					// Task 13d-bg13only (2026-09-22) bisection points, inert unless defined,
-					// left in place for whoever picks this back up (see
-					// gx-next-steps-log.md#task-13d-bg13only): DSA_MASK3D_BISECT_SKIP skips
+					// left in place for whoever picks this back up (Task
+					// 13d-bg13only): DSA_MASK3D_BISECT_SKIP skips
 					// gxDsBBuildUnder3DMask()+gxDsA3dDrawBandTwoPass() entirely (proved bad=0 on
 					// a3_c25); DSA_MASK3D_BISECT_SKIP_DRAW keeps the mask build but skips the
 					// two-pass draw call (also bad=0 -- mask build is NOT the corruptor);
@@ -4194,8 +4194,8 @@ static void gxDsA3dDrawBandTwoPass(const GxDsA3dTex &tB, int hofs, int y0, int y
 	s_tevK = -2;
 }
 
-// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug --
-// see gx-next-steps-log.md): pass A's GX_BM_BLEND(SRCALPHA,INVSRCALPHA) blend
+// Task 13d follow-up (2026-09-22, "gx_mask-fix" investigation's second bug):
+// pass A's GX_BM_BLEND(SRCALPHA,INVSRCALPHA) blend
 // of a GENUINELY translucent 3D texel (real per-texel alpha 1..254, not the
 // old code's binary present/absent) mathematically leaves the EFB's OWN alpha
 // channel below 255 at that pixel -- out_A = srcA*(srcA/255) + dstA*(1-srcA/255),
@@ -4224,7 +4224,7 @@ static void gxDsA3dStampOpaqueAlpha()
 {
 #ifdef DSB_STATS_DBG
 	// Task 13d-blendleaklead (2026-09-22): confirms this runs every frame
-	// (87/90 a3_c8 frames) -- see gx-next-steps-log.md for why that matters
+	// (87/90 a3_c8 frames) -- this matters
 	// (this pass proved the stamp's own effect on `dsaabd`'s printed value
 	// is unmeasurable, not that it never executes).
 	harness_profile_emitf(GXDS_TAG "stampalpha");
@@ -4440,7 +4440,7 @@ static bool gxDsA3dOverlaySafe(int bandCount)
 	return true;
 }
 
-// gx-remaining-work.md section 1: the geometry pass drawn at the 3D layer's real priority.
+// the geometry pass drawn at the 3D layer's real priority.
 // Frames that fail gxDsA3dOverlaySafe (a BG/OBJ above BG0, a window, a scroll, BG0 targeted)
 // render the pass first into the EFB corner the bands later use, on top of the same BG0
 // texture the overlay would have had beneath it (s_3d: the clear colour, or the CPU raster in
@@ -4457,7 +4457,7 @@ static bool gxDsA3dOverlaySafe(int bandCount)
 // alpha-0 texel (copied alpha is 255); with holes the pass runs in GX_PF_RGBA6_Z24 so the hole
 // texels keep alpha 0 through the copy. RGBA6 truncates colour to 6 bits, which keeps the top
 // 5 the RGB5A3 copy takes, and no blending happens in that case (translucent polygons need a
-// hole-free clear). nds-wii-render-pipeline.md deviation: Stage 3 renders to texture, but the
+// hole-free clear). docs/ARCHITECTURE.md deviation: Stage 3 renders to texture, but the
 // target is the Engine A EFB corner itself, copied before the 2D bands overwrite it.
 static bool gxDsA3dEnsureGeomTex()
 {
@@ -4845,7 +4845,7 @@ static bool gxDsBRenderFrameImpl()
 #ifdef GXDS_FORCE_CPU
 	return false;
 #endif
-	// nds-wii-render-pipeline.md "three runtime-switchable render modes": Software mode
+	// docs/ARCHITECTURE.md "three runtime-switchable render modes": Software mode
 	// bails before any GX work, uniformly across both DS engine instances (this .inc is
 	// shared by Engine A and Engine B), same effect as DSA_FORCE_CPU/DSB_FORCE_CPU but
 	// selectable at runtime. Must precede everything below -- no GX state may be touched.
@@ -5026,7 +5026,7 @@ static bool gxDsBRenderFrameImpl()
 	// The 3D layer's translucency map (per line) feeds gxDsBPlanBand's exactness check, so
 	// the scan runs first; it is a pure read of gfx3d_convertedScreen (cached on the
 	// rasterizer's render counter).
-	// gx-remaining-work.md section 1: decided here, before the scan, because a frame the
+	// decided here, before the scan, because a frame the
 	// geometry pass draws scans a clear-colour layer and never runs the deferred raster.
 	bool geomPass = false, geomOverlay = false;
 	s_3dTexMode = false;

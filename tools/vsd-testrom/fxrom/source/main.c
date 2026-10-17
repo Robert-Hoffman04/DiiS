@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 //
 // DS Engine B (sub screen) WINDOW / COLOUR-EFFECT / MASTER_BRIGHT fixture for the
-// GX 2D compositor (gx-next-steps-log.md task 9; source/gx/gx_ds_engineb_render.cpp).
+// GX 2D compositor (source/gx/gx_ds_engineb_render.cpp).
 //
 // Everything is static after setup (except the HBlank-IRQ cases, which are
 // deterministic per line), so a capture at any frame past boot is byte-stable and

@@ -145,7 +145,7 @@ static u8 gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
 static u16 TopScreen[256*192] __attribute__((aligned(32)));
 static u16 BottomScreen[256*192] __attribute__((aligned(32)));
 
-// gx-next-steps-log.md task 3: direct-present fast path for GBA mode. Same
+// direct-present fast path for GBA mode. Same
 // 256x192 RGB5A3-swizzled layout as TopScreen/TopTex (so it drops straight
 // into draw_thread's existing top-screen quad with no geometry changes),
 // but its top-left [0,240)x[0,160) region is filled by a block-aligned
@@ -618,7 +618,7 @@ void init(){
 
 	memset(TopScreen, 0, 256*192*sizeof(*TopScreen));
 	memset(BottomScreen, 0, 256*192*sizeof(*BottomScreen));
-	// gx-next-steps-log.md task 3: cleared once, here, and never touched
+	// cleared once, here, and never touched
 	// again outside the top-left [0,240)x[0,160) region gxGbaBlitNativeTop()
 	// overwrites each frame -- see GbaTopScreen's own comment above.
 	memset(GbaTopScreen, 0, sizeof(GbaTopScreen));
@@ -632,7 +632,7 @@ void init(){
 	VIDEO_SetBlack(false);
 }
 
-// gx-next-steps-log.md task 7 (DS Engine B GX compositor): InitVideo()
+// DS Engine B GX compositor: InitVideo()
 // above establishes the GX "present" state -- viewport, scissor, projection,
 // Z-mode, vertex format and, crucially, the EFB-copy source/destination
 // registers GX_CopyDisp() reads -- exactly ONCE, and neither Draw() nor
@@ -699,7 +699,7 @@ static void Draw(void) {
 
 	{ PZ_SCOPE(PZ_DRAW_CONVERT);
 
-	// gx-next-steps-log.md task 3: GBA-mode direct-present fast path.
+	// GBA-mode direct-present fast path.
 	// gxGbaRenderFrame() already ran this frame (called from
 	// gbaPpuEndFrame(), itself called from DSExec() on this same thread,
 	// strictly before Draw() -- see NDSSystem.cpp's gbaExecFrame() call
@@ -917,7 +917,7 @@ static void *draw_thread(void*){
 		// TOP SCREEN
 		if ((screen_layout != SCREEN_SUB_NORMAL) && (screen_layout != SCREEN_SUB_STRETCH)){
 			GXDBG_MAIN("draw_thread: top screen quad start");
-			// gx-next-steps-log.md task 3: GbaUseDirectTopTex was set by
+			// GbaUseDirectTopTex was set by
 			// Draw() under this same vidmutex critical section, strictly
 			// before draw_thread could observe it (Draw() runs on the
 			// emulation thread and always unlocks vidmutex before
@@ -1599,7 +1599,7 @@ static void harness_poll_host()
 			} else if (!strncmp(_rx, "movie", 5)) {
 				harness_input_movie_cmd(_rx + 5);
 			} else if (!strncmp(_rx, "rendermode", 10)) {
-				// nds-wii-render-pipeline.md "three runtime-switchable render modes":
+				// docs/ARCHITECTURE.md "three runtime-switchable render modes":
 				// test/bench-only switch (no on-screen UI exists yet). Same PKT_CTRL
 				// dispatch pattern as "movie ..." above -- see gx_rendermode.h.
 				const char *_m = _rx + 10;

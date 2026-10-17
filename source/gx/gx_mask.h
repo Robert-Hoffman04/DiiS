@@ -1,5 +1,5 @@
 /*
-    gx_mask.h - the "mask-texture" primitive from nds-wii-render-pipeline.md's
+    gx_mask.h - the "mask-texture" primitive from docs/ARCHITECTURE.md's
     design principle: render a shape into a private scratch corner of the
     EFB, copy that region out to a texture, then TEV-multiply it into a
     later draw. Used for both the shadow mask (Stage 3) and the OBJ window

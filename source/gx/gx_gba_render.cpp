@@ -13,7 +13,7 @@
 #include <ogc/lwp.h>
 #include <ogc/mutex.h>
 
-// gx-next-steps-log.md task 12: same present-state discipline as
+// same present-state discipline as
 // gx_ds_engineb_render.cpp (task 7). See gxGbaRenderFrame()'s GX section.
 extern void GxRestorePresentState(void);
 extern mutex_t vidmutex;
@@ -149,7 +149,7 @@ static inline GxWinMasks gxDecodeWinByte(u16 v, int shift)
 	return m;
 }
 
-// Precomputed per-band window decomposition (gx-next-steps-log.md task 16):
+// Precomputed per-band window decomposition:
 // the band is split into DISJOINT rectangles (y-slabs x x-runs), each
 // tagged with the winning region's layer/effect masks under WIN0 > WIN1 >
 // outside precedence. A layer is drawn only into the rectangles whose mask
@@ -252,7 +252,7 @@ static inline void gxForWindowRegions(const GxWindowPlan &wp, EnableFn enabled, 
 struct GxBgPlaneCache {
 	GXTexObj texObj;
 	void *texData;
-	// gx-next-steps-log.md task 6: this plane's dedicated TLUT (see "Native
+	// this plane's dedicated TLUT (see "Native
 	// CI4/CI8" in gx_gba_render.h) -- tlutData holds a 256-entry RGB5A3
 	// table built from the live BG palette bank at bake time; tlutObj wraps
 	// it for GX_LoadTlut(). Each BG index gets its OWN permanently-dedicated
@@ -267,7 +267,7 @@ struct GxBgPlaneCache {
 	void *tlutData;
 	u16 mapWpx, mapHpx;
 	bool valid;
-	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
+	// last-baked-configuration fingerprint
 	// (mapWpx/mapHpx above double as the resolved map-size half of this
 	// fingerprint -- the four BGxCNT size selectors produce four distinct
 	// (mapWpx,mapHpx) pairs, so no separate size field is needed). See
@@ -278,7 +278,7 @@ struct GxBgPlaneCache {
 static GxBgPlaneCache s_bgPlane[4];
 static const int kBgPlaneMaxPx = 512;
 static u16 *s_bgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG (toEffectScratch RGB5A3 path only -- see gxBakeBgPlane)
-static u8 *s_bgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-index scratch for the persistent CI8 bake, reused per-BG
+static u8 *s_bgBakeIdxScratch; // linear raw-index scratch for the persistent CI8 bake, reused per-BG
 
 // ---------------------------------------------------------------------
 // Affine BG plane cache (BG2/BG3 in modes 1/2), index 0=BG2, 1=BG3. Affine
@@ -296,7 +296,7 @@ struct GxAffineBgPlaneCache {
 	GXTexObj texObj;
 	void *texData;
 	u32 texDataCap; // bytes currently allocated at texData; regrown on demand
-	// gx-next-steps-log.md task 6: dedicated TLUT, same pattern/rationale as
+	// dedicated TLUT, same pattern/rationale as
 	// GxBgPlaneCache's tlutObj/tlutData above -- GX_TLUT6 (which=0, BG2) /
 	// GX_TLUT7 (which=1, BG3), deliberately NOT shared with the text-mode
 	// GX_TLUT0-3 slots, so a mode switch can't clobber a still-"valid"
@@ -308,13 +308,13 @@ struct GxAffineBgPlaneCache {
 	u16 bufPx;      // baked/allocated texture size (mapPx if wrapping, else gxAffineBufDim(mapPx): pow2 >= mapPx+2, task 19)
 	bool wrap;
 	bool valid;
-	// gx-next-steps-log.md task 5: last-baked-configuration fingerprint
+	// last-baked-configuration fingerprint
 	// (mapPx/wrap above already capture the size-selector and overflow-bit
 	// half of this fingerprint -- see gxAffineBgPlaneNeedsRebake()).
 	u32 cfgCharBase, cfgMapBase;
 };
 static GxAffineBgPlaneCache s_affBgPlane[2];
-// gx-next-steps-log.md task 6: +8 (not +4) so the persistent CI8 bake's
+// +8 (not +4) so the persistent CI8 bake's
 // bordered buffer size (mapPx+8, see gxBakeAffineBgPlane) always fits --
 // CI8's block shape is 8x4 (gx_texformat.h), wider than RGB5A3's 4x4, so a
 // +4 pad (only ever a multiple of 4) isn't guaranteed to be a multiple of 8
@@ -342,11 +342,11 @@ static inline bool gxAffinePlaneUnsupported(u16 cnt)
 	return !((cnt >> 13) & 1) && ((cnt >> 14) & 3) == 3;
 }
 static u16 *s_affBgBakeScratch; // linear (pre-swizzle) scratch, reused per-BG (toEffectScratch RGB5A3 path only)
-static u8 *s_affBgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-index scratch for the persistent CI8 bake, reused per-BG
+static u8 *s_affBgBakeIdxScratch; // linear raw-index scratch for the persistent CI8 bake, reused per-BG
 
 // ---------------------------------------------------------------------
 // OBJ: one persistent texture slot per OAM index (128), sized to the max
-// regular-OBJ box (64x64). gx-next-steps-log.md task 4: each slot also
+// regular-OBJ box (64x64). Each slot also
 // remembers the OAM fields + DISPCNT 1D/2D bit its *current* bake was
 // built from, so gxObjNeedsRebake() can skip re-decoding a sprite whose
 // own config and dependency bytes (VRAM tiles + palette entries) are both
@@ -356,7 +356,7 @@ static u8 *s_affBgBakeIdxScratch; // gx-next-steps-log.md task 6: linear raw-ind
 struct GxObjTexSlot {
 	GXTexObj texObj;
 	void *texData;
-	// gx-next-steps-log.md task 6: this sprite's dedicated TLUT source data
+	// this sprite's dedicated TLUT source data
 	// (up to 256 RGB5A3 entries -- 16 for CI4/4bpp, 256 for CI8/8bpp). All
 	// 128 slots share ONE hardware TLUT name, GX_TLUT5 (unlike the BG planes
 	// above, which each get their own permanently-dedicated slot): 128
@@ -374,7 +374,7 @@ struct GxObjTexSlot {
 	u16 tileNum;       // attribute2 bits0-9 at bake time
 	u8  palNum;        // attribute2 bits12-15 at bake time (4bpp only, harmless for 8bpp)
 	u16 texW, texH;    // resolved source pixel size at bake time (shape+size)
-	u16 bufW, bufH;    // gx-next-steps-log.md task 6: actual baked/allocated CI4/CI8 texture size (texW/texH + 8 -- see gxBakeObjTexture's padding note), needed by gxDrawOneObj's UV normalization since it now differs from the toEffectScratch RGB5A3 path's own texW/texH+4 scheme
+	u16 bufW, bufH;    // actual baked/allocated CI4/CI8 texture size (texW/texH + 8 -- see gxBakeObjTexture's padding note), needed by gxDrawOneObj's UV normalization since it now differs from the toEffectScratch RGB5A3 path's own texW/texH+4 scheme
 };
 static GxObjTexSlot s_objTex[128];
 static const int kObjTexMaxPx = 64; // max regular-OBJ box (visibility/size gate)
@@ -385,7 +385,7 @@ static const int kObjTexMaxPx = 64; // max regular-OBJ box (visibility/size gate
 // (their UV range is always exactly [0,w]x[0,h] in source-texel space) but
 // are baked the same way for one code path.
 //
-// gx-next-steps-log.md task 6: +8, not +4 -- same reasoning as
+// +8, not +4 -- same reasoning as
 // kAffineBgPlaneMaxPx above (CI4's block shape is 8x8 and CI8's is 8x4,
 // gx_texformat.h, both wider than RGB5A3's 4x4 that the old +4 padding was
 // sized for). The toEffectScratch RGB5A3 path still uses its own local
@@ -407,7 +407,7 @@ static inline int gxObjBufDim(int texPx)
 	return n;
 }
 static u16 *s_objBakeScratch; // toEffectScratch RGB5A3 path only
-static u8 *s_objBakeIdxScratch; // gx-next-steps-log.md task 6: persistent CI4/CI8 path
+static u8 *s_objBakeIdxScratch; // persistent CI4/CI8 path
 
 struct GxObjDraw {
 	s16 x, y;             // on-screen top-left of the (possibly doubled) box
@@ -434,7 +434,7 @@ static int s_objDrawCount;
 static GXTexObj s_bmpTexObj;
 static void *s_bmpTexData;
 static bool s_bmpValid;
-// gx-next-steps-log.md task 6: mode 4 (8bpp palette-indexed bitmap) gets its
+// mode 4 (8bpp palette-indexed bitmap) gets its
 // own CI8+TLUT texture object, kept separate from s_bmpTexObj/s_bmpTexData
 // (modes 3/5, direct 16bpp truecolor, stay RGB5A3 unchanged -- see
 // gx_gba_render.h). s_bmpValid/s_bmpValidCI are mutually exclusive in
@@ -457,7 +457,7 @@ static u8 *s_bmpBakeIdxScratch;
 // 1x1 solid-color texture used for the backdrop fill (see gxGbaRenderFrame).
 static GXTexObj s_backdropTexObj;
 static void *s_backdropTexData;
-static bool s_backdropValid; // gx-next-steps-log.md task 5: false until first bake
+static bool s_backdropValid; // false until first bake
 
 // ---------------------------------------------------------------------
 // Shared scratch texture for the bake-time blend effect's "effected"
@@ -492,7 +492,7 @@ static void gxUploadEffectTex(const u16 *linear, int w, int h, u8 wrapMode)
 }
 
 // ---------------------------------------------------------------------
-// gx-next-steps-log.md task 6: fixed GX_TLUTn name assignment for every
+// fixed GX_TLUTn name assignment for every
 // persistent CI4/CI8 texture this file bakes -- see gx_gba_render.h's
 // "Native CI4/CI8" section. Text BG and affine BG each get their OWN
 // dedicated slot (not shared between a BG index's text/affine variants)
@@ -512,7 +512,7 @@ static inline u8 gxAffineBgTlutSlot(int which) { return (u8)(GX_TLUT6 + which); 
 static void *s_copyBackBuf;
 static u16 *s_copyBackLinear;
 
-// gx-next-steps-log.md task 3: true only while s_copyBackBuf holds *this*
+// true only while s_copyBackBuf holds *this*
 // frame's real GX_CopyTex output (the actual draw+copy path just below,
 // not the forced-blank or CPU-bail early returns in gxGbaRenderFrame()) --
 // set true right before that function's final `return true`, and false at
@@ -765,7 +765,7 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 						if (toEffectScratch)
 							s_bgBakeScratch[dstIdx] = gxTexel(gxBgPalColor(palNum * 16 + idx), idx != 0, fx);
 						else
-							// gx-next-steps-log.md task 6: combined 8-bit index
+							// combined 8-bit index
 							// (palNum*16+idx), not the raw 4-bit nibble -- see the
 							// CI8 comment block below for why 4bpp text BG can't
 							// use plain CI4.
@@ -788,7 +788,7 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 		return;
 	}
 
-	// gx-next-steps-log.md task 6: CI8 raw-index bake, replacing the old
+	// CI8 raw-index bake, replacing the old
 	// pre-resolved RGB5A3 bake, for the persistent (non-effect) cache --
 	// see gx_gba_render.h's "Native CI4/CI8" section. Both 4bpp and 8bpp
 	// text BG content are baked into the SAME CI8 format (not CI4 for
@@ -808,7 +808,7 @@ static void gxBakeBgPlane(int bg, const GxTexelEffectParams &fx = kTexelEffectNo
 	// sub-banks this plane's tiles actually reference -- still a real,
 	// correct bandwidth/TMEM win over RGB5A3 (8 bits/texel instead of 16),
 	// just not the maximal 4-bit win a per-palette-group multi-draw
-	// scheme (nds-wii-texture-format-mapping.md's "Extended-palette 2D
+	// scheme (docs/ARCHITECTURE.md's "Extended-palette 2D
 	// BGs" option) would have given for the 4bpp case -- that multi-draw
 	// scheme is a real, larger follow-up, not attempted this pass.
 	GxBgPlaneCache &pc = s_bgPlane[bg];
@@ -879,7 +879,7 @@ static void gxBakeAffineBgPlane(int which, u16 cnt, const GxTexelEffectParams &f
 		return;
 	}
 
-	// gx-next-steps-log.md task 6: CI8 raw-index bake for the persistent
+	// CI8 raw-index bake for the persistent
 	// cache -- affine BG map entries are a full byte (0-255) indexing
 	// directly into an always-8bpp charset with NO per-tile palette
 	// selection (unlike text mode), so this is a clean, exact CI8
@@ -1028,7 +1028,7 @@ static bool gxCollectVisibleObj(u16 dispcnt)
 }
 
 // ---------------------------------------------------------------------
-// gx-next-steps-log.md task 4: per-OAM-index re-bake gate. A baked OBJ
+// per-OAM-index re-bake gate. A baked OBJ
 // texture is a pure function of (DISPCNT's OBJ 1D/2D mapping bit, this
 // OAM entry's own color-mode/shape/size/tile-index/palette-index fields,
 // and the exact VRAM tile bytes + palette bytes that configuration reads)
@@ -1204,7 +1204,7 @@ static bool gxObjNeedsRebake(u16 dispcnt, const GxObjDraw &d)
 }
 
 // ---------------------------------------------------------------------
-// gx-next-steps-log.md task 5: backdrop + per-BG-plane re-bake gates, same
+// backdrop + per-BG-plane re-bake gates, same
 // fingerprint + gxRangeDirty()/gxVramSpanDirty() pattern as task 4's OBJ
 // gate above -- replaces the single coarse `g_gbaFramePlan.vram.anyDirty()
 // || palette.anyDirty()` check that used to gate the backdrop and all four
@@ -1411,7 +1411,7 @@ static bool gxAffineBgPlaneNeedsRebake(int which, u16 cnt)
 }
 
 // ---------------------------------------------------------------------
-// gx-next-steps-log.md queue item 21: not-drawn cache invalidation.
+// not-drawn cache invalidation.
 //
 // g_gbaFramePlan.beginFrame() clears the VRAM/palette dirty bitmaps every
 // frame, and the per-texture rebake gates above only run for a layer that is
@@ -1513,7 +1513,7 @@ static void gxBakeObjTexture(u16 dispcnt, const GxObjDraw &d, const GxTexelEffec
 		return;
 	}
 
-	// gx-next-steps-log.md task 6: persistent (non-effect) OBJ bake now
+	// persistent (non-effect) OBJ bake now
 	// bakes raw palette-index texels (CI4 for 4bpp, CI8 for 8bpp) instead
 	// of pre-resolved RGB5A3 colors, uploaded via GX_InitTexObjCI with a
 	// TLUT built from this sprite's own live GBA OBJ-palette bytes -- see
@@ -1641,7 +1641,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 	}
 
 	if (mode == 4) {
-		// gx-next-steps-log.md task 6: mode 4 (8bpp palette-indexed bitmap
+		// mode 4 (8bpp palette-indexed bitmap
 		// BG2, GBATEK) is a clean CI8 candidate -- direct idx 0-255 into
 		// the whole BG palette bank, same as affine BG, no per-tile
 		// palette indirection. Unlike tiled-mode BG/OBJ content, EVERY
@@ -1672,7 +1672,7 @@ static void gxBakeBitmapMode(int mode, u16 dispcnt, const GxTexelEffectParams &f
 	}
 
 	// Modes 3/5: direct 16bpp truecolor, unchanged RGB5A3 path -- see
-	// nds-wii-texture-format-mapping.md ("Bitmap-mode direct-color BG...
+	// docs/ARCHITECTURE.md ("Bitmap-mode direct-color BG...
 	// no palette involved") and gx_gba_render.h.
 	u16 *dst = (u16 *)s_bmpTexData;
 	if (mode == 3) {
@@ -1739,7 +1739,7 @@ static void gxAffineObjTexCorner(const GxObjDraw &d, s32 col, s32 row, f32 *tx, 
 // Single-sprite draw, shared by the windowed OBJ path (gxDrawObjLayerWindowed)
 // with an explicit texture (the sprite's own persistent CI4/CI8 cache, or
 // the shared s_effectTex RGB5A3 blend variant) and that texture's actual
-// buffer size -- gx-next-steps-log.md task 6: these now differ (bufW/bufH
+// buffer size -- these now differ (bufW/bufH
 // passed in, not always texW/texH+4) since the persistent cache uses a
 // wider CI4/CI8 block-alignment pad (+8) than the effect-scratch RGB5A3
 // texture still does (+4) -- see GxObjTexSlot::bufW/bufH and
@@ -1989,7 +1989,7 @@ static void gxDrawObjLayerWindowed(int prio, int y0, int y1, const GxWindowPlan 
 				gxBakeObjTexture(dispcnt, d, fx, true);
 				gxDrawOneObj(d, &s_effectTex.texObj, (f32)gxObjBufDim(d.texW), (f32)gxObjBufDim(d.texH));
 			} else {
-				// gx-next-steps-log.md task 6: reload the shared OBJ TLUT
+				// reload the shared OBJ TLUT
 				// slot from this sprite's own tlutData immediately before
 				// binding its texture -- every persistent-cache OBJ draw
 				// does this (not just on a rebake), since another sprite's
@@ -2042,7 +2042,7 @@ bool gxGbaRenderFrame()
 #ifdef GBA_FORCE_CPU
 	return false;   // test hook: the CPU compositor renders every frame (reference build)
 #endif
-	// nds-wii-render-pipeline.md "three runtime-switchable render modes": Software mode
+	// docs/ARCHITECTURE.md "three runtime-switchable render modes": Software mode
 	// bails before any GX work, uniformly, same effect as GBA_FORCE_CPU above but
 	// selectable at runtime. Must precede everything below -- no GX state may be touched.
 	if (gxRenderModeIsSoftware())
@@ -2113,7 +2113,7 @@ bool gxGbaRenderFrame()
 	}
 
 	// `dirty`: still used below to gate bitmap-mode (DISPCNT mode 3/4/5)
-	// baking -- out of this task's scope (gx-next-steps-log.md task 5 is
+	// baking -- out of this task's scope (this task is
 	// backdrop + BG-plane precision specifically; bitmap mode keeps the
 	// coarse gate, documented in gx_gba_render.h). Backdrop and the four
 	// tiled-mode BG planes below now use their own per-target fine-grained
@@ -2144,7 +2144,7 @@ bool gxGbaRenderFrame()
 		gxBakeBackdrop();
 	gxDrawQuad(&s_backdropTexObj, 0, 0, GBA_SCREEN_W, GBA_SCREEN_H, 0, 0, 1, 1);
 
-	// Task 4 (gx-next-steps-log.md): per-sprite re-bake gate, deliberately
+	// Task 4: per-sprite re-bake gate, deliberately
 	// NOT gated by the coarse `dirty` aggregate above -- a sprite is
 	// (re)baked exactly when gxObjNeedsRebake() says its own dependencies
 	// (OAM fields, or the VRAM/palette bytes they point at) actually
@@ -2160,7 +2160,7 @@ bool gxGbaRenderFrame()
 	}
 
 	if (tiled) {
-		// gx-next-steps-log.md task 5: per-BG-plane re-bake gate, replacing
+		// per-BG-plane re-bake gate, replacing
 		// the old `if (dirty) { bake all 4 enabled planes }` block -- each
 		// plane is now (re)baked exactly when its own gx{,Affine}BgPlane
 		// NeedsRebake() says its tile/map layout changed or its actual
@@ -2237,7 +2237,7 @@ bool gxGbaRenderFrame()
 				gxBakeBitmapMode(mode, dispcnt, fx, true);
 				effTex = &s_effectTex.texObj;
 			}
-			// gx-next-steps-log.md task 6: mode 4's CI8 texture object
+			// mode 4's CI8 texture object
 			// (s_bmpTexObjCI) already has its TLUT permanently dedicated
 			// (kBmpTlutSlot, reloaded only when gxBakeBitmapMode() actually
 			// rebakes it) -- no per-draw GX_LoadTlut needed here, unlike OBJ.

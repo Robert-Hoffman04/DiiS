@@ -2411,7 +2411,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 
 	adr &= 0x0FFFFFFF;
 
-	// gx-next-steps-log.md item 13j: flush deferred 2D CPU lines before a register write can
+	// flush deferred 2D CPU lines before a register write can
 	// change what they would have rendered (no-op unless a lazy frame has pending lines).
 	GXDS_LAZY_IO_BARRIER8(adr);
 
@@ -2603,7 +2603,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 		return;
 	}
 
-	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Stage 0 dirty tagging for the DS
 	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
 	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
 	// to palette RAM / VRAM / OAM funnels through regardless of access
@@ -2627,7 +2627,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 		gxDsMarkWrite(gxRawAdr, 1);
 	}
 	if(unmapped) return;
-	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
@@ -3112,7 +3112,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 	}
 
 
-	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Stage 0 dirty tagging for the DS
 	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
 	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
 	// to palette RAM / VRAM / OAM funnels through regardless of access
@@ -3136,7 +3136,7 @@ void FASTCALL _MMU_ARM9_write16(u32 adr, u16 val)
 		gxDsMarkWrite(gxRawAdr, 2);
 	}
 	if(unmapped) return;
-	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.
@@ -3572,7 +3572,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		return;
 	}
 
-	// gx-next-steps-log.md task 7: Stage 0 dirty tagging for the DS
+	// Stage 0 dirty tagging for the DS
 	// Engine B GX compositor (source/gx/gx_ds_engineb_render.cpp). This
 	// MMU_LCDmap() tail is the single point every CPU *and* DMA write
 	// to palette RAM / VRAM / OAM funnels through regardless of access
@@ -3596,7 +3596,7 @@ void FASTCALL _MMU_ARM9_write32(u32 adr, u32 val)
 		gxDsMarkWrite(gxRawAdr, 4);
 	}
 	if(unmapped) return;
-	// gx-next-steps-log.md task 10: VRAM dirtiness is tracked in LCDC space, i.e. by the
+	// VRAM dirtiness is tracked in LCDC space, i.e. by the
 	// address MMU_LCDmap() just resolved (the same arithmetic MMU_gpu_map() uses for the
 	// GX bake's reads), not by the pre-map ARM9 address. A write to a mirrored/remapped
 	// page lands on exactly the LCDC bytes a bake reads. Unmapped writes returned above.

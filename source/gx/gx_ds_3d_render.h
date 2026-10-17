@@ -2,8 +2,7 @@
     gx_ds_3d_render.h - item 13e vertical slice: DS 3D geometry (Stage 3) submitted
     through GX instead of the CPU rasterizer (source/rasterize.cpp).
 
-    See gx-13e-design.md for the full survey/design and gx-next-steps-log.md's
-    "Task 13e-slice" section for what this first pass actually implements/verifies.
+    See docs/ARCHITECTURE.md for the full survey/design.
 
     Scope of THIS pass (deliberately narrow -- see the design doc's section 3):
     opaque, untextured, flat- or Gouraud-shaded triangles/quads, Z-buffer mode only,
@@ -29,7 +28,7 @@
                                 reference -- see the log section for the measured
                                 drift on the vertical-slice fixture.
 
-    IMPORTANT deviation from gx-13e-design.md section 2/3 (flagged there too): the
+    IMPORTANT deviation from the original 3D-pass design: the
     design doc's original GX-Accurate proposal ("submit pre-transformed clip-space
     positions via GX_Position4f32 under an identity PNMTX") is not implementable as
     written -- GX has no 4-component (homogeneous, caller-supplied-w) position vertex
@@ -108,7 +107,7 @@
 // limit for opaque-only geometry, but the check is cheap so it's included).
 bool gxDs3dGeomFrameSupported();
 
-// Textured polygons (gx-remaining-work.md section 1): called at VBlank end, when the
+// Textured polygons: called at VBlank end, when the
 // CPU raster samples texture VRAM. True iff the frame is in scope and every texture it
 // uses has been snapshotted into a GX RGB5A3 texture (texcache.cpp decoder), which is
 // what gxDs3dGeomFrameSupported() later requires of textured polygons. GxAccurate takes
@@ -170,8 +169,8 @@ void gxDs3dRenderFast();
 // identifies that recording (equal gens: the same GX stream, so the same EFB result).
 bool gxDs3dFastReplayGen(u32 *gen);
 
-// Fog post-process, GxFast only (Task 13f-fog, made live by Task gxfast-fog; see
-// gx-next-steps-log.md). Called by gxDs3dRenderFast()'s own draw (so it is in the replayed
+// Fog post-process, GxFast only (Task 13f-fog, made live by Task gxfast-fog).
+// Called by gxDs3dRenderFast()'s own draw (so it is in the replayed
 // display list) after the geometry: a full-screen quad, EFB-Z-masked (GX_GREATER against the
 // CLEAR_DEPTH value gxDs3dClearDepth() seeded, so only pixels the geometry wrote are fogged;
 // 2D content showing through a hole never is) and GX-hardware alpha-blended toward

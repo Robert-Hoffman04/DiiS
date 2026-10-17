@@ -1,4 +1,4 @@
-@ gx-next-steps-log.md task 6: 8bpp coverage. checkerboard.s/objcheck.s/
+@ 8bpp coverage. checkerboard.s/objcheck.s/
 @ affinecheck.s/windowcheck.s/winblend.s/objcache.s/bgcache.s are all 4bpp
 @ (BGxCNT bit7 clear / OAM attribute0 bit13 clear) -- this ROM specifically
 @ exercises the 8bpp CI8 bake paths task 6 added: an 8bpp text BG0

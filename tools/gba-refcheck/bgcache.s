@@ -1,5 +1,5 @@
-@ bgcache.s - Synthetic GBA ROM for gx-next-steps-log.md task 5 (BG-plane
-@ dirty-gating precision). Mode 0, three text BGs, each occupying its own
+@ bgcache.s - Synthetic GBA ROM for BG-plane dirty-gating
+@ precision. Mode 0, three text BGs, each occupying its own
 @ horizontal band of tile rows so all three are visible simultaneously in
 @ one capture without occluding each other (unused rows/tile 0 are left
 @ zero-filled, which is transparent regardless of palette bank -- text BG
@@ -9,7 +9,7 @@
 @       data are written once at boot and NEVER touched again, and BG0's
 @       scroll registers are also never touched (HOFS=VOFS=0 always).
 @       Proves the "genuinely static plane is never re-baked" case (see
-@       gx-next-steps-log.md task 4's identical objcache.gba proof for
+@       objcache.s's identical proof for
 @       OBJ) -- bg0's cumulative bake count must stay 1 forever.
 @   BG1 (tile rows 10-13, ~y 80-111): yellow/cyan vertical column stripes.
 @       Tile/map/palette data are written once at boot and never touched
