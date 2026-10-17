@@ -831,8 +831,8 @@ int NDS_CreateDummyFirmware( struct NDS_fw_config_data *user_settings)
 }
 
 void NDS_FillDefaultFirmwareConfigData( struct NDS_fw_config_data *fw_config) {
-	const char *default_nickname = "DeSmuME";
-	const char *default_message = "DeSmuME makes you happy!";
+	const char *default_nickname = "DiiS";
+	const char *default_message = "DiiS makes you happy!";
 	int i;
 	int str_length;
 
