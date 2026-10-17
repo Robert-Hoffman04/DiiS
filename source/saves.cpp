@@ -696,7 +696,7 @@ void scan_savestates()
 	path.getpathnoext(path.STATES, filename);
 	
 	if (strlen(filename) + strlen(".dst") + strlen("-2147483648") /* = biggest string for i */ >MAX_PATH) return ;
-	sprintf(filename+strlen(filename), ".ds%d", i);
+	path.getstatepath(i, filename);   // <rom>.ds<i>, or state<i>.ds<i> in the game folder
 	if( stat(filename,&sbuf) == -1 ) continue;
 	savestates[i].exists = TRUE;
 	strncpy(savestates[i].date, format_time(sbuf.st_mtime),40);
@@ -716,7 +716,7 @@ void savestate_slot(int num)
     path.getpathnoext(path.STATES, filename);
 
    if (strlen(filename) + strlen(".dsx") + strlen("-2147483648") /* = biggest string for num */ >MAX_PATH) return ;
-   sprintf(filename+strlen(filename), ".ds%d", num);
+   path.getstatepath(num, filename);
 
    SSTRACE("savestate_slot(%d): enter, file=%s", num, filename);
    if (savestate_save(filename))
@@ -755,7 +755,7 @@ void loadstate_slot(int num)
     path.getpathnoext(path.STATES, filename);
 
    if (strlen(filename) + strlen(".dsx") + strlen("-2147483648") /* = biggest string for num */ >MAX_PATH) return ;
-   sprintf(filename+strlen(filename), ".ds%d", num);
+   path.getstatepath(num, filename);
    if (savestate_load(filename))
    {
 //	   osd->setLineColor(255, 255, 255);

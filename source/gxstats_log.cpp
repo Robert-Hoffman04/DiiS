@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include "harness/harness_profile.h"
+#include "sd_log_path.h"
 
 #ifndef DIIS_GXSTATS_BLOCK
 #define DIIS_GXSTATS_BLOCK 60
@@ -24,7 +25,8 @@ static bool s_truncated;   // first write of the run: "w" (fresh log), then "a"
 
 static void gxs_flush(void)
 {
-	FILE *f = fopen("sd:/gxstats.log", s_truncated ? "a" : "w");
+	char path[160];
+	FILE *f = fopen(sdLogPath(path, sizeof(path), "gxstats"), s_truncated ? "a" : "w");
 	s_truncated = true;
 	if (!f) { s_len = 0; return; }
 	fprintf(f, "# gxstats frame=%u\n", (unsigned)s_frame);

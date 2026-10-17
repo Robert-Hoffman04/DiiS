@@ -150,9 +150,9 @@ const char* pzName(int z) { return (z >= 0 && z < PZ_COUNT) ? k_name[z] : "?"; }
 // Draw() isn't zoned.
 //
 // Sink (§3.2): with -DDIIS_HARNESS the row goes out as a PKT_PROFILE frame
-// (harness_send routes it to the listener, or to sd:/perfzones.log via the SD
+// (harness_send routes it to the listener, or to sd:/perf/<rom>_perfzones.log via the SD
 // backend when there's none). Without the harness it's written to
-// sd:/perfzones.log directly, exactly as before.
+// sd:/perf/<rom>_perfzones.log directly, exactly as before.
 //---------------------------------------------------------------------------
 #ifndef DIIS_PERFZONES_BLOCK
 #define DIIS_PERFZONES_BLOCK 60
@@ -261,14 +261,17 @@ static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_
 	harness_profile_emit(line);
 }
 
-#else  // legacy sd:/perfzones.log sink
+#else  // legacy SD sink: sd:/perf/<rom>_perfzones.log
+
+#include "sd_log_path.h"
 
 static inline void pz_ft_push(u32) {}
 static inline void pz_emit_percentiles(u32) {}
 
 static void pz_emit_header(void)
 {
-	FILE* f = fopen("sd:/perfzones.log", "w");
+	char path[160];
+	FILE* f = fopen(sdLogPath(path, sizeof(path), "perfzones"), "w");
 	if (!f) return;
 	fprintf(f, "# diis perfzones  block=%d\n", DIIS_PERFZONES_BLOCK);
 	fprintf(f, PZ_PMC_COMMENT "frame,wall_us");
@@ -288,7 +291,8 @@ static void pz_emit_row(u32 frame, const u64 acc_ticks[PZ_COUNT], const u64 acc_
 {
 	u64 wall_us = 0;
 	for (int i = 0; i < PZ_COUNT; i++) wall_us += ticks_to_microsecs(acc_ticks[i]);
-	FILE* f = fopen("sd:/perfzones.log", "a");
+	char path[160];
+	FILE* f = fopen(sdLogPath(path, sizeof(path), "perfzones"), "a");
 	if (!f) return;
 	fprintf(f, "%u,%llu", frame, (unsigned long long)wall_us);
 	for (int i = 0; i < PZ_COUNT; i++)

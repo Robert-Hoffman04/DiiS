@@ -4,7 +4,7 @@
     Consolidates the three pre-existing profiling paths onto one transport:
       1. perf_zones.h's zone accountant - pzFrameTick() formats its per-block
          CSV row and hands it to harness_profile_emit() instead of writing
-         sd:/perfzones.log directly. The pzSet/pzGet/PZ_SCOPE mechanism is
+         sd:/perf/<rom>_perfzones.log directly. The pzSet/pzGet/PZ_SCOPE mechanism is
          untouched.
       2. jit_debug.h's JIT_LOG_* string macros - previously ((void)0), now
          routed to harness_profile_emitf() under HARNESS_PROFILE.
@@ -39,7 +39,7 @@ static inline void harness_profile_log(const char *line) { (void)line; }
 
 // One already-formatted profile record (CSV row, stat block, ...) as PKT_PROFILE.
 // Task hw-measure: without the harness, -DDIIS_GXSTATS gives these a body that
-// appends to sd:/gxstats.log instead (source/gxstats_log.cpp), so the -DDSB_STATS /
+// appends to sd:/perf/<rom>_gxstats.log instead (source/gxstats_log.cpp), so the -DDSB_STATS /
 // -DDSA_GXGEOM_TEXSTATS / ... stat lines can be collected on real hardware.
 #define HARNESS_PROFILE_SINK 1
 void harness_profile_emit(const char *text);

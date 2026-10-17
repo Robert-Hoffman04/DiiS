@@ -20,7 +20,7 @@ TARGET		:=	diis
 BUILD		:=	build
 SOURCES		:=	source source/metaspu \
 				source/addons source/utils source/gekko_utils \
-				source/jit source/harness source/gx
+				source/jit source/harness source/gx source/library
 DATA		:=	data  
 INCLUDES	:=
 

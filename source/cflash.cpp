@@ -76,6 +76,7 @@
 #include "cflash.h"
 #include "NDSSystem.h"
 #include "debug.h"
+#include "path.h"
 
 static int use_disk_image_file = 0;
 
@@ -123,7 +124,9 @@ static DIR_ENT *extraDirEntries[SECPERFAT*256];
 static int numFiles,maxLevel,numRootFiles;
 static int *dirEntriesInCluster, clusterNum, firstDirEntCluster,
   lastDirEntCluster, lastFileDataCluster;
-static const char *sRomPath = "sd:/DS/SAVES/";
+// Host directory exposed to the DS as the CFlash card: the game's own folder
+// (path.gameDir, ROM library) when one is set, else the old flat save dir.
+static const char *cflash_root() { return path.gameDir[0] ? path.gameDir : "sd:/DS/SAVES/"; }
 static int activeDirEnt=-1;
 static u32 bufferStart;
 static u32 fileStartLBA,fileEndLBA;
@@ -328,7 +331,7 @@ static bool cflash_build_fat( void) {
 	}
 
 	//COMMENT OUT THIS LINE TO STOP THE IRRITATING FILESYSTEM SCANNING BEHAVIOR
-	list_files(sRomPath);
+	list_files(cflash_root());
 	
 	//--DCN (Desmume Original)
 	//list_files(sFlashPath.c_str());
@@ -610,7 +613,7 @@ static u16 fread_buffered(int dirent,u32 cluster,u32 offset) {
 	if (activeDirEnt != -1)
 		fclose(hFile);
 
-	strncpy(fpath,sRomPath,ARRAY_SIZE(fpath));
+	strncpy(fpath,cflash_root(),ARRAY_SIZE(fpath));
 	strncat(fpath,DIR_SEP,ARRAY_SIZE(fpath)-strlen(fpath));
 	
 	resolve_path(dirent);

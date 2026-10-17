@@ -5,7 +5,7 @@
  * lines (the GX gate/bail counters: -DDSB_STATS "dsa"/"dsaw"/"dsb"/"dsbw"...,
  * -DDSA_GXGEOM_TEXSTATS "gxds3dstats ... gates:", -DDSLZ_STATS, ...), so they can
  * be collected on real hardware. -DDIIS_GXSTATS routes those lines into a RAM
- * buffer that gxStatsFrameTick() appends to sd:/gxstats.log once per 60 frames,
+ * buffer that gxStatsFrameTick() appends to sd:/perf/<rom>_gxstats.log once per 60 frames,
  * each block preceded by a "# gxstats frame=<n>" marker. Under -DDIIS_HARNESS
  * the harness keeps the lines (PKT_PROFILE) and this is a no-op.
  *

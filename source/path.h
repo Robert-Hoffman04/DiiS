@@ -236,10 +236,36 @@ public:
 		strcpy(buffer,noextension().c_str());
 	}
 
+	// Per-game folder (ROM library, source/library/library.h), with trailing
+	// '/'. Set before NDS_LoadROM; empty = the old flat layout
+	// (<module dir>/<rom name>.ext), which harness/benchmark builds keep.
+	// With it set: save.dsv / save.sav, state<N>.ds<N>, cheats.dct.
+	char gameDir[MAX_PATH];
+
+	void setGameDir(const char *dir)
+	{
+		strncpy(gameDir, dir ? dir : "", MAX_PATH - 1);
+		gameDir[MAX_PATH - 1] = 0;
+	}
+
 	void getpathnoext(KnownPath path, char *buffer)
 	{
+		if (gameDir[0] && (path == BATTERY || path == STATES || path == CHEATS)) {
+			strcpy(buffer, gameDir);
+			strcat(buffer, path == BATTERY ? "save" : path == STATES ? "state" : "cheats");
+			return;
+		}
 		getpath(path, buffer);
 		strcat(buffer, GetRomNameWithoutExtension().c_str());
+	}
+
+	// Savestate file for `slot`: <rom name>.ds<slot>, or state<slot>.ds<slot>
+	// in the game folder.
+	void getstatepath(int slot, char *buffer)
+	{
+		getpathnoext(STATES, buffer);
+		if (gameDir[0]) sprintf(buffer + strlen(buffer), "%d", slot);
+		sprintf(buffer + strlen(buffer), ".ds%d", slot);
 	}
 
 	std::string extension() {

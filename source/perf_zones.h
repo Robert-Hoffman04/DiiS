@@ -6,7 +6,7 @@
  * time between a fixed set of zones (interpreter / JIT execute / JIT build /
  * geometry engine / 3D render / the GX 3D and 2D passes piece by piece / SPU /
  * GX present / sequencer / other) and -DDIIS_BENCH's frame loop dumps the
- * running totals to sd:/perfzones.log. tools/benchmark/pztable.py prints them.
+ * running totals to sd:/perf/<rom>_perfzones.log. tools/benchmark/pztable.py prints them.
  *
  * Model: a single "current zone" plus one save slot per call site. pzSet(z)
  * only reads the Wii timebase when the zone actually *changes*, so a run of a
@@ -110,7 +110,7 @@ extern u64 g_pzPmc[PZ_COUNT][4];
 #endif
 
 // -DDIIS_BENCH frame loop calls this once per emulated frame; every 60th
-// call it appends a CSV row (ticks, converted to us) to sd:/perfzones.log.
+// call it appends a CSV row (ticks, converted to us) to sd:/perf/<rom>_perfzones.log.
 void pzFrameTick(void);
 
 // RAII zone switch that restores the previous zone on scope exit. Used at
