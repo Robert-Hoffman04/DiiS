@@ -34,8 +34,8 @@
 // keep in sync (or extract) if either file's copy ever changes.
 //
 // Cross-referenced against mGBA's src/gba/hle-bios.s (MPL 2.0, (c) 2013-
-// 2015 Jeffrey Pfau) while designing this file -- see the plan doc's step 6
-// writeup for why that file's assembled binary isn't usable as a drop-in
+// 2015 Jeffrey Pfau) while designing this file. That file's assembled
+// binary isn't usable as a drop-in
 // replacement here (several of its SWIs, including Div/Sqrt/ArcTan/LZ77,
 // are stubs that depend on an mGBA-internal-only hook and would silently
 // leave registers unmodified if executed by a different interpreter). Its

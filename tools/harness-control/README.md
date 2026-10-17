@@ -1,7 +1,7 @@
 # tools/harness-control
 
 Desktop side of the DiiS unified test harness
-(`docs/PLAN.md`, "Test harness & network transport"). This is **live session control**:
+(`docs/ARCHITECTURE.md`, harness & wire protocol). This is **live session control**:
 launching a build, talking to it over the network transport, receiving
 logs / frames / profiles / crashes, driving input and control commands.
 
@@ -15,7 +15,7 @@ concern, kept separate on purpose.
 | `wire.py` | Single source of truth for the §2 framed wire protocol (`magic \| version \| type \| len \| payload`, big-endian). Packet types, encoder, incremental `Decoder`, FRAME payload helpers. The device side (`source/harness/`) must stay byte-compatible with this. |
 | `wii_control.py` | The transport **server**. Listens on one TCP port (default 4300), same server whether the peer is Dolphin (network passthrough) or a real Wii on the LAN. Prints LOG, saves FRAME (PNG if Pillow is present, else raw `.bin`), records PROFILE, symbolicates CRASH, tallies ASSERT into the process exit code. Built-in watchdog (`--watchdog SECONDS`) sends `CTRL next_rom` on device silence. stdin line commands send INPUT / CTRL. |
 | `symbolicate.py` | Turns raw `0x8xxxxxxx` addresses from a CRASH into `<func+0xNN>` using the build's `-Wl,-Map` linker `.map`. Usable standalone. |
-| `launch.sh` | One entry point: `launch.sh dolphin <dol>` (headless Dolphin, network passthrough) or `launch.sh wiiload <dol>` (real `wiiload` transfer to `WIILOAD=tcp:<host>`). Sending/launching on a **physical** Wii still needs explicit per-run permission (plan §6.3). |
+| `launch.sh` | One entry point: `launch.sh dolphin <dol>` (headless Dolphin, network passthrough) or `launch.sh wiiload <dol>` (real `wiiload` transfer to `WIILOAD=tcp:<host>`). Sending/launching on a **physical** Wii still needs explicit per-run permission. |
 
 ## Quick start (Dolphin, once network passthrough is confirmed enabled)
 
@@ -29,12 +29,12 @@ tools/harness-control/launch.sh dolphin build/diis.dol
 ```
 
 A single `LOG` round-trip is enough to prove the path before anything is built
-on top of it (plan §7.2).
+on top of it.
 
 ## Wire protocol
 
 ```
-offset 0  : magic         "DSMH"   (4 bytes)
+offset 0  : magic         "DIIS"   (4 bytes)
 offset 4  : version        1        (u8)
 offset 5  : packet_type             (u8)   LOG=1 FRAME=2 INPUT=3 CTRL=4
 offset 6  : payload_length          (u32, big-endian)

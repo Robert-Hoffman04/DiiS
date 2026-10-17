@@ -1,5 +1,5 @@
 /* Headless mGBA runner used as the GBA reference emulator for
- * docs/PLAN.md §4.3 item 8 / §4.1 reference-first methodology.
+ * Reference-first methodology (see docs/ARCHITECTURE.md, test methodology).
  *
  * Drives libmgba's public mCore API directly (mCoreFind/loadROM/runFrame/
  * getPixels/readRegister) -- no Qt, no SDL, no display, no event loop.
@@ -38,7 +38,7 @@ static void nullLogger(struct mLogger* logger, int category, enum mLogLevel leve
 int main(int argc, char** argv) {
 	if (argc != 4 && argc != 5) {
 		fprintf(stderr, "usage: %s <rom.gba> <frames> <out.ppm> [out.pcm]\n", argv[0]);
-		fprintf(stderr, "  out.pcm (optional, PLAN.md §4.3 item 3): raw interleaved\n"
+		fprintf(stderr, "  out.pcm (optional): raw interleaved\n"
 			"  stereo s16le PCM, drained via mCore's public getAudioChannel()/\n"
 			"  blip_buf API once per runFrame() -- final mixed DirectSound+PSG\n"
 			"  output at mGBA's own internal sample rate, not resampled further.\n");
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
 	color_t* vbuf = calloc((size_t)width * height, sizeof(color_t));
 	core->setVideoBuffer(core, vbuf, width);
 
-	/* PLAN.md §4.3 item 3 (APU): pure I/O plumbing added on top of the
+	/* APU: pure I/O plumbing added on top of the
 	 * existing headless driver -- taps mCore's public audio API, no PPU/
 	 * CPU/APU code touched. getAudioChannel(core, 0/1) returns the two
 	 * blip_t* stereo output buffers (left/right) that every mGBA platform

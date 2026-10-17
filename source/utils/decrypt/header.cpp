@@ -94,7 +94,7 @@ int DetectRomType(const Header& header, char* romdata)
 	// Nintendo-logo bitmap at 0xC0). On its own this byte isn't decisive
 	// enough (see GBA_LOGO's comment above for the real collision this
 	// caused), so require the full 156-byte GBA logo match too before
-	// committing to ROMTYPE_GBA -- see roadmap #20/plan doc §12.
+	// committing to ROMTYPE_GBA.
 	if ((unsigned char)romdata[0xB2] == 0x96 &&
 	    memcmp(romdata + 0x04, GBA_LOGO, sizeof(GBA_LOGO)) == 0)
 		return ROMTYPE_GBA;

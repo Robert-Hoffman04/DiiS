@@ -1,6 +1,6 @@
 /*
     harness_transport.h - the one channel every harness subsystem sends and
-    receives through (plan §3.1).
+    receives through.
 
     harness_send()/harness_recv() are backend-agnostic. Which backend carries
     them is decided once, at harness_transport_init(), by the probe order in

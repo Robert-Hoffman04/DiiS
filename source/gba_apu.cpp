@@ -17,7 +17,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3: GBA APU. New code written from GBATEK's documented
+// GBA APU. New code written from GBATEK's documented
 // SOUND1..4CNT_*/SOUNDCNT_L/H/X/SOUNDBIAS/FIFO_A/FIFO_B layout, not a port
 // of any existing emulator's APU core. See gba_apu.h for the DirectSound-
 // only scope note.
@@ -198,7 +198,7 @@ void gbaApuMixAudio(s16* buf, u32 numSamples)
 	}
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support). See gba_apu.h's comment.
+// GBA savestate support. See gba_apu.h's comment.
 void gbaApuSaveState(EMUFILE* os)
 {
 	write32le(1, os); // version

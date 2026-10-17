@@ -1,5 +1,5 @@
 /*
-    harness.h - master include for the unified test harness (plan §3.0).
+    harness.h - master include for the unified test harness.
 
     DESMUME_HARNESS is the one flag a release build must never define. Every
     other harness sub-flag is meaningless without it and is folded into it

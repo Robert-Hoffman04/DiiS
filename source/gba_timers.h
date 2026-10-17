@@ -24,7 +24,7 @@
 
 class EMUFILE;
 
-// docs/PLAN.md §4.3 step 1 (peripherals): the four GBA hardware timers
+// The four GBA hardware timers
 // (TM0CNT-TM3CNT, 0x04000100-0x0400010F). Reference is GBATEK's documented
 // prescaler/cascade/reload/IRQ behavior.
 
@@ -42,7 +42,7 @@ void gbaTimersStep(int gbaCycles);
 void gbaTimersIoWrite8(u32 offset, u8 val);
 void gbaTimersIoWrite16(u32 offset, u16 val);
 
-// PLAN.md §4.3 item 7 (GBA savestate support). counter/subCycles aren't
+// GBA savestate support. counter/subCycles aren't
 // reconstructible from TMxCNT_L/H alone -- see gba_timers.cpp's file
 // comment: TMxCNT_L's write-side (reload) and read-side (live counter)
 // values are two different pieces of state sharing one address, and

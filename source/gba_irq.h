@@ -22,7 +22,7 @@
 
 #include "types.h"
 
-// docs/PLAN.md §4.3: shared IRQ-delivery HLE, factored out of gba_ppu.cpp's
+// Shared IRQ-delivery HLE, factored out of gba_ppu.cpp's
 // original VBlank-only version so every peripheral interrupt source
 // (timers, keypad, and PPU's own VBlank/HBlank/VCount) goes through one
 // place. See gba_irq.cpp for why this is a BIOS-IRQ-trampoline stand-in,

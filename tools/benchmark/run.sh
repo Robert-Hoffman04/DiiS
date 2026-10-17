@@ -163,7 +163,7 @@ if [ "$DO_PERF" = 1 ]; then
 				"${stop_args[@]}" \
 				--timeout "${timeout:-$TIMEOUT_DEFAULT}"
 			rc=$?
-			[ "$rc" = 2 ] && echo "   !! device never connected - check Dolphin network passthrough (plan §0)"
+			[ "$rc" = 2 ] && echo "   !! device never connected - check Dolphin network passthrough"
 			RAN=$((RAN + 1))
 		done
 	done < "$HERE/scenes.conf"
@@ -199,7 +199,7 @@ if [ "$DO_WRESTLERS" = 1 ]; then
 			--settle-frame "${settle:-300}" --capture-frame "$id" \
 			--timeout "$TIMEOUT_DEFAULT"
 		rc=$?
-		[ "$rc" = 2 ] && echo "   !! device never connected - check Dolphin network passthrough (plan §0)"
+		[ "$rc" = 2 ] && echo "   !! device never connected - check Dolphin network passthrough"
 		RAN=$((RAN + 1))
 	done < "$HERE/wrestlers.conf"
 fi

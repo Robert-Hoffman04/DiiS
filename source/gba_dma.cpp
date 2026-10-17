@@ -17,7 +17,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3: GBA DMA. New code written from GBATEK's documented
+// GBA DMA. New code written from GBATEK's documented
 // DMAxSAD/DAD/CNT_L/CNT_H layout, not a port of any existing emulator's
 // DMA core. See gba_dma.h for the "fires instantly, not cycle-accurate"
 // scope note.
@@ -190,7 +190,7 @@ static void handleCntHWrite(int chan, u16 val)
 			// Sound-FIFO Special DMA (dst 0x040000A0/0x040000A4, DMA channels
 			// 1/2) is handled below by gbaDmaOnFifoTrigger(), called from
 			// gba_apu.cpp whenever the selected timer overflows and that FIFO
-			// drops to half empty (docs/PLAN.md item 3, APU). DMA3 Special is
+			// drops to half empty. DMA3 Special is
 			// Video Capture (see gbaDmaOnHblank() below), handled above. Any
 			// other Special-timing arm (DMA0, which GBATEK marks Prohibited)
 			// is still a documented, never-fires gap. Throttled to avoid
@@ -319,7 +319,7 @@ void gbaDmaOnFifoTrigger(u32 fifoAddr)
 	}
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support). See gba_dma.h's comment.
+// GBA savestate support. See gba_dma.h's comment.
 void gbaDmaSaveState(EMUFILE* os)
 {
 	write32le(1, os); // version

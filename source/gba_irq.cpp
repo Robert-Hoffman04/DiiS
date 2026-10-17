@@ -17,7 +17,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3: shared GBA interrupt-delivery HLE. This is not a real
+// Shared GBA interrupt-delivery HLE. This is not a real
 // ARM-level IRQ exception -- GBA mode direct-boots with no BIOS code loaded
 // (bios_gba.cpp is function-level HLE, same as the rest of GBA BIOS
 // support), so there is no BIOS IRQ vector stub to jump to and no way to

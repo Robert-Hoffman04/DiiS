@@ -49,7 +49,7 @@
 #include "mic.h"
 #include "MMU_timing.h"
 
-// PLAN.md §4.3 item 7 (GBA savestate support).
+// GBA savestate support.
 #include "gba_dma.h"
 #include "gba_timers.h"
 #include "gba_apu.h"
@@ -222,7 +222,7 @@ static void SF_MEM_rebind()
 	SF_MEM[4].v = MMU.ARM9_VMEM;
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support): the flat GBA memory-map
+// GBA savestate support: the flat GBA memory-map
 // backing buffers (MMU.h, roadmap #20 §12.3 step 3) plus the GBA I/O
 // register block. Inline arrays inside the global MMU struct (like
 // ARM9_OAM/ARM9_LCD above), not heap pointers, so -- same as those -- no
@@ -347,7 +347,7 @@ static void mmu_savestate(EMUFILE* os)
 	MMU_timing.arm9dataCache.savestate(os, version);
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support): each GBA peripheral
+// GBA savestate support: each GBA peripheral
 // module's own private runtime state (see each gba_*.h header's savestate
 // comment for exactly what and why). Only ever written/read when
 // gameInfo.isGBA (writechunks() below gates chunk 201 on it) -- ARM7's CPU
@@ -1127,7 +1127,7 @@ static void writechunks(EMUFILE* os) {
 	WC(savestate_WriteChunk(os,91,gfx3d_savestate));
 	WC(savestate_WriteChunk(os,110,SF_WIFI));
 	WC(savestate_WriteChunk(os,120,SF_RTC));
-	// PLAN.md §4.3 item 7 (GBA savestate support): only emitted for a GBA
+	// GBA savestate support: only emitted for a GBA
 	// session -- a DS savestate carries no GBA chunks at all, so loading an
 	// old (pre-this-feature) or DS-mode savestate is unaffected either way.
 	if (gameInfo.isGBA) {
@@ -1173,7 +1173,7 @@ static bool ReadStateChunks(EMUFILE* is, s32 totalsize)
 			//case 101: if(!mov_loadstate(is, size)) ret=false; break;
 			case 110: if(!ReadStateChunk(is,SF_WIFI,size)) ret=false; break;
 			case 120: if(!ReadStateChunk(is,SF_RTC,size)) ret=false; break;
-			// PLAN.md §4.3 item 7 (GBA savestate support): only present when
+			// GBA savestate support: only present when
 			// the chunk was written by a GBA session (see writechunks()).
 			case 200: if(!ReadStateChunk(is,SF_GBA_MEM,size)) ret=false; break;
 			case 201: if(!gba_modules_loadstate(is,size)) ret=false; break;

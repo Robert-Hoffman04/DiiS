@@ -1,4 +1,4 @@
-@ Synthetic GBA ROM for PLAN.md §4.3 item 4: WAITCNT-driven cartridge ROM
+@ Synthetic GBA ROM for WAITCNT-driven cartridge ROM
 @ wait-state cycle cost. Configures WAITCNT to two different settings in
 @ turn -- the real hardware post-reset default (0x0000: WS0 First/Second
 @ access = 4/2 cycles per GBATEK) and the fastest possible WS0 setting

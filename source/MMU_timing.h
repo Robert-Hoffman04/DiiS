@@ -181,7 +181,7 @@ public:
 	template<int READSIZE, MMU_ACCESS_DIRECTION DIRECTION>
 	FORCEINLINE u32 Fetch(u32 address)
 	{
-		// §4.3 item 4 (docs/PLAN.md): WAITCNT-driven cartridge bus timing
+		// WAITCNT-driven cartridge bus timing
 		// needs real sequential-vs-non-sequential tracking, which the DS
 		// side of this file keeps behind ACCOUNT_FOR_NON_SEQUENTIAL_ACCESS
 		// (off by default) -- but that flag is a DS accuracy/speed knob,
@@ -283,7 +283,7 @@ FORCEINLINE u32 _MMU_accesstime(u32 addr, bool sequential)
 	static const int M16 = M32 * ((READSIZE>16) ? 2 : 1); // access through 16-bit bus
 	static const int MSLW = M16 * 8; // this needs tuning
 
-	// §4.3 item 4 (docs/PLAN.md): WAITCNT-driven cartridge ROM/SRAM wait
+	// WAITCNT-driven cartridge ROM/SRAM wait
 	// states. Scoped narrowly to the two region classes WAITCNT actually
 	// governs -- everything else in GBA's address space (BIOS/EWRAM/IWRAM/
 	// palette/VRAM/OAM/I-O) keeps exactly the behavior it had before this
@@ -438,7 +438,7 @@ FORCEINLINE u32 MMU_fetchExecuteCycles(u32 executeCycles, u32 fetchCycles)
 	//  in the case of a conflict this should be:
 	//  return std::max(aluCycles, memCycles + fetchCycles);
 #else
-	// §4.3 item 4 (docs/PLAN.md): with ACCOUNT_FOR_CODE_FETCH_CYCLES off
+	// With ACCOUNT_FOR_CODE_FETCH_CYCLES off
 	// (this build's default), fetch cost is normally discarded entirely --
 	// each instruction's own base executeCycles constant already assumes a
 	// flat minimum 1-cycle bus turnaround for its fetch. That assumption is

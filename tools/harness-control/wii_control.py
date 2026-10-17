@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wii_control.py - desktop side of the unified harness transport (plan §2 / §3.7).
+wii_control.py - desktop side of the unified harness transport.
 
 Listens on one TCP port for the device's HARNESS_TRANSPORT_NET connection - the
 *same* server whether the device is Dolphin (network passthrough, per §0) or a

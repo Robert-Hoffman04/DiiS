@@ -22,7 +22,7 @@
 #include <ogc/cache.h>
 
 // The JIT heap canary + "minefield" poison-block checks are heap-corruption
-// detection, so per plan §3.0 they belong with crash reporting: gated on the
+// detection, so they belong with crash reporting: gated on the
 // master harness flag (+ HARNESS_CRASH) and sunk through harness_send(
 // PKT_CRASH, ...) rather than a hardcoded sd:/jit.log open. Without the flag
 // the whole apparatus compiles to nothing and jitCheckCanaries() is a no-op,

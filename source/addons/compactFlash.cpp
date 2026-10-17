@@ -525,7 +525,7 @@ static BOOL cflash_init()
 		cflashDeviceEnabled = FALSE;
 		currLBA = 0;
 
-		// PLAN.md §4.3 item 8 root cause: CFlash_Path is never assigned
+		// Root cause: CFlash_Path is never assigned
 		// anywhere outside the interactive config UI, so the default
 		// ADDON_CFLASH_MODE_Path pak (addonsInit()'s default) starts with
 		// an empty sFlashPath. list_files("") below doesn't fail cleanly --

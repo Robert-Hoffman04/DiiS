@@ -24,7 +24,7 @@
 
 class EMUFILE;
 
-// docs/PLAN.md §4.3: GBA cartridge save memory (SRAM/EEPROM). See
+// GBA cartridge save memory (SRAM/EEPROM). See
 // gba_backup.cpp's file comment for the protocol writeup and sourcing.
 
 enum GbaBackupType { GBA_BACKUP_NONE, GBA_BACKUP_SRAM, GBA_BACKUP_EEPROM };
@@ -79,7 +79,7 @@ bool gbaEepromAddrHit(u32 addr);
 void gbaEepromCommandWrite(const u16* bits, u32 count);
 void gbaEepromCommandRead(u16* outBits, u32 count);
 
-// PLAN.md §4.3 item 7 (GBA savestate support). Deliberately does NOT
+// GBA savestate support. Deliberately does NOT
 // include s_sram/s_eeprom's contents: that's the persistent .sav payload,
 // already written out separately (gbaBackupFlushIfDirty(), on its own
 // dirty-flag-gated schedule) and reloaded from disk once at ROM-load time

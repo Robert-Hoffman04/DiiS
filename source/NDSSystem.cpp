@@ -2137,8 +2137,7 @@ static void gbaExecFrame(bool jit)
 	}
 	gbaPpuEndFrame();
 
-	// Diagnostic for the Minish Cap post-cutscene freeze (docs/PLAN.md §4.3
-	// item 1): this file already documents one exact-match bug shape above
+	// Diagnostic for the Minish Cap post-cutscene freeze: this file already documents one exact-match bug shape above
 	// (the sequencer.reschedule comment on this function) -- the outer
 	// per-line/per-frame loop keeps completing and ticking PROFILE's frame
 	// counter forward even when armInnerLoop makes zero real progress each
@@ -2507,8 +2506,8 @@ void NDS_Reset()
 	// GBA state before the game even starts. So GBA mode gets its own
 	// self-contained branch instead of threading more isGBA checks through
 	// the existing one: direct-boot straight into the cartridge with no
-	// BIOS execution at all (this codebase's declared strategy -- see the
-	// plan doc's §12.3 step 6 decision -- is function-level HLE for SWI,
+	// BIOS execution at all (this codebase's declared strategy
+	// is function-level HLE for SWI,
 	// not executing any code at the BIOS address, so there is nothing to
 	// "boot from" at 0x00000000 the way DS boots from its own BIOS/
 	// firmware). armcpu_init() already sets CPSR = SYS (0x1F: System mode,

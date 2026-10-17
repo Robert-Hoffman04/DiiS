@@ -5,7 +5,7 @@
 # The single copy of the Dolphin session-control helpers. Both
 # tools/vsd-testrom/harness/*.sh and tools/benchmark/*.sh source THIS file
 # instead of keeping their own dolphin_launch/dolphin_kill/gecko_* copies
-# (harness-and-network plan §3.7).
+#.
 #
 # This is *live session control* only. Offline analysis of already-collected
 # results (tools/benchmark/analyze.py, perfzones.py, scenes.conf) stays where

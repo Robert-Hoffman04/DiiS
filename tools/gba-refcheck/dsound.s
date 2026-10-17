@@ -1,4 +1,4 @@
-@ Synthetic GBA ROM for PLAN.md §4.3 item 3 (APU): drives the DirectSound
+@ Synthetic GBA ROM for the APU: drives the DirectSound
 @ FIFO A path end to end -- Timer0 for sample-rate cadence, DMA channel 1
 @ (Special/Sound-FIFO timing, dst 0x040000A0) for refill, SOUNDCNT_H/X for
 @ routing/volume/enable -- with a known, deterministic 8-bit PCM pattern so
@@ -16,7 +16,7 @@
 @ i.e. exactly 32768 Hz -- GBATEK's own suggested DirectSound rate.
 @
 @ Hand-written raw ARM asm, same style/toolchain as irqsoak.s/gradient.s
-@ (build_roms.sh); see docs/PLAN.md §4.3 item 3.
+@ (build_roms.sh).
 
     .arm
     .section .text

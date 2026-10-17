@@ -38,7 +38,7 @@ static inline bool inSoundRange(u32 off) { return off >= IO_SOUND_LO && off <= I
 static inline bool inDmaRange(u32 off)   { return off >= IO_DMA_LO && off <= IO_DMA_HI; }
 static inline bool inTimerRange(u32 off) { return off >= IO_TM0CNT_L && off <= IO_TM3CNT_H; }
 
-// docs/PLAN.md §4.3 item 4: WAITCNT-driven cartridge bus timing.
+// WAITCNT-driven cartridge bus timing.
 GbaCartTiming gbaCartTiming;
 
 void gbaWaitcntRecompute(u16 waitcnt)

@@ -17,7 +17,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3 step 1 (peripherals): GBA hardware timers. New code
+// GBA hardware timers. New code
 // written from GBATEK's documented TMxCNT_L/H layout, not a port of any
 // existing emulator's timer core.
 //
@@ -153,7 +153,7 @@ void gbaTimersIoWrite8(u32 offset, u8 val)
 	gbaTimersIoWrite16(base, merged);
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support). See gba_timers.h's comment.
+// GBA savestate support. See gba_timers.h's comment.
 void gbaTimersSaveState(EMUFILE* os)
 {
 	write32le(1, os); // version

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #-----------------------------------------------------------------------------
 # tools/gba-refcheck/run_conformance.sh - GBA conformance suite driver
-# (PLAN.md §4.3 item 9 / §5.3).
 #
 # Builds a dedicated .dol per gbaconf.conf row (one -DDESMUME_GBA_*_SOAK
 # probe + its companion synthetic ROM, same pattern as the individual
@@ -130,7 +129,7 @@ while IFS='|' read -r id rom probeflag untilframe timeout jitdefs label; do
 	RAN=$((RAN + 1))
 
 	if [ "$rc" = 2 ]; then
-		echo "   FAIL $id: device never connected (check Dolphin network passthrough, PLAN §7.1)"
+		echo "   FAIL $id: device never connected (check Dolphin network passthrough)"
 		FAIL=$((FAIL + 1)); FAILED_IDS="$FAILED_IDS $id"
 		continue
 	fi

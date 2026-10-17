@@ -5,9 +5,7 @@ ARM binary, producing a bootable .gba file.
 The 156-byte Nintendo logo bitmap is copied byte-for-byte from this
 codebase's own source/NDSSystem.cpp (GBA_LOGO[]) -- already committed,
 upstream-derived data used purely for hardware/emulator boot-logo
-detection, not redistributed Nintendo software. See docs/PLAN.md §4.3
-item 8.
-"""
+detection, not redistributed Nintendo software."""
 import sys
 
 # Copied verbatim from source/NDSSystem.cpp's GBA_LOGO[156].
@@ -41,7 +39,7 @@ def build_header(title: bytes, game_code: bytes) -> bytes:
     # it -- including the appended code body -- by that many bytes, while
     # the entry-point branch at offset 0 stays hardcoded for a 192-byte
     # header (target 0x080000C0). Found via a real, reproducible bug hunt
-    # (docs/PLAN.md §4.3 item 6): every hand-titled test ROM with a title
+    # every hand-titled test ROM with a title
     # shorter than 12 chars booted to a PC runaway (CPU executing
     # misaligned garbage from the shifted code) -- "GRADIENT"/"CHECKER"
     # (both exactly 8 chars) happened to shift by a whole 4-byte word,

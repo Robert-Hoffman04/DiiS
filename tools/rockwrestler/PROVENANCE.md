@@ -8,7 +8,7 @@ derived from:
   for emulators". No formal license file upstream, same "freely
   redistributed by the DS emulator dev community for exactly this purpose"
   situation as `tools/armwrestler`/`tools/arm7wrestler` (see their
-  PROVENANCE.md) -- this is the ROM the project's own plan doc (§8.4/§16/§19)
+  PROVENANCE.md) -- this is the ROM the project
   names as the intended primary DS homebrew conformance/regression target,
   covering ground armwrestler/arm7wrestler don't: ARMv5 `LDM`/`STM` edge
   cases, `BLX`/interworking, IPCSYNC/IPCFIFO (+ their IRQs), WRAMCNT/VRAMCNT,
@@ -76,7 +76,7 @@ Both `jitArm7Enabled` and `jitArm9Enabled` are left alone by the probe
 armwrestler/arm7wrestler, which each isolate one CPU's JIT because the
 other side is a stub, RockWrestler's IPC/WRAMCNT/VRAMCNT/TCM tests
 genuinely exercise both CPUs together, which is the point of adopting it
-as the primary conformance target (plan doc §8.4).
+as the primary conformance target.
 
 ## Building
 

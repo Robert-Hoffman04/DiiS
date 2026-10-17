@@ -10,7 +10,7 @@
 #                                                           kills it
 #
 # All session control (dolphin_launch/dolphin_kill) comes from the one
-# shared copy in tools/harness-control/common.sh (plan §3.7) - this file
+# shared copy in tools/harness-control/common.sh - this file
 # does not reimplement it.
 #-----------------------------------------------------------------------------
 BENCH_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

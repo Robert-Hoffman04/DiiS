@@ -2,7 +2,7 @@
 @ Hand-written raw ARM asm, assembled directly with devkitARM's
 @ arm-none-eabi-as/ld (no libgba/BIOS runtime needed -- direct-boot style,
 @ matching how this project's own GBA loader direct-boots a cartridge).
-@ Built by tools/gba-refcheck/build_roms.sh; see docs/PLAN.md §4.3 item 8.
+@ Built by tools/gba-refcheck/build_roms.sh.
 
     .arm
     .section .text

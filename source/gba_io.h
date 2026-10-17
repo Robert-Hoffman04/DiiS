@@ -22,7 +22,7 @@
 
 #include "types.h"
 
-// docs/PLAN.md §4.3: single dispatch point for GBA I/O-register writes
+// Single dispatch point for GBA I/O-register writes
 // (0x04000000-0x040003FF, MMU.cpp's _MMU_ARM7GBA_write08/16/32), routing
 // each register range to the peripheral module that owns it -- gba_ppu.cpp
 // (video), gba_timers.cpp (TM0CNT-TM3CNT), gba_keypad.cpp (KEYCNT) -- and
@@ -33,7 +33,7 @@ void gbaIoWrite8(u32 offset, u8 val);
 void gbaIoWrite16(u32 offset, u16 val);
 void gbaIoWrite32(u32 offset, u32 val);
 
-// docs/PLAN.md §4.3 item 4: WAITCNT (0x04000204)-derived cartridge bus
+// WAITCNT (0x04000204)-derived cartridge bus
 // timing. GBATEK's own First-Access/Second-Access terminology is kept
 // verbatim in the field names below (== non-sequential/sequential cycle
 // cost): WS0/WS1/WS2 are the three 32MB cartridge ROM mirror regions

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 symbolicate.py - turn raw PPC addresses from a PKT_CRASH into function+offset
-using the build's linker .map file (plan §3.6 / §3.7).
+using the build's linker .map file.
 
 The Makefile already emits `-Wl,-Map,$(notdir $@).map`, so the device only ever
 needs to send addresses - all name resolution happens here.

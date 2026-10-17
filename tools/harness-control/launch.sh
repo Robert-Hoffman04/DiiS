@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #-----------------------------------------------------------------------------
 # tools/harness-control/launch.sh - one entry point for getting a .dol running,
-# against Dolphin or a real Wii (plan §3.7 / §0 / §6).
+# against Dolphin or a real Wii.
 #
 #   launch.sh dolphin <dol> [logfile]
 #       headless Dolphin with Wii network passthrough on; the .dol's
@@ -12,7 +12,7 @@
 #       real wiiload transfer to WIILOAD=tcp:<host> (devkitPro wiiload, :4299).
 #       Target is a physical Wii or Dolphin's emulated one - only the IP differs.
 #       *** Sending/launching on a physical Wii needs explicit per-run
-#       permission every time (plan §6.3). This script only does the transfer
+#       permission every time. This script only does the transfer
 #       you asked for; it does not decide that for you. ***
 #
 # Env: WIILOAD (tcp:<host>), plus everything common.sh honours.
@@ -29,7 +29,7 @@ case "$mode" in
 		# Network passthrough must be enabled in this Dolphin's config
 		# (Config -> Wii -> "BBA network settings" / Wii network); this is a
 		# one-time settings check, not something the script can force via -C
-		# reliably across Dolphin versions. See plan §0.
+		# reliably across Dolphin versions.
 		dolphin_kill; sleep 2
 		dolphin_launch "$dol" "${2:-}"
 		echo "launched (dolphin): $dol"

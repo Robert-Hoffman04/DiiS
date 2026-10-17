@@ -17,7 +17,7 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3 step 4: GBA cartridge save memory. New code written
+// GBA cartridge save memory. New code written
 // directly from GBATEK's "GBA Cart Backup" pages (ID-string detection,
 // EEPROM bit-serial command framing, the 6-bit/14-bit address-size ->
 // chip-size correspondence) -- not a port of any existing emulator's
@@ -36,7 +36,7 @@
 // (so they're never misrouted through the SRAM flat-buffer path, which
 // would silently accept writes a real Flash chip would reject without the
 // unlock-command sequence) but not backed by real chip emulation yet --
-// left as an explicit gap, tracked in docs/PLAN.md, rather than modeled
+// left as an explicit gap rather than modeled
 // incorrectly.
 //
 // EEPROM protocol framing -- why this is done per-DMA-transfer rather than
@@ -275,7 +275,7 @@ void gbaEepromCommandRead(u16* outBits, u32 count)
 	}
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support). See gba_backup.h's comment
+// GBA savestate support. See gba_backup.h's comment
 // for why s_sram/s_eeprom's contents are deliberately excluded.
 void gbaBackupSaveState(EMUFILE* os)
 {

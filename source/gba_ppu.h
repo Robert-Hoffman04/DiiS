@@ -19,7 +19,7 @@
 #ifndef GBA_PPU_H
 #define GBA_PPU_H
 
-// docs/PLAN.md §4.3 step 1 (peripherals): GBA PPU (video). Modeled as a
+// GBA PPU (video). Modeled as a
 // scanline-accurate raster device driven by NDSSystem.cpp's GBA frame
 // executor (gbaExecFrame(), NDSSystem.cpp), which runs the ARM7 CPU for
 // each scanline's HDraw/HBlank duration in turn and calls the hooks below
@@ -132,7 +132,7 @@ void gbaPpuIoWrite8(u32 offset, u8 val);
 void gbaPpuIoWrite16(u32 offset, u16 val);
 void gbaPpuIoWrite32(u32 offset, u32 val);
 
-// PLAN.md §4.3 item 7 (GBA savestate support): the private per-scanline
+// GBA savestate support: the private per-scanline
 // counter and affine reference-point accumulators. VCOUNT/DISPSTAT
 // themselves are hardware-owned bits kept authoritative directly in
 // MMU.GBA_IOREG (already covered by the GBA_IOREG memory chunk) and stay

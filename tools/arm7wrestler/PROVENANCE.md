@@ -16,7 +16,7 @@
   formal license file upstream, same "freely redistributed by the DS
   emulator dev community for exactly this purpose" situation as
   `tools/armwrestler` (see its PROVENANCE.md) -- this is the ROM the
-  project's own plan doc (§8.3/§16/§18) calls out by name as the intended
+  project calls out by name as the intended
   ARM7 CPU-correctness gate.
 * See `UPSTREAM-README.md` (kept alongside these files unmodified) for the
   documented ARM7-vs-ARM9 behavioral differences this ROM specifically

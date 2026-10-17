@@ -24,7 +24,7 @@
 
 class EMUFILE;
 
-// docs/PLAN.md §4.3: the four GBA DMA channels (DMA0SAD..DMA3CNT_H,
+// The four GBA DMA channels (DMA0SAD..DMA3CNT_H,
 // 0x040000B0-0x040000DF). This is a "fires all at once" HLE, not a
 // cycle-accurate one: an immediate-timing transfer runs to completion the
 // instant its enable bit is written, and a VBlank/HBlank-timing transfer
@@ -67,7 +67,7 @@ void gbaDmaOnVblank();
 // (16 bytes), ignoring DMAxCNT_L's count, with a fixed destination.
 void gbaDmaOnFifoTrigger(u32 fifoAddr);
 
-// PLAN.md §4.3 item 7 (GBA savestate support): the per-channel shadow
+// GBA savestate support: the per-channel shadow
 // state (GbaDmaChan) that a plain DMAxSAD/DAD/CNT_L/CNT_H register replay
 // can't reconstruct -- liveSrc/liveDst are the in-flight source/dest
 // cursors (meaningful mid-repeat for VBlank/HBlank/Special-timing channels,

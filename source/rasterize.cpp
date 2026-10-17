@@ -74,7 +74,7 @@ static u8 index_start_table[8];
 // sizeof(TClippedPoly) is ~400 bytes, so allocating POLYLIST_SIZE of them
 // is a ~16MB single allocation - it fits fine on desktop but overruns the
 // Wii's heap and hangs the whole console during boot before a frame is
-// ever rendered (BUGS.md: "Software rasterizer hangs on boot").
+// ever rendered (the "software rasterizer hangs on boot" bug).
 #define SOFTRAST_MAX_CLIPPED_POLYS 4096
 static GFX3D_Clipper clipper;
 static GFX3D_Clipper::TClippedPoly *clippedPolys = NULL;

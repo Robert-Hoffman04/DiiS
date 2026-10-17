@@ -58,8 +58,7 @@
 #endif
 
 #ifdef DESMUME_FORCE_ROM
-// Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below (PLAN.md
-// §4.3 item 8). Declared here, ahead of the more specific probe blocks
+// Needed for the NDS_ADDON_NONE CFlash-boot-hang sidestep below. Declared here, ahead of the more specific probe blocks
 // below, since DESMUME_FORCE_ROM alone (no other probe macro) is now a
 // valid, supported combination -- e.g. a plain single-ROM boot test.
 #include "addons.h"
@@ -95,7 +94,7 @@
 #endif
 
 #ifdef DESMUME_GBA_SAVESTATE_SOAK
-// PLAN.md §4.3 item 7 / item 9's gba-conformance sstest: addonsChangePak()/
+// gba-conformance sstest: addonsChangePak()/
 // NDS_ADDON_NONE below (this soak's own CFlash-boot-hang sidestep, same as
 // its siblings above) needs this declared -- missing here until the
 // gba-conformance harness's first real build of this flag combo caught it
@@ -346,7 +345,7 @@ int main(int argc, char **argv){
 		quit_game = true;
 #endif
 
-	// Harness transport bring-up (plan §3.1). Probes NET -> GECKO -> SD (or a
+	// Harness transport bring-up. Probes NET -> GECKO -> SD (or a
 	// pinned backend). No-op without -DDESMUME_HARNESS; on failure it disables
 	// itself and boot continues.
 	harness_transport_init();
@@ -374,7 +373,7 @@ int main(int argc, char **argv){
 	cflash_disk_image_file = NULL;
 
 #ifdef DESMUME_FORCE_ROM
-	// PLAN.md §4.3 item 8 root cause: the default CFlash slot-2 passthrough
+	// Root cause: the default CFlash slot-2 passthrough
 	// (addonsInit()'s default pak) defaults to ADDON_CFLASH_MODE_Path with
 	// an empty CFlash_Path (never assigned anywhere outside the interactive
 	// config UI). cflash_init() -> cflash_build_fat() -> list_files("")
@@ -1186,7 +1185,7 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 //---------------------------------------------------------------------------
 // §17 armwrestler gate (-DDESMUME_ARMWRESTLER_PROBE).
 //
-// The patched armwrestler ROM (see the plan doc / tools/) auto-runs every
+// The patched armwrestler ROM (see tools/) auto-runs every
 // ARM9 ARM and THUMB CPU test with no input and harvests pass/fail results
 // into slot-2 expansion RAM (0x09000000+, the "Memory Expansion Pak" addon --
 // see addonsChangePak() below) rather than only drawing them to a screen no
@@ -1793,7 +1792,7 @@ void DSExec(){
 	gxStatsFrameTick();
 
 #ifdef DESMUME_GBA_IRQ_SOAK
-	// PLAN.md §4.3 item 6 tail: sustained ARM7-JIT-vs-GBA-IRQ soak probe.
+	// Sustained ARM7-JIT-vs-GBA-IRQ soak probe.
 	// The companion synthetic ROM (tools/gba-refcheck/irqsoak.s) maintains
 	// five u32 counters at GBA_EWRAM+0x0/0x4/0x8/0xC/0x10 (total_irq,
 	// vblank_count, timer_count, mainloop_iters, bad_source_count) --
@@ -1823,7 +1822,7 @@ void DSExec(){
 #endif
 
 #ifdef DESMUME_GBA_SAVESTATE_SOAK
-	// PLAN.md §4.3 item 7: GBA savestate determinism test. Rides on the same
+	// GBA savestate determinism test. Rides on the same
 	// irqsoak.gba ROM/counters as DESMUME_GBA_IRQ_SOAK above (timers +
 	// VBlank IRQ + a main-loop counter, all continuously active) instead of
 	// a new synthetic ROM. `sframe` is a host-side counter, untouched by
@@ -1898,7 +1897,7 @@ void DSExec(){
 #endif
 
 #ifdef DESMUME_GBA_APU_SOAK
-	// PLAN.md §4.3 item 3 (APU): DirectSound FIFO reference-check probe.
+	// APU: DirectSound FIFO reference-check probe.
 	// The companion synthetic ROM (tools/gba-refcheck/dsound.s) arms Timer0
 	// (32768 Hz cadence) + DMA1 Special-timing FIFO-A refill with a known,
 	// deterministic +-100 (0x64/0x9C) 8-bit PCM square wave and enables
@@ -1923,7 +1922,7 @@ void DSExec(){
 #endif
 
 #ifdef DESMUME_GBA_WAITCNT_SOAK
-	// PLAN.md §4.3 item 4: WAITCNT-driven cartridge ROM wait-state cost
+	// WAITCNT-driven cartridge ROM wait-state cost
 	// verification. The companion synthetic ROM (tools/gba-refcheck/
 	// waitcnt.s) times a fixed number of non-sequential cartridge-ROM
 	// reads against Timer0 under two WAITCNT configs in turn (0x0000
@@ -1946,7 +1945,7 @@ void DSExec(){
 #endif
 
 #ifdef DESMUME_GBA_DMA_SOAK
-	// PLAN.md §4.3 item 2: DMA3 Video Capture Special-timing trigger
+	// DMA3 Video Capture Special-timing trigger
 	// verification. The companion synthetic ROM (tools/gba-refcheck/
 	// dmavcap.s) arms DMA3 with src fixed at REG_VCOUNT and dst incrementing
 	// into EWRAM 0x02010000, Special timing, repeat=1 -- so each firing

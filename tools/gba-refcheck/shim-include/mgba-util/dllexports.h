@@ -2,8 +2,7 @@
  * mgba/dllexports.h but omit the CMake-generated mgba-util/dllexports.h
  * companion. Pure build-time shim (visibility macros only) so this
  * project's headless GBA reference driver (tools/gba-refcheck/) can build
- * against the installed snap; does not touch mGBA's own source/behavior.
- * See docs/PLAN.md §4.3 item 8. */
+ * against the installed snap; does not touch mGBA's own source/behavior. */
 #ifndef MGBA_UTIL_EXPORT_H
 #define MGBA_UTIL_EXPORT_H
 

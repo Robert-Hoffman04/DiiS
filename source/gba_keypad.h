@@ -22,7 +22,7 @@
 
 #include "types.h"
 
-// docs/PLAN.md §4.3 step 1 (peripherals): GBA keypad (KEYINPUT/KEYCNT,
+// GBA keypad (KEYINPUT/KEYCNT,
 // 0x04000130/0x04000132). KEYINPUT itself needs no dedicated module --
 // NDS_applyFinalInput() (NDSSystem.cpp) already computes the exact
 // active-low bit pattern GBA hardware uses (confirmed identical to the DS

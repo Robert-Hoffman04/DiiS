@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the two hand-written synthetic GBA test ROMs (gradient / checkerboard)
-# referenced in docs/PLAN.md §4.2/§4.3 item 8. Local-only test aids, same
+# Build the two hand-written synthetic GBA test ROMs (gradient /
+# checkerboard). Local-only test aids, same
 # handling as before: sources are committed (tools/gba-refcheck/*.s), the
 # assembled .gba outputs are not (see .gitignore).
 set -euo pipefail

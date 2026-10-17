@@ -1,5 +1,5 @@
 /*
-    harness_net.h - HARNESS_TRANSPORT_NET backend (plan §3.1), minimal form.
+    harness_net.h - HARNESS_TRANSPORT_NET backend, minimal form.
 
     This is the Step-2 slice: enough to open the connection and push framed
     packets out, so the Dolphin network-passthrough path can be proven with a

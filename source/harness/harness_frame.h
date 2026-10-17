@@ -1,5 +1,5 @@
 /*
-    harness_frame.h - on-demand video buffer readout (plan §3.4).
+    harness_frame.h - on-demand video buffer readout.
 
     Generalises the fixed-frame -DDESMUME_FBDUMP block (main.cpp, hardcoded
     frame, SD-only) into a PKT_FRAME stream with three triggers:

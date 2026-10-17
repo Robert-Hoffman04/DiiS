@@ -1,5 +1,5 @@
 /*
-    harness_input.h - transport-agnostic remote input core (plan §3.5).
+    harness_input.h - transport-agnostic remote input core.
 
     The byte protocol, edge/level detection and GECKO_TAP_FRAMES auto-release
     that geckoinput.cpp implements for the USB-Gecko channel, lifted out so the

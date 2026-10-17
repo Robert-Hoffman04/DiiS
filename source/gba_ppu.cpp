@@ -17,9 +17,9 @@
     Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 */
 
-// docs/PLAN.md §4.3 step 1 (peripherals): GBA PPU. Reference is GBATEK's
+// GBA PPU. Reference is GBATEK's
 // documented register/tile/OBJ layout (cross-checked against mGBA's
-// video/*.c behavior where GBATEK was ambiguous, per the plan's
+// video/*.c behavior where GBATEK was ambiguous, per the
 // reference-first rule for the "actual GBA execution/peripheral"
 // dimension); this is new code written from that spec, not a port of any
 // existing DS or GBA emulator's renderer -- the DS 2D engine (GPU.cpp) is
@@ -1191,7 +1191,7 @@ void gbaPpuHBlankEnd(int line)
 	if (s_vcount == GBA_SCREEN_H) gbaFireVBlankIrqIfNeeded();
 }
 
-// PLAN.md §4.3 item 7 (GBA savestate support). See gba_ppu.h's comment.
+// GBA savestate support. See gba_ppu.h's comment.
 void gbaPpuSaveState(EMUFILE* os)
 {
 	write32le(1, os); // version

@@ -1,4 +1,4 @@
-@ Synthetic GBA ROM for PLAN.md §4.3 item 2's remaining piece: DMA channel
+@ Synthetic GBA ROM for DMA channel
 @ 3's Video Capture Special-timing trigger. Per GBATEK: "Capture works
 @ similar like HBlank DMA, however, the transfer is started when VCOUNT=2,
 @ it is then repeated each scanline, and it gets stopped when VCOUNT=162."

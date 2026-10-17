@@ -1,4 +1,4 @@
-@ Synthetic GBA ROM for PLAN.md §4.3 item 6's sustained-play tail: whether
+@ Synthetic GBA ROM for sustained-play IRQ soak: whether
 @ armcpu_irqException()'s real exception dispatch (source/gba_irq.cpp's
 @ trampoline path) interacts correctly with ARM7-JIT-compiled code under
 @ SUSTAINED play (many thousands of real interrupt deliveries), not just
@@ -22,7 +22,7 @@
 @                                (should stay 0 -- a real corruption signal)
 @
 @ Hand-written raw ARM asm, same style/toolchain as gradient.s/
-@ checkerboard.s (build_roms.sh); see docs/PLAN.md §4.3 item 6.
+@ checkerboard.s (build_roms.sh).
 
     .arm
     .section .text

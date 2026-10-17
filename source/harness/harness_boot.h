@@ -1,5 +1,5 @@
 /*
-    harness_boot.h - boot manifest + multi-ROM playlist + watchdog (plan §3.4).
+    harness_boot.h - boot manifest + multi-ROM playlist + watchdog.
 
     A single text file - sd:/harness.cfg (or usb:/harness.cfg, or pushed as a
     companion file over wiiload) - replaces the -DDESMUME_FORCE_ROM /

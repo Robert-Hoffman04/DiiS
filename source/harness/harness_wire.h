@@ -1,7 +1,7 @@
 /*
     harness_wire.h - device-side mirror of tools/harness-control/wire.py.
 
-    Framed packet protocol (plan §2). Fixed 10-byte big-endian header:
+    Framed packet protocol. Fixed 10-byte big-endian header:
 
         magic (4) | version (1) | packet_type (1) | payload_length (u32) | payload
 
@@ -14,9 +14,9 @@
 #include <gctypes.h>
 
 #define HARNESS_WIRE_MAGIC0 'D'
-#define HARNESS_WIRE_MAGIC1 'S'
-#define HARNESS_WIRE_MAGIC2 'M'
-#define HARNESS_WIRE_MAGIC3 'H'
+#define HARNESS_WIRE_MAGIC1 'I'
+#define HARNESS_WIRE_MAGIC2 'I'
+#define HARNESS_WIRE_MAGIC3 'S'
 #define HARNESS_WIRE_VERSION 1
 #define HARNESS_WIRE_HEADER_LEN 10
 

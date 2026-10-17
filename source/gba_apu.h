@@ -24,7 +24,7 @@
 
 class EMUFILE;
 
-// docs/PLAN.md §4.3: GBA APU. DirectSound (FIFO A/B, SOUNDCNT_H's DMA Sound
+// GBA APU. DirectSound (FIFO A/B, SOUNDCNT_H's DMA Sound
 // A/B) is fully wired -- the two DMA-fed 8-bit PCM channels almost every
 // commercial GBA game actually uses for music/SFX (a tracker-style engine
 // bitstreams pre-mixed audio through these; the four legacy PSG channels
@@ -67,7 +67,7 @@ void gbaApuFifoPushByte(int which, u8 val);
 // path when gameInfo.isGBA. Fills numSamples interleaved stereo s16 frames.
 void gbaApuMixAudio(s16* buf, u32 numSamples);
 
-// PLAN.md §4.3 item 7 (GBA savestate support): the DirectSound FIFO A/B
+// GBA savestate support: the DirectSound FIFO A/B
 // circular-buffer contents/head/count and the last-latched output sample
 // -- all private module state with no register backing (SOUNDCNT_H etc.
 // are plain register storage already covered by the GBA_IOREG memory

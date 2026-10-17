@@ -1,5 +1,5 @@
 /*
-    harness_crash.h - host crash reporting and pass/fail assertions (plan §3.6).
+    harness_crash.h - host crash reporting and pass/fail assertions.
 
     Two things, both gated on DESMUME_HARNESS && HARNESS_CRASH:
 

@@ -1,7 +1,7 @@
 /*
     harness_config.h - one place for the harness transport endpoint.
 
-    The Dolphin-vs-real-hardware cutover (plan §6) is a one-line change here (or
+    The Dolphin-vs-real-hardware cutover is a one-line change here (or
     an override on the build command line):
 
         make TESTDEFS='-DDESMUME_HARNESS -DHARNESS_HOST=\"192.168.1.50\"'
