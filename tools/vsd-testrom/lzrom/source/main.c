@@ -54,6 +54,14 @@
 //  27  B: on even frames BG1 is disabled at line 80 and its BG1CNT map base changed in the same hblank (BG1 never
 //      enabled again that frame; restored in vblank): the per-line 'bgcntchange' check never sees the new value on an
 //      enabled line, the frame-end check must still bail (planes are baked from the frame-final BGxCNT).
+//  28  B: sub = mode 2 (BG2 affine 128x128 wrap) + BG0/BG1; scroll / affine / window writes mid-frame become
+//      register segments (task 2d-bails-2). Per frame (f % 6):
+//      0 BG2X (32-bit) + BG2PB at line 57, BG0HOFS at 70, sub palette write at 130 (data barrier: segments
+//        replayed on the CPU, GX bails midframewrite);  1 the same without the palette write (GX handles);
+//      2 WIN0 on (vblank); BG2Y low/high halves at lines 40/41, WIN0H + WININ + WINOUT at 80, BG2Y (32-bit)
+//        at 100, palette at 150;  3 one byte of BG2X at 50 (8-bit: still a flush), BG2PD at 90, BG2X at 91,
+//        palette at 130;  4 BG2X rewritten at 7 lines (more segments than the cap), palette at 150;
+//      5 BG2PA-PD (32-bit pairs) + BG2X at 60, BG2X again at 61, BG0VOFS at 62 (GX handles).
 
 #include <nds.h>
 #include <stdio.h>
@@ -93,6 +101,13 @@
 #define B_BG0CNT  R16(0x04001008)
 #define B_BLDCNT  R16(0x04001050)
 #define B_BLDY    R16(0x04001054)
+#define B_BG2CNT  R16(0x0400100C)
+#define B_BG2PA   R16(0x04001020)
+#define B_BG2PB   R16(0x04001022)
+#define B_BG2PC   R16(0x04001024)
+#define B_BG2PD   R16(0x04001026)
+#define B_BG2X    R32(0x04001028)
+#define B_BG2Y    R32(0x0400102C)
 #define R_POWCNT1 R16(0x04000304)
 #define R_VRAMCNT_A (*(volatile u8 *)0x04000240)
 
@@ -178,6 +193,18 @@ static void setupEngines(void)
 	fillMap((u16 *)(VRAM_C_BASE + 0xC800), 8);
 	REG_BG0CNT_SUB = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(24) | BG_TILE_BASE(0) | BG_PRIORITY(1);
 	REG_BG1CNT_SUB = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);
+#if LZ_CASE == 28
+	// sub BG2 rotscale: 128x128 map (16x16 tiles, screen block 28 = 0xE000), 256-colour tiles at char block 4
+	{
+		u8 *tiles = VRAM_C_BASE + 0x10000;
+		for (int t = 0; t < 64; t++)
+			for (int i = 0; i < 64; i++)
+				tiles[t * 64 + i] = (u8)(((hashb(t, i + 7) % 6) == 0) ? 0 : (1 + (hashb(t, i + 300) % 200)));
+		u8 *map = VRAM_C_BASE + 0xE000;
+		for (int i = 0; i < 16 * 16; i++) map[i] = (u8)(hashb(i, 9) % 64);
+	}
+	B_BG2CNT = BG_RS_16x16 | BG_MAP_BASE(28) | BG_TILE_BASE(4) | BG_WRAP_ON | BG_PRIORITY(2);
+#endif
 }
 
 static u16 *gfxA, *gfxB;
@@ -291,6 +318,33 @@ static void hb(void)
 		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(24) | BG_TILE_BASE(1) | BG_PRIORITY(2);
 		B_DISPCNT &= ~(1u << 9);
 	}
+#elif LZ_CASE == 28
+	{
+		const int v = ff % 6;
+		if (v <= 1) {
+			if (L == 56) { B_BG2X = (u32)((20 + (ff & 63)) * 256); B_BG2PB = (u16)(40 + (ff & 7)); }
+			if (L == 69) B_BG0HOFS = 37;
+			if (v == 0 && L == 129) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v == 2) {
+			if (L == 39) R16(0x0400102C) = (u16)(0x80 + (ff & 0xFF));
+			if (L == 40) R16(0x0400102E) = 0;
+			if (L == 79) { B_WIN0H = (30 << 8) | 200; B_WININ = L_BG2 | L_OBJ; B_WINOUT = L_BG0 | L_BG1; }
+			if (L == 99) B_BG2Y = (u32)(-12 * 256);
+			if (L == 149) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v == 3) {
+			if (L == 49) *(volatile u8 *)0x04001029 = (u8)(5 + (ff & 3));
+			if (L == 89) B_BG2PD = 300;
+			if (L == 90) B_BG2X = (u32)(7 * 256 + ff);
+			if (L == 129) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else if (v == 4) {
+			if (L == 19 || L == 29 || L == 39 || L == 49 || L == 59 || L == 69 || L == 79) B_BG2X = (u32)(L * 64);
+			if (L == 149) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 2 + ff) & 31, (i * 3) & 31, 31 - i); }
+		} else {
+			if (L == 59) { R32(0x04001020) = (u32)(230 | (25u << 16)); R32(0x04001024) = (u32)((u16)-25 | (240u << 16)); B_BG2X = (u32)(3 * 256); }
+			if (L == 60) B_BG2X = (u32)(9 * 256 + ff);
+			if (L == 61) B_BG0VOFS = 11;
+		}
+	}
 #elif LZ_CASE == 22
 	if ((ff % 3) == 0) { if (L == 49) A_BG0HOFS = 33; else if (L == 149) A_BG0HOFS = 0; if (L == 59) B_BG0VOFS = 17; else if (L == 159) B_BG0VOFS = 0; }
 #endif
@@ -308,7 +362,11 @@ int main(void)
 	dcnt = MODE_2_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_SPR_ACTIVE | DISPLAY_SPR_1D;
 #endif
 	videoSetMode(dcnt);
+#if LZ_CASE == 28
+	videoSetModeSub(MODE_2_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG1_ACTIVE | DISPLAY_BG2_ACTIVE | DISPLAY_SPR_ACTIVE | DISPLAY_SPR_1D);
+#else
 	videoSetModeSub(MODE_0_2D | DISPLAY_BG0_ACTIVE | DISPLAY_BG1_ACTIVE | DISPLAY_SPR_ACTIVE | DISPLAY_SPR_1D);
+#endif
 #if LZ_CASE == 10 || LZ_CASE == 17
 	// BG2 as rotscale: 128x128 map (16x16 tiles) from screen base block 28, char base block 4, wrap
 	REG_BG2CNT = BG_RS_16x16 | BG_MAP_BASE(28) | BG_TILE_BASE(4) | BG_WRAP_ON | BG_PRIORITY(2);
@@ -340,6 +398,13 @@ int main(void)
 		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);
 		B_BLDCNT = 0; B_BLDY = 0; B_MOSAIC = 0;
 		if ((f % 5) == 3) { for (int i = 1; i < 16; i++) BG_PALETTE_SUB[i] = RGB15((i * 3 + 5) & 31, (i * 9 + 14) & 31, (i * 5 + 2) & 31); }
+#endif
+#if LZ_CASE == 28
+		B_BG2PA = 200; B_BG2PB = 30; B_BG2PC = (u16)-30; B_BG2PD = 220;
+		B_BG2X = 12 * 256; B_BG2Y = 9 * 256;
+		B_BG0HOFS = 0; B_BG0VOFS = 0;
+		B_WIN0H = (16 << 8) | 240; B_WIN0V = (8 << 8) | 180; B_WININ = L_BG0 | L_BG2 | L_OBJ; B_WINOUT = L_BG1 | L_BG2;
+		if ((f % 6) == 2) B_DISPCNT |= (1u << 13); else B_DISPCNT &= ~(1u << 13);
 #endif
 #if LZ_CASE == 27
 		B_BG1CNT = BG_32x32 | BG_COLOR_16 | BG_MAP_BASE(25) | BG_TILE_BASE(1) | BG_PRIORITY(2);

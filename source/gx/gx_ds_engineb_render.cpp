@@ -59,7 +59,7 @@ void gxDsLazyFlushAll() { gxDsEngineALazyBarrier(0); gxDsEngineBLazyBarrier(0); 
 void gxDsLazyVramRemapped() { s_lzVisDirty = true; }
 
 // Register / remap writes (adr = 0x04xxxxxx, called before the write lands).
-void gxDsLazyIoWriteSlow(u32 adr)
+void gxDsLazyIoWriteSlow(u32 adr, u32 size)
 {
 	if ((adr & 0xFFFFEF80u) == 0x04000000u) {
 		// 0x04000000.. = Engine A, 0x04001000.. = Engine B. DISPSTAT/VCOUNT (0x04-0x07) and DISP3DCNT
@@ -68,10 +68,23 @@ void gxDsLazyIoWriteSlow(u32 adr)
 		if (off < 4 || (off >= 8 && off < 0x60) || (off >= 0x64 && off < 0x70)) {
 			// Task 2d-bails-1: BGxCNT (0x08-0x0F) and BLDCNT / BLDALPHA / BLDY (0x50-0x57) become a
 			// pending-line segment instead of a flush where possible (writes are size-aligned, so
-			// they stay inside their 8-byte range).
-			if (((off >= 0x08 && off < 0x10) || (off >= 0x50 && off < 0x58)) &&
-			    ((adr & 0x1000u) ? gxDsEngineBLazySegWrite() : gxDsEngineALazySegWrite()))
-				return;
+			// they stay inside their 8-byte range). Task 2d-bails-2: so do the scroll, affine and
+			// window registers (0x10-0x4B); a 16/32-bit BGxX/BGxY write reloads that latch, an 8-bit
+			// one (the running value poked without a reload) keeps the flush.
+			if ((off >= 0x08 && off < 0x4C) || (off >= 0x50 && off < 0x58)) {
+				const bool latch = (off >= 0x28 && off < 0x30) || (off >= 0x38 && off < 0x40);
+#ifndef DSB_MUTATE_LZSEG2   // mutation: only the 2d-bails-1 registers become segments
+				const bool seg = !(latch && size == 1);
+#else
+				const bool seg = (off < 0x10 || off >= 0x50);
+#endif
+				const u32 reload = latch ? (1u << (((off >> 2) & 1) + (off >= 0x38 ? 2 : 0))) : 0u;
+				if (seg && ((adr & 0x1000u) ? gxDsEngineBLazySegWrite(reload) : gxDsEngineALazySegWrite(reload)))
+					return;
+			}
+#ifdef DSLZ_STATS
+			if (adr & 0x1000u) gxDsEngineBLazyStatIo(off); else gxDsEngineALazyStatIo(off);
+#endif
 			if (adr & 0x1000u) gxDsEngineBLazyBarrier(0); else gxDsEngineALazyBarrier(0);
 		}
 		return;
@@ -84,8 +97,12 @@ void gxDsLazyIoWriteSlow(u32 adr)
 		gxDsEngineBLazyBarrier(1);
 		return;
 	}
-	if ((adr & ~3u) == 0x04000304u)          // POWCNT1: screen swap / engine enables
+	if ((adr & ~3u) == 0x04000304u) {        // POWCNT1: screen swap / engine enables
+#ifdef DSLZ_STATS
+		gxDsEngineALazyStatIo(0x7C); gxDsEngineBLazyStatIo(0x7C);
+#endif
 		gxDsLazyFlushAll();
+	}
 }
 
 // Palette RAM (0x05) / OAM (0x07): 2KB, Engine A = first KB, Engine B = second KB.

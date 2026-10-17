@@ -2413,7 +2413,7 @@ void FASTCALL _MMU_ARM9_write08(u32 adr, u8 val)
 
 	// gx-next-steps-log.md item 13j: flush deferred 2D CPU lines before a register write can
 	// change what they would have rendered (no-op unless a lazy frame has pending lines).
-	GXDS_LAZY_IO_BARRIER(adr);
+	GXDS_LAZY_IO_BARRIER8(adr);
 
 	if (adr >> 24 == 4)
 	{

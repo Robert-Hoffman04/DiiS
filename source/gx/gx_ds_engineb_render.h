@@ -574,17 +574,24 @@ void gxDsInvalidateAll();
 // (gxDsMarkWrite / gxDsMarkVram) call the data form internally.
 extern u32 g_gxDsLazyPend;   // bit 0 = Engine A has deferred lines, bit 1 = Engine B
 extern u32 g_gxDsLazyOn;     // bit n = engine n is inside a lazy frame (data writes bail its GX pass)
-void gxDsLazyIoWriteSlow(u32 adr);
+void gxDsLazyIoWriteSlow(u32 adr, u32 size);   // size: write width in bytes (1, 2 or 4)
 void gxDsLazyVramRemapped();   // MMU_VRAMmapControl: a bank was (re)mapped, recompute which LCDC pages each engine sees
 void gxDsEngineALazyBarrier(int data);
 void gxDsEngineBLazyBarrier(int data);
-// Task 2d-bails-1: BGxCNT / colour-effect register write; true = absorbed as a pending-line segment (no flush).
-bool gxDsEngineALazySegWrite();
-bool gxDsEngineBLazySegWrite();
+// Task 2d-bails-1/-2: BGxCNT / scroll / affine / window / colour-effect register write (`reload` = BGxX/BGxY
+// latches it reloads); true = absorbed as a pending-line segment (no flush).
+bool gxDsEngineALazySegWrite(u32 reload);
+bool gxDsEngineBLazySegWrite(u32 reload);
+#ifdef DSLZ_STATS
+void gxDsEngineALazyStatIo(u32 off);
+void gxDsEngineBLazyStatIo(u32 off);
+#endif
 bool gxDsEngineALazyPending();
 bool gxDsEngineBLazyPending();
 void gxDsLazyFlushAll();
 // Call at the top of the IO branch of every ARM9 write function (adr already & 0x0FFFFFFF).
-#define GXDS_LAZY_IO_BARRIER(adr_) do { if (g_gxDsLazyOn && ((adr_) >> 24) == 4) gxDsLazyIoWriteSlow(adr_); } while (0)
+#define GXDS_LAZY_IO_BARRIER(adr_) do { if (g_gxDsLazyOn && ((adr_) >> 24) == 4) gxDsLazyIoWriteSlow(adr_, 2); } while (0)
+// The 8-bit write function's form (task 2d-bails-2: a byte write to BGxX/BGxY does not reload the latch).
+#define GXDS_LAZY_IO_BARRIER8(adr_) do { if (g_gxDsLazyOn && ((adr_) >> 24) == 4) gxDsLazyIoWriteSlow(adr_, 1); } while (0)
 
 #endif // GX_DS_ENGINEB_RENDER_H

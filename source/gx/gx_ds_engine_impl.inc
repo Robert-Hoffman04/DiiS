@@ -298,10 +298,22 @@ static bool s_lzDataHit = false;  // a data write (VRAM/palette/OAM) hit this en
 // eager one. Exact: those fields are only read by the line pass (DISPCNT, which the derivation
 // also reads, and every other write still flush before they land), and GPU_DiscardDeferredLines
 // only reads the frame-final state. Bounded: kLzMaxRegSegs writes per frame, then the old flush.
+// Task 2d-bails-2: the same for the scroll (0x10-0x1F), affine (0x20-0x3F) and window (0x40-0x4B)
+// registers (MOSAIC 0x4C-0x4F still flushes). The affine reference point is a running latch
+// (GPU.cpp keeps it in the IO bytes themselves: lineRot/lineExtRot advance it by PB/PD after each
+// line, a 16/32-bit BGxX/BGxY write reloads it from affineInfo[]), so the saved BGxX/BGxY bytes are
+// only put back where the eager pass would have reloaded them: at the first segment, and at a
+// segment that starts at a reload (`reload`); in between the flushed lines advance it themselves.
+// 8-bit writes to BGxX/BGxY (DeSmuME pokes the running value without a reload) still flush.
+// GPU_DiscardDeferredLines replays the advance from the frame-final latch, so a frame with
+// segments puts the latch the eager pass would have left (s_lzAffRun) back after it.
 struct GxDsLzRegSeg {
 	int line;                          // this state applied to pending lines < line
-	u8 ioCnt[8];                       // IO 0x08-0x0F (BG0CNT..BG3CNT)
+	u8 io[0x48];                       // IO 0x08-0x4F (BGxCNT, BGxHOFS/VOFS, BG2/BG3 affine, WINxH/V, WININ/OUT, MOSAIC)
 	u8 ioBld[8];                       // IO 0x50-0x57 (BLDCNT, BLDALPHA, BLDY, unused)
+	u32 affInfo[2][2];                 // GPU::affineInfo (the line-0 / write reload source)
+	u8 reload;                         // latches reloaded where this segment starts: 1 BG2X, 2 BG2Y, 4 BG3X, 8 BG3Y
+	u8 win[16];                        // the window setters' outputs: WIN0H0 .. WINOBJ_SPECIAL
 	// GPU_setBGProp's outputs
 	u8 prioBGs[NB_PRIORITIES][NB_BG], prioNb[NB_PRIORITIES];
 	u32 bmpLarge[4], bmp[4], tile[4], map[4];
@@ -318,11 +330,16 @@ struct GxDsLzRegSeg {
 enum { kLzMaxRegSegs = 4 };
 static GxDsLzRegSeg s_lzSeg[kLzMaxRegSegs];
 static int s_lzSegN = 0;
+static u8 s_lzSegReloadPend = 0;   // latches reloaded by absorbed writes since the last segment was saved
+static u8 s_lzAffReloadHook = 0;   // ... since the last scanline hook (see gxDsLzAffHook)
+static s32 s_lzAffRun[2][2];       // BG2/BG3 latch (x, y) the eager pass would have at line s_lzSeen
 extern u32 g_gxDsLazyPend;       // gx_ds_engineb_render.cpp: bit `core` = this engine has pending lines
 extern u32 g_gxDsLazyOn;          // bit `core` = this engine is inside a lazy frame (data-write bail window)
 #ifdef DSLZ_STATS
 static u32 s_lzStFrames, s_lzStDeferredLines, s_lzStFlushRegLines, s_lzStFlushDataLines, s_lzStFlushBailLines,
            s_lzStFlushOosLines, s_lzStDiscardFrames, s_lzStEagerLines, s_lzStBarrierIo, s_lzStBarrierData, s_lzStDataBail, s_lzStRegSeg;
+// Task 2d-bails-2: register barriers with pending lines by IO offset (0x7C = POWCNT1), and segment-cap hits.
+static u32 s_lzStIoOff[0x80], s_lzStIoOffLines[0x80], s_lzStSegCap;
 #endif
 
 // vram_arm9_map (MMU.h) page ranges that back Engine B's BG and OBJ
@@ -905,6 +922,56 @@ static inline bool gxDsBIsAffineType(u8 t)
 	       t == BGType_AffineExt_Direct || t == BGType_Large8bpp;
 }
 
+// The BG2/BG3 reference-point latch in effect at `line` (s_lzAffRun), both BGs, every in-scope
+// line. Line 0: the CPU re-latches BGxX/BGxY from affineInfo[] inside GPU_RenderLine(l==0), which
+// runs AFTER this hook, so the live parms->BGxX still holds last frame's accumulated value here.
+// Task 13j: with deferred CPU lines parms only advance when a line is really rendered
+// (s_lzRendered lines so far; s_lzRendered == 0 means not even the line-0 latch has run), so with
+// nothing pending the value is the parms value as of line s_lzRendered plus (line - s_lzRendered)
+// steps of PB/PD. With lines pending (task 2d-bails-2: PB/PD and the latch can change inside the
+// pending range, see GxDsLzRegSeg) it is the running value gxDsLzAffAdvance kept for every
+// deferred line, or the live parms value where an absorbed write reloaded it since the last hook.
+static void gxDsLzAffHook(GPU *gpu, int line)
+{
+	const bool pending = s_lzSeen > s_lzRendered;
+	for (int w = 0; w < 2; ++w) {
+		const BGxPARMS *p = w ? &gpu->dispx_st->dispx_BG3PARMS : &gpu->dispx_st->dispx_BG2PARMS;
+		s32 x, y;
+		if (pending) {
+			x = s_lzAffRun[w][0]; y = s_lzAffRun[w][1];
+#ifndef DSB_MUTATE_LZAFF   // mutation: ignore mid-range reloads (lz_c28 must then differ)
+			if (s_lzAffReloadHook & (1u << (2 * w))) x = p->BGxX;
+			if (s_lzAffReloadHook & (2u << (2 * w))) y = p->BGxY;
+#endif
+		} else {
+			const bool fromInfo = (line == 0) || (s_lzRendered == 0);
+			const u32 steps = (u32)(line - s_lzRendered);
+			x = fromInfo ? (s32)gpu->affineInfo[w].x : p->BGxX;
+			y = fromInfo ? (s32)gpu->affineInfo[w].y : p->BGxY;
+			if (line != 0) {
+				x = (s32)((u32)x + steps * (u32)(s32)(s16)LE_TO_LOCAL_16(p->BGxPB));
+				y = (s32)((u32)y + steps * (u32)(s32)(s16)LE_TO_LOCAL_16(p->BGxPD));
+			}
+		}
+		s_lzAffRun[w][0] = x; s_lzAffRun[w][1] = y;
+	}
+	s_lzAffReloadHook = 0;
+}
+
+// A line was deferred: advance s_lzAffRun the way its CPU pass would (the GPU_DiscardDeferredLines rule).
+static void gxDsLzAffAdvance(GPU *gpu)
+{
+	for (int layer = 2; layer < 4; ++layer) {
+		if (!gpu->LayersEnable[layer]) continue;
+		const u8 t = GPU_mode2type[gpu->dispCnt().BG_Mode][layer];
+		if (t != BGType_Affine && t != BGType_AffineExt && t != BGType_Large8bpp) continue;
+		const BGxPARMS *p = (layer == 2) ? &gpu->dispx_st->dispx_BG2PARMS : &gpu->dispx_st->dispx_BG3PARMS;
+		s32 *r = s_lzAffRun[layer - 2];
+		r[0] = (s32)((u32)r[0] + (u32)(s32)(s16)LE_TO_LOCAL_16(p->BGxPB));
+		r[1] = (s32)((u32)r[1] + (u32)(s32)(s16)LE_TO_LOCAL_16(p->BGxPD));
+	}
+}
+
 // Fills `r` with the layout state this scanline is about to be drawn with.
 // `affChanged` is set when an enabled affine BG's running state differs from
 // what the previous line predicted (it is never set on line 0: line 0 is the
@@ -959,22 +1026,8 @@ static void gxDsBSnapshotBandRegs(GPU *gpu, GxDsBBandRegs *r, int line, bool *af
 		// BGxX/BGxY are plain host s32 and are read unswapped, as it does.
 		s16 pa = (s16)LE_TO_LOCAL_16(p->BGxPA), pb = (s16)LE_TO_LOCAL_16(p->BGxPB);
 		s16 pc = (s16)LE_TO_LOCAL_16(p->BGxPC), pd = (s16)LE_TO_LOCAL_16(p->BGxPD);
-		// Line 0: the CPU re-latches BGxX/BGxY from affineInfo[] inside
-		// GPU_RenderLine(l==0), which runs AFTER this hook, so the live
-		// parms->BGxX still holds last frame's accumulated value here.
-		// Task 13j: with deferred CPU lines parms only advance when a line is really rendered
-		// (s_lzRendered lines so far; s_lzRendered == 0 means not even the line-0 latch has run),
-		// so the value in effect at `line` is the parms value as of line s_lzRendered plus
-		// (line - s_lzRendered) steps of PB/PD (PB/PD/enable state are constant across the pending
-		// range: any write flushes it). With eager rendering line == s_lzRendered, i.e. the old code.
-		const bool fromInfo = (line == 0) || (s_lzRendered == 0);
-		const u32 steps = (u32)(line - s_lzRendered);
-		s32 x = fromInfo ? (s32)gpu->affineInfo[w].x : p->BGxX;
-		s32 y = fromInfo ? (s32)gpu->affineInfo[w].y : p->BGxY;
-		if (line != 0) {
-			x = (s32)((u32)x + steps * (u32)(s32)pb);
-			y = (s32)((u32)y + steps * (u32)(s32)pd);
-		}
+		// The latch in effect at `line`: gxDsLzAffHook (run just before this).
+		const s32 x = s_lzAffRun[w][0], y = s_lzAffRun[w][1];
 		r->affX[w] = x; r->affY[w] = y;
 		r->affPA[w] = pa; r->affPB[w] = pb; r->affPC[w] = pc; r->affPD[w] = pd;
 		if (line != 0 && (!pr.valid || pr.x != x || pr.y != y || pr.pa != pa || pr.pb != pb || pr.pc != pc || pr.pd != pd))
@@ -1200,6 +1253,7 @@ static void gxDsBScanlineTrace(int line)
 
 	GxDsBBandRegs cur;
 	bool affChanged;
+	gxDsLzAffHook(gpu, line);
 	gxDsBSnapshotBandRegs(gpu, &cur, line, &affChanged);
 	if (line == 0) {
 		GXDS_REGS[0] = cur;
@@ -1242,8 +1296,14 @@ static void gxDsLzSegSave(GxDsLzRegSeg *sg, int line)
 	const GPU *gpu = GXDS_SCREEN.gpu;
 	const u8 *io = MMU.ARM9_REG + GXDS_CORE * 0x1000;
 	sg->line = line;
-	memcpy(sg->ioCnt, io + 0x08, sizeof(sg->ioCnt));
+	memcpy(sg->io, io + 0x08, sizeof(sg->io));
 	memcpy(sg->ioBld, io + 0x50, sizeof(sg->ioBld));
+	for (int w = 0; w < 2; ++w) { sg->affInfo[w][0] = gpu->affineInfo[w].x; sg->affInfo[w][1] = gpu->affineInfo[w].y; }
+	sg->reload = 0;
+	const u8 win[16] = { gpu->WIN0H0, gpu->WIN0H1, gpu->WIN0V0, gpu->WIN0V1, gpu->WIN1H0, gpu->WIN1H1, gpu->WIN1V0, gpu->WIN1V1,
+	                     gpu->WININ0, (u8)gpu->WININ0_SPECIAL, gpu->WININ1, (u8)gpu->WININ1_SPECIAL,
+	                     gpu->WINOUT, (u8)gpu->WINOUT_SPECIAL, gpu->WINOBJ, (u8)gpu->WINOBJ_SPECIAL };
+	memcpy(sg->win, win, sizeof(sg->win));
 	for (int p = 0; p < NB_PRIORITIES; ++p) {
 		memcpy(sg->prioBGs[p], gpu->itemsForPriority[p].BGs, NB_BG);
 		sg->prioNb[p] = gpu->itemsForPriority[p].nbBGs;
@@ -1262,12 +1322,26 @@ static void gxDsLzSegSave(GxDsLzRegSeg *sg, int line)
 	sg->table = gpu->blendTable;
 }
 
-static void gxDsLzSegApply(const GxDsLzRegSeg *sg)
+// `latch`: which BGxX/BGxY running latches to put back (see GxDsLzRegSeg), bits as `reload`.
+static void gxDsLzSegApply(const GxDsLzRegSeg *sg, u32 latch)
 {
 	GPU *gpu = GXDS_SCREEN.gpu;
 	u8 *io = MMU.ARM9_REG + GXDS_CORE * 0x1000;
-	memcpy(io + 0x08, sg->ioCnt, sizeof(sg->ioCnt));
+	memcpy(io + 0x08, sg->io, 0x28 - 0x08);                        // BGxCNT, scroll, BG2PA-PD
+	memcpy(io + 0x30, sg->io + (0x30 - 0x08), 8);                  // BG3PA-PD
+	memcpy(io + 0x40, sg->io + (0x40 - 0x08), 0x50 - 0x40);        // windows, MOSAIC
+	for (int k = 0; k < 4; ++k)                                    // BG2X, BG2Y, BG3X, BG3Y
+		if (latch & (1u << k)) {
+			const u32 o = (k < 2 ? 0x28 : 0x38) + (k & 1) * 4;
+			memcpy(io + o, sg->io + (o - 0x08), 4);
+		}
 	memcpy(io + 0x50, sg->ioBld, sizeof(sg->ioBld));
+	for (int w = 0; w < 2; ++w) { gpu->affineInfo[w].x = sg->affInfo[w][0]; gpu->affineInfo[w].y = sg->affInfo[w][1]; }
+	gpu->WIN0H0 = sg->win[0]; gpu->WIN0H1 = sg->win[1]; gpu->WIN0V0 = sg->win[2]; gpu->WIN0V1 = sg->win[3];
+	gpu->WIN1H0 = sg->win[4]; gpu->WIN1H1 = sg->win[5]; gpu->WIN1V0 = sg->win[6]; gpu->WIN1V1 = sg->win[7];
+	gpu->WININ0 = sg->win[8]; gpu->WININ0_SPECIAL = sg->win[9] != 0; gpu->WININ1 = sg->win[10]; gpu->WININ1_SPECIAL = sg->win[11] != 0;
+	gpu->WINOUT = sg->win[12]; gpu->WINOUT_SPECIAL = sg->win[13] != 0; gpu->WINOBJ = sg->win[14]; gpu->WINOBJ_SPECIAL = sg->win[15] != 0;
+	gpu->need_update_winh[0] = gpu->need_update_winh[1] = true;   // h_win[] is rebuilt from WINxH0/H1 on the next line
 	for (int p = 0; p < NB_PRIORITIES; ++p) {
 		memcpy(gpu->itemsForPriority[p].BGs, sg->prioBGs[p], NB_BG);
 		gpu->itemsForPriority[p].nbBGs = sg->prioNb[p];
@@ -1312,22 +1386,33 @@ static void gxDsLzFlush(int why)
 			// Task 2d-bails-1: per-segment register state (see GxDsLzRegSeg).
 			GxDsLzRegSeg now;
 			gxDsLzSegSave(&now, s_lzSeen);
+			now.reload = s_lzSegReloadPend;
 			int si = 0, applied = -1;
 			while (s_lzRendered < s_lzSeen) {
 				while (si < s_lzSegN && s_lzRendered >= s_lzSeg[si].line) ++si;
 				if (si != applied) {
 #ifndef DSB_MUTATE_LZSEG   // mutation: render every pending line with the current (frame-later) state
-					gxDsLzSegApply(si < s_lzSegN ? &s_lzSeg[si] : &now);
+					const GxDsLzRegSeg *sg = si < s_lzSegN ? &s_lzSeg[si] : &now;
+#ifdef DSB_MUTATE_LZAFF
+					gxDsLzSegApply(sg, applied < 0 ? 0xFu : 0u);
+#else
+					gxDsLzSegApply(sg, applied < 0 ? 0xFu : sg->reload);
+#endif
 #endif
 					applied = si;
 				}
 				GPU_RenderLine(&GXDS_SCREEN, (u16)s_lzRendered, false);
 				++s_lzRendered;
 			}
-			gxDsLzSegApply(&now);
+#ifndef DSB_MUTATE_LZSEG
+			// the current state (where `now` was not reached, i.e. its range is empty: its reloads too;
+			// otherwise it is in place and the latches have advanced from it)
+			if (applied != s_lzSegN) gxDsLzSegApply(&now, now.reload);
+#endif
 			s_lzSegN = 0;
 		}
 	}
+	s_lzSegReloadPend = 0; s_lzAffReloadHook = 0;   // nothing pending: the hook reads the live latch
 	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
 	s_lzFlushing = false;
 }
@@ -1352,18 +1437,28 @@ void GXDS_API(LazyBarrier)(int data)
 }
 
 // Task 2d-bails-1: a BGxCNT / colour-effect register write (IO 0x08-0x0F / 0x50-0x57 of this
-// engine, called before it lands). Returns true when it was absorbed as a new pending-line segment
-// (no flush needed); false = the caller takes the ordinary register barrier.
-bool GXDS_API(LazySegWrite)()
+// engine, called before it lands); task 2d-bails-2: also scroll / affine / window (0x10-0x4B).
+// `reload` = the reference-point latches the write reloads (GxDsLzRegSeg::reload bits). Returns
+// true when it was absorbed as a new pending-line segment (no flush needed); false = the caller
+// takes the ordinary register barrier.
+bool GXDS_API(LazySegWrite)(u32 reload)
 {
 #if GXDS_LAZY_COMPILED && !defined(DSLZ_MUTATE_NOBARRIER)
 	if (s_lzFlushing || s_lzSeen <= s_lzRendered)
 		return false;                                  // nothing pending: the barrier is a no-op anyway
-	if (s_lzSegN > 0 && s_lzSeg[s_lzSegN - 1].line == s_lzSeen)
+	if (s_lzSegN > 0 && s_lzSeg[s_lzSegN - 1].line == s_lzSeen) {
+		s_lzSegReloadPend |= (u8)reload; s_lzAffReloadHook |= (u8)reload;
 		return true;                                   // another write before the next line: the saved state already precedes it
-	if (s_lzSegN >= kLzMaxRegSegs)
+	}
+	if (s_lzSegN >= kLzMaxRegSegs) {
+#ifdef DSLZ_STATS
+		++s_lzStSegCap;
+#endif
 		return false;
-	gxDsLzSegSave(&s_lzSeg[s_lzSegN++], s_lzSeen);
+	}
+	gxDsLzSegSave(&s_lzSeg[s_lzSegN], s_lzSeen);
+	s_lzSeg[s_lzSegN++].reload = s_lzSegReloadPend;   // the reloads at its start (the previous write's)
+	s_lzSegReloadPend = (u8)reload; s_lzAffReloadHook |= (u8)reload;
 #ifdef DSLZ_STATS
 	++s_lzStRegSeg;
 #endif
@@ -1373,6 +1468,17 @@ bool GXDS_API(LazySegWrite)()
 #endif
 }
 
+#ifdef DSLZ_STATS
+// Task 2d-bails-2: called before a register barrier (off = IO offset & 0x7F, 0x7C = POWCNT1).
+void GXDS_API(LazyStatIo)(u32 off)
+{
+	if (s_lzFlushing || s_lzSeen <= s_lzRendered)
+		return;
+	++s_lzStIoOff[off & 0x7F];
+	s_lzStIoOffLines[off & 0x7F] += (u32)(s_lzSeen - s_lzRendered);
+}
+#endif
+
 bool GXDS_API(LazyPending)()
 {
 	return s_lzSeen > s_lzRendered;
@@ -1381,6 +1487,7 @@ bool GXDS_API(LazyPending)()
 static void gxDsLzReset()
 {
 	s_lzOn = false; s_lzRendered = 0; s_lzSeen = 0; s_lzFlushing = false; s_lzDataHit = false; s_lzSegN = 0;
+	s_lzSegReloadPend = 0; s_lzAffReloadHook = 0;
 	g_gxDsLazyPend &= ~(1u << GXDS_CORE);
 	g_gxDsLazyOn &= ~(1u << GXDS_CORE);
 }
@@ -1395,7 +1502,17 @@ static void gxDsLzDiscard()
 	++s_lzStDiscardFrames;
 #endif
 #ifndef DSLZ_MUTATE_NODISCARD   // mutation check: skip the side-effect replay (lz_c24 must then differ)
+	BGxPARMS *pp[2] = { &GXDS_SCREEN.gpu->dispx_st->dispx_BG2PARMS, &GXDS_SCREEN.gpu->dispx_st->dispx_BG3PARMS };
+	const s32 live[2][2] = { { pp[0]->BGxX, pp[0]->BGxY }, { pp[1]->BGxX, pp[1]->BGxY } };
+	const bool segs = s_lzSegN > 0 || s_lzSegReloadPend != 0;
 	GPU_DiscardDeferredLines(&GXDS_SCREEN, s_lzRendered, s_lzSeen - 1);
+	if (segs) {
+		// Task 2d-bails-2: the latch the eager pass would have left (a reload after the last line wins).
+		for (int w = 0; w < 2; ++w) {
+			pp[w]->BGxX = (s_lzAffReloadHook & (1u << (2 * w))) ? live[w][0] : s_lzAffRun[w][0];
+			pp[w]->BGxY = (s_lzAffReloadHook & (2u << (2 * w))) ? live[w][1] : s_lzAffRun[w][1];
+		}
+	}
 #endif
 }
 
@@ -1434,6 +1551,7 @@ bool GXDS_API(Scanline)(int line)
 	}
 	if (defer) {
 		++s_lzSeen;
+		gxDsLzAffAdvance(GXDS_SCREEN.gpu);
 		g_gxDsLazyPend |= (1u << GXDS_CORE);
 #ifdef DSLZ_STATS
 		++s_lzStDeferredLines;
@@ -5369,6 +5487,19 @@ bool GXDS_API(RenderFrame)()
 		                      (unsigned)s_lzStFrames, (unsigned)s_lzStDeferredLines, (unsigned)s_lzStEagerLines, (unsigned)s_lzStDiscardFrames,
 		                      (unsigned)s_lzStFlushRegLines, (unsigned)s_lzStFlushDataLines, (unsigned)s_lzStFlushBailLines, (unsigned)s_lzStFlushOosLines,
 		                      (unsigned)s_lzStBarrierIo, (unsigned)s_lzStBarrierData, (unsigned)s_lzStDataBail, (unsigned)s_lzStRegSeg);
+		// Task 2d-bails-2: top register-barrier offsets (offset:barriers/lines) and segment-cap hits.
+		char buf[160]; int len = 0;
+		u8 used[0x80] = {0};
+		for (int k = 0; k < 6; ++k) {
+			int best = -1;
+			for (int o = 0; o < 0x80; ++o)
+				if (!used[o] && s_lzStIoOff[o] && (best < 0 || s_lzStIoOffLines[o] > s_lzStIoOffLines[best])) best = o;
+			if (best < 0) break;
+			used[best] = 1;
+			len += snprintf(buf + len, sizeof(buf) - len, " %02x:%u/%u", best, (unsigned)s_lzStIoOff[best], (unsigned)s_lzStIoOffLines[best]);
+		}
+		buf[len] = 0;
+		harness_profile_emitf(GXDS_TAG "lzio segcap=%u io%s", (unsigned)s_lzStSegCap, buf);
 #endif
 	}
 #endif
