@@ -22,7 +22,7 @@
     With >=1 rom= line the harness drives the per-ROM boot path in a loop,
     advancing after frames_per_rom or on a PKT_CTRL "next_rom", tagging every
     heartbeat with the current ROM. No manifest -> every accessor is inert and
-    main() falls through to the existing FileBrowser path unchanged.
+    main() boots DS/ROMS/test.nds as without the harness.
 
     Follows the perf_zones.h pattern: real bodies under DIIS_HARNESS &&
     HARNESS_BOOT, static-inline no-ops otherwise, so call sites never #ifdef.

@@ -37,37 +37,46 @@ DiiS is a homebrew DS emulator based on the original port of [DeSmuMEWii](https:
    running under Dolphin instead of real hardware, point Dolphin at the
    `.dol`/`.elf` directly (see `run.sh` for a scripted example using the
    Dolphin flatpak).
-2. Create the following folders on the SD card root:
+2. Put your ROMs (`.nds` and `.gba`) in a folder on the SD card or USB
+   storage. DiiS looks in `sd:/ROMS/DS/` and `sd:/DS/ROMS/` out of the box;
+   any other folder can be added in **Settings > ROM folders**.
+3. If you have real DS BIOS dumps, name them exactly `biosnds7.rom` and
+   `biosnds9.rom` and place them in `DS/BIOS/` on the device DiiS starts from
+   (`sd:/DS/BIOS/` normally). Without them, DiiS falls back to internal HLE
+   BIOS/firmware, which works for most games but not all.
+4. DiiS keeps its own files in `DiiS/` on the device it starts from:
 ```
-   sd:/DS/ROMS/   - your .nds ROM files go here
-   sd:/DS/BIOS/   - biosnds7.rom and biosnds9.rom go here
-   sd:/DS/SAVES/  - battery saves and save states are written here
+   DiiS/config.ini                 - settings and the ROM folder list
+   DiiS/library.cache              - so the library doesn't re-read every ROM on each start
+   DiiS/games/<id> <title>/        - one folder per game: battery save, save states,
+                                     per-game settings
 ```
- 
-3. Drop your ROM(s) into `sd:/DS/ROMS/`. If you have real DS BIOS dumps,
-   name them exactly `biosnds7.rom` and `biosnds9.rom` and place them in
-   `sd:/DS/BIOS/`. Without them, DiiS falls back to internal HLE BIOS/firmware,
-   which works for most games but not all.
-4. If your storage is a USB device rather than an SD card, use the same
-   folder layout under `usb:/DS/...` instead.
+   Saves from older versions in `sd:/DS/SAVES/` are moved into the game's
+   folder the first time you play it.
 
 ## Usage
  
 ### Starting a game
  
-On launch, DiiS asks whether to use the SD card or USB storage (Left / Right)
-and which CPU emulation to use (Up / Down): **JIT** (the default, fastest) or
-**Interpreter** (slower, for troubleshooting a game the JIT gets wrong). Press
-A to continue; it then opens a file browser rooted at `DS/ROMS` on whichever
-device you picked. The browser only lists folders and `.nds` files.
- 
+DiiS opens on the **Library**: an icon grid of every game in your ROM
+folders, filtered by All / DS / GBA. Pick a game to see its details, then
+**Play**, or **Load state** to jump straight into one of its save states.
+
+- **Settings** (top right) sets the defaults for every game: CPU emulation
+  (**JIT**, the default and fastest, or **Interpreter**, slower, for
+  troubleshooting a game the JIT gets wrong) and render mode (**GxFast**,
+  **GxAccurate** or **Software**). It also manages the ROM folders (Add folder,
+  Remove, include subfolders, Rescan) and has the About screen.
+- **Game settings** on a game's page overrides the CPU and render mode for
+  just that game; "Default" follows Settings.
+
 | Action | Control |
 |---|---|
-| Move selection | D-pad / left stick Up / Down |
-| Jump to top / bottom of list | D-pad / left stick Left / Right |
-| Open folder / select ROM | A |
-| Cancel / back out | HOME (Wiimote) or Z (GameCube) |
- 
+| Move selection | D-pad / stick, or point with the Wiimote |
+| Select | A |
+| Back | B |
+| Quit to loader | HOME, or console Reset / Power |
+
 ### In-game controls
  
 Default mapping (Classic Controller shown; GameCube controller mirrors A/B/X/Y,
@@ -98,9 +107,10 @@ controller's equivalent, where mapped).
 ### Notes
  
 - There is currently no in-game settings menu - control remapping, BIOS
-  paths, and similar options are set at compile time or by editing the SD card layout above.
-- Save states and battery saves are written to `sd:/DS/SAVES/` (or the
-  equivalent `usb:/` path).
+  paths, and similar options are set at compile time; CPU and render mode are
+  set from the menu before a game starts.
+- Save states and battery saves are written to the game's folder,
+  `DiiS/games/<id> <title>/`.
 
 
 ## Advance Input Expansion Pak
@@ -116,4 +126,6 @@ This addition was mostly for the sake of my own homebrew plans. It is an entirel
  
 DiiS is free software, licensed under the GNU General Public License v2 - see `LICENSE.txt`. It builds on DeSmuME and DeSmuMEWii, and vendors a
 JIT derived from Visual Boy Advance GX (see
-`source/jit/upstream/PROVENANCE.md` for details and attribution).
+`source/jit/upstream/PROVENANCE.md` for details and attribution). The menu
+font is Noto Sans, under the SIL Open Font License 1.1 (see
+`source/gui/gui_font_LICENSE.txt`).

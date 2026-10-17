@@ -249,8 +249,4 @@ void guiQuit(int code);
 // `rom` to boot, then load savestate `stateSlot` (-1: none); GUI_EXIT: leave.
 int guiLibraryRun(std::string &rom, int &stateSlot);
 
-#ifdef DIIS_GUI_DEMO
-int guiDemoRun();                // gui_demo.cpp: the framework demo screen
-#endif
-
 #endif // DIIS_GUI_H

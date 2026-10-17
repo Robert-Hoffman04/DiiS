@@ -134,7 +134,6 @@ static void gxdbg_main(const char *msg)
 #else
 #define GXDBG_MAIN(msg)
 #endif
-#include "filebrowser.h"
 #include "gekko_utils/usb2storage.h"
 #include "gekko_utils/mload.h"
 
@@ -255,7 +254,6 @@ void init();
 #ifdef DIIS_USE_LIBRARY
 static void ApplyLibrary(const char *rom);
 #else
-void ShowCredits();
 bool PickDevice();
 #endif
 static void Draw(void);
@@ -351,12 +349,6 @@ int main(int argc, char **argv){
 				sleep(1);
 		}
 	}
-#ifdef DIIS_GUI_DEMO
-	// GUI framework demo (gui/gui_demo.cpp): straight into the demo screen,
-	// no device menu; leaving it (Home/Reset/Power) leaves the app.
-	guiDemoRun();
-	sys_exit();
-#endif
 	// The menu (gui/gui_library.cpp): Library -> Game -> Play / Load state.
 	// Home, Reset or Power there leave the app.
 	{
@@ -375,7 +367,6 @@ int main(int argc, char **argv){
 		fatUnmount("sd:/");
 		__io_wiisd.shutdown();
 		fatMountSimple("sd", &__io_wiisd);
-		sprintf(rom_filename, "sd:/DS/ROMS");
 	}
 	else {
 		fatUnmount("usb:/");
@@ -384,15 +375,14 @@ int main(int argc, char **argv){
 			if (isMounted) break;
 			sleep(1);
 		}
-		sprintf(rom_filename, "usb:/DS/ROMS");
 	}
 
-#ifdef DIIS_FORCE_ROM
-	// Hardcoded ROM path for automated testing (see Makefile TESTDEFS).
+	// Hardcoded ROM path for automated testing (see Makefile TESTDEFS); the
+	// test builds have no ROM browser.
 	strcpy(rom_filename, device ? "usb:/DS/ROMS/test.nds" : "sd:/DS/ROMS/test.nds");
-#elif defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
+#if !defined(DIIS_FORCE_ROM) && defined(DIIS_HARNESS) && defined(HARNESS_BOOT)
 	// §3.4 boot manifest: sd:/harness.cfg (or usb:/) with >=1 rom= line drives
-	// the playlist; no manifest -> fall through to the FileBrowser path.
+	// the playlist; no manifest -> test.nds as above.
 	if (harness_boot_load(device ? "usb:" : "sd:") > 0) {
 		strncpy(rom_filename, harness_boot_rom_path(), MAXPATHLEN - 1);
 		rom_filename[MAXPATHLEN - 1] = 0;
@@ -404,15 +394,8 @@ int main(int argc, char **argv){
 			harness_boot_rom_count(),
 			(unsigned long)harness_boot_frames_per_rom(), (int)current3Dcore,
 			(int)gxRenderMode());
-	} else if(FileBrowser(rom_filename) != 0) {
-		quit_game = true;
 	}
-#else
-	if(FileBrowser(rom_filename) != 0)
-		quit_game = true;
 #endif
-	if (quit_game)   // browser cancelled, or Reset/Power pressed in it
-		sys_exit();
 #endif // !DIIS_USE_LIBRARY
 
 #ifdef DIIS_USE_LIBRARY
@@ -2199,7 +2182,8 @@ static void ApplyLibrary(const char *rom)
 
 // Console device / CPU / render picker of the non-library builds (harness,
 // benchmark and test builds that don't force the core); the normal build
-// has the GUI (gui/gui_library.cpp) instead.
+// has the GUI (gui/gui_library.cpp) instead. They boot DS/ROMS/test.nds on
+// the picked device (or the harness manifest's ROMs).
 bool PickDevice(){
 	bool device = false;
 	current3Dcore = 1; //Soft Raster (only 3D core; see core3DList)
@@ -2254,7 +2238,6 @@ bool PickDevice(){
 		printf("\nSelect CPU \\/ ");
 		printf("%s", useJit ? "JIT /\\" : "Interpreter /\\");
 		printf("\nSelect Render (1): %s", kRenderModeNames[renderModeIdx]);
-		printf("\n\nPress B to see the credits.");
 
 		if(GetInput(LEFT, LEFT, LEFT) || GetInput(RIGHT, RIGHT, RIGHT)) {
 			device = !device;
@@ -2283,41 +2266,12 @@ bool PickDevice(){
 			break;
 		}
 
-		if(GetInput(B, B, B))
-		    ShowCredits();
-
 		VIDEO_WaitVSync();
 	}
 
 	return device;
 }
 
-void ShowCredits() {
-
-	printf("\x1b[2J");
-	printf("\x1b[2;0H");
-	
-	printf("DiiS\n\n");
-	printf("http://code.google.com/p/desmumewii\n\n");
-	printf("Written By:\n\n");
-	printf("Arikado - http://arikadosblog.blogspot.com\n");
-	printf("scanff\n");
-	printf("DCN\n");	
-	printf("firnis\n");
-	printf("baby.lueshi\n");
-	printf("With contributions from Cyan\n\n");
-
-	printf("Press A to return to the menu.");
-	
-	while(true){
-	    PAD_ScanPads();
-		WPAD_ScanPads();
-		if (sys_exit_requested()) sys_exit();   // console Reset / Power
-		if(GetInput(A, A, A))
-		    break;
-	}
-
-}
 #endif // !DIIS_USE_LIBRARY
 
 //needed for some games

@@ -24,7 +24,7 @@ CLEAN_EACH_BUILD="${CLEAN_EACH_BUILD:-1}"                 # 1 = `make clean` bef
 # defaults to on, so these two names are simply ignored (harmless unused
 # defines) and a newer commit is tested with both JITs on just the same.
 JITDEFS="${JITDEFS:--DDIIS_JIT_ARM7 -DDIIS_JIT_ARM9_ON}"
-TESTDEFS="${TESTDEFS:--DDIIS_FORCE_CORE=1 -DDIIS_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the file browser
+TESTDEFS="${TESTDEFS:--DDIIS_FORCE_CORE=1 -DDIIS_FORCE_ROM}"  # 1 = software raster; FORCE_ROM skips the menu
 #
 # Notes:
 # - DEVKITPPC must already be exported in your shell (as the Makefile requires).

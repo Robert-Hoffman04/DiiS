@@ -19,9 +19,7 @@
 
 #include "gui_menu.h"
 
-static const GuiColor kText = GUI_COL_TEXT, kDim = GUI_COL_DIM;
-static const GuiColor kPanel = GUI_COL_PANEL, kPanelEdge = GUI_COL_PANEL_EDGE;
-static const GuiColor kAccent = GUI_COL_ACCENT, kCell = guiRgba(24, 29, 42), kCellFocus = guiRgba(44, 56, 82);
+static const GuiColor kCell = guiRgba(24, 29, 42), kCellFocus = guiRgba(44, 56, 82);
 
 #define NUM_SLOTS 10
 
@@ -87,27 +85,27 @@ public:
 		menuHeader(entry.game->info.isGba ? "GBA game" : "DS game");
 
 		const GuiRect p(40, 68, 560, 152);
-		guiPanel(p, 12, kPanel, kPanelEdge, 1);
+		guiPanel(p, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
 		guiImage(entryIcon(entry), p.x + 12, p.y + 12, 4);
 		const LibRomInfo &info = entry.game->info;
 		const int tx = p.x + 160, tw = p.x + p.w - 14 - tx;
 		for (int l = 0; l < LIB_TITLE_LINES; l++)
-			guiText(GUI_FONT_BODY, tx, p.y + 14 + l * 28, info.lines[l].c_str(), l ? kDim : kText, GUI_ALIGN_LEFT, tw);
-		guiText(GUI_FONT_BODY, tx, p.y + 14 + 3 * 28 + 10, info.id.c_str(), kDim, GUI_ALIGN_LEFT, tw);
+			guiText(GUI_FONT_BODY, tx, p.y + 14 + l * 28, info.lines[l].c_str(), l ? GUI_COL_DIM : GUI_COL_TEXT, GUI_ALIGN_LEFT, tw);
+		guiText(GUI_FONT_BODY, tx, p.y + 14 + 3 * 28 + 10, info.id.c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, tw);
 
 		guiButton(focus.screenRect(BTN_PLAY), "Play", true);
 		guiButton(focus.screenRect(BTN_SETTINGS), "Game settings", false);
 
-		guiText(GUI_FONT_BODY, 40, 300, "Load state", kText);
+		guiText(GUI_FONT_BODY, 40, 300, "Load state", GUI_COL_TEXT);
 		if (!nslots)
-			guiText(GUI_FONT_BODY, 160, 300, "none saved yet", kDim);
+			guiText(GUI_FONT_BODY, 160, 300, "none saved yet", GUI_COL_DIM);
 		for (int i = 0; i < nslots; i++) {
 			const GuiRect r = focus.screenRect(BTN_SLOT + slot[i]);
 			char label[16];
 			snprintf(label, sizeof(label), "Slot %d", slot[i]);
-			guiRoundRect(r, 10, kPanel);
-			guiTextBox(GUI_FONT_BODY, GuiRect(r.x, r.y + 4, r.w, 24), label, kText, GUI_ALIGN_CENTER);
-			guiTextBox(GUI_FONT_BODY, GuiRect(r.x, r.y + 28, r.w, 22), date[i] + 5, kDim, GUI_ALIGN_CENTER);   // MM-DD HH:MM
+			guiRoundRect(r, 10, GUI_COL_PANEL);
+			guiTextBox(GUI_FONT_BODY, GuiRect(r.x, r.y + 4, r.w, 24), label, GUI_COL_TEXT, GUI_ALIGN_CENTER);
+			guiTextBox(GUI_FONT_BODY, GuiRect(r.x, r.y + 28, r.w, 22), date[i] + 5, GUI_COL_DIM, GUI_ALIGN_CENTER);   // MM-DD HH:MM
 		}
 		guiFocusFrame(focus.highlight());
 	}
@@ -211,17 +209,17 @@ public:
 		menuHeader("Library");
 		for (int t = 0; t < 4; t++) {
 			const GuiRect r = focus.screenRect(TAB_BASE + t);
-			guiRoundRect(r, 10, t == filter ? kAccent : kPanel);
-			guiTextBox(GUI_FONT_BODY, r, kTabs[t], kText, GUI_ALIGN_CENTER);
+			guiRoundRect(r, 10, t == filter ? GUI_COL_ACCENT : GUI_COL_PANEL);
+			guiTextBox(GUI_FONT_BODY, r, kTabs[t], GUI_COL_TEXT, GUI_ALIGN_CENTER);
 		}
 
 		// Grid, clipped to its view; a scroll bar when it scrolls.
 		const GuiRect view = focus.view(grid);
 		if (shown.empty()) {
-			guiPanel(view, 12, kPanel, kPanelEdge, 1);
+			guiPanel(view, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
 			const char *msg = !all.empty() ? (filter == 1 ? "No DS games in the library." : "No GBA games in the library.") :
 			                  "No games found.\n\nAdd the folders that hold your .nds and .gba files in Settings > ROM folders.";
-			guiTextWrap(GUI_FONT_BODY, GuiRect(view.x + 40, view.y + 100, view.w - 80, view.h - 120), msg, kDim, GUI_ALIGN_CENTER);
+			guiTextWrap(GUI_FONT_BODY, GuiRect(view.x + 40, view.y + 100, view.w - 80, view.h - 120), msg, GUI_COL_DIM, GUI_ALIGN_CENTER);
 		}
 		guiPushClip(view);
 		for (size_t n = 0; n < shown.size(); n++) {
@@ -238,28 +236,28 @@ public:
 			const int track = view.h, thumb = track * GRID_ROWS / rows;
 			const int y = view.y + (track - thumb) * focus.scroll(grid) / ((rows - GRID_ROWS) * CELL_H);
 			guiRoundRect(GuiRect(view.x + view.w + 8, view.y, 6, track), 3, guiRgba(36, 42, 58));
-			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, kDim);
+			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, GUI_COL_DIM);
 		}
 		if (focus.visible(focus.focused()))
 			guiFocusFrame(focus.highlight());
 
 		// Focused game: its three title lines as stored, and its id.
 		const GuiRect info(40, 380, 560, 88);
-		guiPanel(info, 12, kPanel, kPanelEdge, 1);
+		guiPanel(info, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
 		const int f = focus.focused();
 		if (f >= 0 && f < TAB_BASE) {
 			const LibRomInfo &ri = all[f].game->info;
 			const int idW = guiTextWidth(GUI_FONT_BODY, ri.id.c_str());
 			for (int l = 0; l < LIB_TITLE_LINES; l++)
-				guiText(GUI_FONT_BODY, info.x + 14, info.y + 4 + l * 27, ri.lines[l].c_str(), l ? kDim : kText,
+				guiText(GUI_FONT_BODY, info.x + 14, info.y + 4 + l * 27, ri.lines[l].c_str(), l ? GUI_COL_DIM : GUI_COL_TEXT,
 				        GUI_ALIGN_LEFT, info.w - 28 - idW - 16);
-			guiText(GUI_FONT_BODY, info.x + info.w - 14, info.y + 4, ri.id.c_str(), kDim, GUI_ALIGN_RIGHT);
+			guiText(GUI_FONT_BODY, info.x + info.w - 14, info.y + 4, ri.id.c_str(), GUI_COL_DIM, GUI_ALIGN_RIGHT);
 		} else if (f == TAB_SETTINGS) {
-			guiTextBox(GUI_FONT_BODY, info.inset(14), "Settings, ROM folders, About", kDim, GUI_ALIGN_CENTER);
+			guiTextBox(GUI_FONT_BODY, info.inset(14), "Settings, ROM folders, About", GUI_COL_DIM, GUI_ALIGN_CENTER);
 		} else if (f >= TAB_BASE && !shown.empty()) {
 			char buf[64];
 			snprintf(buf, sizeof(buf), "%d game%s shown", (int)shown.size(), shown.size() == 1 ? "" : "s");
-			guiTextBox(GUI_FONT_BODY, info.inset(14), buf, kDim, GUI_ALIGN_CENTER);
+			guiTextBox(GUI_FONT_BODY, info.inset(14), buf, GUI_COL_DIM, GUI_ALIGN_CENTER);
 		}
 	}
 

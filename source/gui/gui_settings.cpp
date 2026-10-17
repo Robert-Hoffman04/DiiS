@@ -26,8 +26,6 @@
 
 #include "gui_menu.h"
 
-static const GuiColor kText = GUI_COL_TEXT, kDim = GUI_COL_DIM;
-static const GuiColor kPanel = GUI_COL_PANEL, kPanelEdge = GUI_COL_PANEL_EDGE;
 static const GuiColor kRow = guiRgba(24, 29, 42), kRowFocus = guiRgba(44, 56, 82);
 
 #define LABEL_W 220   // label column of the choice rows
@@ -55,15 +53,21 @@ public:
 	{
 		menuBackground();
 		menuHeader("About");
-		// The old console menu's credits ("Press B to see the credits").
-		const GuiRect a(40, 72, 560, 216);
-		guiPanel(a, 12, kPanel, kPanelEdge, 1);
-		guiText(GUI_FONT_TITLE, a.x + 14, a.y + 8, "About DiiS", kText);
-		guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 48, a.w - 28, a.h - 56),
-		            "http://code.google.com/p/desmumewii\n"
-		            "Written by: Arikado (arikadosblog.blogspot.com), scanff, DCN, firnis, baby.lueshi\n"
-		            "With contributions from Cyan\n"
-		            "Based on DeSmuME.", kDim);
+		const GuiRect a(40, 72, 560, 332);
+		guiPanel(a, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
+		guiText(GUI_FONT_TITLE, a.x + 14, a.y + 8, "About DiiS", GUI_COL_TEXT);
+		// Same wording as the homebrew channel's meta.xml.
+		const int h = guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 48, a.w - 28, a.h - 56),
+		            "DiiS \xE2\x80\x94 Nintendo DS and GBA emulator for Wii.\n"
+		            "Built by: Robert Hoffman\n"
+		            "Based on the original DeSmuME Wii port by: Arikado, scanff, firnis, and baby.lueshi\n"
+		            "Based on DeSmuME.", GUI_COL_TEXT);
+		// The original port's credits (the old console menu's) and the font licence.
+		guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 60 + h, a.w - 28, a.h - 68 - h),
+		            "Original port: http://code.google.com/p/desmumewii\n"
+		            "Written by: Arikado (arikadosblog.blogspot.com), scanff, DCN, firnis, baby.lueshi. "
+		            "With contributions from Cyan.\n"
+		            "Font: Noto Sans, SIL Open Font License 1.1.", GUI_COL_DIM);
 		guiButton(focus.screenRect(0), "Back", true);
 		guiFocusFrame(focus.highlight());
 	}
@@ -133,26 +137,26 @@ public:
 		menuBackground();
 		menuHeader("Add a ROM folder");
 		const GuiRect p(40, 64, 560, 36);
-		guiPanel(p, 10, kPanel, kPanelEdge, 1);
-		guiTextBox(GUI_FONT_BODY, GuiRect(p.x + 12, p.y, p.w - 24, p.h), cur.empty() ? "Choose a device" : cur.c_str(), kText);
+		guiPanel(p, 10, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
+		guiTextBox(GUI_FONT_BODY, GuiRect(p.x + 12, p.y, p.w - 24, p.h), cur.empty() ? "Choose a device" : cur.c_str(), GUI_COL_TEXT);
 
 		const GuiRect view = focus.view(list);
 		if (dirs.empty())
-			guiTextBox(GUI_FONT_BODY, GuiRect(view.x, view.y, view.w, PICK_ROW_H), cur.empty() ? "No device found." : "No folders in here.", kDim, GUI_ALIGN_CENTER);
+			guiTextBox(GUI_FONT_BODY, GuiRect(view.x, view.y, view.w, PICK_ROW_H), cur.empty() ? "No device found." : "No folders in here.", GUI_COL_DIM, GUI_ALIGN_CENTER);
 		guiPushClip(view);
 		for (size_t i = 0; i < dirs.size(); i++) {
 			if (!focus.visible((int)i))
 				continue;
 			const GuiRect r = focus.screenRect((int)i);
 			guiRoundRect(r, 8, focus.isFocused((int)i) ? kRowFocus : kRow);
-			guiTextBox(GUI_FONT_BODY, GuiRect(r.x + 14, r.y, r.w - 28, r.h), dirs[i].c_str(), kText);
+			guiTextBox(GUI_FONT_BODY, GuiRect(r.x + 14, r.y, r.w - 28, r.h), dirs[i].c_str(), GUI_COL_TEXT);
 		}
 		guiPopClip();
 		if (dirs.size() > PICK_ROWS) {
 			const int rows = (int)dirs.size(), thumb = view.h * PICK_ROWS / rows;
 			const int y = view.y + (view.h - thumb) * focus.scroll(list) / ((rows - PICK_ROWS) * PICK_ROW_H);
 			guiRoundRect(GuiRect(view.x + view.w + 8, view.y, 6, view.h), 3, guiRgba(36, 42, 58));
-			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, kDim);
+			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, GUI_COL_DIM);
 		}
 
 		// What's in the current folder, to tell the right one.
@@ -160,7 +164,7 @@ public:
 			char buf[128];
 			snprintf(buf, sizeof(buf), "Here: %d .nds, %d .gba, %d other file%s, %d folder%s", nds, gba,
 			         files, files == 1 ? "" : "s", (int)dirs.size(), dirs.size() == 1 ? "" : "s");
-			guiText(GUI_FONT_BODY, 40, 372, buf, nds + gba ? kText : kDim, GUI_ALIGN_LEFT, 560);
+			guiText(GUI_FONT_BODY, 40, 372, buf, nds + gba ? GUI_COL_TEXT : GUI_COL_DIM, GUI_ALIGN_LEFT, 560);
 		}
 		guiButton(focus.screenRect(PICK_USE), "Use this folder", !cur.empty());
 		guiButton(focus.screenRect(PICK_UP), "Up", false);
@@ -342,12 +346,12 @@ public:
 		guiChoiceDraw(focus.screenRect(SET_CPU), "CPU", cpu, focus.isFocused(SET_CPU), false, LABEL_W);
 		guiChoiceDraw(focus.screenRect(SET_RENDER), "Render mode", render, focus.isFocused(SET_RENDER), false, LABEL_W);
 
-		guiText(GUI_FONT_BODY, 40, 166, "ROM folders", kText);
+		guiText(GUI_FONT_BODY, 40, 166, "ROM folders", GUI_COL_TEXT);
 		const LibConfig &c = libConfig();
 		const GuiRect view = focus.view(list);
 		if (c.folders.empty())
 			guiTextBox(GUI_FONT_BODY, GuiRect(view.x, view.y, view.w, FOLDER_ROW_H),
-			           "No ROM folders yet: Add folder picks one.", kDim, GUI_ALIGN_CENTER);
+			           "No ROM folders yet: Add folder picks one.", GUI_COL_DIM, GUI_ALIGN_CENTER);
 		guiPushClip(view);
 		for (int i = 0; i < (int)c.folders.size() && i < nfolders; i++) {
 			const GuiRect s = focus.screenRect(SET_SUB + i);
@@ -355,21 +359,21 @@ public:
 			if (s.y + s.h < view.y || s.y > view.y + view.h)
 				continue;
 			guiRoundRect(pathR, 8, kRow);
-			guiTextBox(GUI_FONT_BODY, GuiRect(pathR.x + 12, pathR.y, pathR.w - 24, pathR.h), c.folders[i].path.c_str(), kText);
+			guiTextBox(GUI_FONT_BODY, GuiRect(pathR.x + 12, pathR.y, pathR.w - 24, pathR.h), c.folders[i].path.c_str(), GUI_COL_TEXT);
 			guiToggleDraw(s, "Subfolders", c.folders[i].subfolders, focus.isFocused(SET_SUB + i));
 			const GuiRect d = focus.screenRect(SET_DEL + i);
 			guiRoundRect(d, 8, focus.isFocused(SET_DEL + i) ? kRowFocus : kRow);
-			guiTextBox(GUI_FONT_BODY, d, "Remove", kText, GUI_ALIGN_CENTER);
+			guiTextBox(GUI_FONT_BODY, d, "Remove", GUI_COL_TEXT, GUI_ALIGN_CENTER);
 		}
 		guiPopClip();
 		if (nfolders > FOLDER_ROWS) {
 			const int thumb = view.h * FOLDER_ROWS / nfolders;
 			const int y = view.y + (view.h - thumb) * focus.scroll(list) / ((nfolders - FOLDER_ROWS) * FOLDER_ROW_H);
 			guiRoundRect(GuiRect(view.x + view.w + 8, view.y, 6, view.h), 3, guiRgba(36, 42, 58));
-			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, kDim);
+			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, GUI_COL_DIM);
 		}
 
-		guiText(GUI_FONT_BODY, 40, 374, scanPending ? "Scanning..." : status.c_str(), kDim, GUI_ALIGN_LEFT, 560);
+		guiText(GUI_FONT_BODY, 40, 374, scanPending ? "Scanning..." : status.c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, 560);
 		if (scanPending)
 			scanDrawn = true;
 
@@ -539,13 +543,13 @@ public:
 		menuBackground();
 		menuHeader("Game settings");
 		const GuiRect p(40, 68, 560, 92);
-		guiPanel(p, 12, kPanel, kPanelEdge, 1);
+		guiPanel(p, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
 		guiImage(icon, p.x + 14, p.y + 14, 2);
 		const LibRomInfo &info = game->info;
 		const int tx = p.x + 96, tw = p.x + p.w - 14 - tx;
-		guiText(GUI_FONT_BODY, tx, p.y + 12, info.lines[0].c_str(), kText, GUI_ALIGN_LEFT, tw);
-		guiText(GUI_FONT_BODY, tx, p.y + 40, info.lines[1].c_str(), kDim, GUI_ALIGN_LEFT, tw);
-		guiText(GUI_FONT_BODY, p.x + p.w - 14, p.y + 12, info.id.c_str(), kDim, GUI_ALIGN_RIGHT);
+		guiText(GUI_FONT_BODY, tx, p.y + 12, info.lines[0].c_str(), GUI_COL_TEXT, GUI_ALIGN_LEFT, tw);
+		guiText(GUI_FONT_BODY, tx, p.y + 40, info.lines[1].c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, tw);
+		guiText(GUI_FONT_BODY, p.x + p.w - 14, p.y + 12, info.id.c_str(), GUI_COL_DIM, GUI_ALIGN_RIGHT);
 
 		guiChoiceDraw(focus.screenRect(GS_CPU), "CPU", cpu, focus.isFocused(GS_CPU), ov.cpu != LIB_CPU_DEFAULT, LABEL_W);
 		guiChoiceDraw(focus.screenRect(GS_RENDER), "Render mode", render, focus.isFocused(GS_RENDER),
@@ -560,7 +564,7 @@ public:
 			       " (highlighted).";
 		if (!error.empty())
 			note = error;
-		guiTextWrap(GUI_FONT_BODY, GuiRect(40, 280, 560, 80), note.c_str(), kDim);
+		guiTextWrap(GUI_FONT_BODY, GuiRect(40, 280, 560, 80), note.c_str(), GUI_COL_DIM);
 
 		guiButton(focus.screenRect(GS_BACK), "Back", true);
 		guiFocusFrame(focus.highlight());

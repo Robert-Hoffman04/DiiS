@@ -39,7 +39,7 @@ OPTFLAGS    =   -O3 -fno-strict-aliasing -fwrapv -fno-aggressive-loop-optimizati
 
 # TESTDEFS/TESTLDFLAGS: empty by default. Pass e.g.
 #   make TESTDEFS="-DDIIS_FORCE_CORE=1 -DDIIS_FORCE_ROM"
-# to skip the on-screen device/renderer picker and file browser and boot
+# to skip the GUI menu and the console device/renderer picker and boot
 # straight into sd:/DS/ROMS/test.nds for automated testing.
 
 # The ARM9 + ARM7 trace JIT (source/jit/) is always compiled in: a plain  make
