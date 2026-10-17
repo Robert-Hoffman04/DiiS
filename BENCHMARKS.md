@@ -7,25 +7,31 @@ in-game savestates.
 
 | Game | Before: fps | Before: ms/frame | DiiS: fps | DiiS: ms/frame | Speed-up |
 |---|--:|--:|--:|--:|--:|
-| Super Mario 64 DS | 19.3 | 52.0 | 81.9 | 12.2 | **4.3×** |
-| LEGO Indiana Jones | 10.3 | 96.7 | 48.4 | 20.7 | **4.7×** |
-| New Super Mario Bros. | 12.4 | 80.5 | 31.2 | 32.0 | **2.5×** |
-| Zelda: Spirit Tracks | 10.9 | 91.6 | 12.2 | 81.8 | 1.1× |
-| Mario Kart DS | 7.8 | 128.0 | 12.4 | 80.5 | 1.6× |
+| Super Mario 64 DS | 19.3 | 52.0 | 59.8 | 16.7 | **3.1×** (capped) |
+| LEGO Indiana Jones | 10.3 | 96.7 | 33.5 | 29.8 | **3.3×** |
+| New Super Mario Bros. | 12.4 | 80.5 | 22.1 | 45.2 | **1.8×** |
+| Zelda: Spirit Tracks | 10.9 | 91.6 | 24.7 | 40.5 | **2.3×** |
+| Mario Kart DS | 7.8 | 128.0 | 19.1 | 52.5 | **2.4×** |
 
-A real DS runs at 59.8 fps, so anything at or above that is full speed. In this test SM64 DS
-runs faster than real time because the frame limiter is off.
+A real DS runs at 59.8 fps, so anything at that rate is full speed. SM64 DS hits the frame
+limiter, so its real headroom is higher than the table shows.
 
 - **Before:** the original renderer design: GX for the screens, both CPUs interpreted (no JIT).
   This is the closest stand-in for the original DeSmuMEWii.
-- **DiiS:** the current build: ARM9 + ARM7 JIT, GX Fast render mode.
+- **DiiS:** the current build: ARM9 + ARM7 JIT, GX Fast render mode, measured on a real Wii.
 
-## Why two games barely moved
+**The two columns come from different machines.** The DiiS numbers are from a real Wii. The
+"before" numbers are from Dolphin. Dolphin underestimates CPU cost by roughly half, which flatters
+the old interpreter-only build most, so the real speed-ups are likely larger than shown.
 
-Spirit Tracks and Mario Kart DS still use a 3D feature the GX renderer can't draw yet, so
-every 3D frame falls back to the CPU renderer. That alone costs about 48 ms a frame, and
-their 2D also falls back to the CPU in part. Once those features are drawn on GX they should
-speed up like the other games.
+## What still holds games back
+
+Spirit Tracks and Mario Kart DS now draw their 3D on GX. Their remaining cost is mostly 2D
+features the GX compositor can't draw yet, which fall back to the CPU:
+
+- Spirit Tracks: OBJ mosaic, on both screens, nearly every frame.
+- Mario Kart DS: OBJ window on the top screen.
+- LEGO Indiana Jones: blended bitmap OBJs on the bottom screen.
 
 ## Known rendering issues
 
@@ -36,16 +42,16 @@ speed up like the other games.
 
 ## How this was measured
 
-- Every run uses the same savestate, which loads about 90 frames after boot. Each result is
-  the average over frames 150 to 1050, so all runs cover the same stretch of gameplay.
-- Both builds ran in Dolphin 2606a on an Intel i5-1145G7, through the project's benchmark
-  harness (`tools/benchmark/run.sh`).
-- **Dolphin isn't a real Wii.** It underestimates CPU-side cost, roughly by half on this
-  project's measurements. Expect lower fps on hardware for both builds. The speed-ups are
-  more trustworthy than the absolute numbers.
+- Every run starts from the same gameplay savestate per game.
+- **DiiS:** a real Wii, with the build's frame-time log (`-DDIIS_PERFZONES`, one log per game
+  on the SD card). Each result is the median 60-frame block of the run, skipping the first
+  three blocks (savestate load).
+- **Before:** Dolphin 2606a on an Intel i5-1145G7, through the project's benchmark harness
+  (`tools/benchmark/run.sh`), averaged over frames 150 to 1050.
 
 | | Before | DiiS |
 |---|---|---|
-| Build | commit 285f69b | commit e22b52a |
+| Build | commit 285f69b | commit fdcb4d7 + GX Fast translucency/fog/shadow fix |
+| Platform | Dolphin | Wii |
 | CPUs | interpreter (no JIT) | ARM9 + ARM7 JIT |
 | Renderer | original GX path | GX Fast |
