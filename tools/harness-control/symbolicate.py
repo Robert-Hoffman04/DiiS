@@ -19,8 +19,8 @@ a backtrace, one item per line, e.g.
 render() rewrites every 0x8xxxxxxx token in that text as
 `0x80123456 <NDS_exec+0x36>`. Standalone use:
 
-    symbolicate.py desmumewii.elf.map < crash_1.txt
-    symbolicate.py desmumewii.elf.map 0x80123456 0x80100abc
+    symbolicate.py diis.elf.map < crash_1.txt
+    symbolicate.py diis.elf.map 0x80123456 0x80100abc
 """
 
 import bisect

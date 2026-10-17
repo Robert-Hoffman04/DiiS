@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #-----------------------------------------------------------------------------
-# desmumewii benchmark - soak.sh
+# DiiS benchmark - soak.sh
 #
 # JIT_DIFFERENTIAL_TESTING soak: build a dol that runs the interpreter and
 # both JITs side by side, comparing guest state after every instruction, and

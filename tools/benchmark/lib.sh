@@ -15,9 +15,8 @@
 #-----------------------------------------------------------------------------
 BENCH_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(cd "$BENCH_HERE/../.." && pwd)"
-# The Makefile names its output after the checkout directory
-# (TARGET := $(notdir $(CURDIR))), so derive it rather than hardcoding one name.
-BENCH_TARGET="$(basename "$BENCH_ROOT")"
+# The Makefile output name is fixed (TARGET := diis in the Makefile).
+BENCH_TARGET=diis
 
 DOLPHIN_DATA="${DOLPHIN_DATA:-$HOME/.var/app/org.DolphinEmu.dolphin-emu/data/dolphin-emu}"
 DOLPHIN_SD="${DOLPHIN_SD:-$DOLPHIN_DATA/desmume-sd.raw}"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-capture.py - single-shot network capture client for the desmumewii benchmark
+capture.py - single-shot network capture client for the DiiS benchmark
 system, speaking the same unified harness wire protocol as
 tools/harness-control/wii_control.py (see that tool for interactive/live
 session control; this one is non-interactive and built for scripted runs).

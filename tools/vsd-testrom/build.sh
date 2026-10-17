@@ -27,7 +27,7 @@
 #                         scanline 96 (HBlank IRQ) -> 2 brightness bands.
 #
 # Both are BlocksDS projects built in the official container so no host toolchain
-# is needed (devkitARM will NOT produce a working ROM here - desmumewii needs the
+# is needed (devkitARM will NOT produce a working ROM here - DiiS needs the
 # BlocksDS default ARM7 / NitroFS layout).
 #
 # Requires: docker.

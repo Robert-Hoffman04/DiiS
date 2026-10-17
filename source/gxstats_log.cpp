@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii - gxstats_log.cpp   (see gxstats_log.h)
+ * DiiS - gxstats_log.cpp   (see gxstats_log.h)
  *
  * Compiled to nothing unless -DDESMUME_GXSTATS without -DDESMUME_HARNESS.
  ***************************************************************************/

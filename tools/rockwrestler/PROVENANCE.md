@@ -46,7 +46,7 @@ button input anywhere in `src7/`) -- so only `src9/framework/menu.cpp` and
    instead of via key input.
 2. `cpp_fail_test()` (called by `fail_test`/`timeout_test`/`timeout_rw`,
    `menu.s`) additionally tallies into **slot-2 expansion RAM** (guest
-   `0x09000000`+, desmumewii's `ExpMemory` addon -- the same guest range
+   `0x09000000`+, DiiS's `ExpMemory` addon -- the same guest range
    this ROM's own `enable_trace()`/`disable_trace()` debug hooks already
    poke at `0x08004400`/`0x08005500`, `common/common.cpp`): running/failed
    counts, and a capped 32-entry fail log storing each failure's
@@ -88,9 +88,9 @@ Needs `devkitARM` (`arm-none-eabi-g++`/`-objcopy`) and `ndstool` on `PATH`
 -- `/opt/devkitpro/devkitARM/bin` and `/opt/devkitpro/tools/bin`. Produces
 `out/rockwrestler.nds`.
 
-## Running against desmumewii
+## Running against DiiS
 
-Build desmumewii with `-DDESMUME_ROCKWRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDESMUME_ROCKWRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon and polls it once per frame; on
 completion it writes `sd:/rockwrestler.log` (total run/failed, plus each
 failing test's name and detail number) and quits. Stage

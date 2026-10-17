@@ -15,7 +15,8 @@ include $(DEVKITPPC)/wii_rules
 # SOURCES is a list of directories containing source code
 # INCLUDES is a list of directories containing extra header files
 #---------------------------------------------------------------------------------
-TARGET		:=	$(notdir $(CURDIR))
+# Output name is fixed (the repo folder keeps its historical name desmumewii)
+TARGET		:=	diis
 BUILD		:=	build
 SOURCES		:=	source source/metaspu \
 				source/addons source/utils source/gekko_utils \

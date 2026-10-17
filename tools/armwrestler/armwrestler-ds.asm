@@ -65,7 +65,7 @@ mov 	r1,#0x4000000
 str 	r0,[r1]	
 
 @ ===========================================================================
-@ §17 auto-run driver (desmumewii): the stock interactive menu/keys loop is
+@ §17 auto-run driver (DiiS): the stock interactive menu/keys loop is
 @ replaced with a straight-line walk over every ARM test group (RunTest is
 @ already a clean tail-dispatcher: Test0..Test5 each stmfd/ldmfd their own
 @ lr, so calling it repeatedly via `bl RunTest` from here is exactly what the

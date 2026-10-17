@@ -36,7 +36,7 @@
  *     this to stay correct.
  ***************************************************************************/
 
-// DeSmuMEWii port: vendored from VBA-GX (jit/upstream/PROVENANCE.md).
+// DiiS port: vendored from VBA-GX (jit/upstream/PROVENANCE.md).
 // P0: retargeted includes + build guard. Body unchanged.
 #include "jit.h"
 

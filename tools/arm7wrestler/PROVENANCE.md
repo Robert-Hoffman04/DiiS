@@ -36,7 +36,7 @@ Same technique as `tools/armwrestler`'s §17 patch:
    `DrawResult`/`_drawresult` call is otherwise untouched.
 2. `AW_RecordResult` (ARM, hooked into `DrawResult`) and `_TW_Record`
    (THUMB, hooked into `_drawresult`) tally results into **slot-2 expansion
-   RAM** (guest `0x09000000`+, desmumewii's `ExpMemory` addon), using the
+   RAM** (guest `0x09000000`+, DiiS's `ExpMemory` addon), using the
    *same* header layout `tools/armwrestler` established: ARM total/fail at
    `+0x04`/`+0x08`, THUMB total/fail at `+0x0C`/`+0x10`, a shared 32-entry
    fail log at `+0x14`/`+0x18..`. Both ARM and THUMB tests run on the same
@@ -89,9 +89,9 @@ Needs `devkitARM` (`arm-none-eabi-as`/`-ld`/`-objcopy`) and `ndstool` on
 `PATH` -- `/opt/devkitpro/devkitARM/bin` and `/opt/devkitpro/tools/bin`.
 Produces `out/arm7wrestler.nds`.
 
-## Running against desmumewii
+## Running against DiiS
 
-Build desmumewii with `-DDESMUME_ARM7WRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDESMUME_ARM7WRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM9 JIT (this ROM's ARM9
 side is a trivial idle/vram-copy stub -- nothing to gain there; **leaves the
 ARM7 JIT setting alone**, unlike `-DDESMUME_ARMWRESTLER_PROBE` which forces

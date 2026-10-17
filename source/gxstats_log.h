@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii - gxstats_log.h
+ * DiiS - gxstats_log.h
  *
  * Task hw-measure: a harness-less sink for the harness_profile_emit[f]() stat
  * lines (the GX gate/bail counters: -DDSB_STATS "dsa"/"dsaw"/"dsb"/"dsbw"...,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-wire.py - the DeSmuMEWii unified harness wire protocol (plan §2).
+wire.py - the DiiS unified harness wire protocol (plan §2).
 
 One TCP connection, one length-framed protocol, every packet type the harness
 needs. Header is fixed 10 bytes, big-endian:
@@ -17,7 +17,7 @@ This module is the single source of truth for the constants; the device side
 
 import struct
 
-MAGIC = b"DSMH"          # DeSmuMEWii Harness
+MAGIC = b"DSMH"          # DiiS Harness (magic kept from the old name)
 VERSION = 1
 HEADER = struct.Struct(">4sBBI")   # magic, version, type, payload_length
 HEADER_LEN = HEADER.size           # 10

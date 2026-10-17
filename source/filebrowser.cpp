@@ -244,7 +244,7 @@ static ret_action textFileBrowser(file_browser_st *file_struct){
 int FileBrowser( char *dir ) {
 
 	file_browser_st game_filename;
-	strcpy(game_filename.title, "Welcome to DeSmuME Wii!\n\nWARNING! If you paid for this software, you have been scammed!");
+	strcpy(game_filename.title, "Welcome to DiiS!\n\nWARNING! If you paid for this software, you have been scammed!");
 
 	sprintf(game_filename.path, "%s", dir);
 

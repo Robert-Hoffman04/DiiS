@@ -1,5 +1,5 @@
 /*
-    geckoinput.h - route controller input into DeSmuME Wii through the
+    geckoinput.h - route controller input into DiiS through the
     USB Gecko / EXI "debug serial" channel (EXI channel 1 / memory-card slot B).
 
     Dolphin emulates a USB Gecko when Slot B is set to "USB Gecko"; it exposes a

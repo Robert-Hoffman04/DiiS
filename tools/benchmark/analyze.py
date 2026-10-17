@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyse a desmumewii benchmark run (tools/benchmark/run.sh) and diff it
+Analyse a DiiS benchmark run (tools/benchmark/run.sh) and diff it
 against the previous one.
 
 A run directory has raw/perf_<scene>_<mode>/ (fps + perf-zones breakdown,
@@ -313,7 +313,7 @@ def _jit_cache_line(jit_cache):
 
 def print_summary(res):
     print()
-    print("  DeSmuME Wii benchmark  -  emulation speed vs real DS (%.4f Hz)" % TARGET_HZ)
+    print("  DiiS benchmark  -  emulation speed vs real DS (%.4f Hz)" % TARGET_HZ)
     m = res.get("meta", {})
     if m:
         print("  %s  |  git %s  |  %s" % (m.get("timestamp", "?"), m.get("git", "?"), m.get("host", "?")))
@@ -417,7 +417,7 @@ def print_comparison(cur, prev_path):
 def write_report(res, path, prev_path):
     L = []
     m = res.get("meta", {})
-    L.append("# DeSmuME Wii benchmark\n")
+    L.append("# DiiS benchmark\n")
     L.append("Emulation speed as a fraction of real DS hardware (%.4f Hz). "
              "Below 100%% = slow motion.\n" % TARGET_HZ)
     L.append("| field | value |")
@@ -540,7 +540,7 @@ def write_report(res, path, prev_path):
 
 # -------------------------------------------------------------------- main ---
 def main():
-    ap = argparse.ArgumentParser(description="Analyse a desmumewii benchmark run.")
+    ap = argparse.ArgumentParser(description="Analyse a DiiS benchmark run.")
     ap.add_argument("rundir", nargs="?", help="run directory containing raw/")
     ap.add_argument("--scenes", help="path to scenes.conf (default: alongside this script)")
     ap.add_argument("--wrestlers", help="path to wrestlers.conf (default: alongside this script)")

@@ -1,11 +1,11 @@
 /****************************************************************************
- * DeSmuMEWii ARM7 JIT
+ * DiiS ARM7 JIT
  *
  * jit_debug.h
  *
  * No-op debug/profiler macro shims for the vendored VBA-GX JIT infrastructure.
  * Upstream (VBA-GX) provides these from Debug.h behind VBAGX_DEBUG; the
- * DeSmuMEWii port keeps the call sites intact and stubs them here until the
+ * DiiS port keeps the call sites intact and stubs them here until the
  * Profiler / JITDebugStateLog subsystems are ported (plan phase P5).
  *
  * Derived from Visual Boy Advance GX source/vba/gba/Debug.h

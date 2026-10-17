@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii ARM9 JIT
+ * DiiS ARM9 JIT
  *
  * jit_arm9_profile.cpp
  *
@@ -18,8 +18,7 @@
  * (M32 = 2 on the 32-bit bus, main-RAM word = 4, slow-wait up to 16; combined as
  * max(alu, mem) for the 5-stage pipeline -- MMU_timing.h). v1 assumes the common
  * case (cached / main RAM); the hardened harness's per-block cycle compare
- * quantifies the drift. canEnterArm stays false until A5. See
- * desmumewii-arm9-jit-plan.md.
+ * quantifies the drift.
  ***************************************************************************/
 
 #include "jit.h"

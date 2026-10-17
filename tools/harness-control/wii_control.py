@@ -282,7 +282,7 @@ def main():
                     help="directory for logs / captured frames / crash dumps")
     ap.add_argument("--map", default=None,
                     help="linker .map file for CRASH symbolication "
-                         "(e.g. desmumewii.elf.map)")
+                         "(e.g. diis.elf.map)")
     ap.add_argument("--watchdog", type=float, default=0,
                     help="seconds of device silence before sending CTRL next_rom "
                          "(0 = disabled)")

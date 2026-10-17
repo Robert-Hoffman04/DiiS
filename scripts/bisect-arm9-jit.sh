@@ -159,7 +159,9 @@ for line in "${COMMITS[@]}"; do
     fi
     rm -f "$BUILD_LOG"
 
-    DOL_NAME="$(basename "$REPO_DIR").dol"
+    # Current Makefile emits diis.dol; older commits named it after the folder.
+    DOL_NAME="diis.dol"
+    [ -f "$DOL_NAME" ] || DOL_NAME="$(basename "$REPO_DIR").dol"
     if [ ! -f "$DOL_NAME" ]; then
         echo "  ERROR: expected output '$DOL_NAME' not found after build, skipping."
         echo "$idx,$hash,\"$subject\",no-dol,skip," >> "$LOG_FILE"

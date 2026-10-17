@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 //
-// GX-merge two-bucket functional test ROM for desmumewii.
+// GX-merge two-bucket functional test ROM for DiiS.
 //
 // Unlike the Volumetric Shadow Demo (which drives the main screen in framebuffer
 // display mode + display capture, so every frame falls back to the legacy
@@ -28,7 +28,7 @@
 // front blend reproduces.  OBJ0 is moved behind the 3D in this build because the
 // frontAlphaOver path requires an empty front sprite bucket.
 //
-// Status: renders correctly under the software rasterizer (ds_sw).  desmumewii's
+// Status: renders correctly under the software rasterizer (ds_sw).  DiiS's
 // GX 3D core currently stalls on this ROM (a plain BG0=3D scene with no display
 // capture) - see tools/vsd-testrom/README.md; that is a pre-existing GX-core
 // issue, not something the GX-merge redesign introduced, and it blocks GX-core
@@ -234,7 +234,7 @@ int main(void)
 	setup3D();
 
 	printf("\x1b[2J");
-	printf("desmumewii GX-merge test\n-----------------------\n");
+	printf("DiiS GX-merge test\n-----------------------\n");
 	printf("BG1 checker : behind 3D\n");
 	printf("BG2 band    : front of 3D\n");
 	printf("red  sprite : front of 3D\n");

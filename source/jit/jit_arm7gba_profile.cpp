@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii ARM7 JIT
+ * DiiS ARM7 JIT
  *
  * jit_arm7gba_profile.cpp
  *

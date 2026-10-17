@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii ARM9 JIT
+ * DiiS ARM9 JIT
  *
  * jit_arm.cpp
  *
@@ -62,8 +62,7 @@
  *        macros exactly. Routed through the shared ALU core. Rn/Rm/Rs == pc
  *        (pipeline+12 read) ends the trace.
  * Everything else ends the trace cleanly at that PC (the interpreter takes
- * it) -- never a guess. See desmumewii-arm9-jit-plan.md phase A5 / the plan
- * file, and jit_thumb.cpp for the shared idioms.
+ * it) -- never a guess. See jit_thumb.cpp for the shared idioms.
  ***************************************************************************/
 
 #include "jit_trace.h"

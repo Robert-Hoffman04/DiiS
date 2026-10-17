@@ -31,7 +31,7 @@
  *     one place.
  *
  * ---------------------------------------------------------------------------
- * DeSmuMEWii port: vendored verbatim from VBA-GX (see jit/upstream/PROVENANCE.md).
+ * DiiS port: vendored verbatim from VBA-GX (see jit/upstream/PROVENANCE.md).
  * Unchanged for phase P0. The packed-flag bit positions (FLAG_BIT_N..V) are
  * retargeted onto ARM CPSR bit order in phase P1.
  * ---------------------------------------------------------------------------

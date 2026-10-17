@@ -1133,7 +1133,7 @@ static void bench_tick(u64 exec_ticks, u64 draw_ticks)
 		t_block = now;
 		FILE *f = fopen("sd:/bench.log", "w");
 		if (f) {
-			fprintf(f, "# desmumewii bench  core=%d  target_hz=59.8261\n",
+			fprintf(f, "# diis bench  core=%d  target_hz=59.8261\n",
 			        (int)current3Dcore);
 			fprintf(f, "frame,wall_us,block_us,exec_us,draw_us\n");
 			fclose(f);
@@ -2114,7 +2114,7 @@ bool PickDevice(){
 
 		printf("\x1b[2J");
 		printf("\x1b[2;0H");
-		printf("Welcome to DeSmuME Wii!!!\n\n");
+		printf("Welcome to DiiS!!!\n\n");
 		printf("Select Device: << ");
 		printf("%s", device ? "USB >>" : "SD >>");
 		printf("\nSelect CPU \\/ ");
@@ -2163,7 +2163,7 @@ void ShowCredits() {
 	printf("\x1b[2J");
 	printf("\x1b[2;0H");
 	
-	printf("DeSmuME Wii\n\n");
+	printf("DiiS\n\n");
 	printf("http://code.google.com/p/desmumewii\n\n");
 	printf("Written By:\n\n");
 	printf("Arikado - http://arikadosblog.blogspot.com\n");

@@ -8,7 +8,7 @@ These files are copied **verbatim** from Visual Boy Advance GX:
 * Author:     Daryl Borth (JIT © 2026)
 * Licence:    GNU GPL v2 (VBA-GX / VBA-M's own banner text specifies
               "Version 2.0" only, with no "or later" grant -- see
-              https://github.com/visualboyadvance-m). DeSmuMEWii's own files
+              https://github.com/visualboyadvance-m). DiiS's own files
               are licensed "GPL v2 or later", so the combined work is
               distributed under plain GPLv2 (the version both sides permit);
               this is also why the repo root `LICENSE.txt` carries the GPLv2
@@ -28,7 +28,7 @@ Files:
 | `Profiler.{h,cpp}`     | `source/vba/gba/Profiler.{h,cpp}` |
 
 **Nothing in this `upstream/` directory is compiled.** It is a frozen reference
-copy so the DeSmuMEWii port in `source/jit/` can be diffed against its
+copy so the DiiS port in `source/jit/` can be diffed against its
 origin. The compiled port files (`jit_*.{h,cpp,S}` one level up) are derived
 from these and carry their own headers noting the port.
 

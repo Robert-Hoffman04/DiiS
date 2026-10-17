@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #-----------------------------------------------------------------------------
-# desmumewii benchmark - run.sh
+# DiiS benchmark - run.sh
 #
 # One pass over everything: the renderer/JIT fps matrix (scenes.conf) and the
 # correctness probe ROMs (wrestlers.conf), all captured live over the unified

@@ -30,7 +30,7 @@ are patched (search for "§17" in each file) to:
    `_drawresult` is touched.
 2. Tally every `DrawResult` / `_drawresult` call (the single existing
    pass/fail choke point each test already goes through to draw OK/BAD) into
-   **slot-2 expansion RAM** (guest `0x09000000`+, backed by desmumewii's
+   **slot-2 expansion RAM** (guest `0x09000000`+, backed by DiiS's
    `NDS_ADDON_EXPMEMORY` addon -- flat host RAM, no flash/SRAM protocol to
    drive) instead of only the screen: counts, plus up to 32 {name-string
    pointer, raw bitmask} failure records. See the header comment on
@@ -40,7 +40,7 @@ are patched (search for "§17" in each file) to:
    landed, so a host-side poll can never observe a half-written result.
 
 This "write results into slot-2 instead of the screen" trick generalises:
-any DS emulator that emulates the GBA-slot address space (desmumewii's
+any DS emulator that emulates the GBA-slot address space (DiiS's
 `ExpMemory` addon; melonDS's own GBA-slot SRAM/flash emulation is the same
 idea) can read the same bytes back with no input-injection or
 framebuffer-capture harness needed.
@@ -55,9 +55,9 @@ Needs `devkitARM` (`arm-none-eabi-as`/`-ld`/`-objcopy`) and `ndstool` on
 `PATH` -- `/opt/devkitpro/devkitARM/bin` and `/opt/devkitpro/tools/bin`.
 Produces `out/armwrestler.nds`.
 
-## Running against desmumewii
+## Running against DiiS
 
-Build desmumewii with `-DDESMUME_ARMWRESTLER_PROBE` (`source/main.cpp`):
+Build DiiS with `-DDESMUME_ARMWRESTLER_PROBE` (`source/main.cpp`):
 selects the `ExpMemory` slot-2 addon, disables the ARM7 JIT (armwrestler's
 ARM7 side is a no-op stub, nothing to gain there), and polls slot-2 for the
 sentinel once per frame; on completion it writes `sd:/armwrestler.log` (ARM

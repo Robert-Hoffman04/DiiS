@@ -13,7 +13,7 @@
 #
 # Everything is overridable from the environment:
 #   DOLPHIN_DATA    Dolphin flatpak data dir (SD images, configs)
-#   DOLPHIN_SD      FAT image desmumewii reads sd:/ from
+#   DOLPHIN_SD      FAT image DiiS reads sd:/ from
 #   DOL_DIR         directory holding the .dol builds (basename form of
 #                   dolphin_launch resolves against this)
 #   DOLPHIN_SLOTB   Dolphin EXI Slot B device index ("" = leave default,

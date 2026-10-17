@@ -1,6 +1,6 @@
 # tools/harness-control
 
-Desktop side of the DeSmuMEWii unified test harness
+Desktop side of the DiiS unified test harness
 (`docs/PLAN.md`, "Test harness & network transport"). This is **live session control**:
 launching a build, talking to it over the network transport, receiving
 logs / frames / profiles / crashes, driving input and control commands.
@@ -22,10 +22,10 @@ concern, kept separate on purpose.
 ```sh
 # terminal 1 - start the server
 tools/harness-control/wii_control.py --host 127.0.0.1 --port 4300 \
-    --out harness-out --map desmumewii.elf.map
+    --out harness-out --map diis.elf.map
 
 # terminal 2 - launch a DESMUME_HARNESS build in headless Dolphin
-tools/harness-control/launch.sh dolphin build/desmumewii.dol
+tools/harness-control/launch.sh dolphin build/diis.dol
 ```
 
 A single `LOG` round-trip is enough to prove the path before anything is built

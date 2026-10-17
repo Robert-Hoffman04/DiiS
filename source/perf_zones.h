@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii - perf_zones.h
+ * DiiS - perf_zones.h
  *
  * A tiny wall-clock "where does the frame go" accountant, built for
  * optimization work on the trace JIT. It splits each emulated frame's CPU

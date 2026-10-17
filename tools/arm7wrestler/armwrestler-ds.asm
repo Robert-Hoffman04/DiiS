@@ -42,7 +42,7 @@ str 	r0,[r1]
 mov 	r10,#0
 
 @ ===========================================================================
-@ §18 auto-run driver (desmumewii): same technique as the §17 armwrestler
+@ §18 auto-run driver (DiiS): same technique as the §17 armwrestler
 @ patch (tools/armwrestler/PROVENANCE.md) -- replace the stock interactive
 @ menu/keys loop with a straight-line walk over every ARM test group and
 @ every THUMB test group, harvesting results into slot-2 expansion RAM
@@ -107,7 +107,7 @@ mov 	r10,#0
 	@ style call, ARM Test0..5 and THUMB _test0 all completed correctly,
 	@ then execution silently died with THUMB _test0's own `pop {pc}`
 	@ returning into ARM driver bytes still in THUMB state, decoding them
-	@ as garbage THUMB opcodes -- desmumewii's ARM7 interpreter getting
+	@ as garbage THUMB opcodes -- DiiS's ARM7 interpreter getting
 	@ this ARMv4T-vs-ARMv5 distinction right is *exactly* the kind of thing
 	@ this ROM exists to catch, just not the kind it was expected to catch
 	@ in its own test driver.

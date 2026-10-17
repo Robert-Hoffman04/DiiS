@@ -1,5 +1,5 @@
 /****************************************************************************
- * DeSmuMEWii - perf_zones.cpp   (see perf_zones.h)
+ * DiiS - perf_zones.cpp   (see perf_zones.h)
  *
  * Compiled to nothing unless -DDESMUME_PERFZONES.
  ***************************************************************************/
@@ -236,7 +236,7 @@ static void pz_emit_header(void)
 {
 	static char line[PZ_LINE_MAX];
 	int n = snprintf(line, sizeof(line),
-		"# desmumewii perfzones  block=%d\n" PZ_PMC_COMMENT "frame,wall_us", DESMUME_PERFZONES_BLOCK);
+		"# diis perfzones  block=%d\n" PZ_PMC_COMMENT "frame,wall_us", DESMUME_PERFZONES_BLOCK);
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
 		n += snprintf(line + n, sizeof(line) - n, ",%s_us", pzName(i));
 	for (int i = 0; i < PZ_COUNT && n > 0 && n < (int)sizeof(line); i++)
@@ -270,7 +270,7 @@ static void pz_emit_header(void)
 {
 	FILE* f = fopen("sd:/perfzones.log", "w");
 	if (!f) return;
-	fprintf(f, "# desmumewii perfzones  block=%d\n", DESMUME_PERFZONES_BLOCK);
+	fprintf(f, "# diis perfzones  block=%d\n", DESMUME_PERFZONES_BLOCK);
 	fprintf(f, PZ_PMC_COMMENT "frame,wall_us");
 	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_us", pzName(i));
 	for (int i = 0; i < PZ_COUNT; i++) fprintf(f, ",%s_hits", pzName(i));

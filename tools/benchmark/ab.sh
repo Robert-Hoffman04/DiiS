@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #-----------------------------------------------------------------------------
-# desmumewii benchmark - ab.sh
+# DiiS benchmark - ab.sh
 #
 # Generic two-config A/B probe: build two dols (a "before" and an "after"
 # JITDEFS/TESTDEFS pair, optionally with the working tree's uncommitted

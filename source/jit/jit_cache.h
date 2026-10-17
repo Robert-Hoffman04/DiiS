@@ -38,7 +38,7 @@
 #include "jit_ppc_emitter.h"
 #include "jit_debug.h"
 
-// DeSmuMEWii port: vendored from VBA-GX (jit/upstream/PROVENANCE.md).
+// DiiS port: vendored from VBA-GX (jit/upstream/PROVENANCE.md).
 // P1: the hard-coded "code can live in bank 2 / bank 3" SMC test is now driven
 // by smcBankMask, set from JitCpuProfile at initialize() time. For the DS ARM7
 // the tracked banks happen to be the same nibbles -- 0x02xxxxxx main RAM and
