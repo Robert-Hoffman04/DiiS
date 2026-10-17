@@ -252,6 +252,17 @@ void guiRect(const GuiRect &r, GuiColor c)
 	solid(r.x, r.y, r.w, r.h, guiApplyAlpha(c));
 }
 
+void guiTriangle(int x0, int y0, int x1, int y1, int x2, int y2, GuiColor c)
+{
+	c = guiApplyAlpha(c);
+	guiBindMask(&s_whiteTex);
+	GX_Begin(GX_TRIANGLES, GUI_VTXFMT, 3);
+	guiVtx(x0, y0, c, 0, 0);
+	guiVtx(x1, y1, c, 0, 0);
+	guiVtx(x2, y2, c, 0, 0);
+	GX_End();
+}
+
 void guiRectGradient(const GuiRect &r, GuiColor top, GuiColor bottom)
 {
 	if (r.empty())

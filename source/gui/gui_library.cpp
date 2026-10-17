@@ -3,10 +3,9 @@
  *
  * The menu's home (menu rework phase 3): the Library screen (icon grid of
  * the scanned games, All / DS / GBA filter, Settings), the Game screen
- * (large icon, title lines, id, Play / Load state / Game settings) and
- * placeholders for Settings (with the About text) and Game settings until
- * phase 4. guiLibraryRun() returns the picked ROM and savestate slot; main()
- * boots it.
+ * (large icon, title lines, id, Play / Load state / Game settings).
+ * Settings and Game settings are gui_settings.cpp. guiLibraryRun() returns
+ * the picked ROM and savestate slot; main() boots it.
  *
  * -DDIIS_GUI_TEST (Dolphin screenshot builds) scans sd:/DiiStest when it
  * exists instead of the configured folders.
@@ -18,12 +17,11 @@
 #include <sys/stat.h>
 #include <string>
 
-#include "gui.h"
-#include "../library/library.h"
+#include "gui_menu.h"
 
-static const GuiColor kText = guiRgba(236, 240, 248), kDim = guiRgba(150, 160, 180);
-static const GuiColor kPanel = guiRgba(30, 36, 52), kPanelEdge = guiRgba(58, 68, 92);
-static const GuiColor kAccent = guiRgba(56, 120, 200), kCell = guiRgba(24, 29, 42), kCellFocus = guiRgba(44, 56, 82);
+static const GuiColor kText = GUI_COL_TEXT, kDim = GUI_COL_DIM;
+static const GuiColor kPanel = GUI_COL_PANEL, kPanelEdge = GUI_COL_PANEL_EDGE;
+static const GuiColor kAccent = GUI_COL_ACCENT, kCell = guiRgba(24, 29, 42), kCellFocus = guiRgba(44, 56, 82);
 
 #define NUM_SLOTS 10
 
@@ -40,63 +38,6 @@ static const GuiImage &entryIcon(const LibEntry &e)
 {
 	return e.icon.data ? e.icon : guiGenericIcon(e.game->info.isGba);
 }
-
-static void drawBackground()
-{
-	guiRectGradient(GuiRect(0, 0, GUI_W, GUI_H), guiRgba(26, 32, 48), guiRgba(10, 12, 20));
-}
-
-static void drawButton(const GuiRect &r, const char *label, bool primary)
-{
-	guiRoundRect(r, 10, primary ? kAccent : kPanel);
-	guiTextBox(GUI_FONT_BODY, r, label, kText, GUI_ALIGN_CENTER);
-}
-
-static void drawHeader(const char *title)
-{
-	guiText(GUI_FONT_TITLE, 40, 20, "DiiS", kText);
-	if (title)
-		guiText(GUI_FONT_BODY, 112, 28, title, kDim);
-}
-
-//---------------------------------------------------------------------------
-// Placeholders (phase 4 replaces them).
-//---------------------------------------------------------------------------
-class PlaceholderScreen : public GuiScreen {
-public:
-	PlaceholderScreen(const char *t, const char *m, bool about) : title(t), msg(m), showAbout(about) {}
-	void enter()
-	{
-		focus.clear();
-		const int g = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(g, 0, GuiRect(40, 412, 120, 40));
-	}
-	void draw()
-	{
-		drawBackground();
-		drawHeader(title);
-		const GuiRect p(40, 72, 560, 96);
-		guiPanel(p, 12, kPanel, kPanelEdge, 1);
-		guiTextWrap(GUI_FONT_BODY, p.inset(14), msg, kDim);
-		if (showAbout) {
-			// The old console menu's credits ("Press B to see the credits").
-			const GuiRect a(40, 180, 560, 216);
-			guiPanel(a, 12, kPanel, kPanelEdge, 1);
-			guiText(GUI_FONT_TITLE, a.x + 14, a.y + 8, "About DiiS", kText);
-			guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 48, a.w - 28, a.h - 56),
-			            "http://code.google.com/p/desmumewii\n"
-			            "Written by: Arikado (arikadosblog.blogspot.com), scanff, DCN, firnis, baby.lueshi\n"
-			            "With contributions from Cyan\n"
-			            "Based on DeSmuME.", kDim);
-		}
-		drawButton(focus.screenRect(0), "Back", true);
-		guiFocusFrame(focus.highlight());
-	}
-	void activate(int) { guiPop(); }
-private:
-	const char *title, *msg;
-	bool showAbout;
-};
 
 //---------------------------------------------------------------------------
 // Game screen
@@ -142,8 +83,8 @@ public:
 
 	void draw()
 	{
-		drawBackground();
-		drawHeader(entry.game->info.isGba ? "GBA game" : "DS game");
+		menuBackground();
+		menuHeader(entry.game->info.isGba ? "GBA game" : "DS game");
 
 		const GuiRect p(40, 68, 560, 152);
 		guiPanel(p, 12, kPanel, kPanelEdge, 1);
@@ -154,8 +95,8 @@ public:
 			guiText(GUI_FONT_BODY, tx, p.y + 14 + l * 28, info.lines[l].c_str(), l ? kDim : kText, GUI_ALIGN_LEFT, tw);
 		guiText(GUI_FONT_BODY, tx, p.y + 14 + 3 * 28 + 10, info.id.c_str(), kDim, GUI_ALIGN_LEFT, tw);
 
-		drawButton(focus.screenRect(BTN_PLAY), "Play", true);
-		drawButton(focus.screenRect(BTN_SETTINGS), "Game settings", false);
+		guiButton(focus.screenRect(BTN_PLAY), "Play", true);
+		guiButton(focus.screenRect(BTN_SETTINGS), "Game settings", false);
 
 		guiText(GUI_FONT_BODY, 40, 300, "Load state", kText);
 		if (!nslots)
@@ -174,7 +115,7 @@ public:
 	void activate(int id)
 	{
 		if (id == BTN_SETTINGS) {
-			guiPush(new PlaceholderScreen("Game settings", "Per-game settings arrive in the next update.", false));
+			guiPush(newGameSettingsScreen(entry.game, entryIcon(entry)));
 			return;
 		}
 		s_pickRom = entry.game->path;
@@ -204,19 +145,19 @@ class LibraryScreen : public GuiScreen {
 public:
 	LibraryScreen() : filter(0), grid(0)
 	{
-		const std::vector<LibGame> &games = libScan(false);   // sorted by first title line
-		for (size_t i = 0; i < games.size(); i++) {
-			LibEntry e;
-			e.game = &games[i];
-			if (games[i].hasIcon)
-				guiImageCreate(e.icon, games[i].icon, LIB_ICON_W, LIB_ICON_H);
-			all.push_back(e);
-		}
+		load(libScan(false));   // sorted by first title line
 	}
-	~LibraryScreen()
+	~LibraryScreen() { unload(); }
+
+	void resume()
 	{
-		for (size_t i = 0; i < all.size(); i++)
-			guiImageFree(all[i].icon);
+		// Settings changed the ROM folders or rescanned: the entries point
+		// into the old scan.
+		if (generation != libGeneration()) {
+			unload();
+			load(libScan(false));
+			enter();
+		}
 	}
 
 	void enter()
@@ -253,9 +194,7 @@ public:
 	void activate(int id)
 	{
 		if (id == TAB_SETTINGS) {
-			guiPush(new PlaceholderScreen("Settings",
-			        "Global settings and ROM folders arrive in the next update. Until then, ROM folders "
-			        "are the folderN= lines in DiiS/config.ini.", true));
+			guiPush(newSettingsScreen());
 		} else if (id >= TAB_BASE) {
 			filter = id - TAB_BASE;
 			enter();
@@ -268,8 +207,8 @@ public:
 
 	void draw()
 	{
-		drawBackground();
-		drawHeader("Library");
+		menuBackground();
+		menuHeader("Library");
 		for (int t = 0; t < 4; t++) {
 			const GuiRect r = focus.screenRect(TAB_BASE + t);
 			guiRoundRect(r, 10, t == filter ? kAccent : kPanel);
@@ -329,6 +268,25 @@ private:
 	std::vector<int> shown;
 	int filter;   // 0 all, 1 DS, 2 GBA
 	int grid;
+	unsigned generation;
+
+	void load(const std::vector<LibGame> &games)
+	{
+		generation = libGeneration();
+		for (size_t i = 0; i < games.size(); i++) {
+			LibEntry e;
+			e.game = &games[i];
+			if (games[i].hasIcon)
+				guiImageCreate(e.icon, games[i].icon, LIB_ICON_W, LIB_ICON_H);
+			all.push_back(e);
+		}
+	}
+	void unload()
+	{
+		for (size_t i = 0; i < all.size(); i++)
+			guiImageFree(all[i].icon);
+		all.clear();
+	}
 };
 
 int guiLibraryRun(std::string &rom, int &stateSlot)

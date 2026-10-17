@@ -454,8 +454,10 @@ int guiRun(GuiScreen *root)
 		}
 		if (in.down & GUI_BTN_UP) top->focus.move(0, -1);
 		if (in.down & GUI_BTN_DOWN) top->focus.move(0, 1);
-		if (in.down & GUI_BTN_LEFT) top->focus.move(-1, 0);
-		if (in.down & GUI_BTN_RIGHT) top->focus.move(1, 0);
+		// Left/Right go to the focused item first (choice controls).
+		const int f = top->focus.focused();
+		if ((in.down & GUI_BTN_LEFT) && !(f >= 0 && top->step(f, -1))) top->focus.move(-1, 0);
+		if ((in.down & GUI_BTN_RIGHT) && !(f >= 0 && top->step(f, 1))) top->focus.move(1, 0);
 		focusMoved(top, before);
 		if (in.down & GUI_BTN_A) {
 			// With the pointer shown, A acts on what it points at (nothing if

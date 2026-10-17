@@ -76,6 +76,7 @@ void guiRoundRect(const GuiRect &r, int radius, GuiColor c);
 // Rounded panel: fill, then a borderW-pixel border on top (borderW 0: none).
 void guiPanel(const GuiRect &r, int radius, GuiColor fill, GuiColor border, int borderW);
 void guiFade(u8 a);                       // black over the whole canvas
+void guiTriangle(int x0, int y0, int x1, int y1, int x2, int y2, GuiColor c);
 
 // Clipping (scissor); nests by intersection.
 void guiPushClip(const GuiRect &r);
@@ -199,9 +200,41 @@ public:
 	virtual void activate(int id) {}               // A on the focused item / pointer click
 	virtual void focusChanged(int id) {}
 	virtual bool back() { return true; }           // B: true = pop this screen
+	virtual bool step(int id, int dir) { return false; }   // Left/Right (-1/+1) on the focused item: true = used, no focus move
 	virtual bool opaque() const { return true; }   // false: the screen below is drawn first (dialogs)
 	GuiFocus focus;
 };
+
+//---------------------------------------------------------------------------
+// Widgets (gui_widgets.cpp): the menu's palette and standard controls.
+//---------------------------------------------------------------------------
+static const GuiColor GUI_COL_TEXT = guiRgba(236, 240, 248), GUI_COL_DIM = guiRgba(150, 160, 180);
+static const GuiColor GUI_COL_PANEL = guiRgba(30, 36, 52), GUI_COL_PANEL_EDGE = guiRgba(58, 68, 92);
+static const GuiColor GUI_COL_ACCENT = guiRgba(56, 120, 200);
+
+void guiButton(const GuiRect &r, const char *label, bool primary);
+
+// Choice (cycle) control: the label on the left, "<  value  >" on the right.
+// A screen forwards Left/Right on the focused row from GuiScreen::step() and
+// A / a click from activate() (guiChoiceClick: a click on the left arrow
+// steps back). An on/off toggle is a choice with two values.
+struct GuiChoice {
+	std::vector<std::string> values;
+	int sel;
+	GuiChoice() : sel(0) {}
+	void add(const std::string &v) { values.push_back(v); }
+	bool step(int dir);                         // wraps; false with fewer than two values
+	const char *value() const { return sel >= 0 && sel < (int)values.size() ? values[sel].c_str() : ""; }
+};
+// labelW: width of the label column (0: the value area takes the right half;
+// -1: no label, the value fills the row).
+// marked: draw the value in the accent colour (e.g. a per-game override).
+void guiChoiceDraw(const GuiRect &r, const char *label, const GuiChoice &c, bool focused, bool marked = false, int labelW = 0);
+int guiChoiceClick(const GuiRect &r, int labelW = 0);   // A / click on r: -1 on the left arrow, else +1
+
+// On/off switch row: the label on the left, a switch on the right. A / a
+// click flips it (the screen's activate()); Left/Right stay navigation.
+void guiToggleDraw(const GuiRect &r, const char *label, bool on, bool focused);
 
 #define GUI_EXIT (-1)   // Home, console Reset/Power or Wiimote power: caller calls sys_exit()
 

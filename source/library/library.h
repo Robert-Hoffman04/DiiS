@@ -77,6 +77,10 @@ bool libSaveConfig();
 // Scan every configured folder; unchanged files (same path, size, mtime) come
 // from library.cache. force=true re-reads every ROM. Sorted by first title line.
 const std::vector<LibGame> &libScan(bool force);
+// Bumped by every libScan() (which replaces the vector it returns): holders
+// of LibGame pointers compare it to know theirs are stale.
+unsigned libGeneration();
+const std::vector<LibGame> &libGames();   // the last scan's result
 
 // Existing game folder for `id` ("" if none), and create-on-demand.
 std::string libFindGameDir(const std::string &id);
@@ -84,6 +88,9 @@ std::string libEnsureGameDir(const LibRomInfo &info);
 
 bool libLoadGameSettings(const std::string &dir, LibGameSettings &out);
 bool libSaveGameSettings(const std::string &dir, const LibRomInfo &info, const char *romPath, const LibGameSettings &s);
+// A library game's overrides -> its game.ini, creating its folder (and
+// setting its LibGame::dir) when it has none yet.
+bool libSaveGameOverrides(const LibGame &g, const LibGameSettings &s);
 
 // Move old saves for `romPath` into `dir`. Returns the number moved; notes
 // (moves, and files left behind because the destination already exists or

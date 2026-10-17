@@ -22,6 +22,7 @@ static std::string s_root;          // "<device>/DiiS"
 static std::string s_legacy;        // old flat save dir
 static LibConfig s_cfg;
 static std::vector<LibGame> s_games;
+static unsigned s_generation;
 
 //---------------------------------------------------------------------------
 // Small helpers
@@ -221,6 +222,18 @@ bool libSaveGameSettings(const std::string &dir, const LibRomInfo &info, const c
 	return ini.save(join(dir, "game.ini").c_str(), "DiiS per-game settings (cpu/render only when not the global default)");
 }
 
+bool libSaveGameOverrides(const LibGame &g, const LibGameSettings &s)
+{
+	std::string dir = g.dir;
+	if (dir.empty()) {
+		dir = libEnsureGameDir(g.info);
+		if (dir.empty()) return false;
+		for (size_t i = 0; i < s_games.size(); i++)
+			if (s_games[i].info.id == g.info.id) s_games[i].dir = dir;
+	}
+	return libSaveGameSettings(dir, g.info, g.path.c_str(), s);
+}
+
 // GBA user overrides from the game folder: banner.ini lines, 32x32 icon.png.
 static void apply_user_files(LibGame &g)
 {
@@ -413,8 +426,12 @@ const std::vector<LibGame> &libScan(bool force)
 	}
 	if (dirty) save_cache(raw);
 	std::sort(s_games.begin(), s_games.end(), game_less);
+	s_generation++;
 	return s_games;
 }
+
+unsigned libGeneration() { return s_generation; }
+const std::vector<LibGame> &libGames() { return s_games; }
 
 //---------------------------------------------------------------------------
 // Migration of old saves
