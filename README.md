@@ -3,7 +3,7 @@
 </p>
 
 # DiiS
-DiiS is a homebrew DS emulator based on the original port of [DeSmuMEWii](https://github.com/bd452/desmumewii) but with significant preformance gains. Preformance still is not 100% but has improved significatly to the point I think a pre-release is justified ([See breakdown]()). Also compatable with GBA games. 
+DiiS is a homebrew DS emulator based on the original port of [DeSmuMEWii](https://github.com/bd452/desmumewii) but with significant preformance gains. Preformance still is not 100% but has improved significatly to the point I think a pre-release is justified ([See breakdown](BENCHMARKS.md)). Also compatable with GBA games. 
 
 ## Requirements
  

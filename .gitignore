@@ -20,6 +20,7 @@ biosnds7.rom
 biosnds9.rom
 BIOSGBA.ROM
 firmware.bin
+res/Wii_homebrew_cursors
 
 # Bundled archives of the above
 *.rar
@@ -56,5 +57,6 @@ bisect-log.csv
 # Local analysis notes and planning docs (root and docs/ only; keep tools/**/README.md etc.)
 /*.md
 !/README.md
+!/BENCHMARKS.md
 /docs/*.md
 .claude/
