@@ -159,7 +159,7 @@ static u16 GbaTopScreen[256*192] __attribute__((aligned(32)));
 
 static GXTexObj TopTex;
 static GXTexObj BottomTex;
-static GXTexObj CursorTex;
+static GXTexObj CursorTex, CursorShadowTex;
 static GXTexObj GbaTopTex;
 
 // Set by Draw() (under vidmutex) each frame that GBA mode's GX path
@@ -185,13 +185,7 @@ static u32 s_swPresents, s_swStale, s_swWrong, s_swHeld;
 #include "harness/harness_profile.h"
 #endif
 
-// TODO: Make this fancier
-static u16 CursorData[16] __attribute__((aligned(32))) = {
-	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-	0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF
-};
+#include "cursor_tex.h"   // Wii pointer + shadow (res/Wii_homebrew_cursors)
 static int drawcursor = 1;
 static lwp_t vidthread = LWP_THREAD_NULL;
 mutex_t vidmutex = LWP_MUTEX_NULL;
@@ -587,7 +581,7 @@ void init(){
 	GX_SetAlphaUpdate(GX_TRUE);
 	GX_SetColorUpdate(GX_TRUE);
 
-	guOrtho(perspective,0,479,0,639,0,300);
+	guOrtho(perspective,0,480,0,640,0,300);   // edges of the 640x480 canvas: one unit = one pixel
 	GX_LoadProjectionMtx(perspective, GX_ORTHOGRAPHIC);
 
 	guMtxIdentity(GXmodelView2D);
@@ -612,7 +606,10 @@ void init(){
 	// two quads that serve as our DS screens.
 	GX_InitTexObj(&TopTex, TopScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObj(&BottomTex, BottomScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
-	GX_InitTexObj(&CursorTex, CursorData, 4, 4, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObj(&CursorTex, CursorData, CURSOR_TEX_W, CURSOR_TEX_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&CursorTex, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);   // crisp pixels
+	GX_InitTexObj(&CursorShadowTex, CursorShadowData, CURSOR_TEX_W, CURSOR_TEX_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&CursorShadowTex, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
 	GX_InitTexObj(&GbaTopTex, GbaTopScreen, 256, 192, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 
 	memset(TopScreen, 0, 256*192*sizeof(*TopScreen));
@@ -950,20 +947,30 @@ static void *draw_thread(void*){
 			GX_End();
 			GXDBG_MAIN("draw_thread: bottom screen quad end");
 
-			// CURSOR
+			// CURSOR: drawn in 640x480 canvas space at native resolution (one texel per
+			// canvas pixel), not through the DS screen scale/rotate. Only the hotspot
+			// position goes through the screen matrix. Shadow first, offset (+1,+2).
 			if (drawcursor){
 				GXDBG_MAIN("draw_thread: cursor quad start");
-				GX_LoadTexObj(&CursorTex, GX_TEXMAP0);
-				GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-					GX_Position2f32(bottomX+cursor.x-5, bottomY+cursor.y-5);
-					GX_TexCoord2f32(0, 0);
-					GX_Position2f32(bottomX+cursor.x-5, bottomY+cursor.y+5);
-					GX_TexCoord2f32(0, 1);
-					GX_Position2f32(bottomX+cursor.x+5, bottomY+cursor.y+5);
-					GX_TexCoord2f32(1, 1);
-					GX_Position2f32(bottomX+cursor.x+5, bottomY+cursor.y-5);
-					GX_TexCoord2f32(1, 0);
-				GX_End();
+				guVector hot = { bottomX + cursor.x, bottomY + cursor.y, 0.0f }, hc;
+				guVecMultiply(mv, &hot, &hc);
+				GX_LoadPosMtxImm(GXmodelView2D, GX_PNMTX0);
+				for (int pass = 0; pass < 2; pass++) {
+					const f32 x = roundf(hc.x) - CURSOR_HOT_X + (pass ? 0 : 1);
+					const f32 y = roundf(hc.y) - CURSOR_HOT_Y + (pass ? 0 : 2);
+					GX_LoadTexObj(pass ? &CursorTex : &CursorShadowTex, GX_TEXMAP0);
+					GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
+						GX_Position2f32(x, y);
+						GX_TexCoord2f32(0, 0);
+						GX_Position2f32(x, y + CURSOR_TEX_H);
+						GX_TexCoord2f32(0, 1);
+						GX_Position2f32(x + CURSOR_TEX_W, y + CURSOR_TEX_H);
+						GX_TexCoord2f32(1, 1);
+						GX_Position2f32(x + CURSOR_TEX_W, y);
+						GX_TexCoord2f32(1, 0);
+					GX_End();
+				}
+				GX_LoadPosMtxImm(mv, GX_PNMTX0);
 				GXDBG_MAIN("draw_thread: cursor quad end");
 			}
 		}

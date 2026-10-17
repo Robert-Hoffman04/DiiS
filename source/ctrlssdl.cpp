@@ -287,21 +287,31 @@ void process_ctrls_event( u16 *keypad, float nds_screen_size_ratio )
 		}
 	}
 
-	if ((wpad_h & WPAD_BUTTON_LEFT) || (pad_substickx < -20)){
-		--cursor.x;
-	} 
-
-	if ((wpad_h & WPAD_BUTTON_RIGHT) || (pad_substickx > 20)){
-		++cursor.x;
-	} 
-
-	if ((wpad_h & WPAD_BUTTON_DOWN) || (pad_substicky < -20)) {
-		++cursor.y;
-	} 
-		
-	if ((wpad_h & WPAD_BUTTON_UP) || (pad_substicky > 20)){
-		--cursor.y;
+	// Cursor movement: C-stick is analog (speed scales with deflection past the
+	// dead zone, up to kCursorMaxSpeed DS px/frame); D-pad moves at full speed.
+	// Sub-pixel motion accumulates so slow pushes still move smoothly.
+	{
+		const float kCursorMaxSpeed = 2.0f, kDead = 20.0f, kFull = 80.0f;
+		static float accX = 0.0f, accY = 0.0f;
+		auto axis = [&](s32 v) -> float {
+			const float a = (float)(v < 0 ? -v : v);
+			if (a <= kDead) return 0.0f;
+			const float t = a >= kFull ? 1.0f : (a - kDead) / (kFull - kDead);
+			return (v < 0 ? -t : t) * kCursorMaxSpeed;
+		};
+		float dx = axis(pad_substickx), dy = -axis(pad_substicky);
+		if (wpad_h & WPAD_BUTTON_LEFT)  dx = -kCursorMaxSpeed;
+		if (wpad_h & WPAD_BUTTON_RIGHT) dx =  kCursorMaxSpeed;
+		if (wpad_h & WPAD_BUTTON_UP)    dy = -kCursorMaxSpeed;
+		if (wpad_h & WPAD_BUTTON_DOWN)  dy =  kCursorMaxSpeed;
+		if (dx == 0.0f) accX = 0.0f;
+		if (dy == 0.0f) accY = 0.0f;
+		accX += dx; accY += dy;
+		const long mx = (long)accX, my = (long)accY;   // truncates toward zero
+		cursor.x += mx; cursor.y += my;
+		accX -= mx; accY -= my;
 	}
+
 	// WiiMote cursor co-ords. ir.x/ir.y come back in Wii video-mode pixel
 	// space (see WPAD_SetVRes() in main.cpp), while cursor.x/y are DS
 	// touch-screen coordinates (0..255 x 0..191) -- invert the quad
