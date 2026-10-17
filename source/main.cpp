@@ -66,9 +66,7 @@
 #define DIIS_USE_LIBRARY 1
 #include "library/library.h"
 #include "path.h"
-#endif
-#ifdef DIIS_GUI_DEMO
-#include "gui/gui.h"
+#include "gui/gui.h"   // the menu: gui/gui_library.cpp
 #endif
 
 #ifdef DIIS_FORCE_ROM
@@ -254,10 +252,11 @@ GPU3DInterface *core3DList[] = {
 //////////////////////////////////////////////////////////////////
 
 void init();
-void ShowCredits();
-bool PickDevice();
 #ifdef DIIS_USE_LIBRARY
 static void ApplyLibrary(const char *rom);
+#else
+void ShowCredits();
+bool PickDevice();
 #endif
 static void Draw(void);
 void ShowFPS();
@@ -332,17 +331,25 @@ int main(int argc, char **argv){
 
 #ifdef DIIS_USE_LIBRARY
 	// DiiS/ lives on whichever device boot.dol was started from (argv[0] from
-	// the loader; sd: when there's none, e.g. Dolphin). Mount it now so
-	// config.ini's global defaults can seed the picker below.
+	// the loader; sd: when there's none, e.g. Dolphin); that device also
+	// holds DS/BIOS. sd: is mounted either way (default ROM folders, old
+	// saves), usb: also when a ROM folder is on it.
+	const bool device = argc > 0 && argv && argv[0] && !strncmp(argv[0], "usb:", 4);
+	int bootStateSlot = -1;
 	{
-		const bool appOnUsb = argc > 0 && argv && argv[0] && !strncmp(argv[0], "usb:", 4);
-		if (appOnUsb) {
+		fatMountSimple("sd", &__io_wiisd);
+		if (device) {
 			for (int i = 0; i < 11 && !fatMountSimple("usb", &__io_usbstorage); i++)
 				sleep(1);
-		} else {
-			fatMountSimple("sd", &__io_wiisd);
 		}
-		libInit(appOnUsb ? "usb:/DiiS" : "sd:/DiiS", "sd:/DS/SAVES");
+		libInit(device ? "usb:/DiiS" : "sd:/DiiS", "sd:/DS/SAVES");
+		bool usbFolder = false;
+		for (size_t i = 0; i < libConfig().folders.size(); i++)
+			usbFolder |= !strncmp(libConfig().folders[i].path.c_str(), "usb:", 4);
+		if (!device && usbFolder) {
+			for (int i = 0; i < 3 && !fatMountSimple("usb", &__io_usbstorage); i++)
+				sleep(1);
+		}
 	}
 #ifdef DIIS_GUI_DEMO
 	// GUI framework demo (gui/gui_demo.cpp): straight into the demo screen,
@@ -350,8 +357,16 @@ int main(int argc, char **argv){
 	guiDemoRun();
 	sys_exit();
 #endif
-#endif
-
+	// The menu (gui/gui_library.cpp): Library -> Game -> Play / Load state.
+	// Home, Reset or Power there leave the app.
+	{
+		std::string rom;
+		if (guiLibraryRun(rom, bootStateSlot) == GUI_EXIT)
+			sys_exit();
+		strncpy(rom_filename, rom.c_str(), MAXPATHLEN - 1);
+		rom_filename[MAXPATHLEN - 1] = 0;
+	}
+#else
 	bool device = PickDevice();
   
 	VIDEO_WaitVSync();
@@ -398,6 +413,7 @@ int main(int argc, char **argv){
 #endif
 	if (quit_game)   // browser cancelled, or Reset/Power pressed in it
 		sys_exit();
+#endif // !DIIS_USE_LIBRARY
 
 #ifdef DIIS_USE_LIBRARY
 	ApplyLibrary(rom_filename);
@@ -547,6 +563,10 @@ int main(int argc, char **argv){
 		loadstate_slot(harness_boot_autoload_slot());
 	if (harness_boot_frame_every() > 0)
 		harness_frame_set_every(harness_boot_frame_every());
+#endif
+#ifdef DIIS_USE_LIBRARY
+	if (bootStateSlot >= 0)   // "Load state" on the Game screen
+		loadstate_slot(bootStateSlot);
 #endif
 
 	execute = true;
@@ -2148,39 +2168,38 @@ void Pause(){
 }
 
 #ifdef DIIS_USE_LIBRARY
-// Set by PickDevice(): the user moved the CPU / render toggle off its
-// config.ini starting value, so that choice beats a per-game override.
-static bool s_pickCpuChanged, s_pickRenderChanged;
-
 // After a ROM is picked: find/create its game folder, move its old saves in,
-// point saves/states/logs at the folder and apply its per-game settings.
+// point saves/states/logs at the folder and apply the CPU and render mode
+// (the game's own override, else the global default from config.ini).
+// Pre-boot (NDS_Init() hasn't run), so both apply at once.
 static void ApplyLibrary(const char *rom)
 {
 	LibLaunch L;
-	const bool ok = libPrepareLaunch(rom, L);
+	const bool ok = libPrepareLaunch(rom, L);   // L.cpu / L.render: global defaults even when !ok
 	bool warn = !ok;
 	for (size_t i = 0; i < L.messages.size(); i++) {
 		printf("%s\n", L.messages[i].c_str());
 		if (L.messages[i].compare(0, 6, "Moved ") != 0) warn = true;
 	}
+#ifdef DIIS_JIT
+	jitSetEnabled(L.cpu != LIB_CPU_INTERP);
+#endif
+	gxSetRenderMode(L.render == LIB_RENDER_SOFTWARE ? RenderMode::Software :
+	                L.render == LIB_RENDER_GXACCURATE ? RenderMode::GxAccurate : RenderMode::GxFast);
 	if (ok) {
 		path.setGameDir(L.dir.c_str());
 		sdLogSetDir(L.dir.c_str());
-#ifdef DIIS_JIT
-		if (!s_pickCpuChanged && L.game.cpu != LIB_CPU_DEFAULT)
-			jitSetEnabled(L.game.cpu == LIB_CPU_JIT);
-#endif
-		if (!s_pickRenderChanged && L.game.render != LIB_RENDER_DEFAULT)
-			gxSetRenderMode(L.game.render == LIB_RENDER_SOFTWARE ? RenderMode::Software :
-			                L.game.render == LIB_RENDER_GXACCURATE ? RenderMode::GxAccurate : RenderMode::GxFast);
 		printf("Game folder: %s\n", L.dir.c_str());
 	} else {
 		printf("ROM library: couldn't set up a game folder; using sd:/DS/SAVES\n");
 	}
 	if (warn) sleep(4);   // leave the notes on screen long enough to read
 }
-#endif
+#else
 
+// Console device / CPU / render picker of the non-library builds (harness,
+// benchmark and test builds that don't force the core); the normal build
+// has the GUI (gui/gui_library.cpp) instead.
 bool PickDevice(){
 	bool device = false;
 	current3Dcore = 1; //Soft Raster (only 3D core; see core3DList)
@@ -2219,19 +2238,6 @@ bool PickDevice(){
 	static const RenderMode kRenderModes[] = { RenderMode::Software, RenderMode::GxAccurate, RenderMode::GxFast };
 	static const char *const kRenderModeNames[] = { "Software", "GxAccurate", "GxFast" };
 	int renderModeIdx = 1; // GxAccurate
-
-#ifdef DIIS_USE_LIBRARY
-	// The toggles start from the global defaults in DiiS/config.ini;
-	// ApplyLibrary() then lays the picked game's own overrides over any
-	// toggle the user left untouched here.
-#ifdef DIIS_JIT
-	useJit = libConfig().cpu != LIB_CPU_INTERP;
-#endif
-	renderModeIdx = libConfig().render == LIB_RENDER_SOFTWARE ? 0 :
-	                libConfig().render == LIB_RENDER_GXACCURATE ? 1 : 2;
-	const bool startJit = useJit;
-	const int startRenderModeIdx = renderModeIdx;
-#endif
 
 	while(true){
 		PAD_ScanPads();
@@ -2274,10 +2280,6 @@ bool PickDevice(){
 			// Pre-boot, same as above: gxSetRenderMode() is a plain global
 			// write (gx_rendermode.cpp), safe to apply directly here.
 			gxSetRenderMode(kRenderModes[renderModeIdx]);
-#ifdef DIIS_USE_LIBRARY
-			s_pickCpuChanged = useJit != startJit;
-			s_pickRenderChanged = renderModeIdx != startRenderModeIdx;
-#endif
 			break;
 		}
 
@@ -2316,6 +2318,7 @@ void ShowCredits() {
 	}
 
 }
+#endif // !DIIS_USE_LIBRARY
 
 //needed for some games
 void create_dummy_firmware(){

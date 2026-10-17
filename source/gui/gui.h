@@ -36,6 +36,7 @@
 #define DIIS_GUI_H
 
 #include <gccore.h>
+#include <string>
 #include <vector>
 
 #define GUI_W 640
@@ -210,6 +211,10 @@ int guiRun(GuiScreen *root);
 void guiPush(GuiScreen *s);      // takes effect after this frame
 void guiPop();
 void guiQuit(int code);
+
+// gui_library.cpp: the menu (Library / Game screens). 0: the user picked
+// `rom` to boot, then load savestate `stateSlot` (-1: none); GUI_EXIT: leave.
+int guiLibraryRun(std::string &rom, int &stateSlot);
 
 #ifdef DIIS_GUI_DEMO
 int guiDemoRun();                // gui_demo.cpp: the framework demo screen
