@@ -202,7 +202,9 @@ bool libProbeRom(const char *path, LibRomInfo &out)
 void libDecodeDsIcon(const uint8_t raw[LIB_ICON_RAW_SIZE], uint16_t *dst)
 {
 	uint16_t pal[16];
-	pal[0] = 0x0000;   // colour 0: transparent (RGB5A3 alpha 0)
+	// Colour 0 is transparent on the DS, but banner art is drawn (and hand-antialiased) over the
+	// DS menu's white, so it is drawn opaque white here rather than over our own background.
+	pal[0] = 0xFFFF;
 	for (int i = 1; i < 16; i++) {
 		const uint16_t c = rd16(raw + 512 + i * 2);   // BGR555
 		pal[i] = (uint16_t)(0x8000 | ((c & 0x1F) << 10) | (c & 0x03E0) | ((c >> 10) & 0x1F));
