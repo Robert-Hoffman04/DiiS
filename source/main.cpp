@@ -597,7 +597,12 @@ void init(){
 			break;
 	}
 
-	
+	// The preferred modes put a 640-wide picture in the middle of the 720-wide analog line
+	// (viXOrigin 40), which leaves a black bar on each side. Let the VI scale the 640-wide
+	// framebuffer to 704 instead, which fills the visible width of a TV.
+	rmode->viWidth = 704;
+	rmode->viXOrigin = (VI_MAX_WIDTH_NTSC - rmode->viWidth) / 2;
+
 	WPAD_SetDataFormat(WPAD_CHAN_ALL, WPAD_FMT_BTNS_ACC_IR);
 	WPAD_SetVRes(WPAD_CHAN_ALL,rmode->viWidth,rmode->viHeight);
 	WPAD_SetIdleTimeout(200);
