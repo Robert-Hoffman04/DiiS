@@ -17,18 +17,17 @@ DiiS is a homebrew DS emulator based on the original port of [DeSmuMEWii](https:
 ## Features
 - Nintendo DS emulation with ARM7 and ARM9 JIT recompilers
 - Hardware-accelerated 3D rendering on the Wii GPU
-- GBA slot-2 passthrough with its own JIT (for GBA-linked DS titles)
 - Save states, battery saves, and cheat code support
 - Wiimote, Nunchuk, Classic Controller, and GameCube controller input
-- [Advance Input Expansion Pak](#advance-input-expansion-pak)
 
 ## Planned Features
-- Per-Game settings
-- Better UI
-- Enhanced 3D resolution options
+- ~~Per-Game settings~~
+- ~~Better UI~~
+- GBA Compatability
 - Better overall preformance
+- Enhanced 3D resolution options
 - Prebuilt Channel WAD
-- Setup wizard for virtual console style channels 
+- [Advance Input Expansion Pak](#advance-input-expansion-pak)
 
 ## Installation
  
@@ -113,7 +112,7 @@ controller's equivalent, where mapped).
   `DiiS/games/<id> <title>/`.
 
 
-## Advance Input Expansion Pak
+## Advance Input Expansion Pak - TODO
 This addition was mostly for the sake of my own homebrew plans. It is an entirely fictional Slot-2 (GBA slot) accessory which gives full modern controller input for the Nintendo DS. That includes:
 - Controller type flags
 - All default DS inputs
@@ -124,6 +123,8 @@ This addition was mostly for the sake of my own homebrew plans. It is an entirel
 
 ## License/Credations
  
-DiiS is free software, licensed under the GNU General Public License v2 - see `LICENSE.txt`. It builds on DeSmuME and DeSmuMEWii, and vendors a
+DiiS is free software, licensed under the GNU General Public License v3 - see `LICENSE.txt`. It builds on DeSmuME and DeSmuMEWii, vendors a
 JIT derived from Visual Boy Advance GX (see
-`source/jit/upstream/PROVENANCE.md` for details and attribution).
+`source/jit/upstream/PROVENANCE.md` for details and attribution), and its menu uses
+graphics from TWiLight Menu++'s DS menu theme and the Wii Homebrew Cursors by drmr.
+Every third-party component and its licence is listed in `licenses/THIRD_PARTY.md`.

@@ -3,7 +3,8 @@
 (tracked; the Makefile links every file there in with bin2o, gui_gfx.cpp decodes them).
 Each grit -gT colour key becomes real alpha, so data/gui holds plain RGBA PNGs and the
 runtime needs no per-image key. Only the files listed here are copied; res/gfx itself is
-left alone. Run from the repo root:  python3 tools/gui/importgfx.py"""
+left alone. The graphics are TWiLight Menu++'s (GPL v3; licenses/THIRD_PARTY.md).
+Run from the repo root:  python3 tools/gui/importgfx.py"""
 import os
 import re
 from PIL import Image
