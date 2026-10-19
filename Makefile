@@ -22,7 +22,7 @@ SOURCES		:=	source source/metaspu \
 				source/addons source/utils source/gekko_utils \
 				source/jit source/harness source/gx source/library \
 				source/gui
-DATA		:=	data  
+DATA		:=	data/gui
 INCLUDES	:=
 
 #---------------------------------------------------------------------------------

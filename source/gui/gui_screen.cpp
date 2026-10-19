@@ -12,6 +12,7 @@
 
 #include "gui_internal.h"
 #include "../gekko_utils/geckoinput.h"
+#include "../xfb.h"
 #include "../log_console.h"
 
 extern GXRModeObj *rmode;
@@ -46,7 +47,7 @@ static u32 stickDirs(float ang, float mag)
 
 static float axisSpeed(int v)   // GC stick units -> pointer px/frame
 {
-	const float kDead = 20.0f, kFull = 80.0f, kMax = 8.0f;
+	const float kDead = 20.0f, kFull = 80.0f, kMax = 4.0f;
 	const float a = (float)abs(v);
 	if (a <= kDead)
 		return 0.0f;
@@ -112,15 +113,15 @@ void guiPollInput()
 	// Classic right stick move it, and it hides again after a while or as
 	// soon as the D-pad is used.
 	if (wd->ir.valid) {
-		s_pfx = wd->ir.x * GUI_W / rmode->viWidth;
+		s_pfx = (wd->ir.x - XFB_PAD) * GUI_W / 640;   // IR spans the XFB_W-wide line; the canvas its middle 640
 		s_pfy = wd->ir.y * GUI_H / rmode->viHeight;
 		s_pointerIdle = POINTER_IDLE;
 	} else {
 		float dx = axisSpeed(PAD_SubStickX(0)), dy = -axisSpeed(PAD_SubStickY(0));
 		if (wd->exp.type == WPAD_EXP_CLASSIC && wd->exp.classic.rjs.mag > 0.2f) {
 			const float a = wd->exp.classic.rjs.ang * (float)M_PI / 180.0f, m = wd->exp.classic.rjs.mag;
-			dx += sinf(a) * m * 8.0f;
-			dy -= cosf(a) * m * 8.0f;
+			dx += sinf(a) * m * 4.0f;
+			dy -= cosf(a) * m * 4.0f;
 		}
 		if (dx != 0.0f || dy != 0.0f) {
 			s_pfx += dx;
@@ -142,7 +143,7 @@ void guiPollInput()
 	s_in.pointerOn = s_pointerIdle > 0;
 	// IR jitters by a pixel or so; only a real move counts (it re-focuses).
 	static int hx, hy;
-	s_in.pointerMoved = s_in.pointerOn && (!wasOn || abs(s_in.px - hx) + abs(s_in.py - hy) >= 3);
+	s_in.pointerMoved = s_in.pointerOn && (!wasOn || abs(s_in.px - hx) + abs(s_in.py - hy) >= 2);
 	if (s_in.pointerMoved) {
 		hx = s_in.px;
 		hy = s_in.py;
@@ -415,6 +416,24 @@ void guiPush(GuiScreen *s) { s_pushed.push_back(s); }
 void guiPop() { s_pops++; }
 void guiQuit(int code) { s_quit = true; s_quitCode = code; }
 
+#define LAUNCH_FADE_FRAMES 16
+
+// One frame of the stack, from the topmost opaque screen up; fadeA > 0
+// draws fadeCol over it.
+static void drawFrame(bool pointer, u8 fadeA, GuiColor fadeCol)
+{
+	size_t first = s_stack.size() - 1;
+	while (first > 0 && !s_stack[first]->opaque())
+		first--;
+	guiBeginFrame(guiRgba(0, 0, 0));
+	for (size_t i = first; i < s_stack.size(); i++)
+		s_stack[i]->draw();
+	if (pointer)
+		guiPointer(s_in.px, s_in.py);
+	guiFade(fadeA, fadeCol);
+	guiEndFrame();
+}
+
 static void focusMoved(GuiScreen *s, int before)
 {
 	const int now = s->focus.focused();
@@ -471,18 +490,8 @@ int guiRun(GuiScreen *root)
 		}
 		top->focus.tick();
 
-		// Draw from the topmost opaque screen up.
-		size_t first = s_stack.size() - 1;
-		while (first > 0 && !s_stack[first]->opaque())
-			first--;
-		guiBeginFrame(guiRgba(0, 0, 0));
-		for (size_t i = first; i < s_stack.size(); i++)
-			s_stack[i]->draw();
-		if (in.pointerOn)
-			guiPointer(in.px, in.py);
-		if (fade > 0)
-			guiFade((u8)(255 * fade / FADE_FRAMES));   // from black at start, half-way on a screen change
-		guiEndFrame();
+		// From black at start, half-way on a screen change.
+		drawFrame(in.pointerOn, (u8)(255 * fade / FADE_FRAMES), guiRgba(0, 0, 0));
 		if (fade > 0)
 			fade--;
 
@@ -505,6 +514,10 @@ int guiRun(GuiScreen *root)
 		if (changed && !s_stack.empty() && wasOpaque && s_stack.back()->opaque())
 			fade = FADE_FRAMES / 2;
 		if (s_quit) {
+			// Fade out to black, the game's background (it stays black while
+			// the caller loads, until the game's first frame).
+			for (int f = 1; f <= LAUNCH_FADE_FRAMES && !s_stack.empty(); f++)
+				drawFrame(false, (u8)(255 * f / LAUNCH_FADE_FRAMES), guiRgba(0, 0, 0));
 			result = s_quitCode;
 			break;
 		}
@@ -519,6 +532,5 @@ int guiRun(GuiScreen *root)
 	s_stack.clear();
 	s_pushed.clear();
 	guiRestoreGx();
-	log_console_enable_video(true);
 	return result;
 }

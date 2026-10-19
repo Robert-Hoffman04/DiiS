@@ -3,7 +3,7 @@
  *
  * Bitmap text from gui_font_data.h (tools/gui/mkfont.py). Each glyph is a
  * quad of the I4 atlas at an integer pixel position, one texel per pixel;
- * the pen advances in 1/16 px (hinted advances + GPOS kerning) and is
+ * the pen advances in 1/16 px (the font's advances, plus kerning if any) and is
  * rounded per glyph.
  ***************************************************************************/
 #include <string.h>

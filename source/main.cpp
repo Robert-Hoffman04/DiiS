@@ -47,6 +47,7 @@
 #include "sd_log_path.h"
 #include "gxstats_log.h"   // Task hw-measure: -DDIIS_GXSTATS sd:/perf/<rom>_gxstats.log (no-op otherwise)
 #include "fps_overlay.h"
+#include "xfb.h"
 #include "harness/harness.h"
 #include "gx/gx_gba_render.h"
 #include "gx/gx_rendermode.h"
@@ -148,7 +149,8 @@ NDS_header * header;
 GXRModeObj *rmode = NULL;
 Mtx44 perspective;
 Mtx GXmodelView2D;
-unsigned int *xfb[2]; // Double framebuffer [frameBuffer[fb]]
+unsigned int *xfb[2]; // Double framebuffer [frameBuffer[fb]], XFB_W wide (xfb.h)
+GXRModeObj viMode;    // rmode, XFB_W wide: the VI's mode and the XFBs' (xfb.h)
 int currfb;           // Current framebuffer (0 or 1)
 
 static u8 gp_fifo[DEFAULT_FIFO_SIZE] __attribute__((aligned(32)));
@@ -321,7 +323,7 @@ int main(int argc, char **argv){
   
 	init();
 
-	log_console_init(rmode, 0, 20, 30, rmode->fbWidth - 40, rmode->xfbHeight - 60);
+	log_console_init(&viMode, 0, XFB_PAD + 20, 30, rmode->fbWidth - 40, rmode->xfbHeight - 60);
 	log_console_enable_video(true);
 	//log_console_enable_log(true);
 
@@ -597,18 +599,25 @@ void init(){
 			break;
 	}
 
-	
+	// The VI scans XFB_W-wide framebuffers across the full visible width of
+	// the line (no black bars at the sides); GX keeps rendering 640 wide
+	// (rmode) into their middle (xfb.h).
+	viMode = *rmode;
+	viMode.fbWidth = XFB_W;
+	viMode.viWidth = XFB_W;
+	viMode.viXOrigin = (VI_MAX_WIDTH_NTSC - XFB_W) / 2;
+
 	WPAD_SetDataFormat(WPAD_CHAN_ALL, WPAD_FMT_BTNS_ACC_IR);
-	WPAD_SetVRes(WPAD_CHAN_ALL,rmode->viWidth,rmode->viHeight);
+	WPAD_SetVRes(WPAD_CHAN_ALL,viMode.viWidth,viMode.viHeight);
 	WPAD_SetIdleTimeout(200);
 
-	VIDEO_Configure(rmode);
+	VIDEO_Configure(&viMode);
 
-	xfb[0] = (u32 *)MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-	xfb[1] = (u32 *)MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+	xfb[0] = (u32 *)MEM_K0_TO_K1(SYS_AllocateFramebuffer(&viMode));
+	xfb[1] = (u32 *)MEM_K0_TO_K1(SYS_AllocateFramebuffer(&viMode));
 
-	VIDEO_ClearFrameBuffer(rmode, xfb[0], COLOR_BLACK);
-	VIDEO_ClearFrameBuffer(rmode, xfb[1], COLOR_BLACK);
+	VIDEO_ClearFrameBuffer(&viMode, xfb[0], COLOR_BLACK);
+	VIDEO_ClearFrameBuffer(&viMode, xfb[1], COLOR_BLACK);
 	VIDEO_SetNextFramebuffer (xfb[0]);
 
 	VIDEO_SetBlack(FALSE);
@@ -629,7 +638,7 @@ void init(){
 	xfbHeight = GX_SetDispCopyYScale(yscale);
 	GX_SetScissor(0,0,rmode->fbWidth,rmode->efbHeight);
 	GX_SetDispCopySrc(0,0,rmode->fbWidth,rmode->efbHeight);
-	GX_SetDispCopyDst(rmode->fbWidth,xfbHeight);
+	GX_SetDispCopyDst(XFB_W,xfbHeight);   // the XFBs' stride; 640 copied into the middle
 	GX_SetCopyFilter(rmode->aa,rmode->sample_pattern,GX_TRUE,rmode->vfilter);
 	GX_SetFieldMode(rmode->field_rendering,((rmode->viHeight==2*rmode->xfbHeight)?GX_ENABLE:GX_DISABLE));
 
@@ -639,7 +648,7 @@ void init(){
 		GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
 
 	GX_SetCullMode(GX_CULL_NONE);
-	GX_CopyDisp(xfb[currfb],GX_TRUE);
+	GX_CopyDisp(xfbCopyDst(currfb),GX_TRUE);
 	GX_SetDispCopyGamma(GX_GM_1_0);
 
 	GX_SetNumChans(1);
@@ -714,6 +723,16 @@ void init(){
 // re-issuing the display-copy pair here is not redundant with the viewport/
 // scissor restore, it is what keeps draw_thread's GX_CopyDisp() copying the
 // whole framebuffer instead of a 256x192 corner of it.
+void xfbFillEdges(int i, u32 yuyv)
+{
+	const int pairs = XFB_PAD / 2, stride = XFB_W / 2;
+	for (int y = 0; y < viMode.xfbHeight; y++) {
+		u32 *row = (u32 *)xfb[i] + y * stride;
+		for (int k = 0; k < pairs; k++)
+			row[k] = row[stride - pairs + k] = yuyv;
+	}
+}
+
 void GxRestorePresentState(void)
 {
 	if (!rmode)
@@ -725,7 +744,7 @@ void GxRestorePresentState(void)
 	f32 yscale = GX_GetYScaleFactor(rmode->efbHeight, rmode->xfbHeight);
 	u32 xfbHeight = GX_SetDispCopyYScale(yscale);
 	GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
-	GX_SetDispCopyDst(rmode->fbWidth, xfbHeight);
+	GX_SetDispCopyDst(XFB_W, xfbHeight);
 	GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
 
 	GX_SetCullMode(GX_CULL_NONE);
@@ -1056,7 +1075,16 @@ static void *draw_thread(void*){
 		// present textures) and the XFB flip waits for it below, outside the lock.
 		currfb ^= 1;
 
-		GX_CopyDisp(xfb[currfb],GX_TRUE);
+		// The XFBs' edge columns (xfb.h) hold whatever the menu left there
+		// (black after its launch fade, not if it quit another way): the
+		// game's picture is on black.
+		static int edgeClears = 0;
+		if (edgeClears < 2) {
+			xfbFillEdges(currfb, XFB_YUYV_BLACK);
+			edgeClears++;
+		}
+
+		GX_CopyDisp(xfbCopyDst(currfb),GX_TRUE);
 		GXDBG_MAIN("draw_thread: GX_CopyDisp done");
 		const u16 presentTok = g_gxFencePresent = gxFenceIssue();
 

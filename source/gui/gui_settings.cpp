@@ -4,8 +4,6 @@
  * The menu's settings screens (menu rework phase 4):
  *   Settings       global CPU / render defaults, the ROM folder list (Add,
  *                  Remove, include-subfolders switch, Rescan), About.
- *   Game settings  one game's CPU / render, "Default (<global>)" first;
- *                  only overrides go to its game.ini.
  *   Folder picker  directory-only browser from sd:/ (and usb:/ when it
  *                  mounts) for Settings > Add folder.
  * Every change is saved at once (config.ini / game.ini); a folder change
@@ -26,11 +24,9 @@
 
 #include "gui_menu.h"
 
-static const GuiColor kRow = guiRgba(24, 29, 42), kRowFocus = guiRgba(44, 56, 82);
+#define LABEL_W 110   // label column of the choice rows
 
-#define LABEL_W 220   // label column of the choice rows
-
-static void addCpuValues(GuiChoice &c)
+void menuAddCpuValues(GuiChoice &c)
 {
 #ifdef DIIS_JIT
 	c.add(libCpuName(LIB_CPU_JIT));
@@ -47,27 +43,26 @@ public:
 	{
 		focus.clear();
 		const int g = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(g, 0, GuiRect(40, 412, 120, 44));
+		focus.add(g, 0, GuiRect(20, 206, 60, 22));
 	}
 	void draw()
 	{
 		menuBackground();
 		menuHeader("About");
-		const GuiRect a(40, 72, 560, 332);
-		guiPanel(a, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
-		guiText(GUI_FONT_TITLE, a.x + 14, a.y + 8, "About DiiS", GUI_COL_TEXT);
+		const GuiRect a(20, 36, 280, 166);
+		guiPanel(a, 6, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
+		guiText(GUI_FONT_TITLE, a.x + 7, a.y + 4, "About DiiS", GUI_COL_TEXT);
 		// Same wording as the homebrew channel's meta.xml.
-		const int h = guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 48, a.w - 28, a.h - 56),
+		const int h = guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 7, a.y + 24, a.w - 14, a.h - 28),
 		            "DiiS \xE2\x80\x94 Nintendo DS and GBA emulator for Wii.\n"
 		            "Built by: Robert Hoffman\n"
 		            "Based on the original DeSmuME Wii port by: Arikado, scanff, firnis, and baby.lueshi\n"
 		            "Based on DeSmuME.", GUI_COL_TEXT);
-		// The original port's credits (the old console menu's) and the font licence.
-		guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 14, a.y + 60 + h, a.w - 28, a.h - 68 - h),
+		// The original port's credits (the old console menu's).
+		guiTextWrap(GUI_FONT_BODY, GuiRect(a.x + 7, a.y + 30 + h, a.w - 14, a.h - 34 - h),
 		            "Original port: http://code.google.com/p/desmumewii\n"
 		            "Written by: Arikado (arikadosblog.blogspot.com), scanff, DCN, firnis, baby.lueshi. "
-		            "With contributions from Cyan.\n"
-		            "Font: Noto Sans, SIL Open Font License 1.1.", GUI_COL_DIM);
+		            "With contributions from Cyan.", GUI_COL_DIM);
 		guiButton(focus.screenRect(0), "Back", true);
 		guiFocusFrame(focus.highlight());
 	}
@@ -81,7 +76,7 @@ class SettingsScreen;
 static void settingsAddFolder(SettingsScreen *s, const std::string &path);
 
 #define PICK_ROWS 6
-#define PICK_ROW_H 42
+#define PICK_ROW_H 21
 #define PICK_USE 1000
 #define PICK_UP 1001
 #define PICK_CANCEL 1002
@@ -119,13 +114,13 @@ public:
 	void enter()
 	{
 		focus.clear();
-		list = focus.addGroup(GuiRect(40, 108, 560, PICK_ROWS * PICK_ROW_H), PICK_ROW_H);
+		list = focus.addGroup(GuiRect(20, 54, 280, PICK_ROWS * PICK_ROW_H), PICK_ROW_H);
 		for (size_t i = 0; i < dirs.size(); i++)
-			focus.add(list, (int)i, GuiRect(0, (int)i * PICK_ROW_H, 560, PICK_ROW_H - 4));
+			focus.add(list, (int)i, GuiRect(0, (int)i * PICK_ROW_H, 280, PICK_ROW_H - 2));
 		const int bar = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(bar, PICK_USE, GuiRect(40, 412, 200, 44), !cur.empty());
-		focus.add(bar, PICK_UP, GuiRect(256, 412, 120, 44), !cur.empty());
-		focus.add(bar, PICK_CANCEL, GuiRect(480, 412, 120, 44));
+		focus.add(bar, PICK_USE, GuiRect(20, 206, 100, 22), !cur.empty());
+		focus.add(bar, PICK_UP, GuiRect(128, 206, 60, 22), !cur.empty());
+		focus.add(bar, PICK_CANCEL, GuiRect(240, 206, 60, 22));
 		if (pendingFocus != -2) {
 			focus.setFocus(pendingFocus, true);
 			pendingFocus = -2;
@@ -136,9 +131,9 @@ public:
 	{
 		menuBackground();
 		menuHeader("Add a ROM folder");
-		const GuiRect p(40, 64, 560, 36);
-		guiPanel(p, 10, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
-		guiTextBox(GUI_FONT_BODY, GuiRect(p.x + 12, p.y, p.w - 24, p.h), cur.empty() ? "Choose a device" : cur.c_str(), GUI_COL_TEXT);
+		const GuiRect p(20, 32, 280, 18);
+		guiPanel(p, 5, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
+		guiTextBox(GUI_FONT_BODY, GuiRect(p.x + 6, p.y, p.w - 12, p.h), cur.empty() ? "Choose a device" : cur.c_str(), GUI_COL_TEXT);
 
 		const GuiRect view = focus.view(list);
 		if (dirs.empty())
@@ -148,15 +143,15 @@ public:
 			if (!focus.visible((int)i))
 				continue;
 			const GuiRect r = focus.screenRect((int)i);
-			guiRoundRect(r, 8, focus.isFocused((int)i) ? kRowFocus : kRow);
-			guiTextBox(GUI_FONT_BODY, GuiRect(r.x + 14, r.y, r.w - 28, r.h), dirs[i].c_str(), GUI_COL_TEXT);
+			guiButton(r, "", false);
+			guiTextBox(GUI_FONT_BODY, GuiRect(r.x + 7, r.y, r.w - 14, r.h), dirs[i].c_str(), GUI_COL_TEXT);
 		}
 		guiPopClip();
 		if (dirs.size() > PICK_ROWS) {
 			const int rows = (int)dirs.size(), thumb = view.h * PICK_ROWS / rows;
 			const int y = view.y + (view.h - thumb) * focus.scroll(list) / ((rows - PICK_ROWS) * PICK_ROW_H);
-			guiRoundRect(GuiRect(view.x + view.w + 8, view.y, 6, view.h), 3, guiRgba(36, 42, 58));
-			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, GUI_COL_DIM);
+			guiRect(GuiRect(view.x + view.w + 4, view.y, 3, view.h), guiRgba(200, 200, 200));
+			guiRect(GuiRect(view.x + view.w + 4, y, 3, thumb), GUI_COL_ACCENT);
 		}
 
 		// What's in the current folder, to tell the right one.
@@ -164,7 +159,7 @@ public:
 			char buf[128];
 			snprintf(buf, sizeof(buf), "Here: %d .nds, %d .gba, %d other file%s, %d folder%s", nds, gba,
 			         files, files == 1 ? "" : "s", (int)dirs.size(), dirs.size() == 1 ? "" : "s");
-			guiText(GUI_FONT_BODY, 40, 372, buf, nds + gba ? GUI_COL_TEXT : GUI_COL_DIM, GUI_ALIGN_LEFT, 560);
+			guiText(GUI_FONT_BODY, 20, 186, buf, nds + gba ? GUI_COL_TEXT : GUI_COL_DIM, GUI_ALIGN_LEFT, 280);
 		}
 		guiButton(focus.screenRect(PICK_USE), "Use this folder", !cur.empty());
 		guiButton(focus.screenRect(PICK_UP), "Up", false);
@@ -274,7 +269,7 @@ private:
 #define SET_DEL 200   // + folder: Remove
 
 #define FOLDER_ROWS 4
-#define FOLDER_ROW_H 44
+#define FOLDER_ROW_H 22
 
 // Same folder: case-insensitive (FAT), trailing '/' ignored except on a root.
 static std::string folderKey(const std::string &p)
@@ -292,7 +287,7 @@ public:
 	SettingsScreen() : nfolders(0), list(0), scanPending(0), scanForce(false), scanDrawn(false)
 	{
 		const LibConfig &c = libConfig();
-		addCpuValues(cpu);
+		menuAddCpuValues(cpu);
 		cpu.sel = (int)cpu.values.size() > 1 && c.cpu == LIB_CPU_INTERP ? 1 : 0;
 		for (int r = LIB_RENDER_SOFTWARE; r <= LIB_RENDER_GXFAST; r++)
 			render.add(libRenderName((LibRender)r));
@@ -307,20 +302,20 @@ public:
 	{
 		focus.clear();
 		const int top = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(top, SET_CPU, GuiRect(40, 68, 560, 40));
-		focus.add(top, SET_RENDER, GuiRect(40, 114, 560, 40));
-		list = focus.addGroup(GuiRect(40, 196, 560, FOLDER_ROWS * FOLDER_ROW_H), FOLDER_ROW_H);
+		focus.add(top, SET_CPU, GuiRect(20, 34, 280, 20));
+		focus.add(top, SET_RENDER, GuiRect(20, 57, 280, 20));
+		list = focus.addGroup(GuiRect(20, 98, 280, FOLDER_ROWS * FOLDER_ROW_H), FOLDER_ROW_H);
 		nfolders = (int)libConfig().folders.size();
 		for (int i = 0; i < nfolders; i++) {
 			const int y = i * FOLDER_ROW_H;
-			focus.add(list, SET_SUB + i, GuiRect(276, y, 176, FOLDER_ROW_H - 4));
-			focus.add(list, SET_DEL + i, GuiRect(460, y, 100, FOLDER_ROW_H - 4));
+			focus.add(list, SET_SUB + i, GuiRect(130, y, 96, FOLDER_ROW_H - 2));
+			focus.add(list, SET_DEL + i, GuiRect(230, y, 50, FOLDER_ROW_H - 2));
 		}
 		const int bar = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(bar, SET_ADD, GuiRect(40, 412, 150, 44));
-		focus.add(bar, SET_RESCAN, GuiRect(198, 412, 120, 44));
-		focus.add(bar, SET_ABOUT, GuiRect(326, 412, 120, 44));
-		focus.add(bar, SET_BACK, GuiRect(480, 412, 120, 44));
+		focus.add(bar, SET_ADD, GuiRect(20, 206, 75, 22));
+		focus.add(bar, SET_RESCAN, GuiRect(99, 206, 60, 22));
+		focus.add(bar, SET_ABOUT, GuiRect(163, 206, 60, 22));
+		focus.add(bar, SET_BACK, GuiRect(240, 206, 60, 22));
 		if (!focus.has(focus.focused()))
 			focus.setFocus(SET_CPU, true);
 	}
@@ -346,7 +341,7 @@ public:
 		guiChoiceDraw(focus.screenRect(SET_CPU), "CPU", cpu, focus.isFocused(SET_CPU), false, LABEL_W);
 		guiChoiceDraw(focus.screenRect(SET_RENDER), "Render mode", render, focus.isFocused(SET_RENDER), false, LABEL_W);
 
-		guiText(GUI_FONT_BODY, 40, 166, "ROM folders", GUI_COL_TEXT);
+		guiText(GUI_FONT_BODY, 20, 83, "ROM folders", GUI_COL_TEXT);
 		const LibConfig &c = libConfig();
 		const GuiRect view = focus.view(list);
 		if (c.folders.empty())
@@ -355,25 +350,25 @@ public:
 		guiPushClip(view);
 		for (int i = 0; i < (int)c.folders.size() && i < nfolders; i++) {
 			const GuiRect s = focus.screenRect(SET_SUB + i);
-			const GuiRect pathR(view.x, s.y, s.x - view.x - 8, s.h);
+			const GuiRect pathR(view.x, s.y, s.x - view.x - 4, s.h);
 			if (s.y + s.h < view.y || s.y > view.y + view.h)
 				continue;
-			guiRoundRect(pathR, 8, kRow);
-			guiTextBox(GUI_FONT_BODY, GuiRect(pathR.x + 12, pathR.y, pathR.w - 24, pathR.h), c.folders[i].path.c_str(), GUI_COL_TEXT);
+			guiButton(pathR, "", false);
+			guiTextBox(GUI_FONT_BODY, GuiRect(pathR.x + 6, pathR.y, pathR.w - 12, pathR.h), c.folders[i].path.c_str(), GUI_COL_TEXT);
 			guiToggleDraw(s, "Subfolders", c.folders[i].subfolders, focus.isFocused(SET_SUB + i));
 			const GuiRect d = focus.screenRect(SET_DEL + i);
-			guiRoundRect(d, 8, focus.isFocused(SET_DEL + i) ? kRowFocus : kRow);
+			guiButton(d, "", false);
 			guiTextBox(GUI_FONT_BODY, d, "Remove", GUI_COL_TEXT, GUI_ALIGN_CENTER);
 		}
 		guiPopClip();
 		if (nfolders > FOLDER_ROWS) {
 			const int thumb = view.h * FOLDER_ROWS / nfolders;
 			const int y = view.y + (view.h - thumb) * focus.scroll(list) / ((nfolders - FOLDER_ROWS) * FOLDER_ROW_H);
-			guiRoundRect(GuiRect(view.x + view.w + 8, view.y, 6, view.h), 3, guiRgba(36, 42, 58));
-			guiRoundRect(GuiRect(view.x + view.w + 8, y, 6, thumb), 3, GUI_COL_DIM);
+			guiRect(GuiRect(view.x + view.w + 4, view.y, 3, view.h), guiRgba(200, 200, 200));
+			guiRect(GuiRect(view.x + view.w + 4, y, 3, thumb), GUI_COL_ACCENT);
 		}
 
-		guiText(GUI_FONT_BODY, 40, 374, scanPending ? "Scanning..." : status.c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, 560);
+		guiText(GUI_FONT_BODY, 20, 187, scanPending ? "Scanning..." : status.c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, 280);
 		if (scanPending)
 			scanDrawn = true;
 
@@ -496,118 +491,3 @@ private:
 static void settingsAddFolder(SettingsScreen *s, const std::string &path) { s->addFolder(path); }
 
 GuiScreen *newSettingsScreen() { return new SettingsScreen; }
-
-//---------------------------------------------------------------------------
-// Game settings
-//---------------------------------------------------------------------------
-#define GS_CPU 0
-#define GS_RENDER 1
-#define GS_BACK 2
-
-class GameSettingsScreen : public GuiScreen {
-public:
-	GameSettingsScreen(const LibGame *g, const GuiImage &i) : game(g), icon(i)
-	{
-		ov.cpu = LIB_CPU_DEFAULT;
-		ov.render = LIB_RENDER_DEFAULT;
-		if (!game->dir.empty())
-			libLoadGameSettings(game->dir, ov);
-		const LibConfig &c = libConfig();
-#ifdef DIIS_JIT
-		cpu.add(std::string("Default (") + libCpuName(c.cpu) + ")");
-		addCpuValues(cpu);
-		cpu.sel = ov.cpu;   // DEFAULT, JIT, INTERP
-#else
-		addCpuValues(cpu);   // Interpreter only: nothing to override
-		ov.cpu = LIB_CPU_DEFAULT;
-#endif
-		render.add(std::string("Default (") + libRenderName(c.render) + ")");
-		for (int r = LIB_RENDER_SOFTWARE; r <= LIB_RENDER_GXFAST; r++)
-			render.add(libRenderName((LibRender)r));
-		render.sel = ov.render;   // DEFAULT, SOFTWARE, GXACCURATE, GXFAST
-	}
-
-	void enter()
-	{
-		focus.clear();
-		const int g = focus.addGroup(GuiRect(0, 0, GUI_W, GUI_H));
-		focus.add(g, GS_CPU, GuiRect(40, 176, 560, 40));
-		focus.add(g, GS_RENDER, GuiRect(40, 222, 560, 40));
-		focus.add(g, GS_BACK, GuiRect(40, 412, 120, 44));
-		if (!focus.has(focus.focused()))
-			focus.setFocus(GS_CPU, true);
-	}
-
-	void draw()
-	{
-		menuBackground();
-		menuHeader("Game settings");
-		const GuiRect p(40, 68, 560, 92);
-		guiPanel(p, 12, GUI_COL_PANEL, GUI_COL_PANEL_EDGE, 1);
-		guiImage(icon, p.x + 14, p.y + 14, 2);
-		const LibRomInfo &info = game->info;
-		const int tx = p.x + 96, tw = p.x + p.w - 14 - tx;
-		guiText(GUI_FONT_BODY, tx, p.y + 12, info.lines[0].c_str(), GUI_COL_TEXT, GUI_ALIGN_LEFT, tw);
-		guiText(GUI_FONT_BODY, tx, p.y + 40, info.lines[1].c_str(), GUI_COL_DIM, GUI_ALIGN_LEFT, tw);
-		guiText(GUI_FONT_BODY, p.x + p.w - 14, p.y + 12, info.id.c_str(), GUI_COL_DIM, GUI_ALIGN_RIGHT);
-
-		guiChoiceDraw(focus.screenRect(GS_CPU), "CPU", cpu, focus.isFocused(GS_CPU), ov.cpu != LIB_CPU_DEFAULT, LABEL_W);
-		guiChoiceDraw(focus.screenRect(GS_RENDER), "Render mode", render, focus.isFocused(GS_RENDER),
-		              ov.render != LIB_RENDER_DEFAULT, LABEL_W);
-
-		std::string note;
-		if (ov.cpu == LIB_CPU_DEFAULT && ov.render == LIB_RENDER_DEFAULT)
-			note = "No overrides: this game follows the defaults in Settings.";
-		else
-			note = std::string("Overridden for this game: ") +
-			       (ov.cpu != LIB_CPU_DEFAULT ? (ov.render != LIB_RENDER_DEFAULT ? "CPU, render mode" : "CPU") : "render mode") +
-			       " (highlighted).";
-		if (!error.empty())
-			note = error;
-		guiTextWrap(GUI_FONT_BODY, GuiRect(40, 280, 560, 80), note.c_str(), GUI_COL_DIM);
-
-		guiButton(focus.screenRect(GS_BACK), "Back", true);
-		guiFocusFrame(focus.highlight());
-	}
-
-	bool step(int id, int dir)
-	{
-		if (id != GS_CPU && id != GS_RENDER)
-			return false;
-		change(id, dir);
-		return true;
-	}
-
-	void activate(int id)
-	{
-		if (id == GS_BACK)
-			guiPop();
-		else
-			change(id, guiChoiceClick(focus.screenRect(id), LABEL_W));
-	}
-
-private:
-	const LibGame *game;
-	const GuiImage &icon;   // the Game screen's
-	LibGameSettings ov;
-	GuiChoice cpu, render;
-	std::string error;
-
-	void change(int id, int dir)
-	{
-		if (id == GS_CPU) {
-			if (!cpu.step(dir))
-				return;
-			ov.cpu = (LibCpu)cpu.sel;
-		} else {
-			render.step(dir);
-			ov.render = (LibRender)render.sel;
-		}
-		error = libSaveGameOverrides(*game, ov) ? "" : "Could not write the game's game.ini.";
-	}
-};
-
-GuiScreen *newGameSettingsScreen(const LibGame *game, const GuiImage &icon)
-{
-	return new GameSettingsScreen(game, icon);
-}

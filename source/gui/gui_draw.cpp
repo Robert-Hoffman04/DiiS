@@ -13,12 +13,11 @@
 #include <math.h>
 
 #include "gui_internal.h"
-#include "gui_icons.h"
 #include "../cursor_tex.h"   // Wii pointer + shadow (same art as the in-game cursor)
+#include "../xfb.h"
 
 // main.cpp's video setup.
 extern GXRModeObj *rmode;
-extern unsigned int *xfb[2];
 extern int currfb;
 extern Mtx44 perspective;
 extern Mtx GXmodelView2D;
@@ -26,14 +25,26 @@ void GxRestorePresentState(void);
 
 static bool s_ready = false;
 static u8 s_alpha = 255;
-static u32 s_frame = 0;
 static GXTexObj *s_boundTex = 0;
 static int s_boundMode = -1;
 
 static u8 s_white[8 * 8 / 2] __attribute__((aligned(32)));   // I4, all 0xF
 static GXTexObj s_whiteTex;
 static GXTexObj s_ptrTex, s_ptrShadowTex;
-static GuiImage s_genericDs, s_genericGba;
+
+// The canvas is drawn 1:1 into the EFB's top-left GUI_W x GUI_H, copied out
+// to this texture and drawn back over the whole 640x480 screen with a
+// nearest filter: every canvas pixel is exactly a 2x2 block. The pointer is
+// drawn after, at full resolution.
+static u16 s_canvas[GUI_W * GUI_H] __attribute__((aligned(32)));   // RGB565
+static GXTexObj s_canvasTex;
+static Mtx44 s_canvasProj;
+static bool s_ptrShow;
+static int s_edgeFills;      // XFBs whose edges show the settled backdrop (of 2)
+static GuiColor s_fadeCol;   // this frame's guiFade()
+static u8 s_fadeA;
+static void fillEdges(int i);
+static int s_ptrX, s_ptrY;
 
 static std::vector<GuiRect> s_clip;
 
@@ -109,25 +120,26 @@ static void initOnce()
 	GX_InitTexObj(&s_ptrShadowTex, CursorShadowData, CURSOR_TEX_W, CURSOR_TEX_H, GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
 	GX_InitTexObjLOD(&s_ptrShadowTex, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
 
-	guiImageCreate(s_genericDs, GuiIconGenericDs, 32, 32);
-	guiImageCreate(s_genericGba, GuiIconGenericGba, 32, 32);
+	GX_InitTexObj(&s_canvasTex, s_canvas, GUI_W, GUI_H, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+	GX_InitTexObjLOD(&s_canvasTex, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
+	guOrtho(s_canvasProj, 0, GUI_H, 0, GUI_W, 0, 300);
+
 	guiTextInit();
 	s_ready = true;
 }
 
 static void applyScissor(const GuiRect &r)
 {
-	// The canvas is 480 units tall whatever the EFB height (PAL: 528 lines).
-	const int y0 = r.y * rmode->efbHeight / GUI_H, y1 = (r.y + r.h) * rmode->efbHeight / GUI_H;
-	GX_SetScissor(r.x, y0, r.w, y1 - y0);
+	// Canvas pixels are EFB pixels while the canvas is drawn.
+	GX_SetScissor(r.x, r.y, r.w, r.h);
 }
 
 void guiBeginFrame(GuiColor clear)
 {
 	initOnce();
 
-	GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
-	GX_LoadProjectionMtx(perspective, GX_ORTHOGRAPHIC);
+	GX_SetViewport(0, 0, GUI_W, GUI_H, 0, 1);
+	GX_LoadProjectionMtx(s_canvasProj, GX_ORTHOGRAPHIC);
 	GX_LoadPosMtxImm(GXmodelView2D, GX_PNMTX0);
 	GX_SetCurrentMtx(GX_PNMTX0);
 
@@ -154,6 +166,8 @@ void guiBeginFrame(GuiColor clear)
 	s_boundTex = 0;
 	s_boundMode = -1;
 
+	s_ptrShow = false;
+	s_fadeA = 0;
 	s_clip.clear();
 	applyScissor(GuiRect(0, 0, GUI_W, GUI_H));
 
@@ -165,18 +179,104 @@ void guiBeginFrame(GuiColor clear)
 
 void guiEndFrame()
 {
+	// Canvas -> texture, unfiltered (the display copy's vertical filter
+	// would blur it).
+	GX_SetCopyFilter(GX_FALSE, NULL, GX_FALSE, NULL);
+	GX_SetTexCopySrc(0, 0, GUI_W, GUI_H);
+	GX_SetTexCopyDst(GUI_W, GUI_H, GX_TF_RGB565, GX_FALSE);
+	GX_CopyTex(s_canvas, GX_FALSE);
+	GX_PixModeSync();
+	GX_InvalidateTexAll();
+	s_boundTex = 0;
+	GX_SetCopyFilter(rmode->aa, rmode->sample_pattern, GX_TRUE, rmode->vfilter);
+
+	// Scaled up over the whole screen (the 640x480 projection main.cpp
+	// set up, stretched to the EFB's height), then the pointer.
+	GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+	GX_LoadProjectionMtx(perspective, GX_ORTHOGRAPHIC);
+	GX_SetScissor(0, 0, rmode->fbWidth, rmode->efbHeight);
+	GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_CLEAR);
+	guiBindRgba(&s_canvasTex);
+	GX_Begin(GX_QUADS, GUI_VTXFMT, 4);
+	guiQuadVerts(0, 0, 640, 480, guiRgba(255, 255, 255), 0, 0, 1, 1);
+	GX_End();
+	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
+	if (s_ptrShow) {
+		const int x = s_ptrX * 640 / GUI_W, y = s_ptrY * 480 / GUI_H;
+		for (int pass = 0; pass < 2; pass++) {
+			// Shadow first, offset (+1,+2), as the in-game cursor.
+			const int px = x - CURSOR_HOT_X + (pass ? 0 : 1), py = y - CURSOR_HOT_Y + (pass ? 0 : 2);
+			guiBindRgba(pass ? &s_ptrTex : &s_ptrShadowTex);
+			GX_Begin(GX_QUADS, GUI_VTXFMT, 4);
+			guiQuadVerts(px, py, px + CURSOR_TEX_W, py + CURSOR_TEX_H, guiRgba(255, 255, 255), 0, 0, 1, 1);
+			GX_End();
+		}
+	}
+
 	currfb ^= 1;
-	GX_CopyDisp(xfb[currfb], GX_TRUE);
+	GX_SetDispCopySrc(0, 0, rmode->fbWidth, rmode->efbHeight);
+	GX_SetDispCopyDst(XFB_W, GX_SetDispCopyYScale(GX_GetYScaleFactor(rmode->efbHeight, rmode->xfbHeight)));
+	GX_CopyDisp(xfbCopyDst(currfb), GX_TRUE);
 	GX_DrawDone();
+	// The XFB's edge columns continue the backdrop, under the same fade:
+	// every frame a fade runs, then once more per XFB.
+	if (s_fadeA) {
+		fillEdges(currfb);
+		s_edgeFills = 0;
+	} else if (s_edgeFills < 2) {
+		fillEdges(currfb);
+		s_edgeFills++;
+	}
 	VIDEO_SetNextFramebuffer(xfb[currfb]);
 	VIDEO_Flush();
 	VIDEO_WaitVSync();
-	s_frame++;
+}
+
+static u32 yuyvPair(GuiColor c)   // two pixels of c (BT.601, as the XFB copy)
+{
+	const int r = c.r, g = c.g, b = c.b;
+	const u32 y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+	const u32 u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+	const u32 v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+	return y << 24 | u << 16 | y << 8 | v;
+}
+
+static GuiColor faded(GuiColor c)   // c under this frame's guiFade()
+{
+	const int a = s_fadeA;
+	c.r = (u8)((c.r * (255 - a) + s_fadeCol.r * a) / 255);
+	c.g = (u8)((c.g * (255 - a) + s_fadeCol.g * a) / 255);
+	c.b = (u8)((c.b * (255 - a) + s_fadeCol.b * a) / 255);
+	return c;
+}
+
+// The XFB's XFB_PAD columns either side of the 640 picture: canvas columns
+// -XFB_PAD/2.. and GUI_W.. at 2x, one YUYV pair per canvas pixel. A row's
+// backdrop only varies with x's parity (the top bar's dither).
+static void fillEdges(int i)
+{
+	const int pairs = XFB_PAD / 2, stride = XFB_W / 2, rows = viMode.xfbHeight;
+	for (int yy = 0; yy < rows; yy++) {
+		u32 *row = (u32 *)xfb[i] + yy * stride;
+		const int y = yy * GUI_H / rows;
+		u32 l[2], r[2];
+		for (int p = 0; p < 2; p++) {
+			l[p] = yuyvPair(faded(guiDsEdgeColor(p - pairs, y)));
+			r[p] = yuyvPair(faded(guiDsEdgeColor(GUI_W + p, y)));
+		}
+		for (int k = 0; k < pairs; k++) {
+			row[k] = l[k & 1];
+			row[stride - pairs + k] = r[k & 1];
+		}
+	}
 }
 
 void guiRestoreGx()
 {
 	GX_DrawDone();
+	s_edgeFills = 0;
+	// The screen stays as the last frame left it (black after guiQuit()'s
+	// fade) until draw_thread presents the game.
 	GxRestorePresentState();
 }
 
@@ -351,12 +451,14 @@ void guiPanel(const GuiRect &b, int radius, GuiColor fill, GuiColor border, int 
 	ring(b, radius, borderW, guiApplyAlpha(border));
 }
 
-void guiFade(u8 a)
+void guiFade(u8 a, GuiColor c)
 {
+	s_fadeA = a;
+	s_fadeCol = c;
 	if (!a)
 		return;
 	guiBindMask(&s_whiteTex);
-	solid(0, 0, GUI_W, GUI_H, guiRgba(0, 0, 0, a));
+	solid(0, 0, GUI_W, GUI_H, guiRgba(c.r, c.g, c.b, a));
 }
 
 //---------------------------------------------------------------------------
@@ -402,29 +504,40 @@ void guiImage(const GuiImage &img, int x, int y, int scale, GuiColor tint)
 	GX_End();
 }
 
+void guiImagePart(const GuiImage &img, int sx, int sy, int sw, int sh, int x, int y, int scale, GuiColor tint)
+{
+	if (!img.data || sw <= 0 || sh <= 0)
+		return;
+	const f32 iw = 1.0f / img.w, ih = 1.0f / img.h;
+	guiBindRgba((GXTexObj *)&img.tex);
+	GX_Begin(GX_QUADS, GUI_VTXFMT, 4);
+	guiQuadVerts(x, y, x + sw * scale, y + sh * scale, guiApplyAlpha(tint), sx * iw, sy * ih, (sx + sw) * iw, (sy + sh) * ih);
+	GX_End();
+}
+
 const GuiImage &guiGenericIcon(bool gba)
 {
 	initOnce();
-	return gba ? s_genericGba : s_genericDs;
+	return gba ? guiGfx(GUI_GFX_ICON_GBA) : guiGfx(GUI_GFX_ICON_DSCARD);
 }
 
 void guiPointer(int x, int y)
 {
-	const GuiColor c = guiApplyAlpha(guiRgba(255, 255, 255));
-	for (int pass = 0; pass < 2; pass++) {
-		// Shadow first, offset (+1,+2), as the in-game cursor.
-		const int px = x - CURSOR_HOT_X + (pass ? 0 : 1), py = y - CURSOR_HOT_Y + (pass ? 0 : 2);
-		guiBindRgba(pass ? &s_ptrTex : &s_ptrShadowTex);
-		GX_Begin(GX_QUADS, GUI_VTXFMT, 4);
-		guiQuadVerts(px, py, px + CURSOR_TEX_W, py + CURSOR_TEX_H, c, 0, 0, 1, 1);
-		GX_End();
-	}
+	// Drawn by guiEndFrame(), over the scaled-up canvas.
+	s_ptrShow = true;
+	s_ptrX = x;
+	s_ptrY = y;
 }
 
 void guiFocusFrame(const GuiRect &r)
 {
-	// Pulses gently (about once a second).
-	const float p = 0.5f + 0.5f * sinf(s_frame * (2.0f * (float)M_PI / 64.0f));
-	ring(r.inset(-4), 12, 3, guiApplyAlpha(guiRgba(110, 200, 255, (u8)(170 + 85 * p))));
-	ring(r.inset(-6), 14, 2, guiApplyAlpha(guiRgba(110, 200, 255, (u8)(40 + 40 * p))));
+	// The DS menu's cursor: four corner brackets (GUI_GFX_CURSOR frames TL,
+	// TR, BL, BR, 11x11 art in the frame's top-left), each sitting 2 px
+	// outside r, as the DS menu frames its boxes.
+	const int s = GUI_DS_SCALE, k = 11 * s, o = 2 * s;
+	const int x0 = r.x - o, y0 = r.y - o, x1 = r.x + r.w + o - k, y1 = r.y + r.h + o - k;
+	guiImagePart(guiGfx(GUI_GFX_CURSOR, 0), 0, 0, 11, 11, x0, y0, s);
+	guiImagePart(guiGfx(GUI_GFX_CURSOR, 1), 0, 0, 11, 11, x1, y0, s);
+	guiImagePart(guiGfx(GUI_GFX_CURSOR, 2), 0, 0, 11, 11, x0, y1, s);
+	guiImagePart(guiGfx(GUI_GFX_CURSOR, 3), 0, 0, 11, 11, x1, y1, s);
 }

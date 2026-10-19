@@ -158,8 +158,9 @@ void FPSOverlay_Draw() {
 	const float scale = 3.0f;
 	const float gw = GLYPH_W * scale;
 	const float gh = GLYPH_H * scale;
+	// Clear of TV overscan: a 480p TV measured hiding ~14 lines at the top.
 	const float ox = 12.0f;
-	const float oy = 12.0f;
+	const float oy = 24.0f;
 
 	float x = ox;
 	for (const char *p = buf; *p; p++, x += gw) {

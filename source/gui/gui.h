@@ -1,9 +1,10 @@
 /****************************************************************************
  * DiiS - gui.h
  *
- * GX GUI framework (menu rework phase 2): drawing in the 640x480 canvas
- * main.cpp's init() sets up (guOrtho 0..640 x 0..480, one unit = one canvas
- * pixel), bitmap text, controller input, focus navigation and a screen stack.
+ * GX GUI framework (menu rework phase 2): drawing in a 320x240 canvas (one
+ * unit = one canvas pixel) that guiEndFrame() scales 2x, nearest, to the
+ * screen, so everything sits on one pixel grid as on the DS; bitmap text,
+ * controller input, focus navigation and a screen stack.
  * The GUI owns GX and the XFBs while guiRun() runs (draw_thread isn't
  * running yet), and hands GX back in the present state draw_thread expects
  * when it returns.
@@ -13,8 +14,8 @@
  *   class MyScreen : public GuiScreen {
  *       void enter() {                       // pushed (and on guiRefresh())
  *           focus.clear();
- *           int g = focus.addGroup(GuiRect(40, 80, 560, 300), 76);   // scrolls by row
- *           for (i...) focus.add(g, i, GuiRect(col * 80, row * 76, 76, 76));
+ *           int g = focus.addGroup(GuiRect(20, 40, 280, 150), 38);   // scrolls by row
+ *           for (i...) focus.add(g, i, GuiRect(col * 40, row * 38, 38, 38));
  *       }
  *       void draw() {
  *           guiRect(...); guiText(...);
@@ -39,8 +40,8 @@
 #include <string>
 #include <vector>
 
-#define GUI_W 640
-#define GUI_H 480
+#define GUI_W 320   // canvas; shown at 2x
+#define GUI_H 240
 
 struct GuiRect {
 	int x, y, w, h;
@@ -75,15 +76,17 @@ void guiRectGradient(const GuiRect &r, GuiColor top, GuiColor bottom);
 void guiRoundRect(const GuiRect &r, int radius, GuiColor c);
 // Rounded panel: fill, then a borderW-pixel border on top (borderW 0: none).
 void guiPanel(const GuiRect &r, int radius, GuiColor fill, GuiColor border, int borderW);
-void guiFade(u8 a);                       // black over the whole canvas
+// c (black by default) at alpha a over the whole canvas; the screen's edge
+// columns follow it.
+void guiFade(u8 a, GuiColor c = guiRgba(0, 0, 0));
 void guiTriangle(int x0, int y0, int x1, int y1, int x2, int y2, GuiColor c);
 
 // Clipping (scissor); nests by intersection.
 void guiPushClip(const GuiRect &r);
 void guiPopClip();
 
-// RGB5A3 image (e.g. a library icon). The source is row-major (LibGame::icon,
-// gui_icons.h); w and h must be multiples of 4.
+// RGB5A3 image (e.g. a library icon). The source is row-major (LibGame::icon);
+// w and h must be multiples of 4.
 struct GuiImage {
 	GXTexObj tex;
 	u16 *data;
@@ -93,18 +96,49 @@ struct GuiImage {
 bool guiImageCreate(GuiImage &img, const u16 *rgb5a3, int w, int h);
 void guiImageFree(GuiImage &img);
 void guiImage(const GuiImage &img, int x, int y, int scale = 1, GuiColor tint = guiRgba(255, 255, 255));
+// The sw x sh texels at (sx, sy) of img, drawn at (x, y).
+void guiImagePart(const GuiImage &img, int sx, int sy, int sw, int sh, int x, int y, int scale = 1,
+                  GuiColor tint = guiRgba(255, 255, 255));
+
+// Menu textures (gui_gfx.cpp, the PNGs in data/gui). Sheets are split into frames
+// (stacked vertically); the count is in the comment. Decoded on first use and
+// kept; an unknown id / frame gives an empty image (guiImage draws nothing).
+enum GuiGfx {
+	GUI_GFX_BOXART_PLACEHOLDER,   // 64x64
+	GUI_GFX_CORNERICONS,          // 32x32 x4
+	GUI_GFX_CURSOR,               // 32x32 x4: focus-frame corners
+	GUI_GFX_DIALOGBOX,            // 64x64
+	GUI_GFX_FOLDER_ICON,          // 64x64
+	GUI_GFX_ICON_DSCARD,          // 32x32 x2
+	GUI_GFX_ICON_EMPTY,           // 64x64
+	GUI_GFX_ICON_GBA,             // 32x32
+	GUI_GFX_ICONPHAT_GBA,         // 32x32
+	GUI_GFX_ICON_GBAMODE,         // 32x32 x2
+	GUI_GFX_ICON_SETTINGS,        // 32x32 x2
+	GUI_GFX_ICON_SETTINGS_AWAY,   // 32x32
+	GUI_GFX_ICON_UNK,             // 32x32
+	GUI_GFX_ICONBOX,              // 256x64 x2
+	GUI_GFX_ICONBOX_PRESSED,      // 256x64
+	GUI_GFX_LAUNCH_DOT,           // 16x16 x8
+	GUI_GFX_SCROLL_WINDOW,        // 32x32
+	GUI_GFX_START_BORDER,         // 32x32 x8
+	GUI_GFX_WIRELESSICONS,        // 32x32 x2
+	GUI_GFX_COUNT
+};
+const GuiImage &guiGfx(GuiGfx id, int frame = 0);
+int guiGfxFrames(GuiGfx id);
 
 // Built-in images.
-const GuiImage &guiGenericIcon(bool gba);  // 32x32 DS / GBA icon for games without one
+const GuiImage &guiGenericIcon(bool gba);  // 32x32 DS card / GBA icon for games without one
 void guiPointer(int x, int y);            // Wii pointer + shadow, hotspot at (x, y)
-void guiFocusFrame(const GuiRect &r);     // standard focus highlight around r
+void guiFocusFrame(const GuiRect &r);     // standard focus highlight: DS menu cursor corners around r
 
 //---------------------------------------------------------------------------
-// Text (gui_text.cpp): UTF-8, Noto Sans bitmap fonts (tools/gui/mkfont.py).
+// Text (gui_text.cpp): UTF-8, the DS system font at 1x / 2x (tools/gui/mkfont.py).
 // Characters the font doesn't have draw as a box; full-width ASCII (U+FF01..)
 // folds to ASCII. y is the top of the line box (baseline = y + ascent).
 //---------------------------------------------------------------------------
-enum GuiFont { GUI_FONT_BODY, GUI_FONT_TITLE };   // 20 px, 28 px semibold
+enum GuiFont { GUI_FONT_BODY, GUI_FONT_TITLE };   // 11 px line (1x), 22 px line (2x)
 enum GuiAlign { GUI_ALIGN_LEFT, GUI_ALIGN_CENTER, GUI_ALIGN_RIGHT };
 
 int guiFontHeight(GuiFont f);             // line box: ascent + descent
@@ -206,11 +240,33 @@ public:
 };
 
 //---------------------------------------------------------------------------
-// Widgets (gui_widgets.cpp): the menu's palette and standard controls.
+// Widgets (gui_widgets.cpp): the menu's palette and standard controls, in
+// the look of the DS (Lite) system menu, 1:1 on the canvas: a light lined grid,
+// dark text, the slate-blue top bar, orange cursor and accents.
 //---------------------------------------------------------------------------
-static const GuiColor GUI_COL_TEXT = guiRgba(236, 240, 248), GUI_COL_DIM = guiRgba(150, 160, 180);
-static const GuiColor GUI_COL_PANEL = guiRgba(30, 36, 52), GUI_COL_PANEL_EDGE = guiRgba(58, 68, 92);
-static const GuiColor GUI_COL_ACCENT = guiRgba(56, 120, 200);
+static const GuiColor GUI_COL_TEXT = guiRgba(40, 40, 40), GUI_COL_DIM = guiRgba(120, 120, 120);
+static const GuiColor GUI_COL_PANEL = guiRgba(248, 248, 248), GUI_COL_PANEL_EDGE = guiRgba(120, 120, 120);
+static const GuiColor GUI_COL_ACCENT = guiRgba(251, 105, 0);   // the dialog box's orange (the cursor's too)
+static const GuiColor GUI_COL_ROW_FOCUS = guiRgba(255, 228, 204);   // focused choice / toggle row
+static const GuiColor GUI_COL_TEXT_LIGHT = guiRgba(248, 248, 248);   // on the top bar / dialog box
+
+#define GUI_DS_SCALE 1       // DS pixels -> canvas pixels for the menu's art
+// Canvas rows kept clear of text and boxes at the top and bottom: TVs hide
+// the picture's edges (overscan; a 480p component TV measured ~14 lines at
+// the top, ~11 at the bottom of 480). Backgrounds still run to the edge.
+#define GUI_SAFE_Y 8
+#define GUI_TOPBAR_H (GUI_SAFE_Y + 16)   // the top bar: 16 DS rows below the safe margin
+
+// Whole-canvas background: the DS menu's lined paper with its 48 px grid.
+void guiDsBackground();
+// The top bar across the canvas (y 0..GUI_TOPBAR_H; its art from GUI_SAFE_Y).
+void guiTopBar();
+// The backdrop (top bar over the paper) at canvas (x, y) outside the
+// canvas's sides, where guiEndFrame() continues it to the screen's edges.
+GuiColor guiDsEdgeColor(int x, int y);
+// The DS menu's dark dialog box (orange edge), nine-sliced to r. Text on it
+// is GUI_COL_TEXT_LIGHT.
+void guiDialogBox(const GuiRect &r);
 
 void guiButton(const GuiRect &r, const char *label, bool primary);
 
@@ -243,7 +299,7 @@ void guiToggleDraw(const GuiRect &r, const char *label, bool on, bool focused);
 int guiRun(GuiScreen *root);
 void guiPush(GuiScreen *s);      // takes effect after this frame
 void guiPop();
-void guiQuit(int code);
+void guiQuit(int code);         // fades the screen to black first; it stays black
 
 // gui_library.cpp: the menu (Library / Game screens). 0: the user picked
 // `rom` to boot, then load savestate `stateSlot` (-1: none); GUI_EXIT: leave.
