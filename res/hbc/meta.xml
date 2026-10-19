@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="0.3">
+	<name>DiiS</name>
+	<version>r1</version>
+        <release_date>10/17/2026</release_date>
+	<coder>Many</coder>
+	<short_description>Nintendo DS and GBA emulator for Wii</short_description>
+	<long_description>A homebrew Nintendo DS emulator for the Nintendo Wii with ARM7/ARM9 JIT recompilers, hardware-accelerated 3D and GBA slot-2 support.
+
+Built by: Robert Hoffman
+
+Based on the original DeSmuME Wii port by: Arikado, scanff, firnis, and baby.lueshi</long_description>
+</app>
